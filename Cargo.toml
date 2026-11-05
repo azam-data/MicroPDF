@@ -1,0 +1,19 @@
+[package]
+name = "micro_pdf"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+pdfium-render = "0.8"
+anyhow = "1.0"
+winit = "0.30"
+softbuffer = "0.4"
+rfd = "0.15"
+lopdf = "0.34"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

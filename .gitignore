@@ -1,0 +1,21 @@
+# Build & distribution directories
+/target/
+/dist_windows/
+/dist_mac/
+/bin/
+/lib/
+
+# PDF documents & sidecar files
+*.pdf
+*.bookmarks.txt
+
+# Native dynamic libraries, executables & release archives
+*.dll
+*.dylib
+*.so
+*.exe
+*.zip
+
+# OS metadata
+.DS_Store
+Thumbs.db
