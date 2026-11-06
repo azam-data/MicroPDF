@@ -10,6 +10,7 @@ winit = "0.30"
 softbuffer = "0.4"
 rfd = "0.15"
 lopdf = "0.34"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 [profile.release]
 opt-level = "z"

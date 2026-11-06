@@ -1,40 +1,32 @@
 # MicroPDF
 
-**MicroPDF** is an ultra-lightweight (**~12 MB RAM**), portable, zero-GPU-bloat PDF viewer and structural editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), and [`lopdf`](https://crates.io/crates/lopdf).
+**MicroPDF** is an ultra-lightweight (**~12–15 MB RAM**), portable, zero-GPU-bloat PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), and [`image`](https://crates.io/crates/image).
 
-Designed for maximum speed, tiny binary size (**< 1 MB** executable), and strict single-page memory discipline, MicroPDF blits PDFium bitmaps directly into a CPU window buffer and uses the native OS Window Title Bar as a zero-overhead interactive HUD.
+Designed for maximum speed, tiny binary size (**~1 MB** executable), and strict single-page memory discipline, MicroPDF renders a zero-RAM CPU **Top Menu Bar**, **Multi-Document Tab Bar**, and **Bottom Command & Status Bar** directly into the window frame buffer.
 
 ---
 
-## Features
+## Key Features
 
-- **Strict Single-Page Viewport Virtualization (~12 MB RSS)**:
-  - Rasterizes only the single currently visible page into a CPU frame buffer, dropping previous page buffers immediately on page turn or resize.
-  - Automatic aspect-ratio fitting, centering, and crisp HiDPI / Retina scaling.
-- **Multi-Document Tab System (Zero-RAM Inactive Tabs)**:
-  - Open multiple PDFs simultaneously in a 28px top **Tab Bar** (`[ 1: fileA.pdf [x] ]  [ 2: fileB.pdf [x] ]  [ + ]`).
-  - Only the active tab holds a rendered page or thumbnail cache; switching tabs frees cached bitmaps immediately.
-- **Logical Page Numbering Synchronization (`/PageLabels` + Smart Jump `G`)**:
-  - Stamp lowercase Roman numerals (`i, ii, iii, iv, v...`) on pages `1..=K` and Arabic numerals (`1, 2, 3...`) after that via `N`.
-  - Automatically writes PDF `/PageLabels` into the Root Catalog on Save/Compress and restores `roman_end` when opening any PDF.
-  - Displays both logical and physical page numbers (`Page 2 (5 of 10)` or `Page ii (2 of 10)`) and supports Smart Jump (`G`): type `5` for logical page 5, `ii` for Roman page 2, or `#5` for physical page 5.
-- **Hierarchical Bookmark `.txt` Import (`L`) & Native PDF `/Outlines` Embedding**:
-  - Import `--` delimited `.txt` bookmark files (`Serial -- Title -- LogicalPage`, e.g. `1 -- Chapter One -- 1` and `a -- Section A -- 2`) via hotkey `L`, clicking `[Import .txt]` in the Bookmark Sidebar (`B`), or dragging and dropping a `.txt` file into the window.
-  - Top-level numeric chapters (`1, 2, 3`) render in bright white (`1. Chapter [p.1]`) and alphabetic sub-items (`a, b, c`) indent by 16px in soft cyan (`   a. Section [p.2]`).
-  - Automatically re-syncs bookmark page indices whenever Roman/Arabic page numbering (`N`) is changed, and embeds the full hierarchical `/Outlines` tree into the PDF catalog on Save (`S`).
-- **All-Pages Thumbnail Grid Overview (`Tab`) + Per-Page Grayscale (`[BW]` / `K`)**:
-  - Toggle between Single-Page View and a scrollable Thumbnail Grid (`140 x 198` cards).
-  - **Per-Page Grayscale (`[BW]`)**: Click the top-left `[BW]` badge on any thumbnail (or press `K`) to convert that page's text, paths, annotations, and `/DeviceRGB` raster images to 8-bit grayscale (`/DeviceGray`) in-place.
-  - **Per-Page Rotation (`[R]`)**: Click the top-right `[R]` badge on any thumbnail (or press `R`) to rotate that page 90° clockwise.
-  - **Drag-and-Drop Page Reordering & PDF Insertion**: Drag thumbnails to reorder pages live, or drop an external `.pdf` onto a thumbnail to insert its pages before that page.
-- **OS-Native Multi-Step Undo (`Cmd+Z` on macOS, `Ctrl+Z` on Windows)**:
-  - Maintains an in-memory per-tab undo stack (up to 8 states) across all mutating operations (Rotate, Delete, Insert, Highlight, Page Numbering, Header/Footer, Watermark, Clear Margins, Page Reorder, Drop-Insert, and `[BW]` conversion).
-- **Interactive Mouse Text Highlighting**:
-  - Left-click and drag across text in Single-Page View for a live semi-transparent yellow selection box; releasing bakes permanent highlight annotations and multiply-blend highlight paths onto the intersecting text lines.
-- **Aligned Headers & Footers (`H`) + Margin Zone Purge (`C`)**:
-  - 3-step interactive prompt supporting `HL` (Header-Left), `HC` (Header-Center), `HR` (Header-Right), `FL` (Footer-Left), `FC` (Footer-Center), and `FR` (Footer-Right), with automatic margin object removal and whiteout band.
-- **Diagonal Watermarks (`W`), Blank Page Insertion (`I`), Split (`X`), Merge (`M`), & Compression (`Z`)**:
-  - Stamp 45° semi-transparent watermarks, insert blank A4 pages, extract page ranges (`1-3` or `2,4,6`), merge PDFs, or prune & compress streams into `<filename>_compressed.pdf`.
+- **Zero-RAM CPU-Rendered Menu Bar & Command/Status Bar**:
+  - **24px Top Menu Bar (`#1E1E1E`)**: 6 clickable dropdown menus (`[ File ]  [ View ]  [ Edit ]  [ Page ]  [ Tools ]  [ Help ]`) rendered directly over the CPU frame buffer (`#252526` dropdown, `#007ACC` hover highlight).
+  - **22px Bottom Command & Status Bar**: Displays interactive typing prompts with a live cursor inside the window whenever searching text, jumping pages, or stamping numbers/headers/watermarks, plus live page, mode, mouse-tool, filter, and RAM telemetry.
+- **Four View Modes (`1`, `2`, `3`, `4` Keys & `View` Menu)**:
+  1. **`FitPage` (`1`)**: Fits the full page cleanly inside the available viewport.
+  2. **`FitWidth` (`2`)**: Scales the page so its full width fills the viewport (minus 24px padding), with smooth vertical scrolling (`scroll_y`) and automatic page-to-page transitions.
+  3. **`FitTextWidth` (`3`)**: Computes the union bounding box of page content objects (`page.objects().iter()`) to auto-trim left/right margins so the text column fills the viewport width.
+  4. **`TwoPageSpread` (`4`)**: Renders `current_page` and `current_page + 1` side-by-side with a 12px gap, advancing 2 pages at a time.
+- **6 Zero-RAM Power Editor Tools**:
+  1. **Text Search (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`)**: Searches `page.text()` across pages, jumps to matches, and highlights matching character bounding boxes on the CPU canvas in bright orange/cyan.
+  2. **True Black-Box Redaction & Metadata Sanitizer (`Mouse Mode: Redact`)**: Drag a red box across any page region to permanently delete intersecting text/path objects, stamp a solid black rectangle (`0, 0, 0`), and strip `/Author`, `/Creator`, `/Producer`, and `/Keywords` metadata on save.
+  3. **Visual Page Cropping (`Mouse Mode: Crop Page Area`)**: Drag a green box to crop the page's `/CropBox` in-place, with one-click restore via `Page -> Reset Page Crop` or `Cmd/Ctrl+Z`.
+  4. **Signature / Image Stamp (`P` Key or `Tools -> Stamp Signature / Image...`)**: Pick any `.png` (preserving alpha transparency) or `.jpg`/`.jpeg` file and click or drag on the page to stamp it via `PdfPageImageObject`.
+  5. **Dark Mode / Sepia Reading Filter (`V` Key or `View` Menu)**: Cycles `Normal`, `DarkInvert`, and `WarmSepia` directly in the final `softbuffer` blit loop with zero extra RAM and zero modifications to the PDF file.
+  6. **Flatten & Unlock PDF (`U` Key or `Tools -> Flatten & Unlock PDF`)**: Flattens annotations and form fields on all pages into page content streams and strips `/Encrypt`, `/AcroForm`, and `/Perms` restrictions.
+- **Batch Combine Multiple PDFs (`Shift+M` or `File -> Combine Multiple PDFs...`)**:
+  - Select 2 or more PDF files in the native multi-file dialog to append all their pages in order and open the combined document in a new `"Combined.pdf"` tab.
+- **Multi-Document Tab Bar, Thumbnail Grid (`Tab`), Grayscale (`[BW]` / `K`), Bookmarks (`B` / `L`), & Multi-Step Undo (`Cmd/Ctrl+Z`)**:
+  - Zero-RAM inactive tabs, `140 x 198` Thumbnail Grid with drag-and-drop page reordering and `[BW]` / `[R]` badges, Roman/Arabic `/PageLabels` (`N`), aligned Headers/Footers (`H`), Margin Zone purge (`C`), hierarchical `.txt` bookmarks (`L`) embedded into `/Outlines`, and 8-step Undo (`Cmd/Ctrl+Z`).
 
 ---
 
@@ -42,50 +34,31 @@ Designed for maximum speed, tiny binary size (**< 1 MB** executable), and strict
 
 | Shortcut / Action | Mode | Description |
 | :--- | :--- | :--- |
-| `Right` / `Down` / `PageDown` / `Space` | Single-Page | Next page |
-| `Left` / `Up` / `PageUp` | Single-Page | Previous page |
-| `Home` / `End` | Single-Page | First page / Last page |
-| **Mouse Wheel** | Single / Grid / Sidebar | Turn page (`120ms` debounce) / Scroll thumbnail grid / Scroll bookmarks |
-| **Top Tab Bar Click** / `Ctrl+Tab` | Any | Switch PDF tab, click `[x]` (or `Cmd/Ctrl+W`) to close tab, `[+]` to open PDF |
-| **Left-Click & Drag** | Single-Page | Select & highlight text lines in yellow |
-| **Left-Click & Drag** | Thumbnail Grid | Drag thumbnail `A` before thumbnail `B` to reorder pages |
-| **Click `[BW]`** or press `K` | Normal / Grid | Convert current or clicked page to 8-bit Grayscale (Black & White) |
-| **Click `[R]`** or press `R` | Normal / Grid | Rotate current or clicked page 90° clockwise |
-| **Double-Click** / `Enter` | Thumbnail Grid | Open selected thumbnail in Single-Page View |
-| **OS Drag & Drop `.pdf`** | Single / Grid | Open in new tab (Single View) / Insert pages before target thumbnail (Grid View) |
-| **OS Drag & Drop `.txt`** | Any | Import `--` delimited hierarchical bookmarks into active PDF tab |
-| `Tab` | Any | Toggle between **Single-Page View** and **All-Pages Thumbnail Grid** |
+| **Top Menu Bar Click** | Any | Open `[ File ]`, `[ View ]`, `[ Edit ]`, `[ Page ]`, `[ Tools ]`, or `[ Help ]` dropdown menu |
+| `1` / `2` / `3` / `4` | Page View | Switch View Mode: `1` Fit Page, `2` Fit Width, `3` Fit Text Width, `4` Two-Page Side-by-Side |
+| `Tab` | Any | Toggle between **Page View** and **All-Pages Thumbnail Grid** (`Ctrl+Tab` cycles open tabs) |
+| `Cmd/Ctrl+F` & `F3` / `Cmd/Ctrl+G` | Any | Find text in PDF & jump to next search match |
+| `V` | Page View | Cycle **Normal** / **Dark Invert** / **Warm Sepia** reading filter (zero-RAM CPU blit) |
+| `P` | Page View | Pick PNG/JPG signature or image -> Click or drag on page to stamp |
+| `U` | Any | Flatten annotations/form fields on all pages & unlock PDF permissions |
+| `Shift+M` / `M` | Any | **Combine Multiple PDFs** into `"Combined.pdf"` tab (`Shift+M`) / Merge 1 PDF (`M`) |
+| **Left-Click & Drag** | Page View | Highlight text (default), Black-Box Redact, Crop Page Area, or Stamp Image |
 | `B` / `L` | Any | Toggle **Left Bookmark Sidebar** / Import `.txt` bookmarks (`Serial -- Title -- Page`) |
 | `G` or `0`–`9` | Normal | Smart Jump to Logical page (`5`), Roman page (`ii`), or Physical page (`#5`) |
-| `N` | Normal | Stamp Roman (`1..=K`) + Arabic page numbers & sync `/PageLabels` + bookmarks |
-| `H` / `C` | Normal | Stamp aligned Header/Footer (`HL`,`HC`,`HR`,`FL`,`FC`,`FR`) / Clear margin zones |
-| `W` | Normal | Stamp diagonal semi-transparent watermark across all pages |
-| `I` / `D` | Normal | Insert blank A4 page after current page / Delete current page |
-| `Cmd+Z` (macOS) / `Ctrl+Z` (Win) | Normal | Undo last structural or page edit (up to 8 steps per tab) |
-| `X` / `M` / `Z` | Normal | Split page range / Merge PDF / Compress & optimize PDF (`<name>_compressed.pdf`) |
-| `O` / `S` | Normal | Open PDF in new tab / Save modified PDF (embeds `/PageLabels` & `/Outlines`) |
-| `?` / `F1` / `Esc` | Any | Toggle in-window Help Overlay / Cancel current prompt |
+| `N` / `H` / `C` / `W` | Normal | Roman/Arabic Page Numbers (`N`), Aligned Header/Footer (`H`), Clear Margins (`C`), Watermark (`W`) |
+| `K` / `I` / `R` / `D` | Normal / Grid | Convert page to Grayscale `[BW]` (`K`), Insert A4 (`I`), Rotate 90° (`R`), Delete page (`D`) |
+| `Cmd+Z` / `Ctrl+Z` | Normal | Undo last structural or page edit (up to 8 steps per tab) |
+| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Compress PDF (`Z`), Split/Extract range (`X`) |
+| `?` / `F1` / `Esc` | Any | Toggle Help Overlay / Close menu / Cancel prompt / Reset mouse mode |
 
 ---
 
 ## Building from Source
 
-### 1. Download Dynamic PDFium Library
-MicroPDF dynamically binds to PDFium at runtime, looking in the executable's directory first and falling back to the current working directory (`./`).
-
-Download the prebuilt PDFium shared library for your target platform from [`bblanchon/pdfium-binaries`](https://github.com/bblanchon/pdfium-binaries/releases):
-- **Windows (`x86_64`)**: Extract `bin/pdfium.dll` next to `micro_pdf.exe` (or project root).
-- **macOS (`arm64` / `x86_64`)**: Extract `lib/libpdfium.dylib` next to `micro_pdf` (or project root).
-- **Linux (`x86_64`)**: Extract `lib/libpdfium.so` next to `micro_pdf` (or project root).
-
-### 2. Build Native Release Binary
 ```bash
+# Native macOS / Linux Release Build
 cargo build --release
-```
 
-### 3. Cross-Compile Portable Windows `.exe` from macOS/Linux (Optional)
-Using [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin):
-```bash
+# Portable Windows x86_64 Cross-Compile
 cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
-Place `target/x86_64-pc-windows-msvc/release/micro_pdf.exe` and `pdfium.dll` in the same folder for a standalone, zero-install portable Windows bundle.

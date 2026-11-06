@@ -63,6 +63,21 @@ pub struct Bookmark {
     pub level: u8,
 }
 
+/// A single text search match on a specific 0-based page, holding one or more line-level bounding boxes.
+#[derive(Clone, Debug)]
+pub struct SearchMatch {
+    pub page_index: u16,
+    pub rects: Vec<PdfRect>,
+}
+
+/// Decoded RGBA image buffer for stamping signatures or images onto a PDF page (`P` key).
+#[derive(Clone, Debug)]
+pub struct StampImageBuffer {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 pub struct PdfEngine {
     pub pdfium: Pdfium,
 }
@@ -608,6 +623,29 @@ impl PdfEngine {
             catalog_mut.set("PageLabels", lopdf::Object::Reference(page_labels_id));
             if let Some(outlines_id) = outlines_id_opt {
                 catalog_mut.set("Outlines", lopdf::Object::Reference(outlines_id));
+            }
+            catalog_mut.remove(b"Metadata");
+        }
+
+        // Sanitize document metadata: strip /Author, /Creator, /Producer, /Keywords from /Info dictionary
+        if let Ok(info_obj) = ldoc.trailer.get(b"Info").cloned() {
+            match info_obj {
+                lopdf::Object::Reference(info_id) => {
+                    if let Ok(lopdf::Object::Dictionary(info_dict)) = ldoc.get_object_mut(info_id) {
+                        info_dict.remove(b"Author");
+                        info_dict.remove(b"Creator");
+                        info_dict.remove(b"Producer");
+                        info_dict.remove(b"Keywords");
+                    }
+                }
+                lopdf::Object::Dictionary(mut info_dict) => {
+                    info_dict.remove(b"Author");
+                    info_dict.remove(b"Creator");
+                    info_dict.remove(b"Producer");
+                    info_dict.remove(b"Keywords");
+                    ldoc.trailer.set("Info", lopdf::Object::Dictionary(info_dict));
+                }
+                _ => {}
             }
         }
 
@@ -1710,6 +1748,443 @@ impl PdfEngine {
         Ok(step1_bytes)
     }
 
+    /// Computes the union bounding box `(min_x, min_y, max_x, max_y)` in PDF points of all
+    /// content objects (`page.objects().iter()`) on `page` for `FitTextWidth` mode (`3` key).
+    /// Falls back to a 12% left/right margin trim if the page has no detectable content bounds.
+    pub fn compute_page_content_bounds(page: &PdfPage) -> (f32, f32, f32, f32) {
+        let page_w = page.width().value.max(1.0);
+        let page_h = page.height().value.max(1.0);
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        let mut found = false;
+
+        for obj in page.objects().iter() {
+            if let Ok(b) = obj.bounds() {
+                let left = b.left().value.min(b.right().value).max(0.0);
+                let right = b.left().value.max(b.right().value).min(page_w);
+                let bottom = b.bottom().value.min(b.top().value).max(0.0);
+                let top = b.bottom().value.max(b.top().value).min(page_h);
+
+                let w = right - left;
+                let h = top - bottom;
+                if w < 1.0 || h < 1.0 {
+                    continue;
+                }
+                // Skip full-page background paths/whiteout boxes that span >95% of the page width
+                if obj.object_type() == PdfPageObjectType::Path && w >= page_w * 0.95 {
+                    continue;
+                }
+                min_x = min_x.min(left);
+                min_y = min_y.min(bottom);
+                max_x = max_x.max(right);
+                max_y = max_y.max(top);
+                found = true;
+            }
+        }
+
+        if found && max_x > min_x && (max_x - min_x) >= page_w * 0.22 {
+            // Add a small 8pt breathing room on left/right of the detected text column
+            let pad = 8.0_f32;
+            let cl_min_x = (min_x - pad).max(0.0);
+            let cl_max_x = (max_x + pad).min(page_w);
+            let cl_min_y = min_y.clamp(0.0, page_h);
+            let cl_max_y = max_y.clamp(cl_min_y + 1.0, page_h);
+            (cl_min_x, cl_min_y, cl_max_x, cl_max_y)
+        } else {
+            (page_w * 0.12, page_h * 0.08, page_w * 0.88, page_h * 0.92)
+        }
+    }
+
+    /// Combines 2 or more PDF files in order into a single in-memory `Vec<u8>` buffer (`Shift+M`).
+    /// Returns `(combined_pdf_bytes, total_pages)`.
+    pub fn combine_multiple_pdfs(&self, paths: &[PathBuf]) -> Result<(Vec<u8>, u16)> {
+        if paths.is_empty() {
+            anyhow::bail!("No PDF files provided to combine");
+        }
+        let mut combined_doc = self
+            .pdfium
+            .create_new_pdf()
+            .context("Failed to create combined PDF document")?;
+
+        for path in paths {
+            let src_doc = self.load_pdf_safe(path)?;
+            combined_doc
+                .pages_mut()
+                .append(&src_doc)
+                .with_context(|| format!("Failed to append pages from {:?}", path))?;
+        }
+
+        let total_pages = combined_doc.pages().len();
+        let bytes = combined_doc
+            .save_to_bytes()
+            .context("Failed to serialize combined PDF document")?;
+        Ok((bytes, total_pages))
+    }
+
+    /// Searches `page.text()` across all pages in `doc` (case-insensitive) and returns all matches
+    /// with their line-level character bounding boxes (`SearchMatch`).
+    pub fn search_text_in_doc(doc: &PdfDocument, query: &str) -> Vec<SearchMatch> {
+        let q_chars: Vec<char> = query
+            .trim()
+            .chars()
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        if q_chars.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let total = doc.pages().len();
+
+        for page_idx in 0..total {
+            let Ok(page) = doc.pages().get(page_idx) else {
+                continue;
+            };
+            let Ok(text_page) = page.text() else {
+                continue;
+            };
+
+            let mut page_chars: Vec<(char, Option<PdfRect>)> = Vec::new();
+            for ch in text_page.chars().iter() {
+                let Some(uc) = ch.unicode_char() else {
+                    continue;
+                };
+                if uc == '\r' || uc == '\n' {
+                    page_chars.push((' ', None));
+                    continue;
+                }
+                if uc.is_control() {
+                    continue;
+                }
+                let rect_opt = ch
+                    .loose_bounds()
+                    .or_else(|_| ch.tight_bounds())
+                    .ok()
+                    .and_then(|b| {
+                        let bottom = b.bottom().value.min(b.top().value);
+                        let top = b.bottom().value.max(b.top().value);
+                        let left = b.left().value.min(b.right().value);
+                        let right = b.left().value.max(b.right().value);
+                        if (right - left) >= 0.1 && (top - bottom) >= 0.1 {
+                            Some(PdfRect::new_from_values(bottom, left, top, right))
+                        } else {
+                            None
+                        }
+                    });
+                for lc in uc.to_lowercase() {
+                    page_chars.push((lc, rect_opt));
+                }
+            }
+
+            if page_chars.len() < q_chars.len() {
+                continue;
+            }
+
+            let mut i = 0;
+            while i + q_chars.len() <= page_chars.len() {
+                let mut matched = true;
+                for j in 0..q_chars.len() {
+                    let pc = page_chars[i + j].0;
+                    let qc = q_chars[j];
+                    if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
+                        matched = false;
+                        break;
+                    }
+                }
+
+                if matched {
+                    let mut line_rects: Vec<PdfRect> = Vec::new();
+                    for j in 0..q_chars.len() {
+                        if let Some(cb) = page_chars[i + j].1 {
+                            if let Some(last) = line_rects.last_mut() {
+                                let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                                let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                                let lh = (last.top().value - last.bottom().value).max(4.0);
+                                if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
+                                    *last = PdfRect::new_from_values(
+                                        last.bottom().value.min(cb.bottom().value),
+                                        last.left().value.min(cb.left().value),
+                                        last.top().value.max(cb.top().value),
+                                        last.right().value.max(cb.right().value),
+                                    );
+                                    continue;
+                                }
+                            }
+                            line_rects.push(cb);
+                        }
+                    }
+
+                    if !line_rects.is_empty() {
+                        matches.push(SearchMatch {
+                            page_index: page_idx,
+                            rects: line_rects,
+                        });
+                    }
+                    i += q_chars.len();
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
+        matches
+    }
+
+    /// True Black-Box Redaction (`Mouse Mode: Redact`):
+    /// 1. Deletes any text or path objects on `page_index` whose bounding box intersects `pdf_rect`.
+    /// 2. Draws a permanent solid black rectangle (`0, 0, 0`) over `pdf_rect` in PDF coordinates.
+    pub fn redact_rect_on_page(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+    ) -> Result<usize> {
+        let sel_bottom = pdf_rect.bottom().value.min(pdf_rect.top().value);
+        let sel_top = pdf_rect.bottom().value.max(pdf_rect.top().value);
+        let sel_left = pdf_rect.left().value.min(pdf_rect.right().value);
+        let sel_right = pdf_rect.left().value.max(pdf_rect.right().value);
+
+        if (sel_right - sel_left) < 2.0 && (sel_top - sel_bottom) < 2.0 {
+            return Ok(0);
+        }
+
+        let normalized_sel = PdfRect::new_from_values(sel_bottom, sel_left, sel_top, sel_right);
+
+        let mut page = doc
+            .pages_mut()
+            .get(page_index)
+            .context("Page index out of bounds for redaction")?;
+
+        let mut to_remove = Vec::new();
+        let obj_count = page.objects().len();
+        for i in 0..obj_count {
+            if let Ok(obj) = page.objects().get(i) {
+                if matches!(
+                    obj.object_type(),
+                    PdfPageObjectType::Text | PdfPageObjectType::Path
+                ) {
+                    if let Ok(b) = obj.bounds() {
+                        let b_bottom = b.bottom().value.min(b.top().value);
+                        let b_top = b.bottom().value.max(b.top().value);
+                        let b_left = b.left().value.min(b.right().value);
+                        let b_right = b.left().value.max(b.right().value);
+
+                        let intersects = b_left <= sel_right
+                            && b_right >= sel_left
+                            && b_bottom <= sel_top
+                            && b_top >= sel_bottom;
+                        if intersects {
+                            to_remove.push(i);
+                        }
+                    }
+                }
+            }
+        }
+
+        let prev_strategy = page.content_regeneration_strategy();
+        page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+        let mut removed_count = 0usize;
+        for &idx in to_remove.iter().rev() {
+            if let Ok(obj) = page.objects_mut().remove_object_at_index(idx) {
+                std::mem::forget(obj);
+                removed_count += 1;
+            }
+        }
+
+        let black_rect_res = page.objects_mut().create_path_object_rect(
+            normalized_sel,
+            None,
+            None,
+            Some(PdfColor::BLACK),
+        );
+
+        let regen_res = page.regenerate_content();
+        page.set_content_regeneration_strategy(prev_strategy);
+
+        black_rect_res.context("Failed to draw black redaction rectangle")?;
+        regen_res.context("Failed to regenerate page content after redaction")?;
+
+        Ok(removed_count)
+    }
+
+    /// Crops `page_index` (0-based) to `crop_rect` by setting `/CropBox` (while preserving `/MediaBox`
+    /// so `reset_page_crop` can restore the original full page bounds).
+    /// Returns serialized PDF bytes so reloading updates PDFium's cached page dimensions immediately.
+    pub fn crop_page_to_rect(
+        &self,
+        doc: &mut PdfDocument,
+        page_index: u16,
+        crop_rect: PdfRect,
+    ) -> Result<Vec<u8>> {
+        let mut bottom = crop_rect.bottom().value.min(crop_rect.top().value);
+        let mut top = crop_rect.bottom().value.max(crop_rect.top().value);
+        let mut left = crop_rect.left().value.min(crop_rect.right().value);
+        let mut right = crop_rect.left().value.max(crop_rect.right().value);
+
+        if (right - left) < 10.0 || (top - bottom) < 10.0 {
+            anyhow::bail!("Crop area too small (minimum 10x10 pt)");
+        }
+
+        {
+            let mut page = doc
+                .pages_mut()
+                .get(page_index)
+                .context("Page index out of bounds for cropping")?;
+
+            // Ensure MediaBox is explicitly set if not already present so Reset Page Crop always knows the full bounds
+            if page.boundaries().media().is_err() {
+                let full_rect = PdfRect::new_from_values(
+                    0.0,
+                    0.0,
+                    page.height().value,
+                    page.width().value,
+                );
+                let _ = page.boundaries_mut().set_media(full_rect);
+            }
+
+            // If the page already has a CropBox offset, `pixels_to_points` in PDFium is relative to
+            // the current CropBox origin `(cur_left, cur_bottom)` when `left >= 0 && right <= page.width()`.
+            if let Ok(existing_crop) = page.boundaries().crop() {
+                let c_left = existing_crop.bounds.left().value;
+                let c_bottom = existing_crop.bounds.bottom().value;
+                if (c_left.abs() > 0.5 || c_bottom.abs() > 0.5)
+                    && right <= page.width().value + 1.0
+                    && top <= page.height().value + 1.0
+                {
+                    left += c_left;
+                    right += c_left;
+                    bottom += c_bottom;
+                    top += c_bottom;
+                }
+            }
+
+            let normalized = PdfRect::new_from_values(bottom, left, top, right);
+            page.boundaries_mut()
+                .set_crop(normalized)
+                .context("Failed to set page CropBox")?;
+        }
+
+        doc.save_to_bytes()
+            .context("Failed to serialize PDF after setting CropBox")
+    }
+
+    /// Resets the `/CropBox` on `page_index` (0-based) back to the page's full `/MediaBox`.
+    pub fn reset_page_crop(&self, doc: &mut PdfDocument, page_index: u16) -> Result<Vec<u8>> {
+        {
+            let mut page = doc
+                .pages_mut()
+                .get(page_index)
+                .context("Page index out of bounds for resetting crop")?;
+            let media_rect = page
+                .boundaries()
+                .media()
+                .map(|b| b.bounds)
+                .unwrap_or_else(|_| PdfRect::new_from_values(0.0, 0.0, 841.89, 595.28));
+            page.boundaries_mut()
+                .set_crop(media_rect)
+                .context("Failed to reset page CropBox to MediaBox")?;
+        }
+        doc.save_to_bytes()
+            .context("Failed to serialize PDF after resetting CropBox")
+    }
+
+    /// Decodes a PNG or JPEG image file from `path` into an RGBA `StampImageBuffer`, preserving PNG alpha transparency.
+    pub fn load_stamp_image(path: &Path) -> Result<StampImageBuffer> {
+        let dyn_img = image::open(path)
+            .with_context(|| format!("Failed to decode image file {:?}", path))?;
+        let rgba_img = dyn_img.to_rgba8();
+        let (width, height) = rgba_img.dimensions();
+        if width == 0 || height == 0 {
+            anyhow::bail!("Image has zero width or height");
+        }
+        Ok(StampImageBuffer {
+            width,
+            height,
+            rgba: rgba_img.into_raw(),
+        })
+    }
+
+    /// Stamps `stamp` (preserving PNG alpha transparency via `image::DynamicImage` + `PdfPageImageObject`)
+    /// onto `page_index` inside `target_rect` in PDF coordinates.
+    pub fn stamp_image_on_page(
+        &self,
+        doc: &mut PdfDocument,
+        page_index: u16,
+        stamp: &StampImageBuffer,
+        target_rect: PdfRect,
+    ) -> Result<()> {
+        let left = target_rect.left().value.min(target_rect.right().value);
+        let right = target_rect.left().value.max(target_rect.right().value);
+        let bottom = target_rect.bottom().value.min(target_rect.top().value);
+        let top = target_rect.bottom().value.max(target_rect.top().value);
+        let rect_w = (right - left).max(8.0);
+        let rect_h = (top - bottom).max(8.0);
+
+        let rgba_img =
+            image::RgbaImage::from_raw(stamp.width, stamp.height, stamp.rgba.clone())
+                .context("Invalid RGBA image dimensions for stamp")?;
+        let dyn_img = image::DynamicImage::ImageRgba8(rgba_img);
+
+        let mut img_obj = PdfPageImageObject::new_with_size(
+            doc,
+            &dyn_img,
+            PdfPoints::new(rect_w),
+            PdfPoints::new(rect_h),
+        )
+        .context("Failed to create PdfPageImageObject from DynamicImage")?;
+
+        img_obj
+            .translate(PdfPoints::new(left), PdfPoints::new(bottom))
+            .context("Failed to translate PdfPageImageObject")?;
+
+        let mut page = doc
+            .pages_mut()
+            .get(page_index)
+            .context("Page index out of bounds for stamping image")?;
+        page.objects_mut()
+            .add_image_object(img_obj)
+            .context("Failed to add image object to PDF page")?;
+        page.regenerate_content()
+            .context("Failed to regenerate page content after image stamp")?;
+
+        Ok(())
+    }
+
+    /// Flattens all annotations and form fields across all pages into page content streams,
+    /// and strips any encryption/permissions dictionaries so the resulting PDF is 100% unlocked.
+    pub fn flatten_and_unlock_doc(&self, doc: &mut PdfDocument) -> Result<Vec<u8>> {
+        let total = doc.pages().len();
+        for idx in 0..total {
+            if let Ok(mut page) = doc.pages_mut().get(idx) {
+                let _ = page.flatten();
+            }
+        }
+
+        let flattened_bytes = doc
+            .save_to_bytes()
+            .context("Failed to serialize flattened PDF")?;
+
+        if let Ok(mut ldoc) = lopdf::Document::load_mem(&flattened_bytes) {
+            ldoc.trailer.remove(b"Encrypt");
+            if let Ok(cat) = ldoc.catalog_mut() {
+                cat.remove(b"AcroForm");
+                cat.remove(b"Perms");
+            }
+            let mut out = Vec::with_capacity(flattened_bytes.len());
+            if ldoc.save_to(&mut out).is_ok()
+                && !out.is_empty()
+                && self.load_pdf_from_bytes_safe(out.clone()).is_ok()
+            {
+                return Ok(out);
+            }
+        }
+
+        Ok(flattened_bytes)
+    }
+
     /// Converts a positive integer into lowercase Roman numerals (e.g. 1 -> "i", 4 -> "iv").
     pub fn to_roman(mut num: u16) -> String {
         let numerals = [
@@ -1835,6 +2310,77 @@ mod tests {
         let _ = std::fs::remove_file(PdfEngine::bookmarks_sidecar_path(test_pdf));
         let _ = std::fs::remove_file(test_pdf);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_phase5_power_editor_tools() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let pdf_a = PathBuf::from("test_p5_a.pdf");
+        let pdf_b = PathBuf::from("test_p5_b.pdf");
+        engine.create_sample_pdf(&pdf_a, 3)?;
+        engine.create_sample_pdf(&pdf_b, 2)?;
+
+        // 1. Batch Combine Multiple PDFs
+        let (combined_bytes, total_pages) =
+            engine.combine_multiple_pdfs(&[pdf_a.clone(), pdf_b.clone()])?;
+        assert_eq!(total_pages, 5);
+        let mut doc = engine.load_pdf_from_bytes_safe(combined_bytes)?;
+        assert_eq!(doc.pages().len(), 5);
+
+        // 2. Compute Page Content Bounds (FitTextWidth)
+        {
+            let page0 = doc.pages().get(0)?;
+            let (min_x, _min_y, max_x, _max_y) = PdfEngine::compute_page_content_bounds(&page0);
+            assert!(max_x > min_x);
+            assert!(min_x >= 0.0 && max_x <= page0.width().value);
+        }
+
+        // 3. Text Search across pages
+        let matches = PdfEngine::search_text_in_doc(&doc, "Sample Document");
+        assert_eq!(matches.len(), 5);
+        assert!(!matches[0].rects.is_empty());
+
+        // 4. True Black-Box Redaction
+        let redact_rect = PdfRect::new_from_values(700.0, 60.0, 760.0, 500.0);
+        let removed = PdfEngine::redact_rect_on_page(&mut doc, 0, redact_rect)?;
+        assert!(removed >= 1);
+        let matches_after_redact = PdfEngine::search_text_in_doc(&doc, "Sample Document");
+        assert_eq!(matches_after_redact.len(), 4);
+
+        // 5. Visual Page Cropping & Reset Page Crop
+        let crop_rect = PdfRect::new_from_values(200.0, 50.0, 600.0, 450.0);
+        let cropped_bytes = engine.crop_page_to_rect(&mut doc, 0, crop_rect)?;
+        doc = engine.load_pdf_from_bytes_safe(cropped_bytes)?;
+        {
+            let p0 = doc.pages().get(0)?;
+            assert!((p0.width().value - 400.0).abs() < 1.0);
+            assert!((p0.height().value - 400.0).abs() < 1.0);
+        }
+        let uncropped_bytes = engine.reset_page_crop(&mut doc, 0)?;
+        doc = engine.load_pdf_from_bytes_safe(uncropped_bytes)?;
+        {
+            let p0 = doc.pages().get(0)?;
+            assert!(p0.width().value > 550.0);
+            assert!(p0.height().value > 800.0);
+        }
+
+        // 6. Signature / Image Stamp (with RGBA alpha transparency)
+        let stamp = StampImageBuffer {
+            width: 32,
+            height: 16,
+            rgba: [20u8, 80, 200, 180].repeat(32 * 16),
+        };
+        let stamp_rect = PdfRect::new_from_values(100.0, 100.0, 140.0, 180.0);
+        engine.stamp_image_on_page(&mut doc, 0, &stamp, stamp_rect)?;
+
+        // 7. Flatten & Unlock PDF
+        let flat_bytes = engine.flatten_and_unlock_doc(&mut doc)?;
+        let flat_doc = engine.load_pdf_from_bytes_safe(flat_bytes)?;
+        assert_eq!(flat_doc.pages().len(), 5);
+
+        let _ = std::fs::remove_file(&pdf_a);
+        let _ = std::fs::remove_file(&pdf_b);
         Ok(())
     }
 }

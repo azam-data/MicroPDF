@@ -1,4 +1,6 @@
-use crate::engine::{Bookmark, MarginPosition, MarginZone, PdfEngine};
+use crate::engine::{
+    Bookmark, MarginPosition, MarginZone, PdfEngine, SearchMatch, StampImageBuffer,
+};
 use anyhow::{Context, Result};
 use pdfium_render::prelude::*;
 use softbuffer::{Context as SoftContext, Surface};
@@ -17,26 +19,183 @@ use winit::window::{Window, WindowId};
 const BG_COLOR_U32: u32 = 0x002B2B2B; // #2B2B2B subtle dark gray margin background
 const SIDEBAR_BG_U32: u32 = 0x001E2229;
 const SIDEBAR_WIDTH_LOGICAL: u32 = 240;
+const MENU_BAR_HEIGHT_LOGICAL: u32 = 24;
 const TAB_BAR_HEIGHT_LOGICAL: u32 = 28;
+const STATUS_BAR_HEIGHT_LOGICAL: u32 = 22;
 const PAGE_MARGIN_PX: u32 = 24;
+const SPREAD_GAP_PX: u32 = 12;
 const THUMB_W: u32 = 140;
 const THUMB_H: u32 = 198;
 const MAX_UNDO_STATES: usize = 8;
 
-/// Holds ONLY the single currently visible page's rasterized 0x00RRGGBB pixels.
-/// Replaced immediately whenever `current_page_index` changes or the viewport resizes.
+/// Top Menu Bar categories (`#1E1E1E` bar at the very top of the window).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MenuCategory {
+    File,
+    View,
+    Edit,
+    Page,
+    Tools,
+    Help,
+}
+
+impl MenuCategory {
+    pub const ALL: [MenuCategory; 6] = [
+        MenuCategory::File,
+        MenuCategory::View,
+        MenuCategory::Edit,
+        MenuCategory::Page,
+        MenuCategory::Tools,
+        MenuCategory::Help,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MenuCategory::File => "[ File ]",
+            MenuCategory::View => "[ View ]",
+            MenuCategory::Edit => "[ Edit ]",
+            MenuCategory::Page => "[ Page ]",
+            MenuCategory::Tools => "[ Tools ]",
+            MenuCategory::Help => "[ Help ]",
+        }
+    }
+
+    pub fn items(self) -> &'static [&'static str] {
+        match self {
+            MenuCategory::File => &[
+                "Open PDF in Tab (O)",
+                "Combine Multiple PDFs... (Shift+M)",
+                "Import Bookmarks .txt (L)",
+                "Save PDF (S)",
+                "Compress & Save PDF (Z)",
+                "Close Tab (Ctrl+W)",
+            ],
+            MenuCategory::View => &[
+                "Fit Full Page (1)",
+                "Fit Page Width (2)",
+                "Fit Text Width (3)",
+                "Two-Page Side-by-Side (4)",
+                "Toggle Thumbnail Grid (Tab)",
+                "Toggle Bookmark Sidebar (B)",
+                "Cycle Dark / Sepia / Normal Reading Mode (V)",
+            ],
+            MenuCategory::Edit => &[
+                "Undo (Ctrl+Z / Cmd+Z)",
+                "Find Text in PDF... (Ctrl+F / Cmd+F)",
+                "Mouse Mode: Highlight Text (default)",
+                "Mouse Mode: Black-Box Redact",
+                "Mouse Mode: Crop Page Area",
+            ],
+            MenuCategory::Page => &[
+                "Jump to Page... (G)",
+                "Rotate Current Page 90° (R)",
+                "Insert Blank Page (I)",
+                "Delete Current Page (D)",
+                "Convert Page to Black & White (K)",
+                "Reset Page Crop",
+            ],
+            MenuCategory::Tools => &[
+                "Page Numbering Roman/Arabic... (N)",
+                "Add Header / Footer... (H)",
+                "Clear Existing Margins... (C)",
+                "Add Watermark... (W)",
+                "Stamp Signature / Image... (P)",
+                "Split / Extract Pages... (X)",
+                "Flatten & Unlock PDF (U)",
+            ],
+            MenuCategory::Help => &["Toggle Shortcuts Overlay (? / F1)"],
+        }
+    }
+}
+
+/// Interactive Mouse Drag Mode in Single-Page / Spread Views.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MouseMode {
+    Highlight,
+    Redact,
+    Crop,
+    StampImage,
+}
+
+impl MouseMode {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            MouseMode::Highlight => "Highlight",
+            MouseMode::Redact => "REDACT",
+            MouseMode::Crop => "CROP",
+            MouseMode::StampImage => "STAMP",
+        }
+    }
+}
+
+/// Zero-RAM CPU-rendered Reading Filter (`V` key or `View` menu).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReadingFilter {
+    Normal,
+    DarkInvert,
+    WarmSepia,
+}
+
+impl ReadingFilter {
+    pub fn next(self) -> Self {
+        match self {
+            ReadingFilter::Normal => ReadingFilter::DarkInvert,
+            ReadingFilter::DarkInvert => ReadingFilter::WarmSepia,
+            ReadingFilter::WarmSepia => ReadingFilter::Normal,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ReadingFilter::Normal => "Normal",
+            ReadingFilter::DarkInvert => "Dark",
+            ReadingFilter::WarmSepia => "Sepia",
+        }
+    }
+}
+
+/// Page & Grid View Modes (`1`, `2`, `3`, `4`, and `Tab`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ViewMode {
+    FitPage,
+    FitWidth,
+    FitTextWidth,
+    TwoPageSpread,
+    ThumbnailGrid,
+}
+
+impl ViewMode {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            ViewMode::FitPage => "FitPage",
+            ViewMode::FitWidth => "FitWidth",
+            ViewMode::FitTextWidth => "FitText",
+            ViewMode::TwoPageSpread => "2-Page",
+            ViewMode::ThumbnailGrid => "Grid",
+        }
+    }
+
+    pub fn is_page_view(self) -> bool {
+        !matches!(self, ViewMode::ThumbnailGrid)
+    }
+}
+
+/// Holds a single visible page's rasterized 0x00RRGGBB pixels.
 struct CachedPageBitmap {
     page_index: u16,
+    view_mode: ViewMode,
     viewport_width: u32,
     viewport_height: u32,
     bitmap_width: u32,
     bitmap_height: u32,
+    content_min_x: f32,
+    content_max_x: f32,
     rotation_deg: i32,
     pixels: Vec<u32>,
 }
 
 /// Lightweight 140x198 thumbnail bitmap entry, allocated ONLY while Grid View is active
-/// and freed immediately upon returning to Single-Page View or switching tabs.
+/// and freed immediately upon returning to Page View or switching tabs.
 struct ThumbnailEntry {
     width: u32,
     height: u32,
@@ -49,6 +208,9 @@ struct DocumentTab<'a> {
     doc: Option<PdfDocument<'a>>,
     file_path: PathBuf,
     current_page_index: u16,
+    view_mode: ViewMode,
+    last_page_view_mode: ViewMode,
+    scroll_y: f32,
     roman_end: usize,
     bookmarks: Vec<Bookmark>,
     selected_bookmark: Option<usize>,
@@ -78,16 +240,13 @@ enum SidebarHit {
     BookmarkRow { index: usize, on_delete: bool },
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum ViewMode {
-    SinglePage,
-    ThumbnailGrid,
-}
-
-/// Interactive Command Prompt HUD state machine in the Window Title Bar.
+/// Interactive Command Prompt HUD state machine in the Bottom Command Bar & Window Title Bar.
 #[derive(Clone, Debug, PartialEq)]
 enum InputMode {
     Normal,
+    SearchText {
+        query_input: String,
+    },
     JumpToPage {
         input: String,
     },
@@ -131,6 +290,8 @@ enum PendingDialog {
     Open,
     Save,
     Merge,
+    CombineMultiple,
+    PickStampImage,
     Split(String),
     ImportBookmarksTxt,
 }
@@ -148,15 +309,33 @@ pub struct PdfViewerApp<'a> {
     bw_pages: HashSet<u16>,
     undo_stack: VecDeque<Vec<u8>>,
     cached_page: Option<CachedPageBitmap>,
-    /// Exact screen rectangle `(x, y, width, height)` where the currently rendered PDF page bitmap
-    /// is positioned inside the window buffer.
-    page_rect: (u32, u32, u32, u32),
+    /// Second page bitmap used ONLY in `ViewMode::TwoPageSpread` (`4` key).
+    cached_second_page: Option<CachedPageBitmap>,
+    /// Signed screen draw rectangle `(draw_x, draw_y, bmp_w, bmp_h)` for the primary page.
+    page_draw_rect: (i32, i32, u32, u32),
+    /// Signed screen draw rectangle `(draw_x, draw_y, bmp_w, bmp_h)` for the right page in `TwoPageSpread`.
+    second_page_draw_rect: Option<(i32, i32, u32, u32)>,
     /// Current mouse cursor coordinates in window physical pixels.
     cursor_pos: (f64, f64),
-    /// Active left-click drag state in Single-Page View: `Some((start_x, start_y))` for text highlighting.
+    /// Active left-click drag state in Page View: `Some((start_x, start_y))`.
     drag_start: Option<(f64, f64)>,
-    /// View mode: `SinglePage` vs `ThumbnailGrid` (`Tab` to toggle).
+    /// Active View Mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`, `ThumbnailGrid`).
     view_mode: ViewMode,
+    last_page_view_mode: ViewMode,
+    /// Vertical scroll offset in physical pixels when zoomed in `FitWidth` or `FitTextWidth`.
+    scroll_y: f32,
+    /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
+    open_menu: Option<MenuCategory>,
+    /// Active Mouse Mode (`Highlight`, `Redact`, `Crop`, `StampImage`).
+    mouse_mode: MouseMode,
+    /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
+    pending_stamp_image: Option<StampImageBuffer>,
+    /// Zero-RAM CPU-rendered Reading Filter (`Normal`, `DarkInvert`, `WarmSepia`).
+    reading_filter: ReadingFilter,
+    /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`).
+    search_query: String,
+    search_matches: Vec<SearchMatch>,
+    current_search_match: usize,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
     thumbnail_cache: HashMap<u16, ThumbnailEntry>,
     /// Vertical scroll offset in physical pixels for Thumbnail Grid View.
@@ -172,7 +351,7 @@ pub struct PdfViewerApp<'a> {
     bookmarks: Vec<Bookmark>,
     selected_bookmark: Option<usize>,
     bookmark_scroll_y: usize,
-    /// Debounce timer & accumulator for MouseWheel page turning in Single-Page View.
+    /// Debounce timer & accumulator for MouseWheel page turning.
     last_wheel_turn: Option<Instant>,
     wheel_accum_y: f64,
     shift_pressed: bool,
@@ -201,10 +380,21 @@ impl<'a> PdfViewerApp<'a> {
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             cached_page: None,
-            page_rect: (0, 0, 0, 0),
+            cached_second_page: None,
+            page_draw_rect: (0, 0, 0, 0),
+            second_page_draw_rect: None,
             cursor_pos: (0.0, 0.0),
             drag_start: None,
-            view_mode: ViewMode::SinglePage,
+            view_mode: ViewMode::FitPage,
+            last_page_view_mode: ViewMode::FitPage,
+            scroll_y: 0.0,
+            open_menu: None,
+            mouse_mode: MouseMode::Highlight,
+            pending_stamp_image: None,
+            reading_filter: ReadingFilter::Normal,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            current_search_match: 0,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
             hovered_thumb: None,
@@ -231,12 +421,21 @@ impl<'a> PdfViewerApp<'a> {
         Ok(app)
     }
 
+    fn invalidate_page_caches(&mut self) {
+        self.cached_page = None;
+        self.cached_second_page = None;
+        self.second_page_draw_rect = None;
+    }
+
     fn sync_active_tab_to_slot(&mut self) {
         if self.active_tab < self.tabs.len() {
             let slot = &mut self.tabs[self.active_tab];
             slot.doc = self.doc.take();
             slot.file_path = self.file_path.clone();
             slot.current_page_index = self.current_page_index;
+            slot.view_mode = self.view_mode;
+            slot.last_page_view_mode = self.last_page_view_mode;
+            slot.scroll_y = self.scroll_y;
             slot.roman_end = self.roman_end;
             slot.bookmarks = self.bookmarks.clone();
             slot.selected_bookmark = self.selected_bookmark;
@@ -254,6 +453,9 @@ impl<'a> PdfViewerApp<'a> {
             self.doc = slot.doc.take();
             self.file_path = slot.file_path.clone();
             self.current_page_index = slot.current_page_index;
+            self.view_mode = slot.view_mode;
+            self.last_page_view_mode = slot.last_page_view_mode;
+            self.scroll_y = slot.scroll_y;
             self.roman_end = slot.roman_end;
             self.bookmarks = slot.bookmarks.clone();
             self.selected_bookmark = slot.selected_bookmark;
@@ -261,6 +463,9 @@ impl<'a> PdfViewerApp<'a> {
             self.grid_scroll_y = slot.grid_scroll_y;
             self.bw_pages = slot.bw_pages.clone();
             self.undo_stack = slot.undo_stack.clone();
+            self.search_query.clear();
+            self.search_matches.clear();
+            self.current_search_match = 0;
         }
     }
 
@@ -270,14 +475,15 @@ impl<'a> PdfViewerApp<'a> {
         let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
 
-        // Strictly drop previous cached page bitmap, thumbnail cache, and previous document
-        self.cached_page = None;
+        // Strictly drop previous cached page bitmaps, thumbnail cache, and previous document
+        self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
 
         self.file_path = path.clone();
         self.current_page_index = 0;
+        self.scroll_y = 0.0;
         self.roman_end = roman_end;
         self.bw_pages.clear();
         self.undo_stack.clear();
@@ -285,6 +491,9 @@ impl<'a> PdfViewerApp<'a> {
         self.drag_start = None;
         self.grid_drag_page = None;
         self.grid_scroll_y = 0.0;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = if self.bookmarks.is_empty() {
             None
@@ -299,6 +508,9 @@ impl<'a> PdfViewerApp<'a> {
                 doc: None,
                 file_path: path,
                 current_page_index: 0,
+                view_mode: self.view_mode,
+                last_page_view_mode: self.last_page_view_mode,
+                scroll_y: 0.0,
                 roman_end,
                 bookmarks: self.bookmarks.clone(),
                 selected_bookmark: self.selected_bookmark,
@@ -311,6 +523,7 @@ impl<'a> PdfViewerApp<'a> {
         } else if self.active_tab < self.tabs.len() {
             self.tabs[self.active_tab].file_path = path;
             self.tabs[self.active_tab].current_page_index = 0;
+            self.tabs[self.active_tab].scroll_y = 0.0;
             self.tabs[self.active_tab].roman_end = roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].selected_bookmark = self.selected_bookmark;
@@ -341,7 +554,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // Save current active tab into its slot and release all cached bitmaps
         self.sync_active_tab_to_slot();
-        self.cached_page = None;
+        self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
 
@@ -350,6 +563,9 @@ impl<'a> PdfViewerApp<'a> {
             doc: None,
             file_path: path.clone(),
             current_page_index: 0,
+            view_mode: ViewMode::FitPage,
+            last_page_view_mode: ViewMode::FitPage,
+            scroll_y: 0.0,
             roman_end,
             bookmarks: loaded_bookmarks.clone(),
             selected_bookmark,
@@ -363,6 +579,9 @@ impl<'a> PdfViewerApp<'a> {
         self.doc = Some(loaded);
         self.file_path = path;
         self.current_page_index = 0;
+        self.view_mode = ViewMode::FitPage;
+        self.last_page_view_mode = ViewMode::FitPage;
+        self.scroll_y = 0.0;
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = selected_bookmark;
@@ -370,6 +589,60 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.input_mode = InputMode::Normal;
+        self.drag_start = None;
+        self.grid_drag_page = None;
+
+        self.update_title_bar();
+        self.request_redraw();
+        Ok(())
+    }
+
+    /// Opens an in-memory PDF byte vector in a brand-new tab named `virtual_path` (used by Combine Multiple PDFs).
+    pub fn open_bytes_in_new_tab(&mut self, bytes: Vec<u8>, virtual_path: PathBuf) -> Result<()> {
+        let loaded = self.engine.load_pdf_from_bytes_safe(bytes)?;
+        self.sync_active_tab_to_slot();
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+
+        let new_idx = self.tabs.len();
+        self.tabs.push(DocumentTab {
+            doc: None,
+            file_path: virtual_path.clone(),
+            current_page_index: 0,
+            view_mode: ViewMode::FitPage,
+            last_page_view_mode: ViewMode::FitPage,
+            scroll_y: 0.0,
+            roman_end: 0,
+            bookmarks: Vec::new(),
+            selected_bookmark: None,
+            bookmark_scroll_y: 0,
+            grid_scroll_y: 0.0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+        });
+
+        self.active_tab = new_idx;
+        self.doc = Some(loaded);
+        self.file_path = virtual_path;
+        self.current_page_index = 0;
+        self.view_mode = ViewMode::FitPage;
+        self.last_page_view_mode = ViewMode::FitPage;
+        self.scroll_y = 0.0;
+        self.roman_end = 0;
+        self.bookmarks.clear();
+        self.selected_bookmark = None;
+        self.bookmark_scroll_y = 0;
+        self.grid_scroll_y = 0.0;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
@@ -385,7 +658,7 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.sync_active_tab_to_slot();
         // Zero-RAM discipline for inactive tabs: immediately free cached page and thumbnail bitmaps
-        self.cached_page = None;
+        self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
         self.drag_start = None;
@@ -418,7 +691,7 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         }
         self.sync_active_tab_to_slot();
-        self.cached_page = None;
+        self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
 
@@ -466,6 +739,7 @@ impl<'a> PdfViewerApp<'a> {
         let Some(prev_bytes) = self.undo_stack.pop_back() else {
             self.status_notice = Some("Nothing to undo (0 steps left)".to_string());
             self.update_title_bar();
+            self.request_redraw();
             return;
         };
         match self.engine.load_pdf_from_bytes_safe(prev_bytes) {
@@ -475,7 +749,7 @@ impl<'a> PdfViewerApp<'a> {
                     self.current_page_index = new_total - 1;
                 }
                 self.doc = Some(restored_doc);
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 let steps_left = self.undo_stack.len();
                 self.status_notice =
@@ -486,6 +760,7 @@ impl<'a> PdfViewerApp<'a> {
             Err(e) => {
                 self.status_notice = Some(format!("Undo failed: {e}"));
                 self.update_title_bar();
+                self.request_redraw();
             }
         }
     }
@@ -529,53 +804,67 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    fn menu_bar_height_px(&self, scale_factor: f64) -> u32 {
+        ((MENU_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
+    }
+
     fn tab_bar_height_px(&self, scale_factor: f64) -> u32 {
         ((TAB_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
     }
 
-    fn update_title_bar(&self) {
-        let Some(window) = self.window.as_ref() else {
-            return;
-        };
+    fn top_bars_height_px(&self, scale_factor: f64) -> u32 {
+        self.menu_bar_height_px(scale_factor) + self.tab_bar_height_px(scale_factor)
+    }
 
-        let title = match &self.input_mode {
-            InputMode::JumpToPage { input } => format!(
-                "MicroPDF | JUMP TO PAGE (Logical '5', Roman 'ii', or Physical '#5'): {}_ (Enter to confirm, Esc to cancel)",
+    fn status_bar_height_px(&self, scale_factor: f64) -> u32 {
+        ((STATUS_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
+    }
+
+    /// Formats the active interactive prompt string (if any) for both the Bottom Command Bar and Title Bar.
+    fn format_active_prompt_text(&self) -> Option<String> {
+        match &self.input_mode {
+            InputMode::Normal => None,
+            InputMode::SearchText { query_input } => Some(format!(
+                "FIND TEXT IN PDF: {}_  (Enter to search, Esc to cancel, F3 / Cmd+G next)",
+                query_input
+            )),
+            InputMode::JumpToPage { input } => Some(format!(
+                "JUMP TO PAGE (Logical '5', Roman 'ii', or Physical '#5'): {}_  (Enter confirm, Esc cancel)",
                 input
-            ),
-            InputMode::PageNumbers { input } => format!(
-                "MicroPDF | PAGE NUMBERS: Enter last Roman page # (e.g. '5' for i..v then 1..N, or '0' for all Arabic): {}_",
+            )),
+            InputMode::PageNumbers { input } => Some(format!(
+                "PAGE NUMBERS: Last Roman page # (e.g. '5' for i..v then 1..N, or '0' all Arabic): {}_",
                 input
-            ),
-            InputMode::HeaderFooterRange { range_input } => format!(
-                "MicroPDF | HEADER/FOOTER (1/3): Enter page range (e.g. '1-5' or 'all'): {}_",
+            )),
+            InputMode::HeaderFooterRange { range_input } => Some(format!(
+                "HEADER/FOOTER (1/3): Enter page range (e.g. '1-5' or 'all'): {}_",
                 range_input
-            ),
-            InputMode::HeaderFooterPosition { pos_input, .. } => format!(
-                "MicroPDF | HEADER/FOOTER (2/3): Position — type 'HL' (Header-Left), 'HC' (Header-Center), 'HR' (Header-Right), 'FL' (Footer-Left), 'FC' (Footer-Center), 'FR' (Footer-Right): {}_",
+            )),
+            InputMode::HeaderFooterPosition { pos_input, .. } => Some(format!(
+                "HEADER/FOOTER (2/3): Position ('HL', 'HC', 'HR', 'FL', 'FC', 'FR'): {}_",
                 pos_input
-            ),
-            InputMode::HeaderFooterText { text_input, .. } => format!(
-                "MicroPDF | HEADER/FOOTER (3/3): Enter text (or leave empty and press Enter to delete existing): {}_",
+            )),
+            InputMode::HeaderFooterText { text_input, .. } => Some(format!(
+                "HEADER/FOOTER (3/3): Enter text (or empty + Enter to erase existing): {}_",
                 text_input
-            ),
-            InputMode::ClearMargins { input } => format!(
-                "MicroPDF | CLEAR EXISTING: Press '1' Clear Page Numbers/Footers, '2' Clear Headers, '3' Clear Both (optional range e.g. '1 1-5'): {}_",
+            )),
+            InputMode::ClearMargins { input } => Some(format!(
+                "CLEAR MARGINS: '1' Footers/Page#, '2' Headers, '3' Both (optional range '1 1-5'): {}_",
                 input
-            ),
-            InputMode::Watermark { input } => format!(
-                "MicroPDF | WATERMARK: Type watermark text and press Enter: {}_",
+            )),
+            InputMode::Watermark { input } => Some(format!(
+                "WATERMARK: Type watermark text and press Enter: {}_",
                 input
-            ),
-            InputMode::SplitRange { input } => format!(
-                "MicroPDF | SPLIT PDF: Enter page range to extract (e.g. '1-3' or '2,4,6'): {}_",
+            )),
+            InputMode::SplitRange { input } => Some(format!(
+                "SPLIT PDF: Enter page range to extract (e.g. '1-3' or '2,4,6'): {}_",
                 input
-            ),
-            InputMode::AddBookmark { title_input } => format!(
-                "MicroPDF | ADD BOOKMARK for Page {}: Type title and press Enter: {}_",
+            )),
+            InputMode::AddBookmark { title_input } => Some(format!(
+                "ADD BOOKMARK (Page {}): Type title and press Enter: {}_",
                 self.current_page_index + 1,
                 title_input
-            ),
+            )),
             InputMode::EditBookmark {
                 bookmark_idx,
                 title_input,
@@ -585,48 +874,55 @@ impl<'a> PdfViewerApp<'a> {
                     .get(*bookmark_idx)
                     .map(|b| b.page_index + 1)
                     .unwrap_or(1);
-                format!(
-                    "MicroPDF | EDIT BOOKMARK (Page {}): Type new title and press Enter: {}_",
+                Some(format!(
+                    "EDIT BOOKMARK (Page {}): Type new title and press Enter: {}_",
                     page_num, title_input
-                )
+                ))
             }
-            InputMode::Normal => {
-                let total = self.total_pages();
-                let current_1based = if total > 0 {
-                    self.current_page_index + 1
-                } else {
-                    0
-                };
-                let page_display = if total > 0 && self.roman_end > 0 {
-                    let logical_lbl = PdfEngine::format_logical_page_label(
-                        self.current_page_index as usize,
-                        self.roman_end,
-                    );
-                    format!("Page {} ({} of {})", logical_lbl, current_1based, total)
-                } else {
-                    format!("Page {} / {}", current_1based, total)
-                };
-                let rotation = self.current_page_rotation_degrees();
-                let ram_mb = get_current_rss_mb().unwrap_or(0.0);
-                let filename = self.filename_display();
-                let mode_tag = match self.view_mode {
-                    ViewMode::SinglePage => "Single",
-                    ViewMode::ThumbnailGrid => "Grid",
-                };
+        }
+    }
 
-                let shortcuts_hint =
-                    "[Keys: Tab Grid, B Bmark, L Import .txt, G Jump, N Num, H Hdr/Ftr, C Clr, W Wmark, K BW, I Ins, R Rot, D Del, X Split, M Merge, Z Compress, O Open, S Save, ? Help]";
-                let suffix = if let Some(notice) = &self.status_notice {
-                    format!("{notice} | {shortcuts_hint}")
-                } else {
-                    shortcuts_hint.to_string()
-                };
+    fn update_title_bar(&self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
 
-                format!(
-                    "MicroPDF [{}] | {} | {} | Rotation: {}° | RAM: {:.1} MB | {}",
-                    mode_tag, filename, page_display, rotation, ram_mb, suffix
-                )
-            }
+        let title = if let Some(prompt) = self.format_active_prompt_text() {
+            format!("MicroPDF | {prompt}")
+        } else {
+            let total = self.total_pages();
+            let current_1based = if total > 0 {
+                self.current_page_index + 1
+            } else {
+                0
+            };
+            let page_display = if total > 0 && self.roman_end > 0 {
+                let logical_lbl = PdfEngine::format_logical_page_label(
+                    self.current_page_index as usize,
+                    self.roman_end,
+                );
+                format!("Page {} ({} of {})", logical_lbl, current_1based, total)
+            } else if self.view_mode == ViewMode::TwoPageSpread && current_1based + 1 <= total {
+                format!("Pages {}-{} / {}", current_1based, current_1based + 1, total)
+            } else {
+                format!("Page {} / {}", current_1based, total)
+            };
+            let rotation = self.current_page_rotation_degrees();
+            let ram_mb = get_current_rss_mb().unwrap_or(0.0);
+            let filename = self.filename_display();
+            let mode_tag = self.view_mode.short_label();
+            let mouse_tag = self.mouse_mode.short_label();
+            let filter_tag = self.reading_filter.label();
+
+            let suffix = if let Some(notice) = &self.status_notice {
+                notice.clone()
+            } else {
+                "Use Top Menu Bar or press ? for Shortcuts".to_string()
+            };
+
+            format!(
+                "MicroPDF [{mode_tag} | Mouse:{mouse_tag} | Filter:{filter_tag}] | {filename} | {page_display} | Rot:{rotation}° | RAM:{ram_mb:.1} MB | {suffix}"
+            )
         };
 
         window.set_title(&title);
@@ -638,52 +934,56 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Ensures `self.cached_page` holds the rasterized bitmap for `self.current_page_index`
-    /// fitted inside the content area `(sidebar_w..viewport_w, tab_bar_h..viewport_h)`.
-    fn ensure_current_page_rendered(
-        &mut self,
-        viewport_w: u32,
-        viewport_h: u32,
-        sidebar_w: u32,
-        tab_bar_h: u32,
-    ) -> Result<()> {
-        let content_w = viewport_w.saturating_sub(sidebar_w).max(1);
-        let content_h = viewport_h.saturating_sub(tab_bar_h).max(1);
-        let rotation_deg = self.current_page_rotation_degrees();
-
-        if let Some(cache) = &self.cached_page {
-            if cache.page_index == self.current_page_index
-                && cache.viewport_width == content_w
-                && cache.viewport_height == content_h
-                && cache.rotation_deg == rotation_deg
-            {
-                let offset_x = sidebar_w + content_w.saturating_sub(cache.bitmap_width) / 2;
-                let offset_y = tab_bar_h + content_h.saturating_sub(cache.bitmap_height) / 2;
-                self.page_rect = (offset_x, offset_y, cache.bitmap_width, cache.bitmap_height);
-                return Ok(());
-            }
-        }
-
-        // Immediately drop old page buffer before allocating the new one (Single-Page Memory Discipline)
-        self.cached_page = None;
-
-        let Some(doc) = self.doc.as_ref() else {
-            return Ok(());
-        };
+    /// Rasterizes a single `page_idx` for the specified `mode` and available `(avail_w, avail_h)`.
+    fn rasterize_page_for_mode(
+        &self,
+        page_idx: u16,
+        mode: ViewMode,
+        content_w: u32,
+        content_h: u32,
+        avail_w: f32,
+        avail_h: f32,
+    ) -> Result<CachedPageBitmap> {
+        let doc = self
+            .doc
+            .as_ref()
+            .context("No active PDF document to render")?;
         let page = doc
             .pages()
-            .get(self.current_page_index)
-            .context("Current page index out of bounds")?;
-
-        let avail_w = content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
-        let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+            .get(page_idx)
+            .context("Page index out of bounds")?;
+        let rotation_deg = self.page_rotation_degrees(page_idx);
 
         let page_w_pts = page.width().value.max(1.0);
         let page_h_pts = page.height().value.max(1.0);
 
-        let scale = (avail_w / page_w_pts).min(avail_h / page_h_pts);
-        let target_w = ((page_w_pts * scale).round() as i32).max(1);
-        let target_h = ((page_h_pts * scale).round() as i32).max(1);
+        let (content_min_x, content_max_x) = if mode == ViewMode::FitTextWidth {
+            let (min_x, _min_y, max_x, _max_y) = PdfEngine::compute_page_content_bounds(&page);
+            (min_x, max_x)
+        } else {
+            (0.0, page_w_pts)
+        };
+
+        let scale = match mode {
+            ViewMode::FitPage | ViewMode::TwoPageSpread | ViewMode::ThumbnailGrid => {
+                (avail_w / page_w_pts).min(avail_h / page_h_pts)
+            }
+            ViewMode::FitWidth => avail_w / page_w_pts,
+            ViewMode::FitTextWidth => {
+                let text_w = (content_max_x - content_min_x).max(page_w_pts * 0.25);
+                avail_w / text_w
+            }
+        };
+
+        // Cap maximum rasterized dimension to 3600px to keep RAM strictly bounded
+        let max_dim = 3600.0_f32;
+        let clamped_scale = scale
+            .min(max_dim / page_w_pts)
+            .min(max_dim / page_h_pts)
+            .max(0.05);
+
+        let target_w = ((page_w_pts * clamped_scale).round() as i32).max(1);
+        let target_h = ((page_h_pts * clamped_scale).round() as i32).max(1);
 
         let bindings = self.engine.pdfium.bindings();
         let mut bitmap = PdfBitmap::empty(target_w, target_h, PdfBitmapFormat::BGRx, bindings)
@@ -713,21 +1013,214 @@ impl<'a> PdfViewerApp<'a> {
         }
         drop(raw_bytes);
 
-        let bmp_w = target_w as u32;
-        let bmp_h = target_h as u32;
-        let offset_x = sidebar_w + content_w.saturating_sub(bmp_w) / 2;
-        let offset_y = tab_bar_h + content_h.saturating_sub(bmp_h) / 2;
-        self.page_rect = (offset_x, offset_y, bmp_w, bmp_h);
-
-        self.cached_page = Some(CachedPageBitmap {
-            page_index: self.current_page_index,
+        Ok(CachedPageBitmap {
+            page_index: page_idx,
+            view_mode: mode,
             viewport_width: content_w,
             viewport_height: content_h,
-            bitmap_width: bmp_w,
-            bitmap_height: bmp_h,
+            bitmap_width: target_w as u32,
+            bitmap_height: target_h as u32,
+            content_min_x,
+            content_max_x,
             rotation_deg,
             pixels,
+        })
+    }
+
+    /// Computes `(draw_x, draw_y, bmp_w, bmp_h)` for a single-page view (`FitPage`, `FitWidth`, `FitTextWidth`)
+    /// and clamps `self.scroll_y` to valid vertical bounds.
+    fn compute_single_page_draw_rect(
+        &mut self,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        content_w: u32,
+        content_h: u32,
+        bmp_w: u32,
+        bmp_h: u32,
+        content_min_x: f32,
+        content_max_x: f32,
+        page_w_pts: f32,
+    ) -> (i32, i32, u32, u32) {
+        let draw_x = if self.view_mode == ViewMode::FitTextWidth && page_w_pts > 1.0 {
+            let scale = (bmp_w as f32) / page_w_pts;
+            let text_center_bx = ((content_min_x + content_max_x) * 0.5 * scale).round() as i32;
+            let viewport_center_x = (sidebar_w as i32) + (content_w as i32) / 2;
+            viewport_center_x - text_center_bx
+        } else {
+            (sidebar_w as i32) + ((content_w as i32 - bmp_w as i32) / 2)
+        };
+
+        let draw_y = if bmp_h > content_h {
+            let max_scroll = (bmp_h - content_h) as f32;
+            self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+            (top_bars_h as i32) - (self.scroll_y.round() as i32)
+        } else {
+            self.scroll_y = 0.0;
+            (top_bars_h as i32) + ((content_h as i32 - bmp_h as i32) / 2)
+        };
+
+        (draw_x, draw_y, bmp_w, bmp_h)
+    }
+
+    /// Ensures `self.cached_page` (and `self.cached_second_page` in `TwoPageSpread`) holds the rasterized
+    /// bitmap(s) for `self.current_page_index` inside `(sidebar_w..viewport_w, top_bars_h..viewport_h - status_bar_h)`.
+    fn ensure_current_page_rendered(
+        &mut self,
+        viewport_w: u32,
+        viewport_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+    ) -> Result<()> {
+        let content_w = viewport_w.saturating_sub(sidebar_w).max(1);
+        let content_h = viewport_h
+            .saturating_sub(top_bars_h + status_bar_h)
+            .max(1);
+        let total = self.total_pages();
+        if total == 0 || self.doc.is_none() {
+            return Ok(());
+        }
+
+        if self.view_mode == ViewMode::TwoPageSpread {
+            self.scroll_y = 0.0;
+            let avail_w = (content_w
+                .saturating_sub(PAGE_MARGIN_PX * 2 + SPREAD_GAP_PX)
+                / 2)
+            .max(1) as f32;
+            let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+
+            let left_idx = self.current_page_index;
+            let left_rot = self.page_rotation_degrees(left_idx);
+            let need_left = self.cached_page.as_ref().map_or(true, |c| {
+                c.page_index != left_idx
+                    || c.view_mode != ViewMode::TwoPageSpread
+                    || c.viewport_width != content_w
+                    || c.viewport_height != content_h
+                    || c.rotation_deg != left_rot
+            });
+            if need_left {
+                self.cached_page = None;
+                self.cached_page = Some(self.rasterize_page_for_mode(
+                    left_idx,
+                    ViewMode::TwoPageSpread,
+                    content_w,
+                    content_h,
+                    avail_w,
+                    avail_h,
+                )?);
+            }
+
+            let right_idx_opt = if left_idx + 1 < total {
+                Some(left_idx + 1)
+            } else {
+                None
+            };
+            if let Some(right_idx) = right_idx_opt {
+                let right_rot = self.page_rotation_degrees(right_idx);
+                let need_right = self.cached_second_page.as_ref().map_or(true, |c| {
+                    c.page_index != right_idx
+                        || c.view_mode != ViewMode::TwoPageSpread
+                        || c.viewport_width != content_w
+                        || c.viewport_height != content_h
+                        || c.rotation_deg != right_rot
+                });
+                if need_right {
+                    self.cached_second_page = None;
+                    self.cached_second_page = Some(self.rasterize_page_for_mode(
+                        right_idx,
+                        ViewMode::TwoPageSpread,
+                        content_w,
+                        content_h,
+                        avail_w,
+                        avail_h,
+                    )?);
+                }
+            } else {
+                self.cached_second_page = None;
+            }
+
+            let center_x = (sidebar_w as i32) + (content_w as i32) / 2;
+            if let Some(left_bmp) = &self.cached_page {
+                let lw = left_bmp.bitmap_width;
+                let lh = left_bmp.bitmap_height;
+                let lx = if self.cached_second_page.is_some() {
+                    center_x - (SPREAD_GAP_PX as i32 / 2) - (lw as i32)
+                } else {
+                    center_x - (lw as i32 / 2)
+                };
+                let ly = (top_bars_h as i32) + ((content_h as i32 - lh as i32) / 2);
+                self.page_draw_rect = (lx, ly, lw, lh);
+            }
+            if let Some(right_bmp) = &self.cached_second_page {
+                let rw = right_bmp.bitmap_width;
+                let rh = right_bmp.bitmap_height;
+                let rx = center_x + (SPREAD_GAP_PX as i32 / 2);
+                let ry = (top_bars_h as i32) + ((content_h as i32 - rh as i32) / 2);
+                self.second_page_draw_rect = Some((rx, ry, rw, rh));
+            } else {
+                self.second_page_draw_rect = None;
+            }
+
+            return Ok(());
+        }
+
+        // Single-page view modes: FitPage, FitWidth, FitTextWidth
+        self.cached_second_page = None;
+        self.second_page_draw_rect = None;
+
+        let rotation_deg = self.current_page_rotation_degrees();
+        let page_w_pts = self
+            .doc
+            .as_ref()
+            .and_then(|d| d.pages().get(self.current_page_index).ok())
+            .map(|p| p.width().value.max(1.0))
+            .unwrap_or(595.0);
+
+        let need_render = self.cached_page.as_ref().map_or(true, |cache| {
+            cache.page_index != self.current_page_index
+                || cache.view_mode != self.view_mode
+                || cache.viewport_width != content_w
+                || cache.viewport_height != content_h
+                || cache.rotation_deg != rotation_deg
         });
+
+        if need_render {
+            self.cached_page = None;
+            let avail_w = match self.view_mode {
+                ViewMode::FitWidth | ViewMode::FitTextWidth => {
+                    content_w.saturating_sub(24).max(1) as f32
+                }
+                _ => content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32,
+            };
+            let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+            let rendered = self.rasterize_page_for_mode(
+                self.current_page_index,
+                self.view_mode,
+                content_w,
+                content_h,
+                avail_w,
+                avail_h,
+            )?;
+            self.cached_page = Some(rendered);
+        }
+
+        if let Some(cache) = &self.cached_page {
+            let bmp_w = cache.bitmap_width;
+            let bmp_h = cache.bitmap_height;
+            let c_min_x = cache.content_min_x;
+            let c_max_x = cache.content_max_x;
+            self.page_draw_rect = self.compute_single_page_draw_rect(
+                sidebar_w,
+                top_bars_h,
+                content_w,
+                content_h,
+                bmp_w,
+                bmp_h,
+                c_min_x,
+                c_max_x,
+                page_w_pts,
+            );
+        }
 
         Ok(())
     }
@@ -791,7 +1284,7 @@ impl<'a> PdfViewerApp<'a> {
         &self,
         viewport_w: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
     ) -> (u32, u32, u32, u32, u32) {
         let content_w = viewport_w.saturating_sub(sidebar_w).max(1);
         let pad_x = 28u32;
@@ -801,7 +1294,7 @@ impl<'a> PdfViewerApp<'a> {
         let cols = ((content_w.saturating_sub(pad_x)) / cell_w).max(1);
         let grid_total_w = cols * cell_w;
         let start_x = sidebar_w + content_w.saturating_sub(grid_total_w) / 2 + pad_x / 2;
-        let start_y = tab_bar_h + 20u32;
+        let start_y = top_bars_h + 20u32;
         (cols, cell_w, cell_h, start_x, start_y)
     }
 
@@ -811,10 +1304,10 @@ impl<'a> PdfViewerApp<'a> {
         page_idx: u16,
         viewport_w: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
     ) -> (i32, i32, u32, u32) {
         let (cols, cell_w, cell_h, start_x, start_y) =
-            self.grid_metrics(viewport_w, sidebar_w, tab_bar_h);
+            self.grid_metrics(viewport_w, sidebar_w, top_bars_h);
         let col = (page_idx as u32) % cols;
         let row = (page_idx as u32) / cols;
         let x = (start_x + col * cell_w) as i32;
@@ -829,9 +1322,9 @@ impl<'a> PdfViewerApp<'a> {
         my: f64,
         viewport_w: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
     ) -> Option<(u16, ThumbBadgeHit)> {
-        if (mx as u32) < sidebar_w || (my as u32) < tab_bar_h {
+        if (mx as u32) < sidebar_w || (my as u32) < top_bars_h {
             return None;
         }
         let total = self.total_pages();
@@ -839,7 +1332,8 @@ impl<'a> PdfViewerApp<'a> {
         let iy = my.round() as i32;
 
         for idx in 0..total {
-            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, tab_bar_h);
+            let (tx, ty, tw, th) =
+                self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, top_bars_h);
             if ix >= tx && ix < tx + (tw as i32) && iy >= ty && iy < ty + (th as i32) + 22 {
                 // Top-left `[BW]` badge is 28x18 at `(tx, ty)`
                 let on_bw_badge = ix >= tx && ix <= tx + 28 && iy >= ty && iy <= ty + 18;
@@ -867,23 +1361,175 @@ impl<'a> PdfViewerApp<'a> {
         my: f64,
         viewport_w: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
     ) -> u16 {
         let total = self.total_pages();
         if total == 0 {
             return 0;
         }
-        if let Some((idx, _)) = self.hit_test_thumbnail(mx, my, viewport_w, sidebar_w, tab_bar_h) {
+        if let Some((idx, _)) = self.hit_test_thumbnail(mx, my, viewport_w, sidebar_w, top_bars_h) {
             return idx;
         }
         let (cols, cell_w, cell_h, start_x, start_y) =
-            self.grid_metrics(viewport_w, sidebar_w, tab_bar_h);
+            self.grid_metrics(viewport_w, sidebar_w, top_bars_h);
         let rel_x = (mx as i32 - start_x as i32).max(0) as u32;
         let rel_y = (my as i32 + self.grid_scroll_y.round() as i32 - start_y as i32).max(0) as u32;
         let col = (rel_x / cell_w).min(cols - 1);
         let row = rel_y / cell_h;
         let computed = (row * cols + col) as u16;
         computed.min(total.saturating_sub(1))
+    }
+
+    /// Blits a `CachedPageBitmap` into `buffer` clipped to the content area
+    /// `(sidebar_w..buf_w, top_bars_h..buf_h - status_bar_h)` while applying `self.reading_filter` on the fly.
+    fn blit_cached_page(
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        draw_rect: (i32, i32, u32, u32),
+        pixels: &[u32],
+        filter: ReadingFilter,
+    ) {
+        let (draw_x, draw_y, bmp_w, bmp_h) = draw_rect;
+        let min_screen_x = sidebar_w as i32;
+        let max_screen_x = buf_w as i32;
+        let min_screen_y = top_bars_h as i32;
+        let max_screen_y = (buf_h.saturating_sub(status_bar_h)) as i32;
+
+        let start_row = (min_screen_y - draw_y).max(0) as u32;
+        let end_row = ((max_screen_y - draw_y).max(0) as u32).min(bmp_h);
+        let start_col = (min_screen_x - draw_x).max(0) as u32;
+        let end_col = ((max_screen_x - draw_x).max(0) as u32).min(bmp_w);
+
+        if start_row >= end_row || start_col >= end_col {
+            return;
+        }
+
+        let copy_len = (end_col - start_col) as usize;
+        for row in start_row..end_row {
+            let dst_y = (draw_y + row as i32) as u32;
+            let dst_x = (draw_x + start_col as i32) as u32;
+            let src_idx = (row * bmp_w + start_col) as usize;
+            let dst_idx = (dst_y * buf_w + dst_x) as usize;
+
+            match filter {
+                ReadingFilter::Normal => {
+                    buffer[dst_idx..dst_idx + copy_len]
+                        .copy_from_slice(&pixels[src_idx..src_idx + copy_len]);
+                }
+                ReadingFilter::DarkInvert => {
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        buffer[dst_idx + i] = px ^ 0x00FFFFFF;
+                    }
+                }
+                ReadingFilter::WarmSepia => {
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        let r = (px >> 16) & 0xFF;
+                        let g = (((px >> 8) & 0xFF) * 95) / 100;
+                        let b = ((px & 0xFF) * 83) / 100;
+                        buffer[dst_idx + i] = (r << 16) | (g << 8) | b;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Draws bright cyan/orange search highlight boxes for any `SearchMatch` on `page_idx`.
+    fn draw_search_overlays_on_page(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        page_idx: u16,
+        draw_rect: (i32, i32, u32, u32),
+    ) {
+        if self.search_matches.is_empty() {
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let Ok(page) = doc.pages().get(page_idx) else {
+            return;
+        };
+        let (draw_x, draw_y, bmp_w, bmp_h) = draw_rect;
+        if bmp_w == 0 || bmp_h == 0 {
+            return;
+        }
+        let page_w = page.width().value.max(1.0);
+        let page_h = page.height().value.max(1.0);
+        let config = PdfRenderConfig::new()
+            .set_fixed_width(bmp_w as i32)
+            .set_fixed_height(bmp_h as i32);
+
+        let min_y_bound = top_bars_h as i32;
+        let max_y_bound = (buf_h.saturating_sub(status_bar_h)) as i32;
+
+        for (m_idx, m) in self.search_matches.iter().enumerate() {
+            if m.page_index != page_idx {
+                continue;
+            }
+            let is_active = m_idx == self.current_search_match;
+            let fill_rgba = if is_active {
+                (255, 145, 0, 120) // Bright orange for active match
+            } else {
+                (0, 229, 255, 95) // Bright cyan for other matches on page
+            };
+            let border_col = if is_active { 0x00FF6D00 } else { 0x0000B8D4 };
+
+            for r in &m.rects {
+                let (bx1, by1, bx2, by2) = match (
+                    page.points_to_pixels(r.left(), r.top(), &config),
+                    page.points_to_pixels(r.right(), r.bottom(), &config),
+                ) {
+                    (Ok((x1, y1)), Ok((x2, y2))) => (x1, y1, x2, y2),
+                    _ => {
+                        let x1 = ((r.left().value / page_w) * (bmp_w as f32)).round() as i32;
+                        let y1 =
+                            ((1.0 - (r.top().value / page_h)) * (bmp_h as f32)).round() as i32;
+                        let x2 = ((r.right().value / page_w) * (bmp_w as f32)).round() as i32;
+                        let y2 =
+                            ((1.0 - (r.bottom().value / page_h)) * (bmp_h as f32)).round() as i32;
+                        (x1, y1, x2, y2)
+                    }
+                };
+
+                let sx1 = (draw_x + bx1.min(bx2) - 2).clamp(0, buf_w as i32) as u32;
+                let sx2 = (draw_x + bx1.max(bx2) + 2).clamp(0, buf_w as i32) as u32;
+                let sy1 = (draw_y + by1.min(by2) - 2).clamp(min_y_bound, max_y_bound) as u32;
+                let sy2 = (draw_y + by1.max(by2) + 2).clamp(min_y_bound, max_y_bound) as u32;
+
+                if sx2 > sx1 && sy2 > sy1 {
+                    blend_rect_rgba(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        sx1,
+                        sy1,
+                        sx2 - sx1,
+                        sy2 - sy1,
+                        fill_rgba,
+                    );
+                    draw_rect_border(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        sx1,
+                        sy1,
+                        sx2 - sx1,
+                        sy2 - sy1,
+                        border_col,
+                    );
+                }
+            }
+        }
     }
 
     fn render_to_window(&mut self) -> Result<()> {
@@ -894,26 +1540,37 @@ impl<'a> PdfViewerApp<'a> {
         let width = size.width.max(1);
         let height = size.height.max(1);
         let scale_factor = window.scale_factor();
-        let sidebar_w = self.sidebar_width_px(scale_factor).min(width.saturating_sub(64));
-        let tab_bar_h = self.tab_bar_height_px(scale_factor).min(height.saturating_sub(32));
+        let sidebar_w = self
+            .sidebar_width_px(scale_factor)
+            .min(width.saturating_sub(64));
+        let menu_bar_h = self
+            .menu_bar_height_px(scale_factor)
+            .min(height.saturating_sub(48));
+        let tab_bar_h = self
+            .tab_bar_height_px(scale_factor)
+            .min(height.saturating_sub(menu_bar_h + 24));
+        let top_bars_h = menu_bar_h + tab_bar_h;
+        let status_bar_h = self
+            .status_bar_height_px(scale_factor)
+            .min(height.saturating_sub(top_bars_h + 16));
 
-        match self.view_mode {
-            ViewMode::SinglePage => {
-                self.ensure_current_page_rendered(width, height, sidebar_w, tab_bar_h)?;
+        if self.view_mode.is_page_view() {
+            self.ensure_current_page_rendered(width, height, sidebar_w, top_bars_h, status_bar_h)?;
+        } else {
+            // Render only the thumbnails currently visible in the scrolled viewport
+            let total = self.total_pages();
+            let mut visible_indices = Vec::new();
+            for idx in 0..total {
+                let (_, ty, _, th) =
+                    self.thumbnail_screen_rect(idx, width, sidebar_w, top_bars_h);
+                if ty + (th as i32) + 30 >= (top_bars_h as i32)
+                    && ty <= (height.saturating_sub(status_bar_h) as i32)
+                {
+                    visible_indices.push(idx);
+                }
             }
-            ViewMode::ThumbnailGrid => {
-                // Render only the thumbnails currently visible in the scrolled viewport
-                let total = self.total_pages();
-                let mut visible_indices = Vec::new();
-                for idx in 0..total {
-                    let (_, ty, _, th) = self.thumbnail_screen_rect(idx, width, sidebar_w, tab_bar_h);
-                    if ty + (th as i32) + 30 >= (tab_bar_h as i32) && ty <= (height as i32) {
-                        visible_indices.push(idx);
-                    }
-                }
-                for idx in visible_indices {
-                    let _ = self.ensure_thumbnail_rendered(idx);
-                }
+            for idx in visible_indices {
+                let _ = self.ensure_thumbnail_rendered(idx);
             }
         }
 
@@ -935,42 +1592,87 @@ impl<'a> PdfViewerApp<'a> {
             // Fill background with #2B2B2B
             buffer.fill(BG_COLOR_U32);
 
-            match self.view_mode {
-                ViewMode::SinglePage => {
-                    // 1. Blit cached single-page bitmap
-                    if let Some(cache) = &self.cached_page {
-                        let (offset_x, offset_y, bmp_w, bmp_h) = self.page_rect;
+            if self.view_mode.is_page_view() {
+                // 1. Blit primary page bitmap (with zero-RAM ReadingFilter applied inline)
+                if let Some(cache) = &self.cached_page {
+                    Self::blit_cached_page(
+                        &mut buffer,
+                        width,
+                        height,
+                        sidebar_w,
+                        top_bars_h,
+                        status_bar_h,
+                        self.page_draw_rect,
+                        &cache.pixels,
+                        self.reading_filter,
+                    );
+                    self.draw_search_overlays_on_page(
+                        &mut buffer,
+                        width,
+                        height,
+                        top_bars_h,
+                        status_bar_h,
+                        cache.page_index,
+                        self.page_draw_rect,
+                    );
+                }
 
-                        for row in 0..bmp_h {
-                            let dst_y = offset_y + row;
-                            if dst_y >= height {
-                                break;
-                            }
-                            let src_start = (row * bmp_w) as usize;
-                            let copy_w = bmp_w.min(width.saturating_sub(offset_x)) as usize;
-                            let dst_start = (dst_y * width + offset_x) as usize;
-                            buffer[dst_start..dst_start + copy_w]
-                                .copy_from_slice(&cache.pixels[src_start..src_start + copy_w]);
-                        }
+                // 1b. If in TwoPageSpread mode, blit right-hand page bitmap as well
+                if self.view_mode == ViewMode::TwoPageSpread {
+                    if let (Some(second_cache), Some(second_rect)) =
+                        (&self.cached_second_page, self.second_page_draw_rect)
+                    {
+                        Self::blit_cached_page(
+                            &mut buffer,
+                            width,
+                            height,
+                            sidebar_w,
+                            top_bars_h,
+                            status_bar_h,
+                            second_rect,
+                            &second_cache.pixels,
+                            self.reading_filter,
+                        );
+                        self.draw_search_overlays_on_page(
+                            &mut buffer,
+                            width,
+                            height,
+                            top_bars_h,
+                            status_bar_h,
+                            second_cache.page_index,
+                            second_rect,
+                        );
                     }
+                }
 
-                    // 2. If user is holding Left-Click and dragging, draw live semi-transparent yellow selection box
-                    if let Some((sx1, sy1)) = self.drag_start {
-                        let (sx2, sy2) = self.cursor_pos;
-                        let (px, py, pw, ph) = self.page_rect;
-                        let page_right = px + pw;
-                        let page_bottom = py + ph;
+                // 2. If user is holding Left-Click and dragging, draw live mode-colored selection box
+                if let Some((sx1, sy1)) = self.drag_start {
+                    let (sx2, sy2) = self.cursor_pos;
+                    let (_, target_rect) = self.resolve_target_page_and_draw_rect(sx1, sy1);
+                    let (px, py, pw, ph) = target_rect;
+                    let page_left = px.max(sidebar_w as i32);
+                    let page_right = (px + pw as i32).min(width as i32);
+                    let page_top = py.max(top_bars_h as i32);
+                    let page_bottom =
+                        (py + ph as i32).min(height.saturating_sub(status_bar_h) as i32);
 
-                        let min_x =
-                            (sx1.min(sx2).round() as i64).clamp(px as i64, page_right as i64) as u32;
-                        let max_x =
-                            (sx1.max(sx2).round() as i64).clamp(px as i64, page_right as i64) as u32;
-                        let min_y =
-                            (sy1.min(sy2).round() as i64).clamp(py as i64, page_bottom as i64) as u32;
-                        let max_y =
-                            (sy1.max(sy2).round() as i64).clamp(py as i64, page_bottom as i64) as u32;
+                    if page_right > page_left && page_bottom > page_top {
+                        let min_x = (sx1.min(sx2).round() as i32)
+                            .clamp(page_left, page_right) as u32;
+                        let max_x = (sx1.max(sx2).round() as i32)
+                            .clamp(page_left, page_right) as u32;
+                        let min_y = (sy1.min(sy2).round() as i32)
+                            .clamp(page_top, page_bottom) as u32;
+                        let max_y = (sy1.max(sy2).round() as i32)
+                            .clamp(page_top, page_bottom) as u32;
 
                         if max_x > min_x && max_y > min_y {
+                            let (fill_rgba, border_col) = match self.mouse_mode {
+                                MouseMode::Highlight => ((255, 235, 59, 90), 0x00FBC02D),
+                                MouseMode::Redact => ((229, 57, 53, 110), 0x00FF1744),
+                                MouseMode::Crop => ((0, 230, 118, 85), 0x0000E676),
+                                MouseMode::StampImage => ((41, 182, 246, 95), 0x0000B0FF),
+                            };
                             blend_rect_rgba(
                                 &mut buffer,
                                 width,
@@ -979,7 +1681,7 @@ impl<'a> PdfViewerApp<'a> {
                                 min_y,
                                 max_x - min_x,
                                 max_y - min_y,
-                                (255, 235, 59, 90),
+                                fill_rgba,
                             );
                             draw_rect_border(
                                 &mut buffer,
@@ -989,32 +1691,63 @@ impl<'a> PdfViewerApp<'a> {
                                 min_y,
                                 max_x - min_x,
                                 max_y - min_y,
-                                0x00FBC02D,
+                                border_col,
                             );
                         }
                     }
                 }
-                ViewMode::ThumbnailGrid => {
-                    self.draw_thumbnail_grid(&mut buffer, width, height, sidebar_w, tab_bar_h);
-                }
-            }
-
-            // 3. If Left Bookmark Sidebar (`B`) is active, draw the 240px sidebar panel below tab bar
-            if self.show_bookmarks && sidebar_w > 0 {
-                self.draw_bookmark_sidebar(
+            } else {
+                self.draw_thumbnail_grid(
                     &mut buffer,
                     width,
                     height,
                     sidebar_w,
-                    tab_bar_h,
+                    top_bars_h,
+                    status_bar_h,
+                );
+            }
+
+            // 3. If Left Bookmark Sidebar (`B`) is active, draw the 240px sidebar panel between top_bars_h and status_bar_h
+            if self.show_bookmarks && sidebar_w > 0 {
+                self.draw_bookmark_sidebar(
+                    &mut buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
                     scale_factor,
                 );
             }
 
-            // 4. Draw the 28px Top Multi-Document Tab Bar (`[ 1: fileA.pdf [x] ]  [ + ]`)
-            self.draw_tab_bar(&mut buffer, width, height, tab_bar_h, scale_factor);
+            // 4. Draw the 28px Multi-Document Tab Bar (`y = menu_bar_h .. top_bars_h`)
+            self.draw_tab_bar(
+                &mut buffer,
+                width,
+                height,
+                menu_bar_h,
+                tab_bar_h,
+                scale_factor,
+            );
 
-            // 5. If Help Overlay (`?` or `F1`) is active, draw the modal overlay
+            // 5. Draw the 24px Top Menu Bar (`y = 0 .. menu_bar_h`)
+            self.draw_menu_bar(&mut buffer, width, height, menu_bar_h, scale_factor);
+
+            // 6. Draw the 22px Bottom Command & Status Bar (`y = height - status_bar_h .. height`)
+            self.draw_status_bar(&mut buffer, width, height, status_bar_h, scale_factor);
+
+            // 7. If a Top Menu dropdown is open, draw it over the viewport
+            if let Some(cat) = self.open_menu {
+                self.draw_open_menu_dropdown(
+                    &mut buffer,
+                    width,
+                    height,
+                    menu_bar_h,
+                    cat,
+                    scale_factor,
+                );
+            }
+
+            // 8. If Help Overlay (`?` or `F1`) is active, draw the modal overlay
             if self.show_help_overlay {
                 draw_help_overlay(&mut buffer, width, height, scale_factor);
             }
@@ -1033,11 +1766,338 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    fn menu_header_x_range(&self, cat: MenuCategory, scale: u32) -> (u32, u32) {
+        let mut cur_x = 6 * scale;
+        for c in MenuCategory::ALL {
+            let w = (c.label().len() as u32) * 8 * scale + 12 * scale;
+            if c == cat {
+                return (cur_x, cur_x + w);
+            }
+            cur_x += w + 4 * scale;
+        }
+        (0, 0)
+    }
+
+    fn draw_menu_bar(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        menu_bar_h: u32,
+        scale_factor: f64,
+    ) {
+        if menu_bar_h == 0 {
+            return;
+        }
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        // #1E1E1E crisp dark Menu Bar background
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, 0, buf_w, menu_bar_h, 0x001E1E1E);
+        // 1px bottom divider
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            (menu_bar_h.saturating_sub(1)) as i32,
+            buf_w,
+            1,
+            0x00333333,
+        );
+
+        let text_y = menu_bar_h.saturating_sub(8 * scale) / 2;
+        let mx = self.cursor_pos.0.round() as u32;
+        let my = self.cursor_pos.1.round() as u32;
+
+        for cat in MenuCategory::ALL {
+            let (x0, x1) = self.menu_header_x_range(cat, scale);
+            let is_open = self.open_menu == Some(cat);
+            let is_hover = my < menu_bar_h && mx >= x0 && mx < x1;
+            if is_open || is_hover {
+                let bg = if is_open { 0x00007ACC } else { 0x00333337 };
+                fill_rect_clipped(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    x0 as i32,
+                    1,
+                    x1.saturating_sub(x0),
+                    menu_bar_h.saturating_sub(2),
+                    bg,
+                );
+            }
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                x0 + 6 * scale,
+                text_y,
+                cat.label(),
+                0x00F0F0F0,
+                scale,
+            );
+        }
+
+        // Right-aligned live status badges in Menu Bar (View Mode, Mouse Mode, Filter)
+        let right_info = format!(
+            "View:{} | Mouse:{} | Filter:{}",
+            self.view_mode.short_label(),
+            self.mouse_mode.short_label(),
+            self.reading_filter.label()
+        );
+        let info_w = (right_info.len() as u32) * 8 * scale + 10 * scale;
+        let (_, last_menu_x1) = self.menu_header_x_range(MenuCategory::Help, scale);
+        if buf_w > last_menu_x1 + info_w + 12 * scale {
+            let info_col = match self.mouse_mode {
+                MouseMode::Highlight => 0x0080DEEA,
+                MouseMode::Redact => 0x00FF8A80,
+                MouseMode::Crop => 0x0069F0AE,
+                MouseMode::StampImage => 0x00FFD740,
+            };
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                buf_w - info_w,
+                text_y,
+                &right_info,
+                info_col,
+                scale,
+            );
+        }
+    }
+
+    fn draw_open_menu_dropdown(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        menu_bar_h: u32,
+        cat: MenuCategory,
+        scale_factor: f64,
+    ) {
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let items = cat.items();
+        if items.is_empty() {
+            return;
+        }
+        let (hx0, _) = self.menu_header_x_range(cat, scale);
+        let row_h = 22 * scale;
+        let max_chars = items.iter().map(|s| s.chars().count()).max().unwrap_or(20) as u32;
+        let drop_w = (max_chars * 8 * scale + 24 * scale).min(buf_w.saturating_sub(8));
+        let drop_h = (items.len() as u32) * row_h + 4 * scale;
+        let drop_x = hx0.min(buf_w.saturating_sub(drop_w + 4));
+        let drop_y = menu_bar_h;
+
+        // #252526 dropdown background + border
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            drop_x as i32,
+            drop_y as i32,
+            drop_w,
+            drop_h,
+            0x00252526,
+        );
+        draw_rect_border(
+            buffer,
+            buf_w,
+            buf_h,
+            drop_x,
+            drop_y,
+            drop_w,
+            drop_h,
+            0x00454545,
+        );
+
+        let mx = self.cursor_pos.0.round() as u32;
+        let my = self.cursor_pos.1.round() as u32;
+
+        for (idx, &item_str) in items.iter().enumerate() {
+            let ry = drop_y + 2 * scale + (idx as u32) * row_h;
+            let hovered =
+                mx >= drop_x && mx < drop_x + drop_w && my >= ry && my < ry + row_h;
+            if hovered {
+                // #007ACC hover highlight
+                fill_rect_clipped(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    (drop_x + 1) as i32,
+                    ry as i32,
+                    drop_w.saturating_sub(2),
+                    row_h,
+                    0x00007ACC,
+                );
+            }
+            let text_y = ry + row_h.saturating_sub(8 * scale) / 2;
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                drop_x + 10 * scale,
+                text_y,
+                item_str,
+                0x00F5F5F5,
+                scale,
+            );
+        }
+    }
+
+    fn hit_test_menu_bar_header(
+        &self,
+        mx: f64,
+        my: f64,
+        menu_bar_h: u32,
+        scale_factor: f64,
+    ) -> Option<MenuCategory> {
+        let ix = mx.round() as u32;
+        let iy = my.round() as u32;
+        if iy >= menu_bar_h {
+            return None;
+        }
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        for cat in MenuCategory::ALL {
+            let (x0, x1) = self.menu_header_x_range(cat, scale);
+            if ix >= x0 && ix < x1 {
+                return Some(cat);
+            }
+        }
+        None
+    }
+
+    fn hit_test_open_menu_dropdown(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        menu_bar_h: u32,
+        scale_factor: f64,
+    ) -> Option<(MenuCategory, usize)> {
+        let cat = self.open_menu?;
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let items = cat.items();
+        let (hx0, _) = self.menu_header_x_range(cat, scale);
+        let row_h = 22 * scale;
+        let max_chars = items.iter().map(|s| s.chars().count()).max().unwrap_or(20) as u32;
+        let drop_w = (max_chars * 8 * scale + 24 * scale).min(buf_w.saturating_sub(8));
+        let drop_h = (items.len() as u32) * row_h + 4 * scale;
+        let drop_x = hx0.min(buf_w.saturating_sub(drop_w + 4));
+        let drop_y = menu_bar_h;
+
+        let ix = mx.round() as u32;
+        let iy = my.round() as u32;
+        if ix < drop_x || ix >= drop_x + drop_w || iy < drop_y + 2 * scale || iy >= drop_y + drop_h
+        {
+            return None;
+        }
+        let idx = ((iy - (drop_y + 2 * scale)) / row_h) as usize;
+        if idx < items.len() {
+            Some((cat, idx))
+        } else {
+            None
+        }
+    }
+
+    fn draw_status_bar(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        scale_factor: f64,
+    ) {
+        if status_bar_h == 0 || buf_h < status_bar_h {
+            return;
+        }
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let bar_y = buf_h - status_bar_h;
+
+        if let Some(prompt) = self.format_active_prompt_text() {
+            // Active interactive command prompt: bright #007ACC command bar at bottom of window
+            fill_rect_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                0,
+                bar_y as i32,
+                buf_w,
+                status_bar_h,
+                0x000E639C,
+            );
+            fill_rect_clipped(buffer, buf_w, buf_h, 0, bar_y as i32, buf_w, 1, 0x004FC3F7);
+            let text_y = bar_y + status_bar_h.saturating_sub(8 * scale) / 2;
+            let max_chars = (buf_w.saturating_sub(16 * scale) / (8 * scale)).max(8) as usize;
+            let display_str: String = if prompt.chars().count() > max_chars {
+                let skip = prompt.chars().count() - max_chars;
+                prompt.chars().skip(skip).collect()
+            } else {
+                prompt
+            };
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                8 * scale,
+                text_y,
+                &display_str,
+                0x00FFEB3B,
+                scale,
+            );
+            return;
+        }
+
+        // Standard Status Bar (#1E1E1E background, 1px top border)
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            bar_y as i32,
+            buf_w,
+            status_bar_h,
+            0x001E1E1E,
+        );
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, bar_y as i32, buf_w, 1, 0x00333333);
+
+        let total = self.total_pages();
+        let cur = if total > 0 {
+            self.current_page_index + 1
+        } else {
+            0
+        };
+        let ram_mb = get_current_rss_mb().unwrap_or(0.0);
+        let notice = self
+            .status_notice
+            .as_deref()
+            .unwrap_or("Ready — Click Top Menu or press 1-4 View, Ctrl+F Search, P Stamp, V Filter, U Flatten");
+
+        let status_line = format!(
+            "Page {cur}/{total} | Mode: {} | Mouse: {} | RAM: {ram_mb:.1}MB | {notice}",
+            self.view_mode.short_label(),
+            self.mouse_mode.short_label()
+        );
+        let max_chars = (buf_w.saturating_sub(16 * scale) / (8 * scale)).max(8) as usize;
+        let clipped: String = status_line.chars().take(max_chars).collect();
+        let text_y = bar_y + status_bar_h.saturating_sub(8 * scale) / 2;
+        draw_bitmap_str_8x8(
+            buffer,
+            buf_w,
+            buf_h,
+            8 * scale,
+            text_y,
+            &clipped,
+            0x00CCCCCC,
+            scale,
+        );
+    }
+
     fn draw_tab_bar(
         &self,
         buffer: &mut [u32],
         buf_w: u32,
         buf_h: u32,
+        menu_bar_h: u32,
         tab_bar_h: u32,
         scale_factor: f64,
     ) {
@@ -1045,15 +2105,25 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let top_y = menu_bar_h;
         // Dark slate tab bar backdrop
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, 0, buf_w, tab_bar_h, 0x0015181E);
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            top_y as i32,
+            buf_w,
+            tab_bar_h,
+            0x0015181E,
+        );
         // Bottom 1px divider
         fill_rect_clipped(
             buffer,
             buf_w,
             buf_h,
             0,
-            (tab_bar_h.saturating_sub(1)) as i32,
+            (top_y + tab_bar_h.saturating_sub(1)) as i32,
             buf_w,
             1,
             0x0037474F,
@@ -1063,7 +2133,7 @@ impl<'a> PdfViewerApp<'a> {
         let plus_btn_w = 34 * scale;
         let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + 12 * scale);
         let tab_w = (avail_for_tabs / (num_tabs as u32)).clamp(90 * scale, 210 * scale);
-        let text_y = tab_bar_h.saturating_sub(8 * scale) / 2;
+        let text_y = top_y + tab_bar_h.saturating_sub(8 * scale) / 2;
 
         let mut cur_x = 4 * scale;
         for idx in 0..num_tabs {
@@ -1079,7 +2149,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 cur_x as i32,
-                2,
+                (top_y + 2) as i32,
                 tab_w.saturating_sub(2),
                 tab_bar_h.saturating_sub(3),
                 tab_bg,
@@ -1089,7 +2159,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 cur_x,
-                2,
+                top_y + 2,
                 tab_w.saturating_sub(2),
                 tab_bar_h.saturating_sub(3),
                 border_col,
@@ -1150,7 +2220,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 plus_x as i32,
-                2,
+                (top_y + 2) as i32,
                 plus_btn_w,
                 tab_bar_h.saturating_sub(3),
                 0x00263238,
@@ -1160,7 +2230,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 plus_x,
-                2,
+                top_y + 2,
                 plus_btn_w,
                 tab_bar_h.saturating_sub(3),
                 0x0064B5F6,
@@ -1183,12 +2253,13 @@ impl<'a> PdfViewerApp<'a> {
         mx: f64,
         my: f64,
         buf_w: u32,
+        menu_bar_h: u32,
         tab_bar_h: u32,
         scale_factor: f64,
     ) -> Option<TabBarHit> {
         let ix = mx.round() as u32;
         let iy = my.round() as u32;
-        if iy >= tab_bar_h {
+        if iy < menu_bar_h || iy >= menu_bar_h + tab_bar_h {
             return None;
         }
         let scale = (scale_factor.round() as u32).clamp(1, 2);
@@ -1226,17 +2297,28 @@ impl<'a> PdfViewerApp<'a> {
         buf_w: u32,
         buf_h: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
     ) {
+        let bottom_limit = buf_h.saturating_sub(status_bar_h);
         let total = self.total_pages();
         for idx in 0..total {
-            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, buf_w, sidebar_w, tab_bar_h);
-            if ty + (th as i32) + 28 < (tab_bar_h as i32) || ty >= (buf_h as i32) {
+            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, buf_w, sidebar_w, top_bars_h);
+            if ty + (th as i32) + 28 < (top_bars_h as i32) || ty >= (bottom_limit as i32) {
                 continue;
             }
 
             // Fill cell card backdrop (white paper background inside THUMB_W x THUMB_H)
-            fill_rect_clipped(buffer, buf_w, buf_h, tx, ty, tw, th, 0x003A3A3A);
+            fill_rect_clipped(
+                buffer,
+                buf_w,
+                bottom_limit,
+                tx,
+                ty,
+                tw,
+                th,
+                0x003A3A3A,
+            );
 
             if let Some(entry) = self.thumbnail_cache.get(&idx) {
                 let ox = tx + ((tw.saturating_sub(entry.width)) / 2) as i32;
@@ -1244,7 +2326,7 @@ impl<'a> PdfViewerApp<'a> {
 
                 for r in 0..entry.height {
                     let py = oy + (r as i32);
-                    if py < (tab_bar_h as i32) || py >= (buf_h as i32) {
+                    if py < (top_bars_h as i32) || py >= (bottom_limit as i32) {
                         continue;
                     }
                     for c in 0..entry.width {
@@ -1267,11 +2349,11 @@ impl<'a> PdfViewerApp<'a> {
                 0x00555555 // Subtle border
             };
 
-            if tx >= 0 && ty >= (tab_bar_h as i32) {
+            if tx >= 0 && ty >= (top_bars_h as i32) {
                 draw_rect_border(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     tx as u32,
                     ty as u32,
                     tw,
@@ -1282,7 +2364,7 @@ impl<'a> PdfViewerApp<'a> {
                     draw_rect_border(
                         buffer,
                         buf_w,
-                        buf_h,
+                        bottom_limit,
                         (tx as u32) + 1,
                         (ty as u32) + 1,
                         tw - 2,
@@ -1299,16 +2381,25 @@ impl<'a> PdfViewerApp<'a> {
             let bwy = ty;
             let is_bw = self.bw_pages.contains(&idx);
             if bwx >= (sidebar_w as i32)
-                && bwy >= (tab_bar_h as i32)
-                && (bwy as u32 + bw_badge_h) < buf_h
+                && bwy >= (top_bars_h as i32)
+                && (bwy as u32 + bw_badge_h) < bottom_limit
             {
                 let bg = if is_bw { 0x00455A64 } else { 0x00263238 };
                 let fg = if is_bw { 0x0080DEEA } else { 0x00E0E0E0 };
-                fill_rect_clipped(buffer, buf_w, buf_h, bwx, bwy, bw_badge_w, bw_badge_h, bg);
+                fill_rect_clipped(
+                    buffer,
+                    buf_w,
+                    bottom_limit,
+                    bwx,
+                    bwy,
+                    bw_badge_w,
+                    bw_badge_h,
+                    bg,
+                );
                 draw_rect_border(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     bwx as u32,
                     bwy as u32,
                     bw_badge_w,
@@ -1318,7 +2409,7 @@ impl<'a> PdfViewerApp<'a> {
                 draw_bitmap_str_8x8(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     (bwx as u32) + 5,
                     (bwy as u32) + 4,
                     "BW",
@@ -1333,14 +2424,23 @@ impl<'a> PdfViewerApp<'a> {
             let bx = tx + (tw as i32) - (badge_w as i32);
             let by = ty;
             if bx >= (sidebar_w as i32)
-                && by >= (tab_bar_h as i32)
-                && (by as u32 + badge_h) < buf_h
+                && by >= (top_bars_h as i32)
+                && (by as u32 + badge_h) < bottom_limit
             {
-                fill_rect_clipped(buffer, buf_w, buf_h, bx, by, badge_w, badge_h, 0x00263238);
+                fill_rect_clipped(
+                    buffer,
+                    buf_w,
+                    bottom_limit,
+                    bx,
+                    by,
+                    badge_w,
+                    badge_h,
+                    0x00263238,
+                );
                 draw_rect_border(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     bx as u32,
                     by as u32,
                     badge_w,
@@ -1350,7 +2450,7 @@ impl<'a> PdfViewerApp<'a> {
                 draw_bitmap_str_8x8(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     (bx as u32) + 4,
                     (by as u32) + 4,
                     "R",
@@ -1376,7 +2476,7 @@ impl<'a> PdfViewerApp<'a> {
             let label_w = (label.len() as u32) * 8;
             let lx = (tx + ((tw as i32 - label_w as i32) / 2)).max(sidebar_w as i32);
             let ly = ty + (th as i32) + 6;
-            if ly >= (tab_bar_h as i32) && (ly as u32 + 10) < buf_h {
+            if ly >= (top_bars_h as i32) && (ly as u32 + 10) < bottom_limit {
                 let text_color = if idx == self.current_page_index {
                     0x0064B5F6
                 } else {
@@ -1385,7 +2485,7 @@ impl<'a> PdfViewerApp<'a> {
                 draw_bitmap_str_8x8(
                     buffer,
                     buf_w,
-                    buf_h,
+                    bottom_limit,
                     lx as u32,
                     ly as u32,
                     &label,
@@ -1400,12 +2500,21 @@ impl<'a> PdfViewerApp<'a> {
             let (cx, cy) = self.cursor_pos;
             let dist = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
             if dist > 6.0 {
-                let target_idx = self.grid_drop_target_index(cx, cy, buf_w, sidebar_w, tab_bar_h);
+                let target_idx = self.grid_drop_target_index(cx, cy, buf_w, sidebar_w, top_bars_h);
                 if target_idx != src_idx {
                     let (tx, ty, _tw, th) =
-                        self.thumbnail_screen_rect(target_idx, buf_w, sidebar_w, tab_bar_h);
+                        self.thumbnail_screen_rect(target_idx, buf_w, sidebar_w, top_bars_h);
                     let bar_x = (tx - 8).max(sidebar_w as i32);
-                    fill_rect_clipped(buffer, buf_w, buf_h, bar_x, ty - 4, 4, th + 8, 0x0000E5FF);
+                    fill_rect_clipped(
+                        buffer,
+                        buf_w,
+                        bottom_limit,
+                        bar_x,
+                        ty - 4,
+                        4,
+                        th + 8,
+                        0x0000E5FF,
+                    );
                 }
             }
         }
@@ -1417,13 +2526,13 @@ impl<'a> PdfViewerApp<'a> {
         buf_w: u32,
         buf_h: u32,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
         scale_factor: f64,
     ) {
         let scale = (scale_factor.round() as u32).clamp(1, 2);
         let row_h = 24 * scale;
         let header_h = 54 * scale;
-        let top_y = tab_bar_h;
+        let top_y = top_bars_h;
 
         // Fill sidebar background
         fill_rect_clipped(
@@ -1630,16 +2739,16 @@ impl<'a> PdfViewerApp<'a> {
         mx: f64,
         my: f64,
         sidebar_w: u32,
-        tab_bar_h: u32,
+        top_bars_h: u32,
         scale_factor: f64,
     ) -> Option<SidebarHit> {
-        if !self.show_bookmarks || (mx as u32) >= sidebar_w || (my as u32) < tab_bar_h {
+        if !self.show_bookmarks || (mx as u32) >= sidebar_w || (my as u32) < top_bars_h {
             return None;
         }
         let scale = (scale_factor.round() as u32).clamp(1, 2);
         let row_h = 24 * scale;
         let header_h = 54 * scale;
-        let rel_y = (my.round() as u32).saturating_sub(tab_bar_h);
+        let rel_y = (my.round() as u32).saturating_sub(top_bars_h);
         if rel_y < header_h {
             // Check if clicked inside `[Import .txt]` button (`22 * scale..48 * scale`)
             if rel_y >= 20 * scale && rel_y <= 50 * scale {
@@ -1665,53 +2774,116 @@ impl<'a> PdfViewerApp<'a> {
         let _ = PdfEngine::save_bookmarks_sidecar(&self.file_path, &self.bookmarks);
     }
 
-    fn toggle_view_mode(&mut self) {
-        match self.view_mode {
-            ViewMode::SinglePage => {
-                // Switch to Thumbnail Grid View; free single-page buffer
-                self.cached_page = None;
-                self.view_mode = ViewMode::ThumbnailGrid;
-                self.status_notice = Some(
-                    "Thumbnail Grid View (Click page, Drag to reorder, 'R' rotate, Tab/Enter to view)"
-                        .to_string(),
-                );
+    fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.view_mode == mode {
+            return;
+        }
+        if mode == ViewMode::ThumbnailGrid {
+            if self.view_mode.is_page_view() {
+                self.last_page_view_mode = self.view_mode;
             }
-            ViewMode::ThumbnailGrid => {
-                // Free thumbnail cache immediately when returning to Single-Page View
-                self.thumbnail_cache.clear();
-                self.thumbnail_cache.shrink_to_fit();
-                self.grid_drag_page = None;
-                self.hovered_thumb = None;
-                self.view_mode = ViewMode::SinglePage;
-                self.status_notice = Some("Single-Page View".to_string());
-            }
+            self.invalidate_page_caches();
+            self.view_mode = ViewMode::ThumbnailGrid;
+            self.status_notice = Some(
+                "Thumbnail Grid View (Click page, Drag reorder, [BW]/[R] badges, Tab/Enter to view)"
+                    .to_string(),
+            );
+        } else {
+            // Free thumbnail cache immediately when returning to Page View
+            self.thumbnail_cache.clear();
+            self.thumbnail_cache.shrink_to_fit();
+            self.grid_drag_page = None;
+            self.hovered_thumb = None;
+            self.view_mode = mode;
+            self.last_page_view_mode = mode;
+            self.scroll_y = 0.0;
+            self.invalidate_page_caches();
+            self.status_notice = Some(match mode {
+                ViewMode::FitPage => "View Mode: Fit Full Page (1)".to_string(),
+                ViewMode::FitWidth => "View Mode: Fit Page Width (2) — Scroll vertically".to_string(),
+                ViewMode::FitTextWidth => {
+                    "View Mode: Fit Text Width (3) — Auto-trimmed margins".to_string()
+                }
+                ViewMode::TwoPageSpread => {
+                    "View Mode: Two-Page Side-by-Side Spread (4)".to_string()
+                }
+                ViewMode::ThumbnailGrid => "Thumbnail Grid View".to_string(),
+            });
         }
         self.update_title_bar();
         self.request_redraw();
     }
 
-    /// Converts screen drag start `(sx1, sy1)` and end `(sx2, sy2)` into PDF page coordinates.
+    fn toggle_view_mode(&mut self) {
+        if self.view_mode == ViewMode::ThumbnailGrid {
+            let restore = if self.last_page_view_mode.is_page_view() {
+                self.last_page_view_mode
+            } else {
+                ViewMode::FitPage
+            };
+            self.set_view_mode(restore);
+        } else {
+            self.set_view_mode(ViewMode::ThumbnailGrid);
+        }
+    }
+
+    /// Resolves which page (`current_page_index` vs `current_page_index + 1` in `TwoPageSpread`)
+    /// and its corresponding screen `draw_rect` contains `(sx, sy)`.
+    fn resolve_target_page_and_draw_rect(&self, sx: f64, _sy: f64) -> (u16, (i32, i32, u32, u32)) {
+        if self.view_mode == ViewMode::TwoPageSpread {
+            if let (Some(second_cache), Some(second_rect)) =
+                (&self.cached_second_page, self.second_page_draw_rect)
+            {
+                let (rx, _ry, _rw, _rh) = second_rect;
+                if (sx.round() as i32) >= rx - (SPREAD_GAP_PX as i32 / 2) {
+                    return (second_cache.page_index, second_rect);
+                }
+            }
+        }
+        (self.current_page_index, self.page_draw_rect)
+    }
+
+    /// Converts screen drag start `(sx1, sy1)` and end `(sx2, sy2)` into `(page_idx, PdfRect)`.
+    /// If `allow_single_click` is true (used for Stamp Image mode), a simple click produces a
+    /// default-sized stamp box centered at `(sx1, sy1)`.
     fn screen_drag_to_pdf_rect(
         &self,
         sx1: f64,
         sy1: f64,
         sx2: f64,
         sy2: f64,
-    ) -> Option<PdfRect> {
+        allow_single_click: bool,
+    ) -> Option<(u16, PdfRect)> {
         let doc = self.doc.as_ref()?;
-        let page = doc.pages().get(self.current_page_index).ok()?;
-        let (px, py, pw, ph) = self.page_rect;
+        let (page_idx, (px, py, pw, ph)) = self.resolve_target_page_and_draw_rect(sx1, sy1);
+        let page = doc.pages().get(page_idx).ok()?;
         if pw == 0 || ph == 0 {
             return None;
         }
 
-        let bx1 = (sx1 - px as f64).clamp(0.0, pw as f64) as i32;
-        let by1 = (sy1 - py as f64).clamp(0.0, ph as f64) as i32;
-        let bx2 = (sx2 - px as f64).clamp(0.0, pw as f64) as i32;
-        let by2 = (sy2 - py as f64).clamp(0.0, ph as f64) as i32;
+        let mut bx1 = (sx1 - px as f64).clamp(0.0, pw as f64) as i32;
+        let mut by1 = (sy1 - py as f64).clamp(0.0, ph as f64) as i32;
+        let mut bx2 = (sx2 - px as f64).clamp(0.0, pw as f64) as i32;
+        let mut by2 = (sy2 - py as f64).clamp(0.0, ph as f64) as i32;
 
-        if (bx2 - bx1).abs() < 3 && (by2 - by1).abs() < 3 {
-            return None;
+        if (bx2 - bx1).abs() < 4 && (by2 - by1).abs() < 4 {
+            if !allow_single_click {
+                return None;
+            }
+            // Default stamp size (~22% of page width, preserving stamp aspect ratio)
+            let aspect = self
+                .pending_stamp_image
+                .as_ref()
+                .map(|s| (s.height as f32 / (s.width.max(1) as f32)).clamp(0.15, 4.0))
+                .unwrap_or(0.45);
+            let default_w = ((pw as f32) * 0.22).max(40.0) as i32;
+            let default_h = ((default_w as f32) * aspect).max(20.0) as i32;
+            let cx = bx1;
+            let cy = by1;
+            bx1 = (cx - default_w / 2).clamp(0, pw as i32);
+            bx2 = (cx + default_w / 2).clamp(0, pw as i32);
+            by1 = (cy - default_h / 2).clamp(0, ph as i32);
+            by2 = (cy + default_h / 2).clamp(0, ph as i32);
         }
 
         let config = PdfRenderConfig::new()
@@ -1744,7 +2916,7 @@ impl<'a> PdfViewerApp<'a> {
         let left = pt1_x.min(pt2_x);
         let right = pt1_x.max(pt2_x);
 
-        Some(PdfRect::new_from_values(bottom, left, top, right))
+        Some((page_idx, PdfRect::new_from_values(bottom, left, top, right)))
     }
 
     fn navigate_to_page(&mut self, new_index: u16) {
@@ -1755,11 +2927,84 @@ impl<'a> PdfViewerApp<'a> {
         let clamped = new_index.min(total - 1);
         if clamped != self.current_page_index {
             self.current_page_index = clamped;
-            self.cached_page = None;
+            self.scroll_y = 0.0;
+            self.invalidate_page_caches();
             self.status_notice = None;
             self.update_title_bar();
             self.request_redraw();
         }
+    }
+
+    fn step_pages_forward(&mut self) {
+        let total = self.total_pages();
+        if total == 0 {
+            return;
+        }
+        let step = if self.view_mode == ViewMode::TwoPageSpread {
+            2
+        } else {
+            1
+        };
+        if self.current_page_index + step < total {
+            self.navigate_to_page(self.current_page_index + step);
+        } else if self.current_page_index + 1 < total {
+            self.navigate_to_page(total - 1);
+        }
+    }
+
+    fn step_pages_backward(&mut self) {
+        let step = if self.view_mode == ViewMode::TwoPageSpread {
+            2
+        } else {
+            1
+        };
+        if self.current_page_index > 0 {
+            self.navigate_to_page(self.current_page_index.saturating_sub(step));
+        }
+    }
+
+    /// Scrolls vertically in `FitWidth` / `FitTextWidth` when the page bitmap exceeds the viewport height,
+    /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
+    fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
+        if matches!(self.view_mode, ViewMode::FitWidth | ViewMode::FitTextWidth) {
+            if let Some(cache) = &self.cached_page {
+                let bmp_h = cache.bitmap_height;
+                let content_h = cache.viewport_height;
+                if bmp_h > content_h {
+                    let max_scroll = (bmp_h - content_h) as f32;
+                    let new_scroll = self.scroll_y + scroll_delta_px;
+                    if scroll_delta_px > 0.0 {
+                        if self.scroll_y < max_scroll - 1.0 {
+                            self.scroll_y = new_scroll.min(max_scroll);
+                            self.request_redraw();
+                            return true;
+                        } else if self.current_page_index + 1 < self.total_pages() {
+                            self.current_page_index += 1;
+                            self.scroll_y = 0.0;
+                            self.invalidate_page_caches();
+                            self.update_title_bar();
+                            self.request_redraw();
+                            return true;
+                        }
+                    } else if scroll_delta_px < 0.0 {
+                        if self.scroll_y > 1.0 {
+                            self.scroll_y = new_scroll.max(0.0);
+                            self.request_redraw();
+                            return true;
+                        } else if self.current_page_index > 0 {
+                            self.current_page_index -= 1;
+                            self.scroll_y = 99999.0; // Clamped to bottom of previous page on render
+                            self.invalidate_page_caches();
+                            self.update_title_bar();
+                            self.request_redraw();
+                            return true;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn rotate_page_clockwise(&mut self, page_idx: u16) {
@@ -1777,7 +3022,7 @@ impl<'a> PdfViewerApp<'a> {
             PdfPageRenderRotation::Degrees270 => PdfPageRenderRotation::None,
         };
         page.set_rotation(next_rot);
-        self.cached_page = None;
+        self.invalidate_page_caches();
         self.thumbnail_cache.remove(&page_idx);
         self.status_notice = Some(format!("Rotated page {} by 90°", page_idx + 1));
         self.update_title_bar();
@@ -1802,7 +3047,7 @@ impl<'a> PdfViewerApp<'a> {
                 Ok(new_doc) => {
                     self.doc = Some(new_doc);
                     self.bw_pages.insert(page_idx);
-                    self.cached_page = None;
+                    self.invalidate_page_caches();
                     self.thumbnail_cache.remove(&page_idx);
                     self.status_notice = Some(format!(
                         "Converted Page {} to Grayscale [BW] (Cmd/Ctrl+Z to undo)",
@@ -1818,6 +3063,69 @@ impl<'a> PdfViewerApp<'a> {
             },
             Err(e) => {
                 self.status_notice = Some(format!("BW conversion error: {e}"));
+                self.update_title_bar();
+            }
+        }
+    }
+
+    fn reset_current_page_crop(&mut self) {
+        self.push_undo_snapshot();
+        let page_idx = self.current_page_index;
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        match self.engine.reset_page_crop(doc, page_idx) {
+            Ok(bytes) => match self.engine.load_pdf_from_bytes_safe(bytes) {
+                Ok(new_doc) => {
+                    self.doc = Some(new_doc);
+                    self.invalidate_page_caches();
+                    self.thumbnail_cache.remove(&page_idx);
+                    self.status_notice = Some(format!(
+                        "Reset crop on Page {} to full MediaBox",
+                        page_idx + 1
+                    ));
+                    self.update_title_bar();
+                    self.request_redraw();
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("Reset crop reload error: {e}"));
+                    self.update_title_bar();
+                }
+            },
+            Err(e) => {
+                let _ = self.undo_stack.pop_back();
+                self.status_notice = Some(format!("Reset crop failed: {e}"));
+                self.update_title_bar();
+            }
+        }
+    }
+
+    fn flatten_and_unlock_current_pdf(&mut self) {
+        self.push_undo_snapshot();
+        let Some(doc) = self.doc.as_mut() else {
+            return;
+        };
+        match self.engine.flatten_and_unlock_doc(doc) {
+            Ok(flat_bytes) => match self.engine.load_pdf_from_bytes_safe(flat_bytes) {
+                Ok(new_doc) => {
+                    self.doc = Some(new_doc);
+                    self.invalidate_page_caches();
+                    self.thumbnail_cache.clear();
+                    self.status_notice = Some(
+                        "Flattened all annotations/forms & unlocked PDF permissions (Press 'S' to save)"
+                            .to_string(),
+                    );
+                    self.update_title_bar();
+                    self.request_redraw();
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("Flatten reload error: {e}"));
+                    self.update_title_bar();
+                }
+            },
+            Err(e) => {
+                let _ = self.undo_stack.pop_back();
+                self.status_notice = Some(format!("Flatten failed: {e}"));
                 self.update_title_bar();
             }
         }
@@ -1840,7 +3148,7 @@ impl<'a> PdfViewerApp<'a> {
                 if self.current_page_index >= new_total && new_total > 0 {
                     self.current_page_index = new_total - 1;
                 }
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 self.status_notice = Some("Deleted page (Cmd/Ctrl+Z to undo)".to_string());
                 self.update_title_bar();
@@ -1858,7 +3166,7 @@ impl<'a> PdfViewerApp<'a> {
         match PdfEngine::insert_blank_page_in_doc(doc, target_idx) {
             Ok(inserted_idx) => {
                 self.current_page_index = inserted_idx;
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 self.status_notice =
                     Some(format!("Inserted blank A4 page at #{}", inserted_idx + 1));
@@ -1896,7 +3204,7 @@ impl<'a> PdfViewerApp<'a> {
         };
         match doc.pages_mut().append(&second_doc) {
             Ok(()) => {
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 self.status_notice = Some("Merged successfully!".to_string());
                 self.update_title_bar();
@@ -1907,6 +3215,306 @@ impl<'a> PdfViewerApp<'a> {
                 self.update_title_bar();
             }
         }
+    }
+
+    /// Batch Combine Multiple PDFs (`Shift+M` or `File -> Combine Multiple PDFs...`).
+    fn combine_multiple_pdfs_dialog(&mut self) {
+        let Some(paths) = rfd::FileDialog::new()
+            .set_title("Select 2 or More PDFs to Combine in Order")
+            .add_filter("PDF", &["pdf"])
+            .pick_files()
+        else {
+            return;
+        };
+
+        if paths.len() < 2 {
+            self.status_notice =
+                Some("Select at least 2 PDF files to combine (Shift+M)".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        let num_files = paths.len();
+        match self.engine.combine_multiple_pdfs(&paths) {
+            Ok((combined_bytes, total_pages)) => {
+                let virtual_path = match paths[0].parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p.join("Combined.pdf"),
+                    _ => PathBuf::from("Combined.pdf"),
+                };
+                match self.open_bytes_in_new_tab(combined_bytes, virtual_path) {
+                    Ok(()) => {
+                        self.status_notice = Some(format!(
+                            "Combined {num_files} PDFs ({total_pages} pages) into 'Combined.pdf' (Press 'S' to save)"
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_notice = Some(format!("Failed to open Combined.pdf tab: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Combine PDFs failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Opens native file dialog to choose a PNG/JPG signature or image stamp (`P` key).
+    fn pick_stamp_image_dialog(&mut self) {
+        let Some(img_path) = rfd::FileDialog::new()
+            .set_title("Select Signature or Image Stamp (PNG with transparency or JPG)")
+            .add_filter("Images", &["png", "jpg", "jpeg"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        let fname = img_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("stamp.png")
+            .to_string();
+
+        match PdfEngine::load_stamp_image(&img_path) {
+            Ok(buf) => {
+                let w = buf.width;
+                let h = buf.height;
+                self.pending_stamp_image = Some(buf);
+                self.mouse_mode = MouseMode::StampImage;
+                self.status_notice = Some(format!(
+                    "Loaded '{fname}' ({w}x{h}) — Click or Drag on page to stamp signature/image!"
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Failed to load image '{fname}': {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    fn execute_text_search(&mut self, query: &str) {
+        let trimmed = query.trim().to_string();
+        if trimmed.is_empty() {
+            self.search_query.clear();
+            self.search_matches.clear();
+            self.current_search_match = 0;
+            self.status_notice = Some("Cleared text search highlights".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let matches = PdfEngine::search_text_in_doc(doc, &trimmed);
+        self.search_query = trimmed.clone();
+        if matches.is_empty() {
+            self.search_matches.clear();
+            self.current_search_match = 0;
+            self.status_notice = Some(format!("No matches found for '{trimmed}'"));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        // Start from the first match on or after `self.current_page_index`
+        let start_idx = matches
+            .iter()
+            .position(|m| m.page_index >= self.current_page_index)
+            .unwrap_or(0);
+        let target_page = matches[start_idx].page_index;
+        let total_matches = matches.len();
+        self.search_matches = matches;
+        self.current_search_match = start_idx;
+
+        if target_page != self.current_page_index {
+            self.current_page_index = target_page;
+            self.scroll_y = 0.0;
+            self.invalidate_page_caches();
+        }
+        self.status_notice = Some(format!(
+            "Match {}/{} for '{}' on Page {} (Press F3 or Cmd/Ctrl+G for next)",
+            start_idx + 1,
+            total_matches,
+            trimmed,
+            target_page + 1
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    fn jump_to_next_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.input_mode = InputMode::SearchText {
+                query_input: self.search_query.clone(),
+            };
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+        self.current_search_match = (self.current_search_match + 1) % self.search_matches.len();
+        let target_page = self.search_matches[self.current_search_match].page_index;
+        if target_page != self.current_page_index {
+            self.current_page_index = target_page;
+            self.scroll_y = 0.0;
+            self.invalidate_page_caches();
+        }
+        self.status_notice = Some(format!(
+            "Match {}/{} for '{}' on Page {}",
+            self.current_search_match + 1,
+            self.search_matches.len(),
+            self.search_query,
+            target_page + 1
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    fn execute_menu_item(&mut self, cat: MenuCategory, item_idx: usize) {
+        self.open_menu = None;
+        match (cat, item_idx) {
+            // File menu
+            (MenuCategory::File, 0) => {
+                self.pending_dialog = Some(PendingDialog::Open);
+            }
+            (MenuCategory::File, 1) => {
+                self.pending_dialog = Some(PendingDialog::CombineMultiple);
+            }
+            (MenuCategory::File, 2) => {
+                self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
+            }
+            (MenuCategory::File, 3) => {
+                self.pending_dialog = Some(PendingDialog::Save);
+            }
+            (MenuCategory::File, 4) => {
+                self.compress_current_pdf();
+            }
+            (MenuCategory::File, 5) => {
+                if self.tabs.len() > 1 {
+                    let _ = self.close_tab(self.active_tab);
+                } else {
+                    self.status_notice = Some("Cannot close the last remaining tab".to_string());
+                }
+            }
+
+            // View menu
+            (MenuCategory::View, 0) => self.set_view_mode(ViewMode::FitPage),
+            (MenuCategory::View, 1) => self.set_view_mode(ViewMode::FitWidth),
+            (MenuCategory::View, 2) => self.set_view_mode(ViewMode::FitTextWidth),
+            (MenuCategory::View, 3) => self.set_view_mode(ViewMode::TwoPageSpread),
+            (MenuCategory::View, 4) => self.toggle_view_mode(),
+            (MenuCategory::View, 5) => {
+                self.show_bookmarks = !self.show_bookmarks;
+                self.invalidate_page_caches();
+                self.status_notice = Some(if self.show_bookmarks {
+                    "Bookmarks Sidebar ON".to_string()
+                } else {
+                    "Bookmarks Sidebar OFF".to_string()
+                });
+            }
+            (MenuCategory::View, 6) => {
+                self.reading_filter = self.reading_filter.next();
+                self.status_notice = Some(format!(
+                    "Reading Filter: {} (Zero-RAM CPU Blit Filter)",
+                    self.reading_filter.label()
+                ));
+            }
+
+            // Edit menu
+            (MenuCategory::Edit, 0) => self.perform_undo(),
+            (MenuCategory::Edit, 1) => {
+                self.input_mode = InputMode::SearchText {
+                    query_input: self.search_query.clone(),
+                };
+            }
+            (MenuCategory::Edit, 2) => {
+                self.mouse_mode = MouseMode::Highlight;
+                self.status_notice =
+                    Some("Mouse Mode: Highlight Text (Drag across text)".to_string());
+            }
+            (MenuCategory::Edit, 3) => {
+                self.mouse_mode = MouseMode::Redact;
+                self.status_notice = Some(
+                    "Mouse Mode: Black-Box Redact (Drag red box to permanently purge & black out)"
+                        .to_string(),
+                );
+            }
+            (MenuCategory::Edit, 4) => {
+                self.mouse_mode = MouseMode::Crop;
+                self.status_notice = Some(
+                    "Mouse Mode: Crop Page Area (Drag green box to crop page)".to_string(),
+                );
+            }
+
+            // Page menu
+            (MenuCategory::Page, 0) => {
+                self.input_mode = InputMode::JumpToPage {
+                    input: String::new(),
+                };
+            }
+            (MenuCategory::Page, 1) => {
+                let target = if self.view_mode == ViewMode::ThumbnailGrid {
+                    self.hovered_thumb.unwrap_or(self.current_page_index)
+                } else {
+                    self.current_page_index
+                };
+                self.rotate_page_clockwise(target);
+            }
+            (MenuCategory::Page, 2) => self.insert_blank_page_after_current(),
+            (MenuCategory::Page, 3) => self.delete_current_page(),
+            (MenuCategory::Page, 4) => {
+                let target = if self.view_mode == ViewMode::ThumbnailGrid {
+                    self.hovered_thumb.unwrap_or(self.current_page_index)
+                } else {
+                    self.current_page_index
+                };
+                self.convert_page_to_bw_in_place(target);
+            }
+            (MenuCategory::Page, 5) => self.reset_current_page_crop(),
+
+            // Tools menu
+            (MenuCategory::Tools, 0) => {
+                self.input_mode = InputMode::PageNumbers {
+                    input: String::new(),
+                };
+            }
+            (MenuCategory::Tools, 1) => {
+                self.input_mode = InputMode::HeaderFooterRange {
+                    range_input: String::new(),
+                };
+            }
+            (MenuCategory::Tools, 2) => {
+                self.input_mode = InputMode::ClearMargins {
+                    input: String::new(),
+                };
+            }
+            (MenuCategory::Tools, 3) => {
+                self.input_mode = InputMode::Watermark {
+                    input: String::new(),
+                };
+            }
+            (MenuCategory::Tools, 4) => {
+                self.pending_dialog = Some(PendingDialog::PickStampImage);
+            }
+            (MenuCategory::Tools, 5) => {
+                self.input_mode = InputMode::SplitRange {
+                    input: String::new(),
+                };
+            }
+            (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
+
+            // Help menu
+            (MenuCategory::Help, 0) => {
+                self.show_help_overlay = !self.show_help_overlay;
+            }
+            _ => {}
+        }
+        self.update_title_bar();
+        self.request_redraw();
     }
 
     fn execute_split_range(&mut self, range_spec: &str) {
@@ -1993,7 +3601,7 @@ impl<'a> PdfViewerApp<'a> {
                 };
                 self.bookmark_scroll_y = 0;
                 self.show_bookmarks = true;
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.persist_bookmarks();
                 self.status_notice = Some(format!("Imported {count} bookmarks!"));
                 self.update_title_bar();
@@ -2045,8 +3653,10 @@ impl<'a> PdfViewerApp<'a> {
                         self.tabs[self.active_tab].file_path = save_path;
                     }
                     self.persist_bookmarks();
-                    self.status_notice =
-                        Some("Saved PDF with /PageLabels & /Outlines!".to_string());
+                    self.status_notice = Some(
+                        "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)!"
+                            .to_string(),
+                    );
                 }
                 Err(e) => {
                     self.status_notice = Some(format!("Save error: {e}"));
@@ -2112,6 +3722,7 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         self.update_title_bar();
+        self.request_redraw();
     }
 
     fn parse_page_range_input(&self, input: &str) -> Option<(u16, u16)> {
@@ -2143,13 +3754,18 @@ impl<'a> PdfViewerApp<'a> {
         let mode = std::mem::replace(&mut self.input_mode, InputMode::Normal);
         match mode {
             InputMode::Normal => {}
+            InputMode::SearchText { query_input } => {
+                self.execute_text_search(&query_input);
+                return;
+            }
             InputMode::JumpToPage { input } => {
                 let total = self.total_pages() as usize;
                 if let Some(target_idx) =
                     PdfEngine::resolve_logical_page_str(&input, self.roman_end, total)
                 {
                     self.current_page_index = target_idx as u16;
-                    self.cached_page = None;
+                    self.scroll_y = 0.0;
+                    self.invalidate_page_caches();
                     let lbl =
                         PdfEngine::format_logical_page_label(target_idx, self.roman_end);
                     self.status_notice = Some(format!(
@@ -2177,6 +3793,7 @@ impl<'a> PdfViewerApp<'a> {
                             self.status_notice =
                                 Some("Invalid number for Roman page end".to_string());
                             self.update_title_bar();
+                            self.request_redraw();
                             return;
                         }
                     }
@@ -2193,7 +3810,7 @@ impl<'a> PdfViewerApp<'a> {
                                 total,
                             );
                             self.persist_bookmarks();
-                            self.cached_page = None;
+                            self.invalidate_page_caches();
                             self.thumbnail_cache.clear();
                             self.status_notice = Some(format!(
                                 "Stamped page numbers (Roman 1..={roman_end}) & synced bookmarks"
@@ -2252,7 +3869,7 @@ impl<'a> PdfViewerApp<'a> {
                         doc, position, raw, start_page, end_page,
                     ) {
                         Ok(()) => {
-                            self.cached_page = None;
+                            self.invalidate_page_caches();
                             self.thumbnail_cache.clear();
                             if raw.is_empty() {
                                 self.status_notice = Some(format!(
@@ -2312,7 +3929,7 @@ impl<'a> PdfViewerApp<'a> {
                         };
                         match res {
                             Ok(()) => {
-                                self.cached_page = None;
+                                self.invalidate_page_caches();
                                 self.thumbnail_cache.clear();
                                 self.status_notice = Some(format!(
                                     "Cleared margins (option {choice}) on pages {start_p}..={end_p}"
@@ -2335,7 +3952,7 @@ impl<'a> PdfViewerApp<'a> {
                     if let Some(doc) = self.doc.as_mut() {
                         match PdfEngine::apply_watermark_to_doc(doc, text, true) {
                             Ok(()) => {
-                                self.cached_page = None;
+                                self.invalidate_page_caches();
                                 self.thumbnail_cache.clear();
                                 self.status_notice = Some(format!("Stamped watermark '{text}'"));
                                 self.request_redraw();
@@ -2377,7 +3994,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.selected_bookmark = Some(self.bookmarks.len() - 1);
                 self.show_bookmarks = true;
                 self.persist_bookmarks();
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.status_notice = Some(format!("Added bookmark '{title}'"));
                 self.request_redraw();
             }
@@ -2397,19 +4014,24 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         self.update_title_bar();
+        self.request_redraw();
     }
 
     fn handle_key_input(&mut self, logical_key: Key, text: Option<&str>) {
-        // 1. If in an interactive title-bar prompt mode, handle typing, Backspace, Enter, Esc
+        // 1. If in an interactive Bottom Command Bar / Title-Bar prompt mode, handle typing, Backspace, Enter, Esc
         if self.input_mode != InputMode::Normal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.input_mode = InputMode::Normal;
                     self.status_notice = Some("Cancelled".to_string());
                     self.update_title_bar();
+                    self.request_redraw();
                 }
                 Key::Named(NamedKey::Backspace) => {
                     match &mut self.input_mode {
+                        InputMode::SearchText { query_input } => {
+                            query_input.pop();
+                        }
                         InputMode::JumpToPage { input }
                         | InputMode::PageNumbers { input }
                         | InputMode::ClearMargins { input }
@@ -2433,6 +4055,7 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::Normal => {}
                     }
                     self.update_title_bar();
+                    self.request_redraw();
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.handle_prompt_submission();
@@ -2458,6 +4081,9 @@ impl<'a> PdfViewerApp<'a> {
                     if !typed.is_empty() {
                         let mut auto_submit_clear = false;
                         match &mut self.input_mode {
+                            InputMode::SearchText { query_input } => {
+                                query_input.push_str(&typed);
+                            }
                             InputMode::JumpToPage { input } => {
                                 for c in typed.chars() {
                                     if c.is_ascii_alphanumeric() || c == '#' {
@@ -2523,6 +4149,7 @@ impl<'a> PdfViewerApp<'a> {
                             self.handle_prompt_submission();
                         } else {
                             self.update_title_bar();
+                            self.request_redraw();
                         }
                     }
                 }
@@ -2530,12 +4157,23 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
 
-        // 2. OS-native modifier shortcuts: Cmd+Z / Ctrl+Z (Undo), Cmd+W / Ctrl+W (Close Tab), Ctrl+Tab (Cycle Tab)
+        // 2. OS-native modifier shortcuts: Cmd+Z / Ctrl+Z (Undo), Cmd+F / Ctrl+F (Find), Cmd+G / Ctrl+G (Next Match), Cmd+W / Ctrl+W (Close Tab)
         if self.cmd_or_ctrl_pressed {
             if let Key::Character(ch) = &logical_key {
                 let s = ch.as_str();
                 if s.eq_ignore_ascii_case("z") {
                     self.perform_undo();
+                    return;
+                } else if s.eq_ignore_ascii_case("f") {
+                    self.input_mode = InputMode::SearchText {
+                        query_input: self.search_query.clone(),
+                    };
+                    self.status_notice = None;
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                } else if s.eq_ignore_ascii_case("g") {
+                    self.jump_to_next_search_match();
                     return;
                 } else if s.eq_ignore_ascii_case("w") {
                     if self.tabs.len() > 1 {
@@ -2544,6 +4182,7 @@ impl<'a> PdfViewerApp<'a> {
                         self.status_notice =
                             Some("Cannot close the last remaining tab".to_string());
                         self.update_title_bar();
+                        self.request_redraw();
                     }
                     return;
                 }
@@ -2587,9 +4226,22 @@ impl<'a> PdfViewerApp<'a> {
                 self.show_help_overlay = !self.show_help_overlay;
                 self.request_redraw();
             }
+            Key::Named(NamedKey::F3) => {
+                self.jump_to_next_search_match();
+            }
             Key::Named(NamedKey::Escape) => {
-                if self.show_help_overlay {
+                if self.open_menu.is_some() {
+                    self.open_menu = None;
+                    self.request_redraw();
+                } else if self.show_help_overlay {
                     self.show_help_overlay = false;
+                    self.request_redraw();
+                } else if self.mouse_mode != MouseMode::Highlight {
+                    self.mouse_mode = MouseMode::Highlight;
+                    self.pending_stamp_image = None;
+                    self.status_notice =
+                        Some("Returned to Mouse Mode: Highlight Text".to_string());
+                    self.update_title_bar();
                     self.request_redraw();
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
                     self.toggle_view_mode();
@@ -2615,21 +4267,23 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
-            Key::Named(NamedKey::ArrowRight)
-            | Key::Named(NamedKey::ArrowDown)
-            | Key::Named(NamedKey::PageDown)
-            | Key::Named(NamedKey::Space) => {
-                let total = self.total_pages();
-                if self.current_page_index + 1 < total {
-                    self.navigate_to_page(self.current_page_index + 1);
+            Key::Named(NamedKey::ArrowDown) => {
+                if !self.scroll_or_turn_page_vertical(64.0) {
+                    self.step_pages_forward();
                 }
             }
-            Key::Named(NamedKey::ArrowLeft)
-            | Key::Named(NamedKey::ArrowUp)
-            | Key::Named(NamedKey::PageUp) => {
-                if self.current_page_index > 0 {
-                    self.navigate_to_page(self.current_page_index - 1);
+            Key::Named(NamedKey::ArrowUp) => {
+                if !self.scroll_or_turn_page_vertical(-64.0) {
+                    self.step_pages_backward();
                 }
+            }
+            Key::Named(NamedKey::ArrowRight)
+            | Key::Named(NamedKey::PageDown)
+            | Key::Named(NamedKey::Space) => {
+                self.step_pages_forward();
+            }
+            Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => {
+                self.step_pages_backward();
             }
             Key::Named(NamedKey::Home) => {
                 self.navigate_to_page(0);
@@ -2645,9 +4299,29 @@ impl<'a> PdfViewerApp<'a> {
                 if s == "?" || s == "/" {
                     self.show_help_overlay = !self.show_help_overlay;
                     self.request_redraw();
+                } else if s == "1" {
+                    self.set_view_mode(ViewMode::FitPage);
+                } else if s == "2" {
+                    self.set_view_mode(ViewMode::FitWidth);
+                } else if s == "3" {
+                    self.set_view_mode(ViewMode::FitTextWidth);
+                } else if s == "4" {
+                    self.set_view_mode(ViewMode::TwoPageSpread);
+                } else if s.eq_ignore_ascii_case("v") {
+                    self.reading_filter = self.reading_filter.next();
+                    self.status_notice = Some(format!(
+                        "Reading Filter: {} (Zero-RAM CPU Blit Filter)",
+                        self.reading_filter.label()
+                    ));
+                    self.update_title_bar();
+                    self.request_redraw();
+                } else if s.eq_ignore_ascii_case("p") {
+                    self.pending_dialog = Some(PendingDialog::PickStampImage);
+                } else if s.eq_ignore_ascii_case("u") {
+                    self.flatten_and_unlock_current_pdf();
                 } else if s.eq_ignore_ascii_case("b") {
                     self.show_bookmarks = !self.show_bookmarks;
-                    self.cached_page = None;
+                    self.invalidate_page_caches();
                     self.status_notice = Some(if self.show_bookmarks {
                         "Bookmarks Sidebar ON ('+'/'A' Add, 'L' Import .txt, 'E' Edit, Del Remove)"
                             .to_string()
@@ -2666,6 +4340,7 @@ impl<'a> PdfViewerApp<'a> {
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("e") && self.show_bookmarks {
                     if let Some(sel) = self.selected_bookmark {
                         if let Some(bm) = self.bookmarks.get(sel) {
@@ -2675,6 +4350,7 @@ impl<'a> PdfViewerApp<'a> {
                             };
                             self.status_notice = None;
                             self.update_title_bar();
+                            self.request_redraw();
                         }
                     }
                 } else if s.eq_ignore_ascii_case("g") {
@@ -2683,44 +4359,55 @@ impl<'a> PdfViewerApp<'a> {
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
                     self.input_mode = InputMode::JumpToPage {
                         input: s.to_string(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("n") {
                     self.input_mode = InputMode::PageNumbers {
                         input: String::new(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("h") {
                     self.input_mode = InputMode::HeaderFooterRange {
                         range_input: String::new(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("c") {
                     self.input_mode = InputMode::ClearMargins {
                         input: String::new(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("w") {
                     self.input_mode = InputMode::Watermark {
                         input: String::new(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("x") {
                     self.input_mode = InputMode::SplitRange {
                         input: String::new(),
                     };
                     self.status_notice = None;
                     self.update_title_bar();
+                    self.request_redraw();
                 } else if s.eq_ignore_ascii_case("m") {
-                    self.pending_dialog = Some(PendingDialog::Merge);
+                    if self.shift_pressed || s == "M" {
+                        self.pending_dialog = Some(PendingDialog::CombineMultiple);
+                    } else {
+                        self.pending_dialog = Some(PendingDialog::Merge);
+                    }
                 } else if s.eq_ignore_ascii_case("i") {
                     self.insert_blank_page_after_current();
                 } else if s.eq_ignore_ascii_case("r") {
@@ -2783,6 +4470,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::Open => self.open_file_dialog(),
                 PendingDialog::Save => self.save_file_dialog(),
                 PendingDialog::Merge => self.merge_pdf_dialog(),
+                PendingDialog::CombineMultiple => self.combine_multiple_pdfs_dialog(),
+                PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
                 PendingDialog::ImportBookmarksTxt => self.import_bookmarks_txt_dialog(),
             }
@@ -2797,7 +4486,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     ) {
         match event {
             WindowEvent::CloseRequested => {
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 self.tabs.clear();
                 self.doc = None;
@@ -2807,7 +4496,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 event_loop.exit();
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                self.cached_page = None;
+                self.invalidate_page_caches();
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -2825,12 +4514,28 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.import_bookmarks_from_path(&dropped_path);
                     return;
                 }
+                if ext.eq_ignore_ascii_case("png")
+                    || ext.eq_ignore_ascii_case("jpg")
+                    || ext.eq_ignore_ascii_case("jpeg")
+                {
+                    if let Ok(buf) = PdfEngine::load_stamp_image(&dropped_path) {
+                        self.pending_stamp_image = Some(buf);
+                        self.mouse_mode = MouseMode::StampImage;
+                        self.status_notice = Some(
+                            "Loaded dropped image — Click or Drag on page to stamp!".to_string(),
+                        );
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 if !ext.eq_ignore_ascii_case("pdf") {
                     self.status_notice = Some(format!(
-                        "Dropped file {:?} is not a .pdf or .txt",
+                        "Dropped file {:?} is not a .pdf, .txt, or .png/.jpg",
                         dropped_path
                     ));
                     self.update_title_bar();
+                    self.request_redraw();
                     return;
                 }
 
@@ -2840,12 +4545,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     .unwrap_or("dropped.pdf")
                     .to_string();
 
-                // In Single-Page View (or when holding Shift, or when no document is loaded):
+                // In Page View (or when holding Shift, or when no document is loaded):
                 // Open the dropped PDF in a new tab!
-                if self.view_mode == ViewMode::SinglePage
-                    || self.shift_pressed
-                    || self.doc.is_none()
-                {
+                if self.view_mode.is_page_view() || self.shift_pressed || self.doc.is_none() {
                     match self.open_document_in_new_tab(dropped_path) {
                         Ok(()) => {
                             self.status_notice = Some(format!(
@@ -2864,16 +4566,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // In Thumbnail Grid View (`Tab`): insert all pages of the dropped PDF right before target thumbnail
-                let (win_w, sidebar_w, tab_bar_h) = if let Some(w) = self.window.as_ref() {
+                let (win_w, sidebar_w, top_bars_h) = if let Some(w) = self.window.as_ref() {
                     let sz = w.inner_size();
                     let sf = w.scale_factor();
                     (
                         sz.width.max(1),
                         self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
-                        self.tab_bar_height_px(sf).min(sz.height.saturating_sub(32)),
+                        self.top_bars_height_px(sf).min(sz.height.saturating_sub(32)),
                     )
                 } else {
-                    (1024, 0, TAB_BAR_HEIGHT_LOGICAL)
+                    (1024, 0, MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL)
                 };
 
                 let target_idx = self.grid_drop_target_index(
@@ -2881,7 +4583,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.cursor_pos.1,
                     win_w,
                     sidebar_w,
-                    tab_bar_h,
+                    top_bars_h,
                 );
 
                 self.push_undo_snapshot();
@@ -2892,7 +4594,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     {
                         Ok(inserted_count) => {
                             self.current_page_index = target_idx;
-                            self.cached_page = None;
+                            self.invalidate_page_caches();
                             self.thumbnail_cache.clear();
                             self.status_notice = Some(format!(
                                 "Inserted {inserted_count} page(s) from '{fname}' before Page {}",
@@ -2929,40 +4631,57 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
-                match self.view_mode {
-                    ViewMode::ThumbnailGrid => {
-                        // Scroll thumbnail grid vertically
-                        self.grid_scroll_y = (self.grid_scroll_y - dy as f32).max(0.0);
-                        self.request_redraw();
+                if self.view_mode == ViewMode::ThumbnailGrid {
+                    // Scroll thumbnail grid vertically
+                    self.grid_scroll_y = (self.grid_scroll_y - dy as f32).max(0.0);
+                    self.request_redraw();
+                    return;
+                }
+
+                // In FitWidth or FitTextWidth, smoothly scroll `scroll_y` vertically first
+                if self.scroll_or_turn_page_vertical((-dy) as f32) {
+                    return;
+                }
+
+                // Otherwise turn page(s) cleanly with 120ms debounce
+                let now = Instant::now();
+                if let Some(last) = self.last_wheel_turn {
+                    if now.duration_since(last) < Duration::from_millis(120) {
+                        return;
                     }
-                    ViewMode::SinglePage => {
-                        // Turn 1 page cleanly with 120ms debounce
-                        let now = Instant::now();
-                        if let Some(last) = self.last_wheel_turn {
-                            if now.duration_since(last) < Duration::from_millis(120) {
-                                return;
-                            }
-                        }
-                        self.wheel_accum_y += dy;
-                        if self.wheel_accum_y <= -18.0 {
-                            self.wheel_accum_y = 0.0;
-                            self.last_wheel_turn = Some(now);
-                            let total = self.total_pages();
-                            if self.current_page_index + 1 < total {
-                                self.navigate_to_page(self.current_page_index + 1);
-                            }
-                        } else if self.wheel_accum_y >= 18.0 {
-                            self.wheel_accum_y = 0.0;
-                            self.last_wheel_turn = Some(now);
-                            if self.current_page_index > 0 {
-                                self.navigate_to_page(self.current_page_index - 1);
-                            }
-                        }
-                    }
+                }
+                self.wheel_accum_y += dy;
+                if self.wheel_accum_y <= -18.0 {
+                    self.wheel_accum_y = 0.0;
+                    self.last_wheel_turn = Some(now);
+                    self.step_pages_forward();
+                } else if self.wheel_accum_y >= 18.0 {
+                    self.wheel_accum_y = 0.0;
+                    self.last_wheel_turn = Some(now);
+                    self.step_pages_backward();
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
+                if let Some(w) = self.window.as_ref() {
+                    let sf = w.scale_factor();
+                    let menu_bar_h = self.menu_bar_height_px(sf);
+                    if self.open_menu.is_some() {
+                        // Hover-switch between top-level menus when a dropdown is already open
+                        if let Some(hovered_cat) =
+                            self.hit_test_menu_bar_header(position.x, position.y, menu_bar_h, sf)
+                        {
+                            if self.open_menu != Some(hovered_cat) {
+                                self.open_menu = Some(hovered_cat);
+                            }
+                        }
+                        self.request_redraw();
+                        return;
+                    } else if (position.y as u32) < menu_bar_h {
+                        self.request_redraw();
+                    }
+                }
+
                 if self.drag_start.is_some() || self.grid_drag_page.is_some() {
                     self.request_redraw();
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
@@ -2970,14 +4689,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let sz = w.inner_size();
                         let sf = w.scale_factor();
                         let sidebar_w = self.sidebar_width_px(sf);
-                        let tab_bar_h = self.tab_bar_height_px(sf);
+                        let top_bars_h = self.top_bars_height_px(sf);
                         let new_hover = self
                             .hit_test_thumbnail(
                                 position.x,
                                 position.y,
                                 sz.width.max(1),
                                 sidebar_w,
-                                tab_bar_h,
+                                top_bars_h,
                             )
                             .map(|(idx, _)| idx);
                         if new_hover != self.hovered_thumb {
@@ -2989,29 +4708,97 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if self.show_help_overlay {
+                    if state == ElementState::Pressed {
+                        self.show_help_overlay = false;
+                        self.request_redraw();
+                    }
                     return;
                 }
-                let (win_w, scale_factor, sidebar_w, tab_bar_h) =
+                let (win_w, scale_factor, sidebar_w, menu_bar_h, tab_bar_h, top_bars_h) =
                     if let Some(w) = self.window.as_ref() {
                         let sz = w.inner_size();
                         let sf = w.scale_factor();
+                        let mb_h = self.menu_bar_height_px(sf).min(sz.height.saturating_sub(48));
+                        let tb_h = self
+                            .tab_bar_height_px(sf)
+                            .min(sz.height.saturating_sub(mb_h + 24));
                         (
                             sz.width.max(1),
                             sf,
                             self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
-                            self.tab_bar_height_px(sf).min(sz.height.saturating_sub(32)),
+                            mb_h,
+                            tb_h,
+                            mb_h + tb_h,
                         )
                     } else {
-                        (1024, 1.0, 0, TAB_BAR_HEIGHT_LOGICAL)
+                        (
+                            1024,
+                            1.0,
+                            0,
+                            MENU_BAR_HEIGHT_LOGICAL,
+                            TAB_BAR_HEIGHT_LOGICAL,
+                            MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL,
+                        )
                     };
 
-                // 0. Check Top 28px Multi-Tab Bar interactions first
-                if (self.cursor_pos.1 as u32) < tab_bar_h {
+                // 0a. If a Top Menu dropdown is open, check if the user clicked an item or header
+                if self.open_menu.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some((cat, item_idx)) = self.hit_test_open_menu_dropdown(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            menu_bar_h,
+                            scale_factor,
+                        ) {
+                            self.execute_menu_item(cat, item_idx);
+                            return;
+                        }
+                        if let Some(clicked_cat) = self.hit_test_menu_bar_header(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            menu_bar_h,
+                            scale_factor,
+                        ) {
+                            if self.open_menu == Some(clicked_cat) {
+                                self.open_menu = None;
+                            } else {
+                                self.open_menu = Some(clicked_cat);
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                        // Clicked outside menu dropdown -> close dropdown
+                        self.open_menu = None;
+                        self.request_redraw();
+                    }
+                    return;
+                }
+
+                // 0b. Check Top 24px Menu Bar header clicks
+                if (self.cursor_pos.1 as u32) < menu_bar_h {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(cat) = self.hit_test_menu_bar_header(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            menu_bar_h,
+                            scale_factor,
+                        ) {
+                            self.open_menu = Some(cat);
+                            self.request_redraw();
+                        }
+                    }
+                    return;
+                }
+
+                // 0c. Check 28px Multi-Tab Bar interactions (`menu_bar_h .. top_bars_h`)
+                if (self.cursor_pos.1 as u32) < top_bars_h {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(hit) = self.hit_test_tab_bar(
                             self.cursor_pos.0,
                             self.cursor_pos.1,
                             win_w,
+                            menu_bar_h,
                             tab_bar_h,
                             scale_factor,
                         ) {
@@ -3027,6 +4814,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                             "Cannot close the last remaining tab".to_string(),
                                         );
                                         self.update_title_bar();
+                                        self.request_redraw();
                                     }
                                 }
                                 TabBarHit::NewTab => {
@@ -3045,7 +4833,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             self.cursor_pos.0,
                             self.cursor_pos.1,
                             sidebar_w,
-                            tab_bar_h,
+                            top_bars_h,
                             scale_factor,
                         ) {
                             match hit {
@@ -3081,7 +4869,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                 self.bookmarks[bm_idx].page_index as u16;
                                             self.current_page_index = target_page
                                                 .min(self.total_pages().saturating_sub(1));
-                                            self.cached_page = None;
+                                            self.scroll_y = 0.0;
+                                            self.invalidate_page_caches();
                                             self.update_title_bar();
                                             self.request_redraw();
                                         }
@@ -3129,7 +4918,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     self.cursor_pos.1,
                                     win_w,
                                     sidebar_w,
-                                    tab_bar_h,
+                                    top_bars_h,
                                 ) {
                                     match badge_hit {
                                         ThumbBadgeHit::BwConvert => {
@@ -3143,7 +4932,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                         ThumbBadgeHit::None => {}
                                     }
 
-                                    // Check for double-click to jump into Single-Page View
+                                    // Check for double-click to jump into Page View
                                     let now = Instant::now();
                                     if let Some((last_idx, last_time)) = self.last_thumb_click {
                                         if last_idx == clicked_idx
@@ -3173,7 +4962,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     let dist = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
                                     if dist > 10.0 {
                                         let dst_idx = self.grid_drop_target_index(
-                                            cx, cy, win_w, sidebar_w, tab_bar_h,
+                                            cx, cy, win_w, sidebar_w, top_bars_h,
                                         );
                                         if dst_idx != src_idx {
                                             self.push_undo_snapshot();
@@ -3208,7 +4997,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
-                // 3. Single-Page View mouse drag text highlighting
+                // 3. Page View mouse drag interactions: Highlight, Redact, Crop, StampImage
                 if button == MouseButton::Left {
                     match state {
                         ElementState::Pressed => {
@@ -3217,28 +5006,129 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         ElementState::Released => {
                             if let Some((sx1, sy1)) = self.drag_start.take() {
                                 let (sx2, sy2) = self.cursor_pos;
-                                if let Some(pdf_rect) =
-                                    self.screen_drag_to_pdf_rect(sx1, sy1, sx2, sy2)
-                                {
-                                    self.push_undo_snapshot();
-                                    let page_idx = self.current_page_index;
-                                    if let Some(doc) = self.doc.as_mut() {
-                                        match PdfEngine::highlight_text_in_rect(
-                                            doc, page_idx, pdf_rect,
-                                        ) {
-                                            Ok(count) if count > 0 => {
-                                                self.cached_page = None;
-                                                self.status_notice = Some(format!(
-                                                    "Highlighted {count} text region(s)"
-                                                ));
+                                let allow_click = self.mouse_mode == MouseMode::StampImage;
+                                if let Some((page_idx, pdf_rect)) = self.screen_drag_to_pdf_rect(
+                                    sx1,
+                                    sy1,
+                                    sx2,
+                                    sy2,
+                                    allow_click,
+                                ) {
+                                    match self.mouse_mode {
+                                        MouseMode::Highlight => {
+                                            self.push_undo_snapshot();
+                                            if let Some(doc) = self.doc.as_mut() {
+                                                match PdfEngine::highlight_text_in_rect(
+                                                    doc, page_idx, pdf_rect,
+                                                ) {
+                                                    Ok(count) if count > 0 => {
+                                                        self.invalidate_page_caches();
+                                                        self.status_notice = Some(format!(
+                                                            "Highlighted {count} text region(s) on Page {}",
+                                                            page_idx + 1
+                                                        ));
+                                                    }
+                                                    Ok(_) => {
+                                                        let _ = self.undo_stack.pop_back();
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = self.undo_stack.pop_back();
+                                                        self.status_notice =
+                                                            Some(format!("Highlight error: {e}"));
+                                                    }
+                                                }
                                             }
-                                            Ok(_) => {
-                                                let _ = self.undo_stack.pop_back();
+                                        }
+                                        MouseMode::Redact => {
+                                            self.push_undo_snapshot();
+                                            if let Some(doc) = self.doc.as_mut() {
+                                                match PdfEngine::redact_rect_on_page(
+                                                    doc, page_idx, pdf_rect,
+                                                ) {
+                                                    Ok(removed) => {
+                                                        self.invalidate_page_caches();
+                                                        self.thumbnail_cache.remove(&page_idx);
+                                                        self.status_notice = Some(format!(
+                                                            "REDACTED area on Page {} (purged {} underlying object(s) + solid black box)",
+                                                            page_idx + 1,
+                                                            removed
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = self.undo_stack.pop_back();
+                                                        self.status_notice =
+                                                            Some(format!("Redaction error: {e}"));
+                                                    }
+                                                }
                                             }
-                                            Err(e) => {
-                                                let _ = self.undo_stack.pop_back();
-                                                self.status_notice =
-                                                    Some(format!("Highlight error: {e}"));
+                                        }
+                                        MouseMode::Crop => {
+                                            self.push_undo_snapshot();
+                                            if let Some(doc) = self.doc.as_mut() {
+                                                match self
+                                                    .engine
+                                                    .crop_page_to_rect(doc, page_idx, pdf_rect)
+                                                {
+                                                    Ok(cropped_bytes) => {
+                                                        match self
+                                                            .engine
+                                                            .load_pdf_from_bytes_safe(cropped_bytes)
+                                                        {
+                                                            Ok(new_doc) => {
+                                                                self.doc = Some(new_doc);
+                                                                self.mouse_mode =
+                                                                    MouseMode::Highlight;
+                                                                self.scroll_y = 0.0;
+                                                                self.invalidate_page_caches();
+                                                                self.thumbnail_cache
+                                                                    .remove(&page_idx);
+                                                                self.status_notice = Some(format!(
+                                                                    "Cropped Page {} (Use Page -> Reset Page Crop or Cmd/Ctrl+Z to restore)",
+                                                                    page_idx + 1
+                                                                ));
+                                                            }
+                                                            Err(e) => {
+                                                                let _ = self.undo_stack.pop_back();
+                                                                self.status_notice = Some(format!(
+                                                                    "Crop reload error: {e}"
+                                                                ));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = self.undo_stack.pop_back();
+                                                        self.status_notice =
+                                                            Some(format!("Crop error: {e}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        MouseMode::StampImage => {
+                                            if let Some(stamp) = self.pending_stamp_image.clone() {
+                                                self.push_undo_snapshot();
+                                                if let Some(doc) = self.doc.as_mut() {
+                                                    match self.engine.stamp_image_on_page(
+                                                        doc, page_idx, &stamp, pdf_rect,
+                                                    ) {
+                                                        Ok(()) => {
+                                                            self.mouse_mode = MouseMode::Highlight;
+                                                            self.invalidate_page_caches();
+                                                            self.thumbnail_cache.remove(&page_idx);
+                                                            self.status_notice = Some(format!(
+                                                                "Stamped image/signature onto Page {}! (Cmd/Ctrl+Z to undo)",
+                                                                page_idx + 1
+                                                            ));
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = self.undo_stack.pop_back();
+                                                            self.status_notice = Some(format!(
+                                                                "Image stamp error: {e}"
+                                                            ));
+                                                        }
+                                                    }
+                                                }
+                                            } else {
+                                                self.mouse_mode = MouseMode::Highlight;
                                             }
                                         }
                                     }
@@ -3367,23 +5257,23 @@ fn draw_help_overlay(buffer: &mut [u32], buf_w: u32, buf_h: u32, scale_factor: f
     let line_h = 14 * scale;
 
     let lines = [
-        "=== MICRO_PDF KEYBOARD & MOUSE CONTROLS ===",
+        "=== MICRO_PDF PHASE 5: MENU BAR, VIEW MODES & POWER TOOLS ===",
         "",
-        "TOP TAB BAR: Click Tab to Switch, [x] or Cmd/Ctrl+W Close, [+] Open",
-        "MOUSE DRAG : Left-Click & Drag to Highlight Text (Single View)",
-        "MOUSE WHEEL: Turn Page (Single) / Scroll (Grid & Bookmarks)",
-        "TAB        : Toggle Thumbnail Grid Overview (Ctrl+Tab cycles tabs)",
-        "B / L      : Toggle Bookmark Sidebar / 'L' Import .txt Bookmarks",
-        "G or 0-9   : Smart Jump (Logical '5', Roman 'ii', or Physical '#5')",
-        "N          : Stamp Roman (i..v) & Arabic Page Numbers + Sync Labels",
-        "H / C      : Stamp Aligned Header/Footer / Clear Existing Margins",
-        "W          : Stamp Diagonal Semi-Transparent Watermark",
-        "K / [BW]   : Convert Current/Hovered Page to Grayscale (Black&White)",
-        "I / R / D  : Insert Blank A4 / Rotate 90 deg / Delete Current Page",
-        "CMD/CTRL+Z : Undo Last Structural or Page Edit (up to 8 steps)",
-        "X / M / Z  : Split Range / Merge PDF / Compress & Optimize PDF",
-        "O / S      : Open PDF in New Tab / Save PDF (embeds /Outlines)",
-        "? / F1/ESC : Toggle or Close this Help Overlay",
+        "TOP MENU BAR : Click [File] [View] [Edit] [Page] [Tools] [Help]",
+        "TOP TAB BAR  : Click Tab to Switch, [x] or Cmd/Ctrl+W Close, [+] Open",
+        "VIEW MODES   : '1' Fit Page | '2' Fit Width | '3' Fit Text | '4' 2-Page",
+        "GRID & BKMKS : 'Tab' Thumbnail Grid | 'B' Bookmark Sidebar | 'L' Import",
+        "FIND TEXT    : Cmd/Ctrl+F Search Text in PDF | F3 / Cmd+G Next Match",
+        "MOUSE MODES  : Highlight (default) | Redact (Edit menu) | Crop (Edit)",
+        "STAMP IMAGE  : 'P' Pick PNG/JPG Signature -> Click/Drag on Page to Stamp",
+        "READ FILTER  : 'V' Cycle Normal / Dark Invert / Warm Sepia (0-RAM Blit)",
+        "FLATTEN PDF  : 'U' Flatten Annotations/Forms & Unlock Permissions",
+        "BATCH COMBINE: 'Shift+M' Combine 2+ PDFs in Order into 'Combined.pdf'",
+        "SMART JUMP   : 'G' or 0-9 (Logical '5', Roman 'ii', or Physical '#5')",
+        "MARGINS & #  : 'N' Roman/Arabic # | 'H' Header/Footer | 'C' Clear Zone",
+        "PAGE TOOLS   : 'W' Watermark | 'K' Grayscale [BW] | 'I' Insert | 'R' Rot",
+        "FILE & UNDO  : 'O' Open | 'S' Save | 'Z' Compress | 'X' Split | Cmd+Z Undo",
+        "? / F1 / ESC : Toggle or Close this Help Overlay",
     ];
 
     let max_chars = lines.iter().map(|l| l.len()).max().unwrap_or(40) as u32;
@@ -3508,6 +5398,13 @@ fn glyph_8x8(c: char) -> [u8; 8] {
         '\'' => [0b00100, 0b00100, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100],
         ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100, 0b01000],
+        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
+        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100],
+        '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
+        '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
+        '>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
+        '°' => [0b00110, 0b01001, 0b01001, 0b00110, 0b00000, 0b00000, 0b00000],
+        '—' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         _ => [0; 7],
     };
     [
