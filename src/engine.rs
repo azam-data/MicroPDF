@@ -53,11 +53,14 @@ impl MarginPosition {
     }
 }
 
-/// In-memory Bookmark item for the Left Bookmark Sidebar (`B` key).
+/// In-memory Bookmark item for the Left Bookmark Sidebar (`B` key) and PDF `/Outlines`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Bookmark {
+    pub serial: String,
     pub title: String,
+    pub logical_page: String,
     pub page_index: usize,
+    pub level: u8,
 }
 
 pub struct PdfEngine {
@@ -187,6 +190,435 @@ impl PdfEngine {
         self.load_pdf_safe(path)
     }
 
+    /// Loads a `PdfDocument` directly from an in-memory `Vec<u8>` buffer (used for Undo/Redo and
+    /// in-memory grayscale conversion), retrying with `Some("")` if `None` fails.
+    pub fn load_pdf_from_bytes_safe<'a>(&'a self, bytes: Vec<u8>) -> Result<PdfDocument<'a>> {
+        if let Ok(doc) = self.pdfium.load_pdf_from_byte_vec(bytes.clone(), None) {
+            return Ok(doc);
+        }
+        self.pdfium
+            .load_pdf_from_byte_vec(bytes, Some(""))
+            .context("Failed to load PDF from in-memory byte vector")
+    }
+
+    /// Parses a valid Roman numeral (`i`, `ii`, `iii`, `iv`, `v`... case-insensitive) into a 1-based `usize`.
+    pub fn from_roman(input: &str) -> Option<usize> {
+        let s = input.trim().to_ascii_lowercase();
+        if s.is_empty()
+            || !s
+                .chars()
+                .all(|c| matches!(c, 'i' | 'v' | 'x' | 'l' | 'c' | 'd' | 'm'))
+        {
+            return None;
+        }
+        let val_of = |c: char| -> usize {
+            match c {
+                'i' => 1,
+                'v' => 5,
+                'x' => 10,
+                'l' => 50,
+                'c' => 100,
+                'd' => 500,
+                'm' => 1000,
+                _ => 0,
+            }
+        };
+        let chars: Vec<char> = s.chars().collect();
+        let mut total = 0usize;
+        for idx in 0..chars.len() {
+            let v = val_of(chars[idx]);
+            if idx + 1 < chars.len() && v < val_of(chars[idx + 1]) {
+                total = total.saturating_sub(v);
+            } else {
+                total += v;
+            }
+        }
+        if total >= 1 && total <= 3999 && Self::to_roman(total as u16) == s {
+            Some(total)
+        } else {
+            None
+        }
+    }
+
+    /// Resolves a logical page string (`input`) into a 0-based physical `page_index`:
+    /// - If `input` starts with `#` (e.g. `#5`), parses as 1-based physical page `5 -> index 4`.
+    /// - If `input` is a valid Roman numeral (`i`, `ii`, `iii`, `iv`, `v`...), converts to `r` (`1..=total_pages`) -> `Some(r - 1)`.
+    /// - If `input` is an Arabic integer `n` (`1, 2, 3...`), maps to logical Arabic page `n`, which is
+    ///   1-based physical page `roman_end + n` (0-based index `roman_end + n - 1`), validated against `total_pages`.
+    pub fn resolve_logical_page_str(
+        input: &str,
+        roman_end: usize,
+        total_pages: usize,
+    ) -> Option<usize> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() || total_pages == 0 {
+            return None;
+        }
+
+        if let Some(phys_str) = trimmed.strip_prefix('#') {
+            let p = phys_str.trim().parse::<usize>().ok()?;
+            if p >= 1 && p <= total_pages {
+                return Some(p - 1);
+            }
+            return None;
+        }
+
+        if let Some(r) = Self::from_roman(trimmed) {
+            if r >= 1 && r <= total_pages {
+                return Some(r - 1);
+            }
+            return None;
+        }
+
+        if let Ok(n) = trimmed.parse::<usize>() {
+            if n >= 1 {
+                let phys_1based = roman_end + n;
+                if phys_1based >= 1 && phys_1based <= total_pages {
+                    return Some(phys_1based - 1);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Formats the logical label for 0-based `page_idx` given `roman_end`.
+    pub fn format_logical_page_label(page_idx: usize, roman_end: usize) -> String {
+        let phys_1based = page_idx + 1;
+        if roman_end > 0 && phys_1based <= roman_end {
+            Self::to_roman(phys_1based as u16)
+        } else {
+            format!("{}", phys_1based.saturating_sub(roman_end))
+        }
+    }
+
+    /// Reads `/PageLabels` from `pdf_bytes` via `lopdf` and returns `roman_end` (`0` if all Arabic).
+    pub fn read_page_labels_roman_end(pdf_bytes: &[u8]) -> usize {
+        let Ok(ldoc) = lopdf::Document::load_mem(pdf_bytes) else {
+            return 0;
+        };
+        let Ok(catalog) = ldoc.catalog() else {
+            return 0;
+        };
+        let Ok(pl_obj) = catalog.get(b"PageLabels") else {
+            return 0;
+        };
+        let pl_dict = match pl_obj {
+            lopdf::Object::Reference(id) => ldoc.get_object(*id).and_then(|o| o.as_dict()).ok(),
+            lopdf::Object::Dictionary(d) => Some(d),
+            _ => None,
+        };
+        let Some(pl_dict) = pl_dict else {
+            return 0;
+        };
+        let Ok(nums_obj) = pl_dict.get(b"Nums") else {
+            return 0;
+        };
+        let nums_arr = match nums_obj {
+            lopdf::Object::Reference(id) => ldoc.get_object(*id).and_then(|o| o.as_array()).ok(),
+            lopdf::Object::Array(a) => Some(a),
+            _ => None,
+        };
+        let Some(nums) = nums_arr else {
+            return 0;
+        };
+
+        // Expect [ 0 << /S /r >> roman_end << /S /D ... >> ]
+        if nums.len() >= 4 {
+            let first_idx = nums[0].as_i64().unwrap_or(-1);
+            let first_dict = match &nums[1] {
+                lopdf::Object::Reference(id) => ldoc.get_object(*id).and_then(|o| o.as_dict()).ok(),
+                lopdf::Object::Dictionary(d) => Some(d),
+                _ => None,
+            };
+            let is_roman = first_dict
+                .and_then(|d| d.get(b"S").ok())
+                .and_then(|s| s.as_name_str().ok())
+                .map(|n| n.eq_ignore_ascii_case("r"))
+                .unwrap_or(false);
+            if first_idx == 0 && is_roman {
+                if let Ok(second_idx) = nums[2].as_i64() {
+                    if second_idx > 0 {
+                        return second_idx as usize;
+                    }
+                }
+            }
+        }
+        0
+    }
+
+    pub fn read_page_labels_roman_end_from_path(path: &Path) -> usize {
+        std::fs::read(path)
+            .map(|b| Self::read_page_labels_roman_end(&b))
+            .unwrap_or(0)
+    }
+
+    /// Parses hierarchical bookmarks from a `--` delimited `.txt` string (`Serial -- Title -- LogicalPage`),
+    /// as well as tab-delimited sidecar lines.
+    pub fn parse_bookmarks_txt(
+        content: &str,
+        roman_end: usize,
+        total_pages: usize,
+    ) -> Vec<Bookmark> {
+        let mut list = Vec::new();
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+
+            if line.contains("--") {
+                let parts: Vec<&str> = line.split("--").map(|s| s.trim()).collect();
+                if parts.len() >= 3 {
+                    let serial = parts[0].to_string();
+                    let page_str = parts[parts.len() - 1].to_string();
+                    let title = parts[1..parts.len() - 1].join(" -- ");
+                    let first_char = serial.chars().next().unwrap_or('1');
+                    let level = if first_char.is_ascii_alphabetic() {
+                        1
+                    } else {
+                        0
+                    };
+                    let effective_total = total_pages.max(9999);
+                    let page_index = Self::resolve_logical_page_str(&page_str, roman_end, total_pages)
+                        .or_else(|| {
+                            Self::resolve_logical_page_str(&page_str, roman_end, effective_total)
+                                .map(|idx| {
+                                    if total_pages > 0 {
+                                        idx.min(total_pages - 1)
+                                    } else {
+                                        idx
+                                    }
+                                })
+                        })
+                        .unwrap_or(0);
+
+                    list.push(Bookmark {
+                        serial,
+                        title,
+                        logical_page: page_str,
+                        page_index,
+                        level,
+                    });
+                    continue;
+                }
+            }
+
+            // Fallback for legacy tab-delimited sidecar format (`page_index\ttitle`)
+            if let Some((idx_str, title)) = line.split_once('\t') {
+                if let Ok(page_idx) = idx_str.trim().parse::<usize>() {
+                    if total_pages == 0 || page_idx < total_pages {
+                        let logical_page = Self::format_logical_page_label(page_idx, roman_end);
+                        list.push(Bookmark {
+                            serial: String::new(),
+                            title: title.trim().to_string(),
+                            logical_page,
+                            page_index: page_idx,
+                            level: 0,
+                        });
+                    }
+                }
+            }
+        }
+        list
+    }
+
+    /// Re-evaluates `page_index` for all bookmarks when `roman_end` changes in `N` Mode.
+    pub fn resync_bookmarks_logical_pages(
+        bookmarks: &mut [Bookmark],
+        roman_end: usize,
+        total_pages: usize,
+    ) {
+        if total_pages == 0 {
+            return;
+        }
+        for bm in bookmarks.iter_mut() {
+            if let Some(new_idx) =
+                Self::resolve_logical_page_str(&bm.logical_page, roman_end, total_pages)
+            {
+                bm.page_index = new_idx;
+            }
+        }
+    }
+
+    /// Embeds `/PageLabels` and hierarchical `/Outlines` into `pdf_bytes` using `lopdf`.
+    pub fn embed_metadata_in_pdf_bytes(
+        pdf_bytes: &[u8],
+        roman_end: usize,
+        bookmarks: &[Bookmark],
+    ) -> Result<Vec<u8>> {
+        let Ok(mut ldoc) = lopdf::Document::load_mem(pdf_bytes) else {
+            return Ok(pdf_bytes.to_vec());
+        };
+
+        // 1. Build `/PageLabels` dictionary
+        let mut nums_arr = Vec::new();
+        if roman_end > 0 {
+            let mut roman_dict = lopdf::Dictionary::new();
+            roman_dict.set("S", lopdf::Object::Name(b"r".to_vec()));
+            nums_arr.push(lopdf::Object::Integer(0));
+            nums_arr.push(lopdf::Object::Dictionary(roman_dict));
+
+            let mut arabic_dict = lopdf::Dictionary::new();
+            arabic_dict.set("S", lopdf::Object::Name(b"D".to_vec()));
+            arabic_dict.set("St", lopdf::Object::Integer(1));
+            nums_arr.push(lopdf::Object::Integer(roman_end as i64));
+            nums_arr.push(lopdf::Object::Dictionary(arabic_dict));
+        } else {
+            let mut arabic_dict = lopdf::Dictionary::new();
+            arabic_dict.set("S", lopdf::Object::Name(b"D".to_vec()));
+            arabic_dict.set("St", lopdf::Object::Integer(1));
+            nums_arr.push(lopdf::Object::Integer(0));
+            nums_arr.push(lopdf::Object::Dictionary(arabic_dict));
+        }
+
+        let mut page_labels_dict = lopdf::Dictionary::new();
+        page_labels_dict.set("Nums", lopdf::Object::Array(nums_arr));
+        let page_labels_id = ldoc.add_object(lopdf::Object::Dictionary(page_labels_dict));
+
+        // 2. Build hierarchical `/Outlines` tree if bookmarks are present
+        let outlines_id_opt = if !bookmarks.is_empty() {
+            let pages_map = ldoc.get_pages();
+            let page_ids: Vec<lopdf::ObjectId> = pages_map.values().copied().collect();
+            if !page_ids.is_empty() {
+                let outlines_root_id = ldoc.new_object_id();
+
+                struct ChapterNode {
+                    bm: Bookmark,
+                    obj_id: lopdf::ObjectId,
+                    children: Vec<(Bookmark, lopdf::ObjectId)>,
+                }
+
+                let mut chapters: Vec<ChapterNode> = Vec::new();
+                for bm in bookmarks {
+                    if bm.level == 0 || chapters.is_empty() {
+                        chapters.push(ChapterNode {
+                            bm: bm.clone(),
+                            obj_id: ldoc.new_object_id(),
+                            children: Vec::new(),
+                        });
+                    } else if let Some(last_chap) = chapters.last_mut() {
+                        last_chap.children.push((bm.clone(), ldoc.new_object_id()));
+                    }
+                }
+
+                let format_bm_title = |b: &Bookmark| -> String {
+                    if b.serial.is_empty() {
+                        b.title.clone()
+                    } else {
+                        format!("{}. {}", b.serial, b.title)
+                    }
+                };
+
+                let mut total_outline_items = 0i64;
+                for i in 0..chapters.len() {
+                    total_outline_items += 1 + (chapters[i].children.len() as i64);
+                    let chap_id = chapters[i].obj_id;
+                    let page_obj_id = page_ids[chapters[i]
+                        .bm
+                        .page_index
+                        .min(page_ids.len().saturating_sub(1))];
+
+                    let mut chap_dict = lopdf::Dictionary::new();
+                    chap_dict.set(
+                        "Title",
+                        lopdf::Object::string_literal(format_bm_title(&chapters[i].bm)),
+                    );
+                    chap_dict.set("Parent", lopdf::Object::Reference(outlines_root_id));
+                    chap_dict.set(
+                        "Dest",
+                        lopdf::Object::Array(vec![
+                            lopdf::Object::Reference(page_obj_id),
+                            lopdf::Object::Name(b"XYZ".to_vec()),
+                            lopdf::Object::Null,
+                            lopdf::Object::Null,
+                            lopdf::Object::Null,
+                        ]),
+                    );
+
+                    if i > 0 {
+                        chap_dict.set("Prev", lopdf::Object::Reference(chapters[i - 1].obj_id));
+                    }
+                    if i + 1 < chapters.len() {
+                        chap_dict.set("Next", lopdf::Object::Reference(chapters[i + 1].obj_id));
+                    }
+
+                    let children = &chapters[i].children;
+                    if !children.is_empty() {
+                        chap_dict.set("First", lopdf::Object::Reference(children[0].1));
+                        chap_dict.set(
+                            "Last",
+                            lopdf::Object::Reference(children[children.len() - 1].1),
+                        );
+                        chap_dict.set("Count", lopdf::Object::Integer(children.len() as i64));
+
+                        for c_idx in 0..children.len() {
+                            let (ref c_bm, c_id) = children[c_idx];
+                            let c_page_id = page_ids
+                                [c_bm.page_index.min(page_ids.len().saturating_sub(1))];
+                            let mut c_dict = lopdf::Dictionary::new();
+                            c_dict.set(
+                                "Title",
+                                lopdf::Object::string_literal(format_bm_title(c_bm)),
+                            );
+                            c_dict.set("Parent", lopdf::Object::Reference(chap_id));
+                            c_dict.set(
+                                "Dest",
+                                lopdf::Object::Array(vec![
+                                    lopdf::Object::Reference(c_page_id),
+                                    lopdf::Object::Name(b"XYZ".to_vec()),
+                                    lopdf::Object::Null,
+                                    lopdf::Object::Null,
+                                    lopdf::Object::Null,
+                                ]),
+                            );
+                            if c_idx > 0 {
+                                c_dict.set("Prev", lopdf::Object::Reference(children[c_idx - 1].1));
+                            }
+                            if c_idx + 1 < children.len() {
+                                c_dict.set("Next", lopdf::Object::Reference(children[c_idx + 1].1));
+                            }
+                            ldoc.objects.insert(c_id, lopdf::Object::Dictionary(c_dict));
+                        }
+                    }
+
+                    ldoc.objects
+                        .insert(chap_id, lopdf::Object::Dictionary(chap_dict));
+                }
+
+                let mut root_outlines = lopdf::Dictionary::new();
+                root_outlines.set("Type", lopdf::Object::Name(b"Outlines".to_vec()));
+                root_outlines.set("First", lopdf::Object::Reference(chapters[0].obj_id));
+                root_outlines.set(
+                    "Last",
+                    lopdf::Object::Reference(chapters[chapters.len() - 1].obj_id),
+                );
+                root_outlines.set("Count", lopdf::Object::Integer(total_outline_items));
+                ldoc.objects
+                    .insert(outlines_root_id, lopdf::Object::Dictionary(root_outlines));
+                Some(outlines_root_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Ok(catalog_mut) = ldoc.catalog_mut() {
+            catalog_mut.set("PageLabels", lopdf::Object::Reference(page_labels_id));
+            if let Some(outlines_id) = outlines_id_opt {
+                catalog_mut.set("Outlines", lopdf::Object::Reference(outlines_id));
+            }
+        }
+
+        let mut out_bytes = Vec::with_capacity(pdf_bytes.len() + 1024);
+        if ldoc.save_to(&mut out_bytes).is_ok() && !out_bytes.is_empty() {
+            Ok(out_bytes)
+        } else {
+            Ok(pdf_bytes.to_vec())
+        }
+    }
+
     /// Safely saves a `PdfDocument` to disk by buffering into memory first so that
     /// in-place saves (`input_path == output_path`) never truncate a file currently mapped by PDFium.
     pub fn save_doc<P: AsRef<Path>>(doc: &PdfDocument, output_path: P) -> Result<()> {
@@ -194,6 +626,23 @@ impl PdfEngine {
             .save_to_bytes()
             .context("Failed to serialize PDF document to bytes")?;
         std::fs::write(output_path.as_ref(), bytes)
+            .with_context(|| format!("Failed to write PDF to {:?}", output_path.as_ref()))?;
+        Ok(())
+    }
+
+    /// Saves `doc` to `output_path` and embeds `/PageLabels` (`roman_end`) and `/Outlines` (`bookmarks`).
+    pub fn save_doc_with_metadata<P: AsRef<Path>>(
+        doc: &PdfDocument,
+        output_path: P,
+        roman_end: usize,
+        bookmarks: &[Bookmark],
+    ) -> Result<()> {
+        let raw_bytes = doc
+            .save_to_bytes()
+            .context("Failed to serialize PDF document to bytes")?;
+        let final_bytes = Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks)
+            .unwrap_or(raw_bytes);
+        std::fs::write(output_path.as_ref(), final_bytes)
             .with_context(|| format!("Failed to write PDF to {:?}", output_path.as_ref()))?;
         Ok(())
     }
@@ -207,30 +656,22 @@ impl PdfEngine {
 
     /// Loads bookmarks for `doc`, checking `<pdf_filename>.bookmarks.txt` first so user edits
     /// are preserved, and falling back to `doc.bookmarks().iter()` from the PDF outline tree.
-    pub fn load_bookmarks(doc: &PdfDocument, pdf_path: &Path) -> Vec<Bookmark> {
+    pub fn load_bookmarks(
+        doc: &PdfDocument,
+        pdf_path: &Path,
+        roman_end: usize,
+    ) -> Vec<Bookmark> {
         let sidecar = Self::bookmarks_sidecar_path(pdf_path);
         let total_pages = doc.pages().len() as usize;
 
         if let Ok(content) = std::fs::read_to_string(&sidecar) {
-            let mut list = Vec::new();
-            for line in content.lines() {
-                if let Some((idx_str, title)) = line.split_once('\t') {
-                    if let Ok(page_idx) = idx_str.trim().parse::<usize>() {
-                        if total_pages == 0 || page_idx < total_pages {
-                            list.push(Bookmark {
-                                title: title.trim().to_string(),
-                                page_index: page_idx,
-                            });
-                        }
-                    }
-                }
-            }
-            return list;
+            return Self::parse_bookmarks_txt(&content, roman_end, total_pages);
         }
 
         let mut list = Vec::new();
+        let mut chap_counter = 0usize;
         for bm in doc.bookmarks().iter() {
-            let title = bm
+            let raw_title = bm
                 .title()
                 .unwrap_or_else(|| "Untitled".to_string())
                 .trim()
@@ -247,13 +688,36 @@ impl PdfEngine {
             if let Some(page_idx) = page_opt {
                 let idx = page_idx as usize;
                 if total_pages == 0 || idx < total_pages {
-                    list.push(Bookmark {
-                        title: if title.is_empty() {
-                            format!("Page {}", idx + 1)
+                    let (serial, title, level) =
+                        if let Some((prefix, rest)) = raw_title.split_once(". ") {
+                            let p_trim = prefix.trim();
+                            let first_c = p_trim.chars().next().unwrap_or('1');
+                            if p_trim.len() <= 4 && first_c.is_ascii_alphanumeric() {
+                                let lvl = if first_c.is_ascii_alphabetic() { 1 } else { 0 };
+                                (p_trim.to_string(), rest.trim().to_string(), lvl)
+                            } else {
+                                chap_counter += 1;
+                                (chap_counter.to_string(), raw_title, 0)
+                            }
                         } else {
-                            title
-                        },
+                            chap_counter += 1;
+                            (
+                                chap_counter.to_string(),
+                                if raw_title.is_empty() {
+                                    format!("Page {}", idx + 1)
+                                } else {
+                                    raw_title
+                                },
+                                0,
+                            )
+                        };
+                    let logical_page = Self::format_logical_page_label(idx, roman_end);
+                    list.push(Bookmark {
+                        serial,
+                        title,
+                        logical_page,
                         page_index: idx,
+                        level,
                     });
                 }
             }
@@ -261,7 +725,8 @@ impl PdfEngine {
         list
     }
 
-    /// Saves bookmarks to `<pdf_filename>.bookmarks.txt` so user edits are never lost.
+    /// Saves bookmarks to `<pdf_filename>.bookmarks.txt` in `--` delimited hierarchical format
+    /// (`Serial -- Title -- LogicalPage`) so user edits and hierarchy levels are preserved.
     pub fn save_bookmarks_sidecar(pdf_path: &Path, bookmarks: &[Bookmark]) -> Result<()> {
         let sidecar = Self::bookmarks_sidecar_path(pdf_path);
         if bookmarks.is_empty() {
@@ -271,13 +736,27 @@ impl PdfEngine {
             return Ok(());
         }
         let mut out = String::new();
-        for bm in bookmarks {
+        for (i, bm) in bookmarks.iter().enumerate() {
             let clean_title: String = bm
                 .title
                 .chars()
                 .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
                 .collect();
-            out.push_str(&format!("{}\t{}\n", bm.page_index, clean_title.trim()));
+            let serial = if bm.serial.trim().is_empty() {
+                if bm.level == 0 {
+                    format!("{}", i + 1)
+                } else {
+                    "a".to_string()
+                }
+            } else {
+                bm.serial.trim().to_string()
+            };
+            let logical = if bm.logical_page.trim().is_empty() {
+                format!("#{}", bm.page_index + 1)
+            } else {
+                bm.logical_page.trim().to_string()
+            };
+            out.push_str(&format!("{serial} -- {} -- {logical}\n", clean_title.trim()));
         }
         std::fs::write(&sidecar, out)
             .with_context(|| format!("Failed to write bookmarks sidecar {:?}", sidecar))?;
@@ -1077,6 +1556,160 @@ impl PdfEngine {
         Ok((best_bytes, orig_len, new_len))
     }
 
+    /// Converts a specific page (`page_index`, 0-based) to 8-bit grayscale (`[BW]`):
+    /// 1. Converts all text, path fill, stroke, and annotation RGB colors on `page_index` to
+    ///    8-bit grayscale luminance (`Y = (0.299*R + 0.587*G + 0.114*B) as u8`, `(Y, Y, Y)`).
+    /// 2. Converts embedded raster images on that page to 8-bit grayscale (`/DeviceGray` / 1-channel luma)
+    ///    and compresses their streams so color pages shrink in byte size while keeping vector text razor-sharp.
+    pub fn convert_page_to_bw(&self, doc_bytes: &[u8], page_index: u16) -> Result<Vec<u8>> {
+        let mut doc = self.load_pdf_from_bytes_safe(doc_bytes.to_vec())?;
+        let to_gray = |c: PdfColor| -> PdfColor {
+            let y = (0.299 * (c.red() as f32)
+                + 0.587 * (c.green() as f32)
+                + 0.114 * (c.blue() as f32))
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            PdfColor::new(y, y, y, c.alpha())
+        };
+
+        {
+            let mut page = doc
+                .pages_mut()
+                .get(page_index)
+                .context("Page index out of bounds for BW conversion")?;
+            let prev_strategy = page.content_regeneration_strategy();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+
+            let obj_count = page.objects().len();
+            for i in 0..obj_count {
+                if let Ok(mut obj) = page.objects_mut().get(i) {
+                    if let Ok(fc) = obj.fill_color() {
+                        let _ = obj.set_fill_color(to_gray(fc));
+                    }
+                    if let Ok(sc) = obj.stroke_color() {
+                        let _ = obj.set_stroke_color(to_gray(sc));
+                    }
+                }
+            }
+
+            let annot_count = page.annotations().len();
+            for a_idx in 0..annot_count {
+                if let Ok(mut annot) = page.annotations_mut().get(a_idx) {
+                    if let Ok(fc) = annot.fill_color() {
+                        let _ = annot.set_fill_color(to_gray(fc));
+                    }
+                    if let Ok(sc) = annot.stroke_color() {
+                        let _ = annot.set_stroke_color(to_gray(sc));
+                    }
+                }
+            }
+
+            let _ = page.regenerate_content();
+            page.set_content_regeneration_strategy(prev_strategy);
+        }
+
+        let step1_bytes = doc
+            .save_to_bytes()
+            .context("Failed to serialize PDF after PDFium BW conversion")?;
+
+        // Pass through lopdf to convert any remaining /DeviceRGB image streams on that page to /DeviceGray and compress
+        if let Ok(mut ldoc) = lopdf::Document::load_mem(&step1_bytes) {
+            let page_num_1based = (page_index as u32) + 1;
+            if let Some(&page_obj_id) = ldoc.get_pages().get(&page_num_1based) {
+                // Collect XObject image ObjectIds referenced by this page
+                let mut image_ids = Vec::new();
+                if let Ok(page_dict) = ldoc.get_object(page_obj_id).and_then(|o| o.as_dict()) {
+                    let res_dict = page_dict
+                        .get(b"Resources")
+                        .ok()
+                        .and_then(|r| match r {
+                            lopdf::Object::Reference(id) => {
+                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
+                            }
+                            lopdf::Object::Dictionary(d) => Some(d),
+                            _ => None,
+                        });
+                    if let Some(res) = res_dict {
+                        let xobj_dict = res.get(b"XObject").ok().and_then(|x| match x {
+                            lopdf::Object::Reference(id) => {
+                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
+                            }
+                            lopdf::Object::Dictionary(d) => Some(d),
+                            _ => None,
+                        });
+                        if let Some(xobjs) = xobj_dict {
+                            for (_k, val) in xobjs.iter() {
+                                if let Ok(id) = val.as_reference() {
+                                    image_ids.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                for img_id in image_ids {
+                    if let Ok(lopdf::Object::Stream(stream)) =
+                        ldoc.get_object_mut(img_id)
+                    {
+                        let is_image = stream
+                            .dict
+                            .get(b"Subtype")
+                            .ok()
+                            .and_then(|s| s.as_name_str().ok())
+                            .map(|n| n == "Image")
+                            .unwrap_or(false);
+                        let is_rgb = stream
+                            .dict
+                            .get(b"ColorSpace")
+                            .ok()
+                            .and_then(|s| s.as_name_str().ok())
+                            .map(|n| n == "DeviceRGB")
+                            .unwrap_or(false);
+                        let bpc = stream
+                            .dict
+                            .get(b"BitsPerComponent")
+                            .ok()
+                            .and_then(|b| b.as_i64().ok())
+                            .unwrap_or(8);
+                        if is_image && is_rgb && bpc == 8 {
+                            if let Ok(raw_pixels) = stream.decompressed_content() {
+                                if raw_pixels.len() >= 3 && raw_pixels.len() % 3 == 0 {
+                                    let mut gray_pixels = Vec::with_capacity(raw_pixels.len() / 3);
+                                    for rgb in raw_pixels.chunks_exact(3) {
+                                        let y = ((77 * (rgb[0] as u32)
+                                            + 150 * (rgb[1] as u32)
+                                            + 29 * (rgb[2] as u32))
+                                            >> 8)
+                                            as u8;
+                                        gray_pixels.push(y);
+                                    }
+                                    stream.set_plain_content(gray_pixels);
+                                    stream.dict.set(
+                                        "ColorSpace",
+                                        lopdf::Object::Name(b"DeviceGray".to_vec()),
+                                    );
+                                    let _ = stream.compress();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ldoc.prune_objects();
+            ldoc.compress();
+            let mut out = Vec::with_capacity(step1_bytes.len());
+            if ldoc.save_to(&mut out).is_ok()
+                && !out.is_empty()
+                && self.load_pdf_from_bytes_safe(out.clone()).is_ok()
+            {
+                return Ok(out);
+            }
+        }
+
+        Ok(step1_bytes)
+    }
+
     /// Converts a positive integer into lowercase Roman numerals (e.g. 1 -> "i", 4 -> "iv").
     pub fn to_roman(mut num: u16) -> String {
         let numerals = [
@@ -1161,22 +1794,36 @@ mod tests {
         assert_eq!(inserted, 5);
         assert_eq!(doc.pages().len(), 10);
 
-        // 5. Bookmarks sidecar round-trip
-        let bms = vec![
-            Bookmark {
-                title: "Intro".to_string(),
-                page_index: 0,
-            },
-            Bookmark {
-                title: "Chapter 2".to_string(),
-                page_index: 4,
-            },
-        ];
+        // 5. Hierarchical Bookmarks `.txt` parse, sidecar round-trip, and logical page sync
+        let txt_input = "1 -- Introduction -- i\na -- Overview -- ii\n2 -- Core Analytics -- 1\nb -- SQL Basics -- 2\n";
+        let mut bms = PdfEngine::parse_bookmarks_txt(txt_input, 2, 10);
+        assert_eq!(bms.len(), 4);
+        assert_eq!(bms[0].level, 0);
+        assert_eq!(bms[0].page_index, 0); // "i" -> index 0
+        assert_eq!(bms[1].level, 1);
+        assert_eq!(bms[1].page_index, 1); // "ii" -> index 1
+        assert_eq!(bms[2].level, 0);
+        assert_eq!(bms[2].page_index, 2); // logical "1" with roman_end=2 -> physical page 3 (index 2)
+        assert_eq!(bms[3].level, 1);
+        assert_eq!(bms[3].page_index, 3); // logical "2" with roman_end=2 -> physical page 4 (index 3)
+
+        // Re-sync when roman_end changes from 2 to 4
+        PdfEngine::resync_bookmarks_logical_pages(&mut bms, 4, 10);
+        assert_eq!(bms[2].page_index, 4); // logical "1" with roman_end=4 -> physical page 5 (index 4)
+
         PdfEngine::save_bookmarks_sidecar(test_pdf, &bms)?;
-        let loaded_bms = PdfEngine::load_bookmarks(&doc, test_pdf);
+        let loaded_bms = PdfEngine::load_bookmarks(&doc, test_pdf, 4);
         assert_eq!(loaded_bms, bms);
 
-        // 6. Compress PDF and verify compressed bytes load cleanly with 10 pages
+        // 6. Test /PageLabels and /Outlines metadata embedding + BW page conversion
+        let raw_bytes = doc.save_to_bytes()?;
+        let embedded_bytes = PdfEngine::embed_metadata_in_pdf_bytes(&raw_bytes, 4, &bms)?;
+        assert_eq!(PdfEngine::read_page_labels_roman_end(&embedded_bytes), 4);
+        let bw_bytes = engine.convert_page_to_bw(&embedded_bytes, 0)?;
+        let bw_doc = engine.load_pdf_from_bytes_safe(bw_bytes)?;
+        assert_eq!(bw_doc.pages().len(), 10);
+
+        // 7. Compress PDF and verify compressed bytes load cleanly with 10 pages
         let (compressed_bytes, orig_len, new_len) = engine.compress_doc(&doc)?;
         assert!(!compressed_bytes.is_empty());
         assert!(new_len <= orig_len);

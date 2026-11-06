@@ -2,7 +2,7 @@ use crate::engine::{Bookmark, MarginPosition, MarginZone, PdfEngine};
 use anyhow::{Context, Result};
 use pdfium_render::prelude::*;
 use softbuffer::{Context as SoftContext, Surface};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -17,9 +17,11 @@ use winit::window::{Window, WindowId};
 const BG_COLOR_U32: u32 = 0x002B2B2B; // #2B2B2B subtle dark gray margin background
 const SIDEBAR_BG_U32: u32 = 0x001E2229;
 const SIDEBAR_WIDTH_LOGICAL: u32 = 240;
+const TAB_BAR_HEIGHT_LOGICAL: u32 = 28;
 const PAGE_MARGIN_PX: u32 = 24;
 const THUMB_W: u32 = 140;
 const THUMB_H: u32 = 198;
+const MAX_UNDO_STATES: usize = 8;
 
 /// Holds ONLY the single currently visible page's rasterized 0x00RRGGBB pixels.
 /// Replaced immediately whenever `current_page_index` changes or the viewport resizes.
@@ -34,12 +36,46 @@ struct CachedPageBitmap {
 }
 
 /// Lightweight 140x198 thumbnail bitmap entry, allocated ONLY while Grid View is active
-/// and freed immediately upon returning to Single-Page View.
+/// and freed immediately upon returning to Single-Page View or switching tabs.
 struct ThumbnailEntry {
     width: u32,
     height: u32,
     rotation_deg: i32,
     pixels: Vec<u32>,
+}
+
+/// Zero-RAM inactive document tab slot (never stores cached bitmaps or thumbnails).
+struct DocumentTab<'a> {
+    doc: Option<PdfDocument<'a>>,
+    file_path: PathBuf,
+    current_page_index: u16,
+    roman_end: usize,
+    bookmarks: Vec<Bookmark>,
+    selected_bookmark: Option<usize>,
+    bookmark_scroll_y: usize,
+    grid_scroll_y: f32,
+    bw_pages: HashSet<u16>,
+    undo_stack: VecDeque<Vec<u8>>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum TabBarHit {
+    SwitchTab(usize),
+    CloseTab(usize),
+    NewTab,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum ThumbBadgeHit {
+    None,
+    Rotate,
+    BwConvert,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum SidebarHit {
+    ImportTxtButton,
+    BookmarkRow { index: usize, on_delete: bool },
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -96,13 +132,21 @@ enum PendingDialog {
     Save,
     Merge,
     Split(String),
+    ImportBookmarksTxt,
 }
 
 pub struct PdfViewerApp<'a> {
     engine: &'a PdfEngine,
+    /// Open document tabs; inactive tabs hold zero rendered bitmaps.
+    tabs: Vec<DocumentTab<'a>>,
+    active_tab: usize,
+    /// Active tab state mirrored directly for fast, conflict-free access.
     doc: Option<PdfDocument<'a>>,
     file_path: PathBuf,
     current_page_index: u16,
+    roman_end: usize,
+    bw_pages: HashSet<u16>,
+    undo_stack: VecDeque<Vec<u8>>,
     cached_page: Option<CachedPageBitmap>,
     /// Exact screen rectangle `(x, y, width, height)` where the currently rendered PDF page bitmap
     /// is positioned inside the window buffer.
@@ -132,6 +176,8 @@ pub struct PdfViewerApp<'a> {
     last_wheel_turn: Option<Instant>,
     wheel_accum_y: f64,
     shift_pressed: bool,
+    cmd_or_ctrl_pressed: bool,
+    ctrl_pressed: bool,
     input_mode: InputMode,
     pending_dialog: Option<PendingDialog>,
     show_help_overlay: bool,
@@ -146,9 +192,14 @@ impl<'a> PdfViewerApp<'a> {
     pub fn new(engine: &'a PdfEngine, initial_path: PathBuf) -> Result<Self> {
         let mut app = Self {
             engine,
+            tabs: Vec::new(),
+            active_tab: 0,
             doc: None,
             file_path: initial_path.clone(),
             current_page_index: 0,
+            roman_end: 0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             cached_page: None,
             page_rect: (0, 0, 0, 0),
             cursor_pos: (0.0, 0.0),
@@ -166,6 +217,8 @@ impl<'a> PdfViewerApp<'a> {
             last_wheel_turn: None,
             wheel_accum_y: 0.0,
             shift_pressed: false,
+            cmd_or_ctrl_pressed: false,
+            ctrl_pressed: false,
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
@@ -178,12 +231,44 @@ impl<'a> PdfViewerApp<'a> {
         Ok(app)
     }
 
-    /// Loads `path` using `PdfEngine::load_pdf_safe` (in-memory byte vec + empty-password fallback).
-    /// Only replaces the active document if loading succeeds, so a failed open never leaves
-    /// the viewer with an empty/broken state.
+    fn sync_active_tab_to_slot(&mut self) {
+        if self.active_tab < self.tabs.len() {
+            let slot = &mut self.tabs[self.active_tab];
+            slot.doc = self.doc.take();
+            slot.file_path = self.file_path.clone();
+            slot.current_page_index = self.current_page_index;
+            slot.roman_end = self.roman_end;
+            slot.bookmarks = self.bookmarks.clone();
+            slot.selected_bookmark = self.selected_bookmark;
+            slot.bookmark_scroll_y = self.bookmark_scroll_y;
+            slot.grid_scroll_y = self.grid_scroll_y;
+            slot.bw_pages = self.bw_pages.clone();
+            slot.undo_stack = self.undo_stack.clone();
+        }
+    }
+
+    fn load_slot_into_active(&mut self, index: usize) {
+        if index < self.tabs.len() {
+            self.active_tab = index;
+            let slot = &mut self.tabs[index];
+            self.doc = slot.doc.take();
+            self.file_path = slot.file_path.clone();
+            self.current_page_index = slot.current_page_index;
+            self.roman_end = slot.roman_end;
+            self.bookmarks = slot.bookmarks.clone();
+            self.selected_bookmark = slot.selected_bookmark;
+            self.bookmark_scroll_y = slot.bookmark_scroll_y;
+            self.grid_scroll_y = slot.grid_scroll_y;
+            self.bw_pages = slot.bw_pages.clone();
+            self.undo_stack = slot.undo_stack.clone();
+        }
+    }
+
+    /// Loads `path` into the current tab (or creates the first tab on startup).
     pub fn load_document(&mut self, path: PathBuf) -> Result<()> {
         let loaded = self.engine.load_pdf_safe(&path)?;
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path);
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
+        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
 
         // Strictly drop previous cached page bitmap, thumbnail cache, and previous document
         self.cached_page = None;
@@ -191,8 +276,11 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
 
-        self.file_path = path;
+        self.file_path = path.clone();
         self.current_page_index = 0;
+        self.roman_end = roman_end;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
@@ -205,9 +293,201 @@ impl<'a> PdfViewerApp<'a> {
         };
         self.bookmark_scroll_y = 0;
         self.doc = Some(loaded);
+
+        if self.tabs.is_empty() {
+            self.tabs.push(DocumentTab {
+                doc: None,
+                file_path: path,
+                current_page_index: 0,
+                roman_end,
+                bookmarks: self.bookmarks.clone(),
+                selected_bookmark: self.selected_bookmark,
+                bookmark_scroll_y: 0,
+                grid_scroll_y: 0.0,
+                bw_pages: HashSet::new(),
+                undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            });
+            self.active_tab = 0;
+        } else if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].file_path = path;
+            self.tabs[self.active_tab].current_page_index = 0;
+            self.tabs[self.active_tab].roman_end = roman_end;
+            self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+            self.tabs[self.active_tab].selected_bookmark = self.selected_bookmark;
+            self.tabs[self.active_tab].bookmark_scroll_y = 0;
+            self.tabs[self.active_tab].grid_scroll_y = 0.0;
+            self.tabs[self.active_tab].bw_pages.clear();
+            self.tabs[self.active_tab].undo_stack.clear();
+        }
+
         self.update_title_bar();
         self.request_redraw();
         Ok(())
+    }
+
+    /// Opens `path` in a brand-new tab and switches to it immediately, freeing the previous tab's bitmaps.
+    pub fn open_document_in_new_tab(&mut self, path: PathBuf) -> Result<()> {
+        if self.tabs.is_empty() {
+            return self.load_document(path);
+        }
+        let loaded = self.engine.load_pdf_safe(&path)?;
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
+        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
+        let selected_bookmark = if loaded_bookmarks.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+
+        // Save current active tab into its slot and release all cached bitmaps
+        self.sync_active_tab_to_slot();
+        self.cached_page = None;
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+
+        let new_idx = self.tabs.len();
+        self.tabs.push(DocumentTab {
+            doc: None,
+            file_path: path.clone(),
+            current_page_index: 0,
+            roman_end,
+            bookmarks: loaded_bookmarks.clone(),
+            selected_bookmark,
+            bookmark_scroll_y: 0,
+            grid_scroll_y: 0.0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+        });
+
+        self.active_tab = new_idx;
+        self.doc = Some(loaded);
+        self.file_path = path;
+        self.current_page_index = 0;
+        self.roman_end = roman_end;
+        self.bookmarks = loaded_bookmarks;
+        self.selected_bookmark = selected_bookmark;
+        self.bookmark_scroll_y = 0;
+        self.grid_scroll_y = 0.0;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
+        self.input_mode = InputMode::Normal;
+        self.drag_start = None;
+        self.grid_drag_page = None;
+
+        self.update_title_bar();
+        self.request_redraw();
+        Ok(())
+    }
+
+    fn switch_to_tab(&mut self, target_idx: usize) {
+        if target_idx >= self.tabs.len() || target_idx == self.active_tab {
+            return;
+        }
+        self.sync_active_tab_to_slot();
+        // Zero-RAM discipline for inactive tabs: immediately free cached page and thumbnail bitmaps
+        self.cached_page = None;
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+        self.drag_start = None;
+        self.grid_drag_page = None;
+        self.hovered_thumb = None;
+        self.input_mode = InputMode::Normal;
+
+        self.load_slot_into_active(target_idx);
+        let fname = self.filename_display();
+        self.status_notice = Some(format!(
+            "Switched to tab {}: '{}'",
+            target_idx + 1,
+            fname
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    fn cycle_next_tab(&mut self) {
+        if self.tabs.len() <= 1 {
+            return;
+        }
+        let next = (self.active_tab + 1) % self.tabs.len();
+        self.switch_to_tab(next);
+    }
+
+    /// Closes the tab at `close_idx`. Returns `true` if the last remaining tab was closed.
+    fn close_tab(&mut self, close_idx: usize) -> bool {
+        if close_idx >= self.tabs.len() {
+            return false;
+        }
+        self.sync_active_tab_to_slot();
+        self.cached_page = None;
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+
+        let closed_name = self.tabs[close_idx]
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("tab")
+            .to_string();
+        self.tabs.remove(close_idx);
+
+        if self.tabs.is_empty() {
+            self.doc = None;
+            return true;
+        }
+
+        let next_active = if close_idx < self.active_tab {
+            self.active_tab - 1
+        } else {
+            self.active_tab.min(self.tabs.len() - 1)
+        };
+        self.load_slot_into_active(next_active);
+        self.status_notice = Some(format!("Closed tab '{closed_name}'"));
+        self.update_title_bar();
+        self.request_redraw();
+        false
+    }
+
+    /// Captures the current document's serialized PDF bytes onto `self.undo_stack` (max 8 steps)
+    /// before a mutating action.
+    fn push_undo_snapshot(&mut self) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        if let Ok(bytes) = doc.save_to_bytes() {
+            if self.undo_stack.len() >= MAX_UNDO_STATES {
+                self.undo_stack.pop_front();
+            }
+            self.undo_stack.push_back(bytes);
+        }
+    }
+
+    /// Pops the latest snapshot from `self.undo_stack` and reloads the active document in memory.
+    fn perform_undo(&mut self) {
+        let Some(prev_bytes) = self.undo_stack.pop_back() else {
+            self.status_notice = Some("Nothing to undo (0 steps left)".to_string());
+            self.update_title_bar();
+            return;
+        };
+        match self.engine.load_pdf_from_bytes_safe(prev_bytes) {
+            Ok(restored_doc) => {
+                let new_total = restored_doc.pages().len();
+                if self.current_page_index >= new_total && new_total > 0 {
+                    self.current_page_index = new_total - 1;
+                }
+                self.doc = Some(restored_doc);
+                self.cached_page = None;
+                self.thumbnail_cache.clear();
+                let steps_left = self.undo_stack.len();
+                self.status_notice =
+                    Some(format!("Undo successful! ({steps_left} steps left)"));
+                self.update_title_bar();
+                self.request_redraw();
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Undo failed: {e}"));
+                self.update_title_bar();
+            }
+        }
     }
 
     fn total_pages(&self) -> u16 {
@@ -249,6 +529,10 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    fn tab_bar_height_px(&self, scale_factor: f64) -> u32 {
+        ((TAB_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
+    }
+
     fn update_title_bar(&self) {
         let Some(window) = self.window.as_ref() else {
             return;
@@ -256,7 +540,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let title = match &self.input_mode {
             InputMode::JumpToPage { input } => format!(
-                "MicroPDF | JUMP TO PAGE: {}_ (Press Enter to confirm, Esc to cancel)",
+                "MicroPDF | JUMP TO PAGE (Logical '5', Roman 'ii', or Physical '#5'): {}_ (Enter to confirm, Esc to cancel)",
                 input
             ),
             InputMode::PageNumbers { input } => format!(
@@ -313,6 +597,15 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     0
                 };
+                let page_display = if total > 0 && self.roman_end > 0 {
+                    let logical_lbl = PdfEngine::format_logical_page_label(
+                        self.current_page_index as usize,
+                        self.roman_end,
+                    );
+                    format!("Page {} ({} of {})", logical_lbl, current_1based, total)
+                } else {
+                    format!("Page {} / {}", current_1based, total)
+                };
                 let rotation = self.current_page_rotation_degrees();
                 let ram_mb = get_current_rss_mb().unwrap_or(0.0);
                 let filename = self.filename_display();
@@ -322,7 +615,7 @@ impl<'a> PdfViewerApp<'a> {
                 };
 
                 let shortcuts_hint =
-                    "[Keys: Tab Grid, B Bmark, G Jump, N Num, H Hdr/Ftr, C Clr, W Wmark, I Ins, R Rot, D Del, X Split, M Merge, Z Compress, O Open, S Save, ? Help]";
+                    "[Keys: Tab Grid, B Bmark, L Import .txt, G Jump, N Num, H Hdr/Ftr, C Clr, W Wmark, K BW, I Ins, R Rot, D Del, X Split, M Merge, Z Compress, O Open, S Save, ? Help]";
                 let suffix = if let Some(notice) = &self.status_notice {
                     format!("{notice} | {shortcuts_hint}")
                 } else {
@@ -330,8 +623,8 @@ impl<'a> PdfViewerApp<'a> {
                 };
 
                 format!(
-                    "MicroPDF [{}] | {} | Page {} / {} | Rotation: {}° | RAM: {:.1} MB | {}",
-                    mode_tag, filename, current_1based, total, rotation, ram_mb, suffix
+                    "MicroPDF [{}] | {} | {} | Rotation: {}° | RAM: {:.1} MB | {}",
+                    mode_tag, filename, page_display, rotation, ram_mb, suffix
                 )
             }
         };
@@ -346,24 +639,26 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Ensures `self.cached_page` holds the rasterized bitmap for `self.current_page_index`
-    /// fitted inside the content area `(sidebar_w..viewport_w, 0..viewport_h)`.
+    /// fitted inside the content area `(sidebar_w..viewport_w, tab_bar_h..viewport_h)`.
     fn ensure_current_page_rendered(
         &mut self,
         viewport_w: u32,
         viewport_h: u32,
         sidebar_w: u32,
+        tab_bar_h: u32,
     ) -> Result<()> {
         let content_w = viewport_w.saturating_sub(sidebar_w).max(1);
+        let content_h = viewport_h.saturating_sub(tab_bar_h).max(1);
         let rotation_deg = self.current_page_rotation_degrees();
 
         if let Some(cache) = &self.cached_page {
             if cache.page_index == self.current_page_index
                 && cache.viewport_width == content_w
-                && cache.viewport_height == viewport_h
+                && cache.viewport_height == content_h
                 && cache.rotation_deg == rotation_deg
             {
                 let offset_x = sidebar_w + content_w.saturating_sub(cache.bitmap_width) / 2;
-                let offset_y = viewport_h.saturating_sub(cache.bitmap_height) / 2;
+                let offset_y = tab_bar_h + content_h.saturating_sub(cache.bitmap_height) / 2;
                 self.page_rect = (offset_x, offset_y, cache.bitmap_width, cache.bitmap_height);
                 return Ok(());
             }
@@ -381,7 +676,7 @@ impl<'a> PdfViewerApp<'a> {
             .context("Current page index out of bounds")?;
 
         let avail_w = content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
-        let avail_h = viewport_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+        let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
 
         let page_w_pts = page.width().value.max(1.0);
         let page_h_pts = page.height().value.max(1.0);
@@ -421,13 +716,13 @@ impl<'a> PdfViewerApp<'a> {
         let bmp_w = target_w as u32;
         let bmp_h = target_h as u32;
         let offset_x = sidebar_w + content_w.saturating_sub(bmp_w) / 2;
-        let offset_y = viewport_h.saturating_sub(bmp_h) / 2;
+        let offset_y = tab_bar_h + content_h.saturating_sub(bmp_h) / 2;
         self.page_rect = (offset_x, offset_y, bmp_w, bmp_h);
 
         self.cached_page = Some(CachedPageBitmap {
             page_index: self.current_page_index,
             viewport_width: content_w,
-            viewport_height: viewport_h,
+            viewport_height: content_h,
             bitmap_width: bmp_w,
             bitmap_height: bmp_h,
             rotation_deg,
@@ -492,7 +787,12 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Computes grid layout metrics for Thumbnail Grid View.
-    fn grid_metrics(&self, viewport_w: u32, sidebar_w: u32) -> (u32, u32, u32, u32, u32) {
+    fn grid_metrics(
+        &self,
+        viewport_w: u32,
+        sidebar_w: u32,
+        tab_bar_h: u32,
+    ) -> (u32, u32, u32, u32, u32) {
         let content_w = viewport_w.saturating_sub(sidebar_w).max(1);
         let pad_x = 28u32;
         let pad_y = 36u32;
@@ -501,7 +801,7 @@ impl<'a> PdfViewerApp<'a> {
         let cols = ((content_w.saturating_sub(pad_x)) / cell_w).max(1);
         let grid_total_w = cols * cell_w;
         let start_x = sidebar_w + content_w.saturating_sub(grid_total_w) / 2 + pad_x / 2;
-        let start_y = 24u32;
+        let start_y = tab_bar_h + 20u32;
         (cols, cell_w, cell_h, start_x, start_y)
     }
 
@@ -511,8 +811,10 @@ impl<'a> PdfViewerApp<'a> {
         page_idx: u16,
         viewport_w: u32,
         sidebar_w: u32,
+        tab_bar_h: u32,
     ) -> (i32, i32, u32, u32) {
-        let (cols, cell_w, cell_h, start_x, start_y) = self.grid_metrics(viewport_w, sidebar_w);
+        let (cols, cell_w, cell_h, start_x, start_y) =
+            self.grid_metrics(viewport_w, sidebar_w, tab_bar_h);
         let col = (page_idx as u32) % cols;
         let row = (page_idx as u32) / cols;
         let x = (start_x + col * cell_w) as i32;
@@ -520,16 +822,16 @@ impl<'a> PdfViewerApp<'a> {
         (x, y, THUMB_W, THUMB_H)
     }
 
-    /// Hit-tests which thumbnail (and whether its top-right `[R]` rotate badge was clicked) is at `(mx, my)`.
-    /// Returns `Some((page_idx, clicked_rotate_badge))`.
+    /// Hit-tests which thumbnail (and whether its top-left `[BW]` or top-right `[R]` badge was clicked) is at `(mx, my)`.
     fn hit_test_thumbnail(
         &self,
         mx: f64,
         my: f64,
         viewport_w: u32,
         sidebar_w: u32,
-    ) -> Option<(u16, bool)> {
-        if (mx as u32) < sidebar_w {
+        tab_bar_h: u32,
+    ) -> Option<(u16, ThumbBadgeHit)> {
+        if (mx as u32) < sidebar_w || (my as u32) < tab_bar_h {
             return None;
         }
         let total = self.total_pages();
@@ -537,29 +839,45 @@ impl<'a> PdfViewerApp<'a> {
         let iy = my.round() as i32;
 
         for idx in 0..total {
-            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, viewport_w, sidebar_w);
+            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, tab_bar_h);
             if ix >= tx && ix < tx + (tw as i32) && iy >= ty && iy < ty + (th as i32) + 22 {
+                // Top-left `[BW]` badge is 28x18 at `(tx, ty)`
+                let on_bw_badge = ix >= tx && ix <= tx + 28 && iy >= ty && iy <= ty + 18;
+                if on_bw_badge {
+                    return Some((idx, ThumbBadgeHit::BwConvert));
+                }
                 // Top-right `[R]` badge is 24x18 at `(tx + tw - 24, ty)`
                 let badge_x = tx + (tw as i32) - 24;
                 let badge_y = ty;
                 let on_rotate_badge =
                     ix >= badge_x && ix <= tx + (tw as i32) && iy >= badge_y && iy <= badge_y + 18;
-                return Some((idx, on_rotate_badge));
+                if on_rotate_badge {
+                    return Some((idx, ThumbBadgeHit::Rotate));
+                }
+                return Some((idx, ThumbBadgeHit::None));
             }
         }
         None
     }
 
     /// Determines the target page index when dropping an item (reorder or external file drop) at `(mx, my)` in Grid View.
-    fn grid_drop_target_index(&self, mx: f64, my: f64, viewport_w: u32, sidebar_w: u32) -> u16 {
+    fn grid_drop_target_index(
+        &self,
+        mx: f64,
+        my: f64,
+        viewport_w: u32,
+        sidebar_w: u32,
+        tab_bar_h: u32,
+    ) -> u16 {
         let total = self.total_pages();
         if total == 0 {
             return 0;
         }
-        if let Some((idx, _)) = self.hit_test_thumbnail(mx, my, viewport_w, sidebar_w) {
+        if let Some((idx, _)) = self.hit_test_thumbnail(mx, my, viewport_w, sidebar_w, tab_bar_h) {
             return idx;
         }
-        let (cols, cell_w, cell_h, start_x, start_y) = self.grid_metrics(viewport_w, sidebar_w);
+        let (cols, cell_w, cell_h, start_x, start_y) =
+            self.grid_metrics(viewport_w, sidebar_w, tab_bar_h);
         let rel_x = (mx as i32 - start_x as i32).max(0) as u32;
         let rel_y = (my as i32 + self.grid_scroll_y.round() as i32 - start_y as i32).max(0) as u32;
         let col = (rel_x / cell_w).min(cols - 1);
@@ -577,18 +895,19 @@ impl<'a> PdfViewerApp<'a> {
         let height = size.height.max(1);
         let scale_factor = window.scale_factor();
         let sidebar_w = self.sidebar_width_px(scale_factor).min(width.saturating_sub(64));
+        let tab_bar_h = self.tab_bar_height_px(scale_factor).min(height.saturating_sub(32));
 
         match self.view_mode {
             ViewMode::SinglePage => {
-                self.ensure_current_page_rendered(width, height, sidebar_w)?;
+                self.ensure_current_page_rendered(width, height, sidebar_w, tab_bar_h)?;
             }
             ViewMode::ThumbnailGrid => {
                 // Render only the thumbnails currently visible in the scrolled viewport
                 let total = self.total_pages();
                 let mut visible_indices = Vec::new();
                 for idx in 0..total {
-                    let (_, ty, _, th) = self.thumbnail_screen_rect(idx, width, sidebar_w);
-                    if ty + (th as i32) + 30 >= 0 && ty <= (height as i32) {
+                    let (_, ty, _, th) = self.thumbnail_screen_rect(idx, width, sidebar_w, tab_bar_h);
+                    if ty + (th as i32) + 30 >= (tab_bar_h as i32) && ty <= (height as i32) {
                         visible_indices.push(idx);
                     }
                 }
@@ -676,16 +995,26 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
                 ViewMode::ThumbnailGrid => {
-                    self.draw_thumbnail_grid(&mut buffer, width, height, sidebar_w);
+                    self.draw_thumbnail_grid(&mut buffer, width, height, sidebar_w, tab_bar_h);
                 }
             }
 
-            // 3. If Left Bookmark Sidebar (`B`) is active, draw the 240px sidebar panel
+            // 3. If Left Bookmark Sidebar (`B`) is active, draw the 240px sidebar panel below tab bar
             if self.show_bookmarks && sidebar_w > 0 {
-                self.draw_bookmark_sidebar(&mut buffer, width, height, sidebar_w, scale_factor);
+                self.draw_bookmark_sidebar(
+                    &mut buffer,
+                    width,
+                    height,
+                    sidebar_w,
+                    tab_bar_h,
+                    scale_factor,
+                );
             }
 
-            // 4. If Help Overlay (`?` or `F1`) is active, draw the modal overlay
+            // 4. Draw the 28px Top Multi-Document Tab Bar (`[ 1: fileA.pdf [x] ]  [ + ]`)
+            self.draw_tab_bar(&mut buffer, width, height, tab_bar_h, scale_factor);
+
+            // 5. If Help Overlay (`?` or `F1`) is active, draw the modal overlay
             if self.show_help_overlay {
                 draw_help_overlay(&mut buffer, width, height, scale_factor);
             }
@@ -704,17 +1033,205 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    fn draw_tab_bar(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        tab_bar_h: u32,
+        scale_factor: f64,
+    ) {
+        if tab_bar_h == 0 {
+            return;
+        }
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        // Dark slate tab bar backdrop
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, 0, buf_w, tab_bar_h, 0x0015181E);
+        // Bottom 1px divider
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            (tab_bar_h.saturating_sub(1)) as i32,
+            buf_w,
+            1,
+            0x0037474F,
+        );
+
+        let num_tabs = self.tabs.len().max(1);
+        let plus_btn_w = 34 * scale;
+        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + 12 * scale);
+        let tab_w = (avail_for_tabs / (num_tabs as u32)).clamp(90 * scale, 210 * scale);
+        let text_y = tab_bar_h.saturating_sub(8 * scale) / 2;
+
+        let mut cur_x = 4 * scale;
+        for idx in 0..num_tabs {
+            if cur_x + tab_w > buf_w.saturating_sub(plus_btn_w) {
+                break;
+            }
+            let is_active = idx == self.active_tab;
+            let tab_bg = if is_active { 0x00263238 } else { 0x001C2026 };
+            let border_col = if is_active { 0x0042A5F5 } else { 0x0037474F };
+
+            fill_rect_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                cur_x as i32,
+                2,
+                tab_w.saturating_sub(2),
+                tab_bar_h.saturating_sub(3),
+                tab_bg,
+            );
+            draw_rect_border(
+                buffer,
+                buf_w,
+                buf_h,
+                cur_x,
+                2,
+                tab_w.saturating_sub(2),
+                tab_bar_h.saturating_sub(3),
+                border_col,
+            );
+
+            let fname = if is_active {
+                self.filename_display()
+            } else if let Some(slot) = self.tabs.get(idx) {
+                slot.file_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("doc.pdf")
+                    .to_string()
+            } else {
+                "doc.pdf".to_string()
+            };
+
+            let max_label_chars =
+                ((tab_w.saturating_sub(36 * scale)) / (8 * scale)).max(4) as usize;
+            let mut label = format!("{}: {}", idx + 1, fname);
+            if label.chars().count() > max_label_chars {
+                label = label.chars().take(max_label_chars).collect();
+            }
+
+            let text_col = if is_active { 0x00FFFFFF } else { 0x00B0BEC5 };
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                cur_x + 6 * scale,
+                text_y,
+                &label,
+                text_col,
+                scale,
+            );
+
+            // Close `[x]` button on right side of tab
+            let close_x = cur_x + tab_w.saturating_sub(26 * scale);
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                close_x,
+                text_y,
+                "[x]",
+                0x00EF5350,
+                scale,
+            );
+
+            cur_x += tab_w;
+        }
+
+        // Draw `[ + ]` New Tab button
+        let plus_x = cur_x + 4 * scale;
+        if plus_x + plus_btn_w <= buf_w {
+            fill_rect_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                plus_x as i32,
+                2,
+                plus_btn_w,
+                tab_bar_h.saturating_sub(3),
+                0x00263238,
+            );
+            draw_rect_border(
+                buffer,
+                buf_w,
+                buf_h,
+                plus_x,
+                2,
+                plus_btn_w,
+                tab_bar_h.saturating_sub(3),
+                0x0064B5F6,
+            );
+            draw_bitmap_str_8x8(
+                buffer,
+                buf_w,
+                buf_h,
+                plus_x + 5 * scale,
+                text_y,
+                "[+]",
+                0x0064B5F6,
+                scale,
+            );
+        }
+    }
+
+    fn hit_test_tab_bar(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        tab_bar_h: u32,
+        scale_factor: f64,
+    ) -> Option<TabBarHit> {
+        let ix = mx.round() as u32;
+        let iy = my.round() as u32;
+        if iy >= tab_bar_h {
+            return None;
+        }
+        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let num_tabs = self.tabs.len().max(1);
+        let plus_btn_w = 34 * scale;
+        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + 12 * scale);
+        let tab_w = (avail_for_tabs / (num_tabs as u32)).clamp(90 * scale, 210 * scale);
+
+        let mut cur_x = 4 * scale;
+        for idx in 0..num_tabs {
+            if cur_x + tab_w > buf_w.saturating_sub(plus_btn_w) {
+                break;
+            }
+            if ix >= cur_x && ix < cur_x + tab_w {
+                let close_x = cur_x + tab_w.saturating_sub(28 * scale);
+                if ix >= close_x {
+                    return Some(TabBarHit::CloseTab(idx));
+                } else {
+                    return Some(TabBarHit::SwitchTab(idx));
+                }
+            }
+            cur_x += tab_w;
+        }
+
+        let plus_x = cur_x + 4 * scale;
+        if ix >= plus_x && ix <= plus_x + plus_btn_w {
+            return Some(TabBarHit::NewTab);
+        }
+        None
+    }
+
     fn draw_thumbnail_grid(
         &self,
         buffer: &mut [u32],
         buf_w: u32,
         buf_h: u32,
         sidebar_w: u32,
+        tab_bar_h: u32,
     ) {
         let total = self.total_pages();
         for idx in 0..total {
-            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, buf_w, sidebar_w);
-            if ty + (th as i32) + 28 < 0 || ty >= (buf_h as i32) {
+            let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, buf_w, sidebar_w, tab_bar_h);
+            if ty + (th as i32) + 28 < (tab_bar_h as i32) || ty >= (buf_h as i32) {
                 continue;
             }
 
@@ -727,7 +1244,7 @@ impl<'a> PdfViewerApp<'a> {
 
                 for r in 0..entry.height {
                     let py = oy + (r as i32);
-                    if py < 0 || py >= (buf_h as i32) {
+                    if py < (tab_bar_h as i32) || py >= (buf_h as i32) {
                         continue;
                     }
                     for c in 0..entry.width {
@@ -750,7 +1267,7 @@ impl<'a> PdfViewerApp<'a> {
                 0x00555555 // Subtle border
             };
 
-            if tx >= 0 && ty >= 0 {
+            if tx >= 0 && ty >= (tab_bar_h as i32) {
                 draw_rect_border(
                     buffer,
                     buf_w,
@@ -775,12 +1292,50 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
 
+            // Top-left `[BW]` Grayscale conversion badge on each thumbnail
+            let bw_badge_w = 26u32;
+            let bw_badge_h = 16u32;
+            let bwx = tx;
+            let bwy = ty;
+            let is_bw = self.bw_pages.contains(&idx);
+            if bwx >= (sidebar_w as i32)
+                && bwy >= (tab_bar_h as i32)
+                && (bwy as u32 + bw_badge_h) < buf_h
+            {
+                let bg = if is_bw { 0x00455A64 } else { 0x00263238 };
+                let fg = if is_bw { 0x0080DEEA } else { 0x00E0E0E0 };
+                fill_rect_clipped(buffer, buf_w, buf_h, bwx, bwy, bw_badge_w, bw_badge_h, bg);
+                draw_rect_border(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    bwx as u32,
+                    bwy as u32,
+                    bw_badge_w,
+                    bw_badge_h,
+                    0x0090A4AE,
+                );
+                draw_bitmap_str_8x8(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    (bwx as u32) + 5,
+                    (bwy as u32) + 4,
+                    "BW",
+                    fg,
+                    1,
+                );
+            }
+
             // Top-right `[R]` rotate badge on each thumbnail
             let badge_w = 24u32;
             let badge_h = 16u32;
             let bx = tx + (tw as i32) - (badge_w as i32);
             let by = ty;
-            if bx >= (sidebar_w as i32) && by >= 0 && (by as u32 + badge_h) < buf_h {
+            if bx >= (sidebar_w as i32)
+                && by >= (tab_bar_h as i32)
+                && (by as u32 + badge_h) < buf_h
+            {
                 fill_rect_clipped(buffer, buf_w, buf_h, bx, by, badge_w, badge_h, 0x00263238);
                 draw_rect_border(
                     buffer,
@@ -804,12 +1359,24 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
 
-            // Page number label (`Page X`) centered beneath thumbnail
-            let label = format!("Page {}", idx + 1);
+            // Page number label centered beneath thumbnail (shows Logical + Physical when roman_end > 0)
+            let label = if self.roman_end > 0 {
+                let logical =
+                    PdfEngine::format_logical_page_label(idx as usize, self.roman_end);
+                if is_bw {
+                    format!("P.{} ({}) BW", logical, idx + 1)
+                } else {
+                    format!("Page {} ({})", logical, idx + 1)
+                }
+            } else if is_bw {
+                format!("Page {} [BW]", idx + 1)
+            } else {
+                format!("Page {}", idx + 1)
+            };
             let label_w = (label.len() as u32) * 8;
             let lx = (tx + ((tw as i32 - label_w as i32) / 2)).max(sidebar_w as i32);
             let ly = ty + (th as i32) + 6;
-            if ly >= 0 && (ly as u32 + 10) < buf_h {
+            if ly >= (tab_bar_h as i32) && (ly as u32 + 10) < buf_h {
                 let text_color = if idx == self.current_page_index {
                     0x0064B5F6
                 } else {
@@ -833,10 +1400,10 @@ impl<'a> PdfViewerApp<'a> {
             let (cx, cy) = self.cursor_pos;
             let dist = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
             if dist > 6.0 {
-                let target_idx = self.grid_drop_target_index(cx, cy, buf_w, sidebar_w);
+                let target_idx = self.grid_drop_target_index(cx, cy, buf_w, sidebar_w, tab_bar_h);
                 if target_idx != src_idx {
                     let (tx, ty, _tw, th) =
-                        self.thumbnail_screen_rect(target_idx, buf_w, sidebar_w);
+                        self.thumbnail_screen_rect(target_idx, buf_w, sidebar_w, tab_bar_h);
                     let bar_x = (tx - 8).max(sidebar_w as i32);
                     fill_rect_clipped(buffer, buf_w, buf_h, bar_x, ty - 4, 4, th + 8, 0x0000E5FF);
                 }
@@ -850,11 +1417,13 @@ impl<'a> PdfViewerApp<'a> {
         buf_w: u32,
         buf_h: u32,
         sidebar_w: u32,
+        tab_bar_h: u32,
         scale_factor: f64,
     ) {
         let scale = (scale_factor.round() as u32).clamp(1, 2);
-        let row_h = 26 * scale;
-        let header_h = 34 * scale;
+        let row_h = 24 * scale;
+        let header_h = 54 * scale;
+        let top_y = tab_bar_h;
 
         // Fill sidebar background
         fill_rect_clipped(
@@ -862,9 +1431,9 @@ impl<'a> PdfViewerApp<'a> {
             buf_w,
             buf_h,
             0,
-            0,
+            top_y as i32,
             sidebar_w,
-            buf_h,
+            buf_h.saturating_sub(top_y),
             SIDEBAR_BG_U32,
         );
         // Right separator line
@@ -873,22 +1442,58 @@ impl<'a> PdfViewerApp<'a> {
             buf_w,
             buf_h,
             (sidebar_w.saturating_sub(1)) as i32,
-            0,
+            top_y as i32,
             1,
-            buf_h,
+            buf_h.saturating_sub(top_y),
             0x00455A64,
         );
 
-        // Header bar
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, 0, sidebar_w, header_h, 0x0014171C);
+        // Header bar + clickable `[Import .txt]` button
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            top_y as i32,
+            sidebar_w,
+            header_h,
+            0x0014171C,
+        );
         draw_bitmap_str_8x8(
             buffer,
             buf_w,
             buf_h,
-            10 * scale,
-            10 * scale,
+            8 * scale,
+            top_y + 7 * scale,
             "BOOKMARKS (+/E/Del)",
             0x0064B5F6,
+            scale,
+        );
+
+        // `[Import .txt (L)]` button inside header
+        let btn_x = 8 * scale;
+        let btn_y = top_y + 24 * scale;
+        let btn_w = sidebar_w.saturating_sub(16 * scale);
+        let btn_h = 22 * scale;
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            btn_x as i32,
+            btn_y as i32,
+            btn_w,
+            btn_h,
+            0x00263238,
+        );
+        draw_rect_border(buffer, buf_w, buf_h, btn_x, btn_y, btn_w, btn_h, 0x004FC3F7);
+        draw_bitmap_str_8x8(
+            buffer,
+            buf_w,
+            buf_h,
+            btn_x + 8 * scale,
+            btn_y + 6 * scale,
+            "[Import .txt] (L)",
+            0x0080DEEA,
             scale,
         );
 
@@ -898,7 +1503,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 10 * scale,
-                header_h + 14 * scale,
+                top_y + header_h + 14 * scale,
                 "No bookmarks yet.",
                 0x009E9E9E,
                 scale,
@@ -908,8 +1513,8 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 10 * scale,
-                header_h + 30 * scale,
-                "Press '+' or 'A'",
+                top_y + header_h + 30 * scale,
+                "Press '+' to add or",
                 0x009E9E9E,
                 scale,
             );
@@ -918,15 +1523,13 @@ impl<'a> PdfViewerApp<'a> {
                 buf_w,
                 buf_h,
                 10 * scale,
-                header_h + 46 * scale,
-                "to bookmark page.",
+                top_y + header_h + 46 * scale,
+                "'L' to import .txt",
                 0x009E9E9E,
                 scale,
             );
             return;
         }
-
-        let max_chars = ((sidebar_w.saturating_sub(42 * scale)) / (8 * scale)).max(6) as usize;
 
         for (vis_i, (bm_idx, bm)) in self
             .bookmarks
@@ -935,7 +1538,7 @@ impl<'a> PdfViewerApp<'a> {
             .skip(self.bookmark_scroll_y)
             .enumerate()
         {
-            let ry = header_h + (vis_i as u32) * row_h;
+            let ry = top_y + header_h + (vis_i as u32) * row_h;
             if ry + row_h > buf_h {
                 break;
             }
@@ -961,35 +1564,59 @@ impl<'a> PdfViewerApp<'a> {
                 row_bg,
             );
 
-            let mut label = format!("[P{}] {}", bm.page_index + 1, bm.title);
+            // Indent level == 1 sub-items by 16 * scale pixels
+            let indent_px = if bm.level > 0 { 16 * scale } else { 6 * scale };
+            let avail_px = sidebar_w.saturating_sub(indent_px + 30 * scale);
+            let max_chars = (avail_px / (8 * scale)).max(5) as usize;
+
+            let prefix = if bm.serial.is_empty() {
+                String::new()
+            } else {
+                format!("{}. ", bm.serial)
+            };
+            let page_tag = if !bm.logical_page.is_empty() {
+                format!("[p.{}]", bm.logical_page)
+            } else {
+                format!("[p.{}]", bm.page_index + 1)
+            };
+
+            let mut label = format!("{}{} {}", prefix, bm.title, page_tag);
             if label.chars().count() > max_chars {
-                label = label.chars().take(max_chars).collect();
+                let title_budget =
+                    max_chars.saturating_sub(prefix.chars().count() + page_tag.chars().count() + 1);
+                let short_title: String = bm.title.chars().take(title_budget.max(3)).collect();
+                label = format!("{}{} {}", prefix, short_title, page_tag);
+                if label.chars().count() > max_chars {
+                    label = label.chars().take(max_chars).collect();
+                }
             }
 
             let text_color = if is_current_page {
                 0x00FFEB3B
+            } else if bm.level == 0 {
+                0x00FFFFFF // Bright white for top-level chapters
             } else {
-                0x00ECEFF1
+                0x0080DEEA // Soft cyan/gray for indented sub-items
             };
             draw_bitmap_str_8x8(
                 buffer,
                 buf_w,
                 buf_h,
-                8 * scale,
-                ry + 8 * scale,
+                indent_px,
+                ry + 7 * scale,
                 &label,
                 text_color,
                 scale,
             );
 
             // Draw `[x]` delete button on right side of bookmark row
-            let del_x = sidebar_w.saturating_sub(28 * scale);
+            let del_x = sidebar_w.saturating_sub(26 * scale);
             draw_bitmap_str_8x8(
                 buffer,
                 buf_w,
                 buf_h,
                 del_x,
-                ry + 8 * scale,
+                ry + 7 * scale,
                 "[x]",
                 0x00EF5350,
                 scale,
@@ -998,30 +1625,37 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Hit-tests a click at `(mx, my)` inside the Left Bookmark Sidebar.
-    /// Returns `Some((bookmark_idx, clicked_delete_icon))`.
     fn hit_test_bookmark_sidebar(
         &self,
         mx: f64,
         my: f64,
         sidebar_w: u32,
+        tab_bar_h: u32,
         scale_factor: f64,
-    ) -> Option<(usize, bool)> {
-        if !self.show_bookmarks || (mx as u32) >= sidebar_w {
+    ) -> Option<SidebarHit> {
+        if !self.show_bookmarks || (mx as u32) >= sidebar_w || (my as u32) < tab_bar_h {
             return None;
         }
         let scale = (scale_factor.round() as u32).clamp(1, 2);
-        let row_h = 26 * scale;
-        let header_h = 34 * scale;
-        let iy = my.round() as u32;
-        if iy < header_h {
+        let row_h = 24 * scale;
+        let header_h = 54 * scale;
+        let rel_y = (my.round() as u32).saturating_sub(tab_bar_h);
+        if rel_y < header_h {
+            // Check if clicked inside `[Import .txt]` button (`22 * scale..48 * scale`)
+            if rel_y >= 20 * scale && rel_y <= 50 * scale {
+                return Some(SidebarHit::ImportTxtButton);
+            }
             return None;
         }
-        let vis_row = ((iy - header_h) / row_h) as usize;
+        let vis_row = ((rel_y - header_h) / row_h) as usize;
         let bm_idx = self.bookmark_scroll_y + vis_row;
         if bm_idx < self.bookmarks.len() {
-            let del_x = sidebar_w.saturating_sub(32 * scale);
+            let del_x = sidebar_w.saturating_sub(30 * scale);
             let on_delete = (mx.round() as u32) >= del_x;
-            Some((bm_idx, on_delete))
+            Some(SidebarHit::BookmarkRow {
+                index: bm_idx,
+                on_delete,
+            })
         } else {
             None
         }
@@ -1129,6 +1763,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn rotate_page_clockwise(&mut self, page_idx: u16) {
+        self.push_undo_snapshot();
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
@@ -1149,6 +1784,45 @@ impl<'a> PdfViewerApp<'a> {
         self.request_redraw();
     }
 
+    fn convert_page_to_bw_in_place(&mut self, page_idx: u16) {
+        self.push_undo_snapshot();
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let bytes = match doc.save_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_notice = Some(format!("BW serialize error: {e}"));
+                self.update_title_bar();
+                return;
+            }
+        };
+        match self.engine.convert_page_to_bw(&bytes, page_idx) {
+            Ok(bw_bytes) => match self.engine.load_pdf_from_bytes_safe(bw_bytes) {
+                Ok(new_doc) => {
+                    self.doc = Some(new_doc);
+                    self.bw_pages.insert(page_idx);
+                    self.cached_page = None;
+                    self.thumbnail_cache.remove(&page_idx);
+                    self.status_notice = Some(format!(
+                        "Converted Page {} to Grayscale [BW] (Cmd/Ctrl+Z to undo)",
+                        page_idx + 1
+                    ));
+                    self.update_title_bar();
+                    self.request_redraw();
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("BW reload error: {e}"));
+                    self.update_title_bar();
+                }
+            },
+            Err(e) => {
+                self.status_notice = Some(format!("BW conversion error: {e}"));
+                self.update_title_bar();
+            }
+        }
+    }
+
     fn delete_current_page(&mut self) {
         let total = self.total_pages();
         if total <= 1 {
@@ -1156,6 +1830,7 @@ impl<'a> PdfViewerApp<'a> {
             self.update_title_bar();
             return;
         }
+        self.push_undo_snapshot();
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
@@ -1167,7 +1842,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
                 self.cached_page = None;
                 self.thumbnail_cache.clear();
-                self.status_notice = Some("Deleted page".to_string());
+                self.status_notice = Some("Deleted page (Cmd/Ctrl+Z to undo)".to_string());
                 self.update_title_bar();
                 self.request_redraw();
             }
@@ -1175,6 +1850,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn insert_blank_page_after_current(&mut self) {
+        self.push_undo_snapshot();
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
@@ -1214,6 +1890,7 @@ impl<'a> PdfViewerApp<'a> {
             }
         };
 
+        self.push_undo_snapshot();
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
@@ -1286,9 +1963,12 @@ impl<'a> PdfViewerApp<'a> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("file.pdf")
                 .to_string();
-            match self.load_document(path) {
+            match self.open_document_in_new_tab(path) {
                 Ok(()) => {
-                    self.status_notice = Some(format!("Opened '{fname}'"));
+                    self.status_notice = Some(format!(
+                        "Opened '{fname}' in Tab {}",
+                        self.active_tab + 1
+                    ));
                 }
                 Err(e) => {
                     self.status_notice = Some(format!("ERROR opening '{fname}': {e}"));
@@ -1296,6 +1976,43 @@ impl<'a> PdfViewerApp<'a> {
             }
             self.update_title_bar();
             self.request_redraw();
+        }
+    }
+
+    fn import_bookmarks_from_path(&mut self, txt_path: &Path) {
+        match std::fs::read_to_string(txt_path) {
+            Ok(content) => {
+                let total = self.total_pages() as usize;
+                let parsed = PdfEngine::parse_bookmarks_txt(&content, self.roman_end, total);
+                let count = parsed.len();
+                self.bookmarks = parsed;
+                self.selected_bookmark = if self.bookmarks.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                };
+                self.bookmark_scroll_y = 0;
+                self.show_bookmarks = true;
+                self.cached_page = None;
+                self.persist_bookmarks();
+                self.status_notice = Some(format!("Imported {count} bookmarks!"));
+                self.update_title_bar();
+                self.request_redraw();
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Failed to read bookmark .txt: {e}"));
+                self.update_title_bar();
+            }
+        }
+    }
+
+    fn import_bookmarks_txt_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Import Bookmarks .txt (Serial -- Title -- LogicalPage)")
+            .add_filter("Text File", &["txt"])
+            .pick_file()
+        {
+            self.import_bookmarks_from_path(&path);
         }
     }
 
@@ -1316,17 +2033,27 @@ impl<'a> PdfViewerApp<'a> {
             .save_file();
 
         if let Some(save_path) = target_path {
-            match PdfEngine::save_doc(doc, &save_path) {
+            match PdfEngine::save_doc_with_metadata(
+                doc,
+                &save_path,
+                self.roman_end,
+                &self.bookmarks,
+            ) {
                 Ok(()) => {
-                    self.file_path = save_path;
+                    self.file_path = save_path.clone();
+                    if self.active_tab < self.tabs.len() {
+                        self.tabs[self.active_tab].file_path = save_path;
+                    }
                     self.persist_bookmarks();
-                    self.status_notice = Some("Saved PDF & bookmarks".to_string());
+                    self.status_notice =
+                        Some("Saved PDF with /PageLabels & /Outlines!".to_string());
                 }
                 Err(e) => {
                     self.status_notice = Some(format!("Save error: {e}"));
                 }
             }
             self.update_title_bar();
+            self.request_redraw();
         }
     }
 
@@ -1350,9 +2077,16 @@ impl<'a> PdfViewerApp<'a> {
             .unwrap_or(0);
 
         match self.engine.compress_doc(doc) {
-            Ok((compressed_bytes, serialized_len, new_len)) => {
+            Ok((compressed_bytes, serialized_len, _)) => {
+                let final_bytes = PdfEngine::embed_metadata_in_pdf_bytes(
+                    &compressed_bytes,
+                    self.roman_end,
+                    &self.bookmarks,
+                )
+                .unwrap_or(compressed_bytes);
+                let new_len = final_bytes.len();
                 let orig_len = disk_size.max(serialized_len);
-                match std::fs::write(&out_path, &compressed_bytes) {
+                match std::fs::write(&out_path, &final_bytes) {
                     Ok(()) => {
                         let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
                         let new_mb = (new_len as f64) / (1024.0 * 1024.0);
@@ -1410,17 +2144,26 @@ impl<'a> PdfViewerApp<'a> {
         match mode {
             InputMode::Normal => {}
             InputMode::JumpToPage { input } => {
-                if let Ok(page_1based) = input.trim().parse::<u16>() {
-                    let total = self.total_pages();
-                    if page_1based >= 1 && page_1based <= total {
-                        self.current_page_index = page_1based - 1;
-                        self.cached_page = None;
-                        self.status_notice = None;
-                        self.request_redraw();
-                    } else {
-                        self.status_notice =
-                            Some(format!("Invalid page {page_1based} (1..={total})"));
-                    }
+                let total = self.total_pages() as usize;
+                if let Some(target_idx) =
+                    PdfEngine::resolve_logical_page_str(&input, self.roman_end, total)
+                {
+                    self.current_page_index = target_idx as u16;
+                    self.cached_page = None;
+                    let lbl =
+                        PdfEngine::format_logical_page_label(target_idx, self.roman_end);
+                    self.status_notice = Some(format!(
+                        "Jumped to Page {} (Physical {} of {})",
+                        lbl,
+                        target_idx + 1,
+                        total
+                    ));
+                    self.request_redraw();
+                } else {
+                    self.status_notice = Some(format!(
+                        "Invalid page '{}' (use logical#, Roman 'i..v', or '#physical')",
+                        input.trim()
+                    ));
                 }
             }
             InputMode::PageNumbers { input } => {
@@ -1438,13 +2181,22 @@ impl<'a> PdfViewerApp<'a> {
                         }
                     }
                 };
+                self.push_undo_snapshot();
+                let total = self.total_pages() as usize;
                 if let Some(doc) = self.doc.as_mut() {
                     match PdfEngine::apply_page_numbers_to_doc(doc, roman_end) {
                         Ok(()) => {
+                            self.roman_end = roman_end as usize;
+                            PdfEngine::resync_bookmarks_logical_pages(
+                                &mut self.bookmarks,
+                                self.roman_end,
+                                total,
+                            );
+                            self.persist_bookmarks();
                             self.cached_page = None;
                             self.thumbnail_cache.clear();
                             self.status_notice = Some(format!(
-                                "Replaced & stamped page numbers (Roman 1..={roman_end})"
+                                "Stamped page numbers (Roman 1..={roman_end}) & synced bookmarks"
                             ));
                             self.request_redraw();
                         }
@@ -1494,6 +2246,7 @@ impl<'a> PdfViewerApp<'a> {
                 text_input,
             } => {
                 let raw = text_input.trim();
+                self.push_undo_snapshot();
                 if let Some(doc) = self.doc.as_mut() {
                     match PdfEngine::apply_aligned_header_footer_to_doc(
                         doc, position, raw, start_page, end_page,
@@ -1524,6 +2277,7 @@ impl<'a> PdfViewerApp<'a> {
                 let choice = parts.next().unwrap_or("");
                 let range_str = parts.next().unwrap_or("all");
                 if let Some((start_p, end_p)) = self.parse_page_range_input(range_str) {
+                    self.push_undo_snapshot();
                     if let Some(doc) = self.doc.as_mut() {
                         let res = match choice {
                             "1" => PdfEngine::clear_margin_zone_in_doc(
@@ -1577,6 +2331,7 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::Watermark { input } => {
                 let text = input.trim();
                 if !text.is_empty() {
+                    self.push_undo_snapshot();
                     if let Some(doc) = self.doc.as_mut() {
                         match PdfEngine::apply_watermark_to_doc(doc, text, true) {
                             Ok(()) => {
@@ -1602,9 +2357,22 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     trimmed.to_string()
                 };
+                let page_idx = self.current_page_index as usize;
+                let logical_page =
+                    PdfEngine::format_logical_page_label(page_idx, self.roman_end);
+                let next_serial = (self
+                    .bookmarks
+                    .iter()
+                    .filter(|b| b.level == 0)
+                    .count()
+                    + 1)
+                .to_string();
                 self.bookmarks.push(Bookmark {
+                    serial: next_serial,
                     title: title.clone(),
-                    page_index: self.current_page_index as usize,
+                    logical_page,
+                    page_index: page_idx,
+                    level: 0,
                 });
                 self.selected_bookmark = Some(self.bookmarks.len() - 1);
                 self.show_bookmarks = true;
@@ -1690,7 +2458,14 @@ impl<'a> PdfViewerApp<'a> {
                     if !typed.is_empty() {
                         let mut auto_submit_clear = false;
                         match &mut self.input_mode {
-                            InputMode::JumpToPage { input } | InputMode::PageNumbers { input } => {
+                            InputMode::JumpToPage { input } => {
+                                for c in typed.chars() {
+                                    if c.is_ascii_alphanumeric() || c == '#' {
+                                        input.push(c);
+                                    }
+                                }
+                            }
+                            InputMode::PageNumbers { input } => {
                                 for c in typed.chars() {
                                     if c.is_ascii_digit() {
                                         input.push(c);
@@ -1755,7 +2530,27 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
 
-        // 2. If Help Overlay is open, `Esc`, `?`, or `F1` closes it
+        // 2. OS-native modifier shortcuts: Cmd+Z / Ctrl+Z (Undo), Cmd+W / Ctrl+W (Close Tab), Ctrl+Tab (Cycle Tab)
+        if self.cmd_or_ctrl_pressed {
+            if let Key::Character(ch) = &logical_key {
+                let s = ch.as_str();
+                if s.eq_ignore_ascii_case("z") {
+                    self.perform_undo();
+                    return;
+                } else if s.eq_ignore_ascii_case("w") {
+                    if self.tabs.len() > 1 {
+                        let _ = self.close_tab(self.active_tab);
+                    } else {
+                        self.status_notice =
+                            Some("Cannot close the last remaining tab".to_string());
+                        self.update_title_bar();
+                    }
+                    return;
+                }
+            }
+        }
+
+        // 3. If Help Overlay is open, `Esc`, `?`, or `F1` closes it
         if self.show_help_overlay {
             if matches!(
                 logical_key,
@@ -1774,10 +2569,14 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
-        // 3. Normal Mode hotkeys
+        // 4. Normal Mode hotkeys
         match logical_key {
             Key::Named(NamedKey::Tab) => {
-                self.toggle_view_mode();
+                if self.ctrl_pressed {
+                    self.cycle_next_tab();
+                } else {
+                    self.toggle_view_mode();
+                }
             }
             Key::Named(NamedKey::Enter) => {
                 if self.view_mode == ViewMode::ThumbnailGrid {
@@ -1850,12 +2649,15 @@ impl<'a> PdfViewerApp<'a> {
                     self.show_bookmarks = !self.show_bookmarks;
                     self.cached_page = None;
                     self.status_notice = Some(if self.show_bookmarks {
-                        "Bookmarks Sidebar ON ('+'/'A' Add, 'E' Edit, Del Remove)".to_string()
+                        "Bookmarks Sidebar ON ('+'/'A' Add, 'L' Import .txt, 'E' Edit, Del Remove)"
+                            .to_string()
                     } else {
                         "Bookmarks Sidebar OFF".to_string()
                     });
                     self.update_title_bar();
                     self.request_redraw();
+                } else if s.eq_ignore_ascii_case("l") {
+                    self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
                 } else if (s == "+" || s == "=" || s.eq_ignore_ascii_case("a"))
                     && self.show_bookmarks
                 {
@@ -1928,6 +2730,13 @@ impl<'a> PdfViewerApp<'a> {
                         self.current_page_index
                     };
                     self.rotate_page_clockwise(target_page);
+                } else if s.eq_ignore_ascii_case("k") {
+                    let target_page = if self.view_mode == ViewMode::ThumbnailGrid {
+                        self.hovered_thumb.unwrap_or(self.current_page_index)
+                    } else {
+                        self.current_page_index
+                    };
+                    self.convert_page_to_bw_in_place(target_page);
                 } else if s.eq_ignore_ascii_case("d") {
                     self.delete_current_page();
                 } else if s.eq_ignore_ascii_case("o") {
@@ -1975,6 +2784,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::Save => self.save_file_dialog(),
                 PendingDialog::Merge => self.merge_pdf_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
+                PendingDialog::ImportBookmarksTxt => self.import_bookmarks_txt_dialog(),
             }
         }
     }
@@ -1989,6 +2799,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             WindowEvent::CloseRequested => {
                 self.cached_page = None;
                 self.thumbnail_cache.clear();
+                self.tabs.clear();
                 self.doc = None;
                 self.surface = None;
                 self.context = None;
@@ -2000,17 +2811,25 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 self.request_redraw();
             }
             WindowEvent::ModifiersChanged(modifiers) => {
-                self.shift_pressed = modifiers.state().shift_key();
+                let st = modifiers.state();
+                self.shift_pressed = st.shift_key();
+                self.ctrl_pressed = st.control_key();
+                self.cmd_or_ctrl_pressed = st.super_key() || st.control_key();
             }
             WindowEvent::DroppedFile(dropped_path) => {
-                let is_pdf = dropped_path
+                let ext = dropped_path
                     .extension()
                     .and_then(|e| e.to_str())
-                    .map(|e| e.eq_ignore_ascii_case("pdf"))
-                    .unwrap_or(false);
-                if !is_pdf {
-                    self.status_notice =
-                        Some(format!("Dropped file {:?} is not a .pdf", dropped_path));
+                    .unwrap_or("");
+                if ext.eq_ignore_ascii_case("txt") {
+                    self.import_bookmarks_from_path(&dropped_path);
+                    return;
+                }
+                if !ext.eq_ignore_ascii_case("pdf") {
+                    self.status_notice = Some(format!(
+                        "Dropped file {:?} is not a .pdf or .txt",
+                        dropped_path
+                    ));
                     self.update_title_bar();
                     return;
                 }
@@ -2022,15 +2841,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     .to_string();
 
                 // In Single-Page View (or when holding Shift, or when no document is loaded):
-                // Open the dropped PDF as the active document!
+                // Open the dropped PDF in a new tab!
                 if self.view_mode == ViewMode::SinglePage
                     || self.shift_pressed
                     || self.doc.is_none()
                 {
-                    match self.load_document(dropped_path) {
+                    match self.open_document_in_new_tab(dropped_path) {
                         Ok(()) => {
                             self.status_notice = Some(format!(
-                                "Opened '{fname}' ({} pages)",
+                                "Opened '{fname}' in Tab {} ({} pages)",
+                                self.active_tab + 1,
                                 self.total_pages()
                             ));
                         }
@@ -2044,15 +2864,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // In Thumbnail Grid View (`Tab`): insert all pages of the dropped PDF right before target thumbnail
-                let (win_w, sidebar_w) = if let Some(w) = self.window.as_ref() {
+                let (win_w, sidebar_w, tab_bar_h) = if let Some(w) = self.window.as_ref() {
                     let sz = w.inner_size();
+                    let sf = w.scale_factor();
                     (
                         sz.width.max(1),
-                        self.sidebar_width_px(w.scale_factor())
-                            .min(sz.width.saturating_sub(64)),
+                        self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
+                        self.tab_bar_height_px(sf).min(sz.height.saturating_sub(32)),
                     )
                 } else {
-                    (1024, 0)
+                    (1024, 0, TAB_BAR_HEIGHT_LOGICAL)
                 };
 
                 let target_idx = self.grid_drop_target_index(
@@ -2060,8 +2881,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.cursor_pos.1,
                     win_w,
                     sidebar_w,
+                    tab_bar_h,
                 );
 
+                self.push_undo_snapshot();
                 if let Some(doc) = self.doc.as_mut() {
                     match self
                         .engine
@@ -2145,9 +2968,17 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
                     if let Some(w) = self.window.as_ref() {
                         let sz = w.inner_size();
-                        let sidebar_w = self.sidebar_width_px(w.scale_factor());
+                        let sf = w.scale_factor();
+                        let sidebar_w = self.sidebar_width_px(sf);
+                        let tab_bar_h = self.tab_bar_height_px(sf);
                         let new_hover = self
-                            .hit_test_thumbnail(position.x, position.y, sz.width.max(1), sidebar_w)
+                            .hit_test_thumbnail(
+                                position.x,
+                                position.y,
+                                sz.width.max(1),
+                                sidebar_w,
+                                tab_bar_h,
+                            )
                             .map(|(idx, _)| idx);
                         if new_hover != self.hovered_thumb {
                             self.hovered_thumb = new_hover;
@@ -2160,30 +2991,113 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 if self.show_help_overlay {
                     return;
                 }
-                let (win_w, scale_factor, sidebar_w) = if let Some(w) = self.window.as_ref() {
-                    let sz = w.inner_size();
-                    let sf = w.scale_factor();
-                    (
-                        sz.width.max(1),
-                        sf,
-                        self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
-                    )
-                } else {
-                    (1024, 1.0, 0)
-                };
+                let (win_w, scale_factor, sidebar_w, tab_bar_h) =
+                    if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = w.scale_factor();
+                        (
+                            sz.width.max(1),
+                            sf,
+                            self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
+                            self.tab_bar_height_px(sf).min(sz.height.saturating_sub(32)),
+                        )
+                    } else {
+                        (1024, 1.0, 0, TAB_BAR_HEIGHT_LOGICAL)
+                    };
 
-                // 1. Check Left Bookmark Sidebar interactions first
+                // 0. Check Top 28px Multi-Tab Bar interactions first
+                if (self.cursor_pos.1 as u32) < tab_bar_h {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_tab_bar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            tab_bar_h,
+                            scale_factor,
+                        ) {
+                            match hit {
+                                TabBarHit::SwitchTab(idx) => {
+                                    self.switch_to_tab(idx);
+                                }
+                                TabBarHit::CloseTab(idx) => {
+                                    if self.tabs.len() > 1 {
+                                        let _ = self.close_tab(idx);
+                                    } else {
+                                        self.status_notice = Some(
+                                            "Cannot close the last remaining tab".to_string(),
+                                        );
+                                        self.update_title_bar();
+                                    }
+                                }
+                                TabBarHit::NewTab => {
+                                    self.pending_dialog = Some(PendingDialog::Open);
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // 1. Check Left Bookmark Sidebar interactions
                 if self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w {
                     if state == ElementState::Pressed {
-                        if let Some((bm_idx, on_delete)) = self.hit_test_bookmark_sidebar(
+                        if let Some(hit) = self.hit_test_bookmark_sidebar(
                             self.cursor_pos.0,
                             self.cursor_pos.1,
                             sidebar_w,
+                            tab_bar_h,
                             scale_factor,
                         ) {
-                            match button {
-                                MouseButton::Left => {
-                                    if on_delete {
+                            match hit {
+                                SidebarHit::ImportTxtButton => {
+                                    if button == MouseButton::Left {
+                                        self.pending_dialog =
+                                            Some(PendingDialog::ImportBookmarksTxt);
+                                    }
+                                }
+                                SidebarHit::BookmarkRow {
+                                    index: bm_idx,
+                                    on_delete,
+                                } => match button {
+                                    MouseButton::Left => {
+                                        if on_delete {
+                                            let removed = self.bookmarks.remove(bm_idx);
+                                            if self.bookmarks.is_empty() {
+                                                self.selected_bookmark = None;
+                                            } else if bm_idx >= self.bookmarks.len() {
+                                                self.selected_bookmark =
+                                                    Some(self.bookmarks.len() - 1);
+                                            }
+                                            self.persist_bookmarks();
+                                            self.status_notice = Some(format!(
+                                                "Deleted bookmark '{}'",
+                                                removed.title
+                                            ));
+                                            self.update_title_bar();
+                                            self.request_redraw();
+                                        } else {
+                                            self.selected_bookmark = Some(bm_idx);
+                                            let target_page =
+                                                self.bookmarks[bm_idx].page_index as u16;
+                                            self.current_page_index = target_page
+                                                .min(self.total_pages().saturating_sub(1));
+                                            self.cached_page = None;
+                                            self.update_title_bar();
+                                            self.request_redraw();
+                                        }
+                                    }
+                                    MouseButton::Right => {
+                                        // Right-click bookmark row to Edit Bookmark Title
+                                        self.selected_bookmark = Some(bm_idx);
+                                        self.input_mode = InputMode::EditBookmark {
+                                            bookmark_idx: bm_idx,
+                                            title_input: self.bookmarks[bm_idx].title.clone(),
+                                        };
+                                        self.update_title_bar();
+                                        self.request_redraw();
+                                    }
+                                    MouseButton::Middle => {
+                                        // Middle-click bookmark row to Delete Bookmark
                                         let removed = self.bookmarks.remove(bm_idx);
                                         if self.bookmarks.is_empty() {
                                             self.selected_bookmark = None;
@@ -2192,48 +3106,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                 Some(self.bookmarks.len() - 1);
                                         }
                                         self.persist_bookmarks();
-                                        self.status_notice = Some(format!(
-                                            "Deleted bookmark '{}'",
-                                            removed.title
-                                        ));
-                                        self.update_title_bar();
-                                        self.request_redraw();
-                                    } else {
-                                        self.selected_bookmark = Some(bm_idx);
-                                        let target_page =
-                                            self.bookmarks[bm_idx].page_index as u16;
-                                        self.current_page_index =
-                                            target_page.min(self.total_pages().saturating_sub(1));
-                                        self.cached_page = None;
+                                        self.status_notice =
+                                            Some(format!("Deleted bookmark '{}'", removed.title));
                                         self.update_title_bar();
                                         self.request_redraw();
                                     }
-                                }
-                                MouseButton::Right => {
-                                    // Right-click bookmark row to Edit Bookmark Title
-                                    self.selected_bookmark = Some(bm_idx);
-                                    self.input_mode = InputMode::EditBookmark {
-                                        bookmark_idx: bm_idx,
-                                        title_input: self.bookmarks[bm_idx].title.clone(),
-                                    };
-                                    self.update_title_bar();
-                                    self.request_redraw();
-                                }
-                                MouseButton::Middle => {
-                                    // Middle-click bookmark row to Delete Bookmark
-                                    let removed = self.bookmarks.remove(bm_idx);
-                                    if self.bookmarks.is_empty() {
-                                        self.selected_bookmark = None;
-                                    } else if bm_idx >= self.bookmarks.len() {
-                                        self.selected_bookmark = Some(self.bookmarks.len() - 1);
-                                    }
-                                    self.persist_bookmarks();
-                                    self.status_notice =
-                                        Some(format!("Deleted bookmark '{}'", removed.title));
-                                    self.update_title_bar();
-                                    self.request_redraw();
-                                }
-                                _ => {}
+                                    _ => {}
+                                },
                             }
                         }
                     }
@@ -2245,17 +3124,23 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     if button == MouseButton::Left {
                         match state {
                             ElementState::Pressed => {
-                                if let Some((clicked_idx, on_rotate_badge)) = self
-                                    .hit_test_thumbnail(
-                                        self.cursor_pos.0,
-                                        self.cursor_pos.1,
-                                        win_w,
-                                        sidebar_w,
-                                    )
-                                {
-                                    if on_rotate_badge {
-                                        self.rotate_page_clockwise(clicked_idx);
-                                        return;
+                                if let Some((clicked_idx, badge_hit)) = self.hit_test_thumbnail(
+                                    self.cursor_pos.0,
+                                    self.cursor_pos.1,
+                                    win_w,
+                                    sidebar_w,
+                                    tab_bar_h,
+                                ) {
+                                    match badge_hit {
+                                        ThumbBadgeHit::BwConvert => {
+                                            self.convert_page_to_bw_in_place(clicked_idx);
+                                            return;
+                                        }
+                                        ThumbBadgeHit::Rotate => {
+                                            self.rotate_page_clockwise(clicked_idx);
+                                            return;
+                                        }
+                                        ThumbBadgeHit::None => {}
                                     }
 
                                     // Check for double-click to jump into Single-Page View
@@ -2287,9 +3172,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     let (cx, cy) = self.cursor_pos;
                                     let dist = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
                                     if dist > 10.0 {
-                                        let dst_idx = self
-                                            .grid_drop_target_index(cx, cy, win_w, sidebar_w);
+                                        let dst_idx = self.grid_drop_target_index(
+                                            cx, cy, win_w, sidebar_w, tab_bar_h,
+                                        );
                                         if dst_idx != src_idx {
+                                            self.push_undo_snapshot();
                                             if let Some(doc) = self.doc.as_mut() {
                                                 match self.engine.move_page_in_doc(
                                                     doc, src_idx, dst_idx,
@@ -2333,6 +3220,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 if let Some(pdf_rect) =
                                     self.screen_drag_to_pdf_rect(sx1, sy1, sx2, sy2)
                                 {
+                                    self.push_undo_snapshot();
                                     let page_idx = self.current_page_index;
                                     if let Some(doc) = self.doc.as_mut() {
                                         match PdfEngine::highlight_text_in_rect(
@@ -2344,8 +3232,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                     "Highlighted {count} text region(s)"
                                                 ));
                                             }
-                                            Ok(_) => {}
+                                            Ok(_) => {
+                                                let _ = self.undo_stack.pop_back();
+                                            }
                                             Err(e) => {
+                                                let _ = self.undo_stack.pop_back();
                                                 self.status_notice =
                                                     Some(format!("Highlight error: {e}"));
                                             }
@@ -2478,20 +3369,20 @@ fn draw_help_overlay(buffer: &mut [u32], buf_w: u32, buf_h: u32, scale_factor: f
     let lines = [
         "=== MICRO_PDF KEYBOARD & MOUSE CONTROLS ===",
         "",
-        "MOUSE DRAG : Left-Click & Drag to Highlight Text",
-        "MOUSE WHEEL: Turn Page (Single) / Scroll (Grid)",
-        "TAB        : Toggle Thumbnail Grid Overview",
-        "B          : Toggle Left Bookmark Sidebar (+/E/Del)",
-        "G or 0-9   : Jump directly to any Page Number",
-        "N          : Stamp Roman (i..v) & Arabic Page Numbers",
-        "H          : Stamp Aligned Header/Footer (HL/HC/HR/FL/FC/FR)",
-        "C          : Clear Existing Page Numbers/Headers/Footers",
+        "TOP TAB BAR: Click Tab to Switch, [x] or Cmd/Ctrl+W Close, [+] Open",
+        "MOUSE DRAG : Left-Click & Drag to Highlight Text (Single View)",
+        "MOUSE WHEEL: Turn Page (Single) / Scroll (Grid & Bookmarks)",
+        "TAB        : Toggle Thumbnail Grid Overview (Ctrl+Tab cycles tabs)",
+        "B / L      : Toggle Bookmark Sidebar / 'L' Import .txt Bookmarks",
+        "G or 0-9   : Smart Jump (Logical '5', Roman 'ii', or Physical '#5')",
+        "N          : Stamp Roman (i..v) & Arabic Page Numbers + Sync Labels",
+        "H / C      : Stamp Aligned Header/Footer / Clear Existing Margins",
         "W          : Stamp Diagonal Semi-Transparent Watermark",
-        "I          : Insert a Blank A4 Page after current page",
-        "R / D      : Rotate 90 deg / Delete current page",
-        "X / M      : Split Page Range / Merge PDF (or Drag-Drop)",
-        "Z          : Compress & Optimize PDF (<name>_compressed.pdf)",
-        "O / S      : Open PDF / Save Modified PDF",
+        "K / [BW]   : Convert Current/Hovered Page to Grayscale (Black&White)",
+        "I / R / D  : Insert Blank A4 / Rotate 90 deg / Delete Current Page",
+        "CMD/CTRL+Z : Undo Last Structural or Page Edit (up to 8 steps)",
+        "X / M / Z  : Split Range / Merge PDF / Compress & Optimize PDF",
+        "O / S      : Open PDF in New Tab / Save PDF (embeds /Outlines)",
         "? / F1/ESC : Toggle or Close this Help Overlay",
     ];
 
