@@ -2112,6 +2112,16 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::F3) => {
                 self.jump_to_next_search_match();
             }
+            Key::Named(NamedKey::F5) => {
+                if self.is_presentation {
+                    self.exit_presentation_or_fullscreen();
+                } else {
+                    self.enter_presentation_mode();
+                }
+            }
+            Key::Named(NamedKey::F11) => {
+                self.toggle_fullscreen();
+            }
             Key::Named(NamedKey::Escape) => {
                 if self.open_menu.is_some() {
                     self.open_menu = None;
@@ -2119,6 +2129,8 @@ impl<'a> PdfViewerApp<'a> {
                 } else if self.show_help_overlay {
                     self.show_help_overlay = false;
                     self.request_redraw();
+                } else if self.is_presentation || self.is_fullscreen {
+                    self.exit_presentation_or_fullscreen();
                 } else if !self.selected_text_rects.is_empty() {
                     self.clear_text_selection();
                     self.status_notice = Some("Cleared text selection".to_string());
@@ -2959,6 +2971,22 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     self.request_redraw();
                                 }
                             }
+                        }
+                    }
+                    return;
+                }
+
+                // In Presentation Mode (F5), Left-Click advances a page and Right-Click goes back
+                if self.is_presentation {
+                    if state == ElementState::Pressed {
+                        match button {
+                            MouseButton::Left => {
+                                self.step_pages_forward();
+                            }
+                            MouseButton::Right => {
+                                self.step_pages_backward();
+                            }
+                            _ => {}
                         }
                     }
                     return;

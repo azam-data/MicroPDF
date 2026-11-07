@@ -325,6 +325,14 @@ impl<'a> PdfViewerApp<'a> {
                     self.reading_filter.label()
                 ));
             }
+            (MenuCategory::View, 11) => self.toggle_fullscreen(),
+            (MenuCategory::View, 12) => {
+                if self.is_presentation {
+                    self.exit_presentation_or_fullscreen();
+                } else {
+                    self.enter_presentation_mode();
+                }
+            }
 
             // Edit menu
             (MenuCategory::Edit, 0) => self.perform_undo(),

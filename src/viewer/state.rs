@@ -91,6 +91,8 @@ impl MenuCategory {
                 "Toggle Thumbnail Grid (Tab)",
                 "Toggle Bookmark Sidebar (B)",
                 "Cycle Dark / Sepia / Normal Reading Mode (V)",
+                "Toggle Fullscreen (F11)",
+                "Presentation Mode (F5)",
             ],
             MenuCategory::Edit => &[
                 "Undo (Ctrl+Z / Cmd+Z)",
@@ -519,6 +521,12 @@ pub struct PdfViewerApp<'a> {
     pub(super) input_mode: InputMode,
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
+    /// True when `F11` fullscreen (or `F5` presentation) is active with menu/tab/status bars hidden.
+    pub(super) is_fullscreen: bool,
+    /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
+    pub(super) is_presentation: bool,
+    /// Saved `(view_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
+    pub(super) pre_presentation_state: Option<(ViewMode, f32, f32, f32)>,
     pub(super) status_notice: Option<String>,
     /// Reusable pixel buffer so page turns never reallocate when `cached_page` is invalidated.
     pub(super) spare_pixel_buf: Vec<u32>,
@@ -600,6 +608,9 @@ impl<'a> PdfViewerApp<'a> {
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
+            is_fullscreen: false,
+            is_presentation: false,
+            pre_presentation_state: None,
             status_notice: if initial_path.is_none() {
                 Some("Open PDF (O) or drag and drop a file into this window".to_string())
             } else {
@@ -1177,6 +1188,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn sidebar_width_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation {
+            return 0;
+        }
         if self.show_bookmarks {
             ((SIDEBAR_WIDTH_LOGICAL as f64) * scale_factor).round() as u32
         } else {
@@ -1185,10 +1199,16 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn menu_bar_height_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation {
+            return 0;
+        }
         ((MENU_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
     }
 
     pub(super) fn tab_bar_height_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation {
+            return 0;
+        }
         ((TAB_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
     }
 
@@ -1197,7 +1217,88 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn status_bar_height_px(&self, scale_factor: f64) -> u32 {
+        if (self.is_fullscreen || self.is_presentation) && self.input_mode == InputMode::Normal {
+            return 0;
+        }
         ((STATUS_BAR_HEIGHT_LOGICAL as f64) * scale_factor).round() as u32
+    }
+
+    /// Toggles `F11` fullscreen mode with top/bottom/sidebar bars hidden.
+    pub(super) fn toggle_fullscreen(&mut self) {
+        if self.is_presentation {
+            self.exit_presentation_or_fullscreen();
+            return;
+        }
+        self.is_fullscreen = !self.is_fullscreen;
+        self.open_menu = None;
+        if let Some(w) = self.window.as_ref() {
+            w.set_fullscreen(if self.is_fullscreen {
+                Some(winit::window::Fullscreen::Borderless(None))
+            } else {
+                None
+            });
+        }
+        self.invalidate_page_caches();
+        self.status_notice = Some(if self.is_fullscreen {
+            "Fullscreen Mode ON (F11 or Esc to exit)".to_string()
+        } else {
+            "Fullscreen Mode OFF".to_string()
+        });
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Enters `F5` presentation mode (fullscreen, one page fit to screen, black background, arrows/click to advance, Esc to exit).
+    pub(super) fn enter_presentation_mode(&mut self) {
+        if !self.is_presentation {
+            self.pre_presentation_state = Some((
+                self.view_mode,
+                self.zoom_level,
+                self.pan_x,
+                self.scroll_y,
+            ));
+        }
+        self.is_presentation = true;
+        self.is_fullscreen = true;
+        self.open_menu = None;
+        self.view_mode = ViewMode::FitPage;
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
+        if let Some(w) = self.window.as_ref() {
+            w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        self.invalidate_page_caches();
+        self.status_notice = Some(
+            "Presentation Mode (Arrows/Click to advance, Esc to exit)".to_string(),
+        );
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Exits `F5` presentation mode or `F11` fullscreen mode and restores previous view state.
+    pub(super) fn exit_presentation_or_fullscreen(&mut self) {
+        if !self.is_presentation && !self.is_fullscreen {
+            return;
+        }
+        let was_presentation = self.is_presentation;
+        self.is_presentation = false;
+        self.is_fullscreen = false;
+        if was_presentation {
+            if let Some((vm, zoom, px, sy)) = self.pre_presentation_state.take() {
+                self.view_mode = vm;
+                self.zoom_level = zoom;
+                self.pan_x = px;
+                self.scroll_y = sy;
+            }
+        }
+        if let Some(w) = self.window.as_ref() {
+            w.set_fullscreen(None);
+        }
+        self.invalidate_page_caches();
+        self.status_notice = Some("Exited Fullscreen / Presentation Mode".to_string());
+        self.update_title_bar();
+        self.request_redraw();
     }
 
 

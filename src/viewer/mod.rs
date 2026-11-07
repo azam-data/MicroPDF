@@ -886,4 +886,89 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_fullscreen_and_presentation_mode() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_fullscreen_presentation.pdf");
+        engine.create_sample_pdf(&tmp, 5)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        app.show_bookmarks = true;
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        app.zoom_level = 1.75;
+        app.scroll_y = 140.0;
+        app.pan_x = 30.0;
+
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+
+        // 1. Toggle Fullscreen (F11): hides top menu bar, tab bar, status bar, and bookmark sidebar
+        assert_eq!(app.menu_bar_height_px(1.0), state::MENU_BAR_HEIGHT_LOGICAL);
+        assert_eq!(app.tab_bar_height_px(1.0), state::TAB_BAR_HEIGHT_LOGICAL);
+        assert_eq!(app.status_bar_height_px(1.0), state::STATUS_BAR_HEIGHT_LOGICAL);
+        assert!(app.sidebar_width_px(1.0) > 0);
+
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11),
+            None,
+        );
+        assert!(app.is_fullscreen);
+        assert!(!app.is_presentation);
+        assert_eq!(app.menu_bar_height_px(1.0), 0);
+        assert_eq!(app.tab_bar_height_px(1.0), 0);
+        assert_eq!(app.status_bar_height_px(1.0), 0);
+        assert_eq!(app.sidebar_width_px(1.0), 0);
+
+        // F11 again exits fullscreen
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11),
+            None,
+        );
+        assert!(!app.is_fullscreen);
+        assert_eq!(app.menu_bar_height_px(1.0), state::MENU_BAR_HEIGHT_LOGICAL);
+
+        // 2. Enter Presentation Mode (F5): forces FitPage, zoom 1.0, hides all bars, renders full screen
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::F5),
+            None,
+        );
+        assert!(app.is_presentation);
+        assert!(app.is_fullscreen);
+        assert_eq!(app.view_mode, ViewMode::FitPage);
+        assert!((app.zoom_level - 1.0).abs() < 1e-4);
+        assert_eq!(app.menu_bar_height_px(1.0), 0);
+        assert_eq!(app.status_bar_height_px(1.0), 0);
+
+        app.ensure_current_page_rendered(1920, 1080, 0, 0, 0)?;
+        assert!(app.cached_page.is_some());
+
+        // Arrows advance / step back pages in Presentation Mode
+        assert_eq!(app.current_page_index, 0);
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::ArrowRight),
+            None,
+        );
+        assert_eq!(app.current_page_index, 1);
+
+        // Esc exits Presentation Mode and restores previous view mode, zoom, scroll, and pan
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            None,
+        );
+        assert!(!app.is_presentation);
+        assert!(!app.is_fullscreen);
+        assert_eq!(app.view_mode, ViewMode::ContinuousScroll);
+        assert!((app.zoom_level - 1.75).abs() < 1e-4);
+        assert!((app.scroll_y - 140.0).abs() < 1e-4);
+        assert!((app.pan_x - 30.0).abs() < 1e-4);
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 9 Fullscreen/Presentation RAM] before: {:.2} MB, after F11/F5/Esc cycle: {:.2} MB",
+            ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

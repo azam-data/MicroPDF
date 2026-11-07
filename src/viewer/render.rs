@@ -741,13 +741,18 @@ impl<'a> PdfViewerApp<'a> {
                 .take()
                 .map(|c| c.pixels)
                 .unwrap_or_else(|| std::mem::take(&mut self.spare_pixel_buf));
-            let avail_w = match self.view_mode {
-                ViewMode::FitWidth | ViewMode::FitTextWidth => {
-                    content_w.saturating_sub(24).max(1) as f32
-                }
-                _ => content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32,
+            let (avail_w, avail_h) = if self.is_presentation {
+                (content_w.max(1) as f32, content_h.max(1) as f32)
+            } else {
+                let aw = match self.view_mode {
+                    ViewMode::FitWidth | ViewMode::FitTextWidth => {
+                        content_w.saturating_sub(24).max(1) as f32
+                    }
+                    _ => content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32,
+                };
+                let ah = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+                (aw, ah)
             };
-            let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
             let rendered = self.rasterize_page_for_mode(
                 self.current_page_index,
                 self.view_mode,
@@ -1144,8 +1149,12 @@ impl<'a> PdfViewerApp<'a> {
                 .buffer_mut()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire softbuffer frame: {e}"))?;
 
-            // Fill background with #2B2B2B
-            buffer.fill(BG_COLOR_U32);
+            // Fill background with solid black in Presentation Mode (F5), or #2B2B2B otherwise
+            buffer.fill(if self.is_presentation {
+                0x00000000
+            } else {
+                BG_COLOR_U32
+            });
 
             if self.doc.is_none() {
                 let scale = (scale_factor.round() as u32).clamp(1, 2);
