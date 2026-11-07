@@ -400,6 +400,16 @@ pub(super) enum InputMode {
     },
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct IncrementalSearchState {
+    pub(super) query: String,
+    pub(super) q_chars: Vec<char>,
+    pub(super) next_page: u16,
+    pub(super) total_pages: u16,
+    pub(super) origin_page: u16,
+    pub(super) jumped_to_first: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum PendingDialog {
     Open,
@@ -496,6 +506,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) search_query: String,
     pub(super) search_matches: Vec<SearchMatch>,
     pub(super) current_search_match: usize,
+    /// Time-sliced (~8 ms/frame) incremental search state on the main thread (`Esc` cancels).
+    pub(super) incremental_search: Option<IncrementalSearchState>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
     pub(super) thumbnail_cache: HashMap<u16, ThumbnailEntry>,
     /// Vertical scroll offset in physical pixels for Thumbnail Grid View.
@@ -590,6 +602,7 @@ impl<'a> PdfViewerApp<'a> {
             search_query: String::new(),
             search_matches: Vec::new(),
             current_search_match: 0,
+            incremental_search: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
             hovered_thumb: None,

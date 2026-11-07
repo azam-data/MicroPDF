@@ -1250,10 +1250,12 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn execute_text_search(&mut self, query: &str) {
         let trimmed = query.trim().to_string();
-        if trimmed.is_empty() {
+        let q_chars: Vec<char> = trimmed.chars().flat_map(|c| c.to_lowercase()).collect();
+        if q_chars.is_empty() {
             self.search_query.clear();
             self.search_matches.clear();
             self.current_search_match = 0;
+            self.incremental_search = None;
             self.status_notice = Some("Cleared text search highlights".to_string());
             self.update_title_bar();
             self.request_redraw();
@@ -1263,41 +1265,144 @@ impl<'a> PdfViewerApp<'a> {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
-        let matches = PdfEngine::search_text_in_doc(doc, &trimmed);
-        self.search_query = trimmed.clone();
-        if matches.is_empty() {
-            self.search_matches.clear();
-            self.current_search_match = 0;
-            self.status_notice = Some(format!("No matches found for '{trimmed}'"));
-            self.update_title_bar();
-            self.request_redraw();
+        let total_pages = doc.pages().len();
+        if total_pages == 0 {
             return;
         }
 
-        // Start from the first match on or after `self.current_page_index`
-        let start_idx = matches
-            .iter()
-            .position(|m| m.page_index >= self.current_page_index)
-            .unwrap_or(0);
-        let target_page = matches[start_idx].page_index;
-        let total_matches = matches.len();
-        self.search_matches = matches;
-        self.current_search_match = start_idx;
+        self.search_query = trimmed.clone();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.incremental_search = Some(IncrementalSearchState {
+            query: trimmed,
+            q_chars,
+            next_page: 0,
+            total_pages,
+            origin_page: self.current_page_index,
+            jumped_to_first: false,
+        });
 
-        if target_page != self.current_page_index {
-            self.current_page_index = target_page;
-            self.scroll_y = 0.0;
-            self.invalidate_page_caches();
+        // Immediately run the first ~8 ms time-slice so small/medium PDFs finish in a single frame
+        // while 1,000+ page PDFs stay responsive and continue across frames in `about_to_wait`.
+        self.step_incremental_search(Duration::from_millis(8));
+    }
+
+    /// Advances an active incremental search by searching pages until `budget` (~8 ms) elapses
+    /// (or at least `max_pages_override` if specified for deterministic testing).
+    /// Keeps ONLY the `SearchMatch` list (`self.search_matches`) in memory, never a per-page text cache.
+    /// Returns `true` if incremental search is still in progress after this slice.
+    pub(super) fn step_incremental_search(&mut self, budget: Duration) -> bool {
+        self.step_incremental_search_with_limit(budget, usize::MAX)
+    }
+
+    pub(super) fn step_incremental_search_with_limit(
+        &mut self,
+        budget: Duration,
+        max_pages: usize,
+    ) -> bool {
+        let Some(mut state) = self.incremental_search.take() else {
+            return false;
+        };
+        if self.doc.is_none() {
+            return false;
         }
-        self.status_notice = Some(format!(
-            "Match {}/{} for '{}' on Page {} (Press F3 or Cmd/Ctrl+G for next)",
-            start_idx + 1,
-            total_matches,
-            trimmed,
-            target_page + 1
-        ));
-        self.update_title_bar();
-        self.request_redraw();
+
+        let slice_start = Instant::now();
+        let mut pages_scanned_in_slice = 0usize;
+
+        while state.next_page < state.total_pages && pages_scanned_in_slice < max_pages {
+            let page_idx = state.next_page;
+            let page_matches = match self.doc.as_ref() {
+                Some(doc) => PdfEngine::search_text_on_single_page(doc, page_idx, &state.q_chars),
+                None => break,
+            };
+            if !page_matches.is_empty() {
+                self.search_matches.extend(page_matches);
+                if !state.jumped_to_first {
+                    if let Some(first_on_or_after) = self
+                        .search_matches
+                        .iter()
+                        .position(|m| m.page_index >= state.origin_page)
+                    {
+                        state.jumped_to_first = true;
+                        self.current_search_match = first_on_or_after;
+                        let target_page = self.search_matches[first_on_or_after].page_index;
+                        if target_page != self.current_page_index {
+                            self.current_page_index = target_page;
+                            self.scroll_y = 0.0;
+                            self.invalidate_page_caches();
+                        }
+                    }
+                }
+            }
+
+            state.next_page += 1;
+            pages_scanned_in_slice += 1;
+
+            if slice_start.elapsed() >= budget {
+                break;
+            }
+        }
+
+        if state.next_page < state.total_pages {
+            let scanned = state.next_page;
+            let total = state.total_pages;
+            let found = self.search_matches.len();
+            let q = state.query.clone();
+            self.incremental_search = Some(state);
+            self.status_notice = Some(format!(
+                "Searching '{}' (Page {}/{}, {} match(es) so far) — Press Esc to cancel",
+                q, scanned, total, found
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            true
+        } else {
+            // Search finished across all pages
+            if self.search_matches.is_empty() {
+                self.current_search_match = 0;
+                self.status_notice = Some(format!("No matches found for '{}'", state.query));
+            } else {
+                if !state.jumped_to_first {
+                    self.current_search_match = 0;
+                    let target_page = self.search_matches[0].page_index;
+                    if target_page != self.current_page_index {
+                        self.current_page_index = target_page;
+                        self.scroll_y = 0.0;
+                        self.invalidate_page_caches();
+                    }
+                }
+                let idx = self.current_search_match.min(self.search_matches.len() - 1);
+                let target_page = self.search_matches[idx].page_index;
+                self.status_notice = Some(format!(
+                    "Match {}/{} for '{}' on Page {} (Press F3 or Cmd/Ctrl+G for next)",
+                    idx + 1,
+                    self.search_matches.len(),
+                    state.query,
+                    target_page + 1
+                ));
+            }
+            self.update_title_bar();
+            self.request_redraw();
+            false
+        }
+    }
+
+    pub(super) fn cancel_incremental_search(&mut self) -> bool {
+        if let Some(state) = self.incremental_search.take() {
+            self.status_notice = Some(format!(
+                "Search cancelled at Page {}/{} ({} match(es) found for '{}')",
+                state.next_page,
+                state.total_pages,
+                self.search_matches.len(),
+                state.query
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn jump_to_next_search_match(&mut self) {
@@ -2129,6 +2234,8 @@ impl<'a> PdfViewerApp<'a> {
                 } else if self.show_help_overlay {
                     self.show_help_overlay = false;
                     self.request_redraw();
+                } else if self.incremental_search.is_some() {
+                    self.cancel_incremental_search();
                 } else if self.is_presentation || self.is_fullscreen {
                     self.exit_presentation_or_fullscreen();
                 } else if !self.selected_text_rects.is_empty() {
@@ -2385,7 +2492,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_single_instance_listener();
         self.poll_auto_reload_if_due();
-        if self.single_instance_listener.is_some()
+        if self.incremental_search.is_some() {
+            let still_searching = self.step_incremental_search(Duration::from_millis(8));
+            if still_searching {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            }
+        } else if self.single_instance_listener.is_some()
             || (self.window_focused && self.doc.is_some())
         {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(

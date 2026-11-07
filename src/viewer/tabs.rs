@@ -62,6 +62,7 @@ impl<'a> PdfViewerApp<'a> {
             self.search_query.clear();
             self.search_matches.clear();
             self.current_search_match = 0;
+            self.incremental_search = None;
         }
     }
 
@@ -132,6 +133,7 @@ impl<'a> PdfViewerApp<'a> {
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
+        self.incremental_search = None;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = if self.bookmarks.is_empty() {
             None
@@ -299,6 +301,7 @@ impl<'a> PdfViewerApp<'a> {
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
+        self.incremental_search = None;
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
@@ -366,6 +369,7 @@ impl<'a> PdfViewerApp<'a> {
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
+        self.incremental_search = None;
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;

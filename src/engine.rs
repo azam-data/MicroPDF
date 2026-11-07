@@ -1888,6 +1888,110 @@ impl PdfEngine {
         Ok((bytes, total_pages))
     }
 
+    /// Searches `page.text()` on a single page `page_idx` (case-insensitive) against pre-lowercased
+    /// `q_chars` and returns all `SearchMatch` entries found on that page.
+    /// Does not retain any per-page character buffer after returning.
+    pub fn search_text_on_single_page(
+        doc: &PdfDocument,
+        page_idx: u16,
+        q_chars: &[char],
+    ) -> Vec<SearchMatch> {
+        if q_chars.is_empty() {
+            return Vec::new();
+        }
+        let Ok(page) = doc.pages().get(page_idx) else {
+            return Vec::new();
+        };
+        let Ok(text_page) = page.text() else {
+            return Vec::new();
+        };
+
+        let mut page_chars: Vec<(char, Option<PdfRect>)> = Vec::new();
+        for ch in text_page.chars().iter() {
+            let Some(uc) = ch.unicode_char() else {
+                continue;
+            };
+            if uc == '\r' || uc == '\n' {
+                page_chars.push((' ', None));
+                continue;
+            }
+            if uc.is_control() {
+                continue;
+            }
+            let rect_opt = ch
+                .loose_bounds()
+                .or_else(|_| ch.tight_bounds())
+                .ok()
+                .and_then(|b| {
+                    let bottom = b.bottom().value.min(b.top().value);
+                    let top = b.bottom().value.max(b.top().value);
+                    let left = b.left().value.min(b.right().value);
+                    let right = b.left().value.max(b.right().value);
+                    if (right - left) >= 0.1 && (top - bottom) >= 0.1 {
+                        Some(PdfRect::new_from_values(bottom, left, top, right))
+                    } else {
+                        None
+                    }
+                });
+            for lc in uc.to_lowercase() {
+                page_chars.push((lc, rect_opt));
+            }
+        }
+
+        if page_chars.len() < q_chars.len() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let mut i = 0;
+        while i + q_chars.len() <= page_chars.len() {
+            let mut matched = true;
+            for j in 0..q_chars.len() {
+                let pc = page_chars[i + j].0;
+                let qc = q_chars[j];
+                if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                let mut line_rects: Vec<PdfRect> = Vec::new();
+                for j in 0..q_chars.len() {
+                    if let Some(cb) = page_chars[i + j].1 {
+                        if let Some(last) = line_rects.last_mut() {
+                            let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                            let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                            let lh = (last.top().value - last.bottom().value).max(4.0);
+                            if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
+                                *last = PdfRect::new_from_values(
+                                    last.bottom().value.min(cb.bottom().value),
+                                    last.left().value.min(cb.left().value),
+                                    last.top().value.max(cb.top().value),
+                                    last.right().value.max(cb.right().value),
+                                );
+                                continue;
+                            }
+                        }
+                        line_rects.push(cb);
+                    }
+                }
+
+                if !line_rects.is_empty() {
+                    matches.push(SearchMatch {
+                        page_index: page_idx,
+                        rects: line_rects,
+                    });
+                }
+                i += q_chars.len();
+            } else {
+                i += 1;
+            }
+        }
+
+        matches
+    }
+
     /// Searches `page.text()` across all pages in `doc` (case-insensitive) and returns all matches
     /// with their line-level character bounding boxes (`SearchMatch`).
     pub fn search_text_in_doc(doc: &PdfDocument, query: &str) -> Vec<SearchMatch> {
@@ -1904,94 +2008,7 @@ impl PdfEngine {
         let total = doc.pages().len();
 
         for page_idx in 0..total {
-            let Ok(page) = doc.pages().get(page_idx) else {
-                continue;
-            };
-            let Ok(text_page) = page.text() else {
-                continue;
-            };
-
-            let mut page_chars: Vec<(char, Option<PdfRect>)> = Vec::new();
-            for ch in text_page.chars().iter() {
-                let Some(uc) = ch.unicode_char() else {
-                    continue;
-                };
-                if uc == '\r' || uc == '\n' {
-                    page_chars.push((' ', None));
-                    continue;
-                }
-                if uc.is_control() {
-                    continue;
-                }
-                let rect_opt = ch
-                    .loose_bounds()
-                    .or_else(|_| ch.tight_bounds())
-                    .ok()
-                    .and_then(|b| {
-                        let bottom = b.bottom().value.min(b.top().value);
-                        let top = b.bottom().value.max(b.top().value);
-                        let left = b.left().value.min(b.right().value);
-                        let right = b.left().value.max(b.right().value);
-                        if (right - left) >= 0.1 && (top - bottom) >= 0.1 {
-                            Some(PdfRect::new_from_values(bottom, left, top, right))
-                        } else {
-                            None
-                        }
-                    });
-                for lc in uc.to_lowercase() {
-                    page_chars.push((lc, rect_opt));
-                }
-            }
-
-            if page_chars.len() < q_chars.len() {
-                continue;
-            }
-
-            let mut i = 0;
-            while i + q_chars.len() <= page_chars.len() {
-                let mut matched = true;
-                for j in 0..q_chars.len() {
-                    let pc = page_chars[i + j].0;
-                    let qc = q_chars[j];
-                    if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
-                        matched = false;
-                        break;
-                    }
-                }
-
-                if matched {
-                    let mut line_rects: Vec<PdfRect> = Vec::new();
-                    for j in 0..q_chars.len() {
-                        if let Some(cb) = page_chars[i + j].1 {
-                            if let Some(last) = line_rects.last_mut() {
-                                let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
-                                let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
-                                let lh = (last.top().value - last.bottom().value).max(4.0);
-                                if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
-                                    *last = PdfRect::new_from_values(
-                                        last.bottom().value.min(cb.bottom().value),
-                                        last.left().value.min(cb.left().value),
-                                        last.top().value.max(cb.top().value),
-                                        last.right().value.max(cb.right().value),
-                                    );
-                                    continue;
-                                }
-                            }
-                            line_rects.push(cb);
-                        }
-                    }
-
-                    if !line_rects.is_empty() {
-                        matches.push(SearchMatch {
-                            page_index: page_idx,
-                            rects: line_rects,
-                        });
-                    }
-                    i += q_chars.len();
-                } else {
-                    i += 1;
-                }
-            }
+            matches.extend(Self::search_text_on_single_page(doc, page_idx, &q_chars));
         }
 
         matches

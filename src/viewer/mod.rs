@@ -971,4 +971,85 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_incremental_search_time_sliced_and_esc_cancel() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_incremental_search.pdf");
+        engine.create_sample_pdf(&tmp, 12)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+
+        // 1. Simulate time-sliced incremental search (3 pages per frame slice)
+        let query = "Page";
+        let q_chars: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+        app.search_query = query.to_string();
+        app.search_matches.clear();
+        app.current_search_match = 0;
+        app.incremental_search = Some(state::IncrementalSearchState {
+            query: query.to_string(),
+            q_chars: q_chars.clone(),
+            next_page: 0,
+            total_pages: 12,
+            origin_page: 0,
+            jumped_to_first: false,
+        });
+
+        let still_running =
+            app.step_incremental_search_with_limit(std::time::Duration::from_secs(1), 3);
+        assert!(still_running, "Should still be searching after 3 of 12 pages");
+        assert_eq!(
+            app.incremental_search.as_ref().map(|s| s.next_page),
+            Some(3)
+        );
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Searching 'Page' (Page 3/12"),
+            "Status bar must show incremental search progress"
+        );
+        let matches_after_3_pages = app.search_matches.len();
+        assert!(matches_after_3_pages >= 3);
+
+        // 2. Pressing Esc cancels the in-progress search while preserving matches found so far
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            None,
+        );
+        assert!(
+            app.incremental_search.is_none(),
+            "Esc must cancel active incremental search"
+        );
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Search cancelled at Page 3/12")
+        );
+        assert_eq!(app.search_matches.len(), matches_after_3_pages);
+
+        // 3. Full search completes across slices and finds all 12 pages without caching per-page text
+        app.execute_text_search("Page");
+        while app.incremental_search.is_some() {
+            app.step_incremental_search(std::time::Duration::from_millis(8));
+        }
+        assert_eq!(app.search_matches.len(), matches_after_3_pages * 4);
+        assert!(
+            app.cached_char_boxes.is_none(),
+            "Incremental search must never populate or retain per-page character caches"
+        );
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 10 Incremental Search RAM] before: {:.2} MB, after 12-page incremental search: {:.2} MB (matches: {})",
+            ram_before,
+            ram_after,
+            app.search_matches.len()
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }
