@@ -103,6 +103,64 @@ pub struct PdfEngine {
     pub pdfium: Pdfium,
 }
 
+/// The open PDF file that PDFium reads blocks from on demand (see `load_pdf_with_password`).
+///
+/// PDFium keeps the byte offsets it parsed at open time and asks for blocks at those offsets for
+/// the lifetime of the document. If another program rewrites the file in place (truncate and
+/// write, as `cp` does), those offsets point into a different file: a same-size replacement
+/// would make old pages silently show the new file's content. So every block read is checked
+/// against the length and modification time recorded at open, and refused once either changes.
+/// pdfium-render turns the error into a failed read, PDFium fails that page load, the viewer
+/// reports it in the status bar, and auto-reload then opens the new file.
+///
+/// Each block is read completely or not at all: pdfium-render calls `read` once and would treat
+/// a short read (a truncated file) as success with a partly filled buffer.
+///
+/// A file replaced by rename (an atomic save) or deleted is unaffected: the handle still refers
+/// to the original file, whose bytes stay readable and unchanged until the handle is closed.
+pub(crate) struct ChangeGuardedFile {
+    file: std::fs::File,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl ChangeGuardedFile {
+    pub(crate) fn new(file: std::fs::File) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            file,
+        })
+    }
+
+    fn check_unchanged(&self) -> std::io::Result<()> {
+        let meta = self.file.metadata()?;
+        if meta.len() != self.len || meta.modified().ok() != self.modified {
+            return Err(std::io::Error::other(
+                "the PDF file was changed on disk after it was opened",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for ChangeGuardedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read_exact(buf)?;
+        // Checked after the read: if nothing changed by now, the bytes just read are the
+        // original ones. A change during the read moves the length or mtime and is caught here.
+        self.check_unchanged()?;
+        Ok(buf.len())
+    }
+}
+
+impl std::io::Seek for ChangeGuardedFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 #[allow(dead_code)]
 impl PdfEngine {
     /// Initializes PDFium from the executable's own directory only.
@@ -159,9 +217,11 @@ impl PdfEngine {
 
     /// Unified, safe PDF loader that never passes file paths to PDFium's C loader.
     /// 1. Cleans/canonicalizes `path` (stripping any trailing newlines or surrounding quotes).
-    /// 2. Reads the entire file into memory via `std::fs::read`.
-    /// 3. Strips leading junk/BOM bytes before `%PDF-` (within the first 1 KB) in place.
-    /// 4. Hands the single buffer to PDFium (v1.1: no `bytes.clone()`, so peak RAM is 1x file size).
+    /// 2. Normal case: keeps the file open and lets PDFium read blocks on demand
+    ///    (`FPDF_LoadCustomDocument` via `load_pdf_from_reader`) through a `ChangeGuardedFile`,
+    ///    so the file is never held in RAM.
+    /// 3. Leading junk/BOM before `%PDF-`, or a password: reads the whole file, strips the junk
+    ///    in place and hands that single buffer to PDFium.
     pub fn load_pdf_safe<'a>(&'a self, path: &Path) -> Result<PdfDocument<'a>> {
         self.load_pdf_with_password(path, None)
     }
@@ -207,7 +267,9 @@ impl PdfEngine {
         if junk_offset == 0 && password.is_none() {
             file.seek(SeekFrom::Start(0))
                 .with_context(|| format!("FS Error seeking {:?}", resolved_path))?;
-            match self.pdfium.load_pdf_from_reader(file, None) {
+            let reader = ChangeGuardedFile::new(file)
+                .with_context(|| format!("FS Error reading metadata {:?}", resolved_path))?;
+            match self.pdfium.load_pdf_from_reader(reader, None) {
                 Ok(doc) => return Ok(doc),
                 Err(PdfiumError::PdfiumLibraryInternalError(
                     PdfiumInternalError::PasswordError,

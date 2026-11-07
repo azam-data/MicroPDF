@@ -1504,9 +1504,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_file_dialog(&mut self) {
-        let Some(doc) = self.doc.as_ref() else {
+        if self.doc.is_none() {
             return;
-        };
+        }
         let stem = self
             .file_path
             .file_stem()
@@ -1520,6 +1520,17 @@ impl<'a> PdfViewerApp<'a> {
             .save_file();
 
         if let Some(save_path) = target_path {
+            self.save_active_doc_to(save_path);
+        }
+    }
+
+    /// Saves the active document to `save_path` (which may be the open file itself), then
+    /// reopens it from there. Shows the outcome in the status bar.
+    pub(super) fn save_active_doc_to(&mut self, save_path: std::path::PathBuf) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        {
             match PdfEngine::save_doc_with_metadata(
                 doc,
                 &save_path,

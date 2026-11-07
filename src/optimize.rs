@@ -118,6 +118,8 @@ enum Replacement {
 impl PdfEngine {
     /// Optimizes a copy of `doc` in one go; `doc` itself is not modified.
     /// For large files prefer `OptimizeJob` and call `step()` once per frame.
+    /// The app itself only uses `OptimizeJob`; this one-shot form is kept for tests and tools.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn optimize_doc(&self, doc: &PdfDocument, opts: &OptimizeOptions) -> Result<OptimizeReport> {
         let bytes = doc
             .save_to_bytes()

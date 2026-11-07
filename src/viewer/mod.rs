@@ -1210,6 +1210,222 @@ mod tests {
         Ok(())
     }
 
+    /// `n`-page text PDF whose page `i` reads "`label` page `i`". Each content stream carries
+    /// about 16 KB of comment padding, so PDFium's read-ahead cannot already hold the bytes of
+    /// pages far from the one viewed at open.
+    fn build_labeled_padded_pdf(n: u32, label: &str) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let font_id = ldoc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = ldoc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let padding = format!("% {}\n", "x".repeat(16 * 1024));
+        let mut kids = Vec::new();
+        for i in 1..=n {
+            let content = format!("{padding}BT /F1 14 Tf 72 720 Td ({label} page {i}) Tj ET\n{padding}");
+            let content_id = ldoc.add_object(lopdf::Stream::new(dictionary! {}, content.into_bytes()));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => resources_id, "Contents" => content_id,
+                })
+                .into(),
+            );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Extracted text of page `idx` in the active document, trimmed.
+    fn active_page_text(app: &PdfViewerApp, idx: u16) -> Result<String> {
+        let doc = app.doc.as_ref().context("no document")?;
+        let page = doc.pages().get(idx)?;
+        Ok(page.text()?.all().trim().to_string())
+    }
+
+    /// Navigates to `idx` and renders it the way a frame does, recording any error in the
+    /// status bar. Returns whether the page bitmap was produced.
+    fn render_page_like_frame(app: &mut PdfViewerApp, idx: u16) -> bool {
+        app.navigate_to_page(idx);
+        app.render_page_view_or_notice(1024, 768, 0, 52, 22)
+    }
+
+    /// (a) Saving over the open file (atomic temp + rename), then rendering pages never viewed
+    /// before the save: they must show the saved content (the app reloads after a save), and a
+    /// second document opened on the old file must keep showing the old content.
+    #[test]
+    fn test_streaming_save_over_open_file_then_render_unviewed_pages() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_stream_save_over_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+        // A second handle on the same file, like another tab, with no page ever loaded.
+        let other = engine.load_pdf_safe(&path)?;
+
+        // Unsaved edit: blank page after page 1, so the saved file differs from the old one.
+        app.insert_blank_page_after_current();
+        assert_eq!(app.total_pages(), 21);
+        app.save_active_doc_to(path.clone());
+        assert!(!app.has_unsaved_edits, "save failed: {:?}", app.status_notice);
+        assert!(
+            !dir.join(".doc.pdf.micropdf-tmp").exists(),
+            "atomic save must not leave its temp file behind"
+        );
+
+        // Saved content: page 2 is the blank page, so old page i is now at index i.
+        assert_eq!(app.total_pages(), 21);
+        for idx in 10..21u16 {
+            assert!(
+                render_page_like_frame(&mut app, idx),
+                "page {} failed after save: {:?}",
+                idx + 1,
+                app.status_notice
+            );
+            assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {idx}"));
+        }
+
+        // The other handle still reads the replaced file's old bytes: old content, not garbage.
+        for idx in 10..20u16 {
+            let text = other.pages().get(idx)?.text()?.all();
+            assert_eq!(text.trim(), format!("Alpha page {}", idx + 1));
+        }
+
+        drop(other);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// (b) Another process overwrites the open file in place (truncate + write, as
+    /// `cp other.pdf open.pdf` does). Unviewed pages must render the old content or fail with
+    /// a status-bar error, never show the new file's bytes at the old offsets, and auto-reload
+    /// must then pick up the new file. Covers a shorter, a same-size (identical layout, so old
+    /// offsets land on valid objects of the new file) and a longer replacement.
+    #[test]
+    fn test_streaming_open_file_overwritten_in_place() -> Result<()> {
+        for new_pages in [7u32, 20, 30] {
+            overwrite_in_place_case(new_pages)?;
+        }
+        Ok(())
+    }
+
+    fn overwrite_in_place_case(new_pages: u32) -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join(format!("micropdf_stream_overwrite_{new_pages}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+
+        // In place: same inode, truncated, then rewritten with a different PDF.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&path)?;
+            f.write_all(&build_labeled_padded_pdf(new_pages, "Bravo")?)?;
+            f.sync_all()?;
+        }
+
+        let mut failed = 0;
+        for idx in 10..20u16 {
+            let rendered = render_page_like_frame(&mut app, idx);
+            if !rendered {
+                failed += 1;
+                let notice = app.status_notice.clone().unwrap_or_default();
+                assert!(
+                    notice.contains(&format!("Cannot render page {}", idx + 1)),
+                    "a failed render must say so in the status bar, got: {notice:?}"
+                );
+            }
+            match active_page_text(&app, idx) {
+                Ok(text) => assert_eq!(
+                    text,
+                    format!("Alpha page {}", idx + 1),
+                    "[{new_pages}-page replacement] page {} shows bytes of the new file",
+                    idx + 1
+                ),
+                Err(_) => assert!(!rendered, "page {} rendered but its text is unreadable", idx + 1),
+            }
+        }
+        assert!(
+            failed > 0,
+            "[{new_pages}-page replacement] reads after the overwrite must be refused"
+        );
+
+        // Auto-reload picks up the new file.
+        app.last_file_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
+        app.window_focused = true;
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), new_pages as u16, "auto-reload must load the new file");
+        for idx in [0u16, new_pages as u16 - 1] {
+            assert!(render_page_like_frame(&mut app, idx), "{:?}", app.status_notice);
+            assert_eq!(active_page_text(&app, idx)?, format!("Bravo page {}", idx + 1));
+        }
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// (c) The open file is deleted. Nothing may crash. An open handle keeps a deleted file's
+    /// data readable (POSIX unlink; Windows FILE_SHARE_DELETE), so unviewed pages render the
+    /// original content; a page that cannot be read reports an error in the status bar.
+    #[test]
+    fn test_streaming_open_file_deleted() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_stream_deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+        std::fs::remove_file(&path)?;
+        assert!(!path.exists());
+
+        for idx in 10..20u16 {
+            let rendered = render_page_like_frame(&mut app, idx);
+            if rendered {
+                assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {}", idx + 1));
+            } else {
+                let notice = app.status_notice.clone().unwrap_or_default();
+                assert!(notice.contains(&format!("Cannot render page {}", idx + 1)), "{notice:?}");
+            }
+            #[cfg(unix)]
+            assert!(rendered, "an unlinked file stays readable through the open handle");
+        }
+
+        // Auto-reload must leave the open document alone while the file is missing.
+        app.last_file_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
+        app.window_focused = true;
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), 20);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// `n`-page text PDF built with lopdf.
     fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
         use lopdf::dictionary;

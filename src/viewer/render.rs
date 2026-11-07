@@ -408,6 +408,35 @@ impl<'a> PdfViewerApp<'a> {
         (draw_x, draw_y, bmp_w, bmp_h)
     }
 
+    /// Renders the page view for this frame. A page PDFium cannot read (for example because the
+    /// open file was overwritten or truncated on disk) leaves that page blank and puts the error
+    /// in the status bar, so the rest of the window is still drawn. Returns true on success.
+    pub(super) fn render_page_view_or_notice(
+        &mut self,
+        viewport_w: u32,
+        viewport_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+    ) -> bool {
+        match self.ensure_current_page_rendered(
+            viewport_w,
+            viewport_h,
+            sidebar_w,
+            top_bars_h,
+            status_bar_h,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                self.status_notice = Some(format!(
+                    "Cannot render page {}: {e:#}",
+                    self.current_page_index + 1
+                ));
+                false
+            }
+        }
+    }
+
     /// Ensures `self.cached_page` (and `self.cached_second_page` in `TwoPageSpread`) holds the rasterized
     /// bitmap(s) for `self.current_page_index` inside `(sidebar_w..viewport_w, top_bars_h..viewport_h - status_bar_h)`.
     pub(super) fn ensure_current_page_rendered(
@@ -1173,7 +1202,7 @@ impl<'a> PdfViewerApp<'a> {
             .min(height.saturating_sub(top_bars_h + 16));
 
         if self.view_mode.is_page_view() {
-            self.ensure_current_page_rendered(width, height, sidebar_w, top_bars_h, status_bar_h)?;
+            self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
         } else {
             self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
         }
