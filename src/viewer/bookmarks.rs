@@ -255,7 +255,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn persist_bookmarks(&self) {
-        let _ = PdfEngine::save_bookmarks_sidecar(&self.file_path, &self.bookmarks);
+        // v1.2: Do not write `<pdf_filename>.bookmarks.txt` next to user PDFs by default.
+        // Bookmarks are embedded into `/Outlines` on save (`S` or `Z`), while sidecar reading
+        // in `PdfEngine::load_bookmarks` remains active for backward compatibility.
     }
 
     pub(super) fn import_bookmarks_from_path(&mut self, txt_path: &Path) {
