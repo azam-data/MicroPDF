@@ -2,10 +2,12 @@
 
 **MicroPDF** is a lightweight, portable PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), and [`image`](https://crates.io/crates/image). No GPU, no GUI toolkit, no installer: the menu bar, tab bar and status bar are drawn by the CPU straight into the window frame buffer.
 
-**Footprint (v1.2, measured by the built-in RAM readout):**
+**Footprint (v1.2.1, raw process memory measured by `ram_realistic_measurement`, release build, 1920×1080, without the window frame buffer of about 8 MB):**
 
 - `micro_pdf.exe` is about 1 MB. It needs `pdfium.dll` (roughly 5–10 MB, from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)) in the **same folder**, so a portable install is about 6–11 MB in total.
-- RAM is roughly 16–22 MB with a small text PDF open, ~40 MB on a 300-page scanned PDF, and ~45 MB on a 1,050-page PDF. Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 48 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries.
+- Small text PDF: about 11 MB after opening.
+- The whole file is held in memory, so large scans cost at least their file size. On a 116 MB, 100-page 300-dpi scan: 129 MB after opening, 228 MB peak while scrolling 50 pages, **274 MB at 400% zoom and 301 MB in the thumbnail grid**. The last two exceed the target of file size + 120 MB and are known issues.
+- Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 48 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries.
 
 ---
 
@@ -61,7 +63,7 @@
 | `N` / `H` / `C` / `W` | Normal | Roman/Arabic Page Numbers (`N`), Aligned Header/Footer (`H`), Clear Margins (`C`), Watermark (`W`) |
 | `K` / `I` / `R` / `D` | Normal / Grid | Convert page to Grayscale `[BW]` (`K`), Insert A4 (`I`), Rotate 90° (`R`), Delete page (`D`) |
 | `Cmd+Z` / `Ctrl+Z` | Normal | Undo last structural or page edit (up to 8 steps per tab) |
-| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Compress PDF (`Z`), Split/Extract range (`X`) |
+| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Optimize PDF to `<name>_optimized.pdf` (`Z`), Split/Extract range (`X`) |
 | `?` / `F1` / `Esc` | Any | Toggle Help Overlay / Close menu / Cancel prompt / Reset mouse mode |
 
 ---
@@ -80,11 +82,23 @@ cargo build --release
 cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+## Optimize (`Z`)
+
+Writes `<name>_optimized.pdf` next to the original; the original and the open document are never changed, and nothing is written if the result would not be smaller. Images are downsampled to 200 dpi and re-encoded as JPEG (quality 70). On scanned pages (an image covering most of the page) off-white paper is pushed to pure white and text is sharpened, while ink colour is kept, so blue signatures stay blue. Black-and-white (1-bit) and gray output are built into the engine and will be selectable from the Optimize menu. Everything runs locally; no Ghostscript or OCR.
+
+On a 10-page, 24 MB scan: 6.0 MB in about 1 s per page; 0.54 MB in black-and-white mode.
+
 ## Testing
 
 ```
 # PDFium must be reachable: copy it next to the test binary or set MICROPDF_PDFIUM_DIR
 cargo test
+```
+
+Real memory figures (run on its own, takes a minute):
+
+```
+cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
 ```
 
 `test_redaction_leaves_no_trace` builds a PDF with secret text over an image, redacts it, saves it, and fails if the secret survives in extracted text, in any decompressed stream, or in the image pixels under the box.

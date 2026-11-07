@@ -1555,7 +1555,14 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    /// `Z`: optimize images (Balanced preset: 200 dpi, JPEG 70, scan cleanup) and write
+    /// `<name>_optimized.pdf` next to the original. The open document and the original file
+    /// are never modified. Nothing is written when optimizing would not make the file smaller.
     pub(super) fn compress_current_pdf(&mut self) {
+        self.optimize_current_pdf(crate::optimize::OptimizeOptions::default());
+    }
+
+    pub(super) fn optimize_current_pdf(&mut self, opts: crate::optimize::OptimizeOptions) {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
@@ -1563,61 +1570,87 @@ impl<'a> PdfViewerApp<'a> {
             .file_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("document");
-        let out_name = format!("{stem}_compressed.pdf");
-        let out_path = match self.file_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&out_name),
-            _ => PathBuf::from(&out_name),
-        };
+            .unwrap_or("document")
+            .to_string();
+        let dir = self
+            .file_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let mut out_name = format!("{stem}_optimized.pdf");
+        let mut out_path = dir.join(&out_name);
+        let mut n = 2;
+        while out_path == self.file_path {
+            out_name = format!("{stem}_optimized-{n}.pdf");
+            out_path = dir.join(&out_name);
+            n += 1;
+        }
 
         let disk_size = std::fs::metadata(&self.file_path)
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
-        match self.engine.compress_doc(doc) {
-            Ok((compressed_bytes, serialized_len, _)) => {
-                let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
-                    &compressed_bytes,
-                    self.roman_end,
-                    &self.bookmarks,
-                    self.redacted,
-                ) {
-                    Ok(b) => (b, None),
-                    Err(e) if self.redacted => {
-                        self.status_notice = Some(format!(
-                            "Compression refused: post-redaction cleanup failed ({e}). Nothing was written."
-                        ));
-                        self.update_title_bar();
-                        self.request_redraw();
-                        return;
-                    }
-                    Err(e) => (compressed_bytes, Some(format!(" (WARNING: metadata not sanitized: {e})"))),
+        let report = match self.engine.optimize_doc(doc, &opts) {
+            Ok(r) => r,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+        let orig_len = disk_size.max(report.original_len);
+        if report.kept_original {
+            self.status_notice = Some(format!(
+                "Optimize: no size gain ({} image(s) checked); nothing written",
+                report.images_seen
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
+            &report.bytes,
+            self.roman_end,
+            &self.bookmarks,
+            self.redacted,
+        ) {
+            Ok(b) => (b, None),
+            Err(e) if self.redacted => {
+                self.status_notice = Some(format!(
+                    "Optimize refused: post-redaction cleanup failed ({e}). Nothing was written."
+                ));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+            Err(e) => (report.bytes, Some(format!(" (WARNING: metadata not sanitized: {e})"))),
+        };
+        let new_len = final_bytes.len();
+        match PdfEngine::write_atomic(&out_path, &final_bytes) {
+            Ok(()) => {
+                let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
+                let new_mb = (new_len as f64) / (1024.0 * 1024.0);
+                let saved_pct = if orig_len > 0 && new_len < orig_len {
+                    (((orig_len - new_len) as f64 / (orig_len as f64)) * 100.0).round() as u32
+                } else {
+                    0
                 };
-                let new_len = final_bytes.len();
-                let orig_len = disk_size.max(serialized_len);
-                match PdfEngine::write_atomic(&out_path, &final_bytes) {
-                    Ok(()) => {
-                        let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
-                        let new_mb = (new_len as f64) / (1024.0 * 1024.0);
-                        let saved_pct = if orig_len > 0 && new_len < orig_len {
-                            (((orig_len - new_len) as f64 / (orig_len as f64)) * 100.0).round()
-                                as u32
-                        } else {
-                            0
-                        };
-                        self.status_notice = Some(format!(
-                            "Compressed! {:.2} MB -> {:.2} MB (Saved {}%) -> '{}'{}",
-                            orig_mb, new_mb, saved_pct, out_name, warning.unwrap_or_default()
-                        ));
-                    }
-                    Err(e) => {
-                        self.status_notice =
-                            Some(format!("Failed to write compressed PDF '{}': {e}", out_name));
-                    }
-                }
+                self.status_notice = Some(format!(
+                    "Optimized {:.2} MB -> {:.2} MB ({}% smaller; {} image(s) rewritten, {} left as is) -> '{}'{}",
+                    orig_mb,
+                    new_mb,
+                    saved_pct,
+                    report.images_rewritten,
+                    report.images_skipped,
+                    out_name,
+                    warning.unwrap_or_default()
+                ));
             }
             Err(e) => {
-                self.status_notice = Some(format!("Compression error: {e}"));
+                self.status_notice = Some(format!("Failed to write '{}': {e}", out_name));
             }
         }
         self.update_title_bar();

@@ -76,7 +76,7 @@ impl MenuCategory {
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
-                "Compress & Save PDF (Z)",
+                "Optimize -> _optimized.pdf (Z)",
                 "Close Tab (Ctrl+W)",
             ],
             MenuCategory::View => &[
@@ -1022,7 +1022,7 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         };
         let new_total = new_doc.pages().len();
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&self.file_path);
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&new_doc);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&new_doc, &self.file_path, roman_end);
 
         self.invalidate_page_caches();
@@ -1030,6 +1030,11 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
 
         self.doc = Some(new_doc);
+        // v1.2.1: snapshots from before the reload must not be restorable, otherwise Ctrl+Z
+        // would silently bring back the old file content over the external change.
+        self.undo_stack.clear();
+        self.undo_stack.shrink_to_fit();
+        self.redacted = false;
         self.last_file_mtime = Some(disk_mtime);
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
@@ -1057,6 +1062,8 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].view_mode = self.view_mode;
             self.tabs[self.active_tab].roman_end = self.roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+            self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redacted = false;
         }
 
         let fname = self.filename_display();

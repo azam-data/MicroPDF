@@ -841,8 +841,11 @@ mod tests {
         assert_eq!(app.total_pages(), 3, "Must not poll/reload while window is unfocused");
 
         // 2. When focused and no unsaved edits, reloads and preserves page & scroll_y
+        //    v1.2.1: a stale pre-reload snapshot must not survive (Ctrl+Z would revert the change)
+        app.undo_stack.push_back(b"stale snapshot".to_vec());
         app.window_focused = true;
         app.poll_auto_reload_if_due();
+        assert!(app.undo_stack.is_empty(), "undo history must be cleared on auto-reload");
         assert_eq!(app.total_pages(), 6, "Must auto-reload updated 6-page PDF from disk");
         assert_eq!(app.current_page_index, 2, "Must preserve current_page_index");
         assert!((app.scroll_y - 145.5).abs() < 0.01, "Must preserve scroll_y");
@@ -1053,253 +1056,233 @@ mod tests {
         Ok(())
     }
 
+    /// Cache caps hold while scrolling, zooming and browsing the grid. (v1.2.1: RSS figures were
+    /// removed from this test: inside a shared test process they mostly measure other tests.
+    /// Real RAM is measured by `ram_realistic_measurement` below, in its own process.)
     #[test]
-    fn test_phase4_ram_measurement_matrix() -> Result<()> {
-        use lopdf::dictionary;
-        let tmp_dir = std::env::temp_dir().join("micropdf_phase4_ram_bench");
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        std::fs::create_dir_all(&tmp_dir)?;
-
-        let small_pdf = tmp_dir.join("small_text.pdf");
-        let scanned_pdf = tmp_dir.join("scanned_300p.pdf");
-        let large_pdf = tmp_dir.join("large_1050p.pdf");
-
+    fn test_phase4_cache_caps_hold() -> Result<()> {
         let engine = PdfEngine::new()?;
-        let baseline_rss = get_current_rss_mb().unwrap_or(0.0);
-
-        // 1. Small text PDF (< 1 MB): 15-page text PDF built with lopdf
-        {
-            let mut ldoc = lopdf::Document::with_version("1.5");
-            let pages_id = ldoc.new_object_id();
-            let font_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => "Helvetica",
-            });
-            let resources_id = ldoc.add_object(lopdf::dictionary! {
-                "Font" => lopdf::dictionary! {
-                    "F1" => font_id,
-                },
-            });
-            let mut kids = Vec::with_capacity(15);
-            for i in 1..=15u32 {
-                let content_str = format!(
-                    "BT /F1 18 Tf 72 720 Td (Small Text PDF - Page {i} of 15) Tj 0 -30 Td /F1 12 Tf (MicroPDF lightweight PDF viewer benchmark.) Tj ET"
-                );
-                let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content_str.into_bytes());
-                let _ = stream.compress();
-                let content_id = ldoc.add_object(stream);
-                let page_id = ldoc.add_object(lopdf::dictionary! {
-                    "Type" => "Page",
-                    "Parent" => pages_id,
-                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-                    "Resources" => resources_id,
-                    "Contents" => content_id,
-                });
-                kids.push(page_id.into());
-            }
-            ldoc.objects.insert(
-                pages_id,
-                lopdf::Object::Dictionary(lopdf::dictionary! {
-                    "Type" => "Pages",
-                    "Kids" => kids,
-                    "Count" => 15,
-                }),
-            );
-            let catalog_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Catalog",
-                "Pages" => pages_id,
-            });
-            ldoc.trailer.set("Root", catalog_id);
-            let mut out = Vec::new();
-            ldoc.save_to(&mut out)?;
-            PdfEngine::write_atomic(&small_pdf, &out)?;
-        }
-        let small_file_mb =
-            (std::fs::metadata(&small_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        assert!(small_file_mb < 1.0, "Small text PDF must be < 1 MB");
-
-        // Measure 1. Small Text PDF immediately before generating the 300p and 1,050p files
-        // so its idle RSS reflects a clean launch (target: <= 25 MB).
-        let measure_scenarios = |label: &str, path: &std::path::Path, file_mb: f64| -> Result<(f64, f64, f64, f64)> {
-            let mut app = PdfViewerApp::new(&engine, Some(path.to_path_buf()))?;
-            let vw = 1024u32;
-            let vh = 768u32;
-            let sw = 0u32;
-            let th = 52u32;
-            let sb = 22u32;
-
-            // Scenario 1: Idle after open (page 1 rendered in FitPage)
+        let path = std::env::temp_dir().join("micropdf_cache_caps.pdf");
+        PdfEngine::write_atomic(&path, &build_text_pdf(60)?)?;
+        let (vw, vh, sw, th, sb) = (1024u32, 768u32, 0u32, 52u32, 22u32);
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        for step in 0..50u16 {
+            app.current_page_index = step;
+            app.scroll_y = 120.0;
             app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
-            let rss_idle = get_current_rss_mb().unwrap_or(0.0);
+            assert!(app.continuous_page_cache.len() <= 5);
+        }
+        app.set_view_mode(ViewMode::FitPage);
+        app.set_zoom_around_cursor(4.0, 512.0, 384.0);
+        for k in 0..8 {
+            app.pan_x = k as f32 * 320.0;
+            app.scroll_y = k as f32 * 280.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            assert!(app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES);
+        }
+        app.reset_zoom();
+        app.set_view_mode(ViewMode::ThumbnailGrid);
+        let mut gs = 0.0f32;
+        while gs < 20_000.0 {
+            app.grid_scroll_y = gs;
+            app.update_visible_thumbnails(vw, vh, sw, th, sb);
+            assert!(app.thumbnail_cache.len() <= state::MAX_THUMB_CACHE_ENTRIES);
+            gs += 600.0;
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
 
-            // Scenario 2: After scrolling 50 pages in Continuous Scroll mode
-            app.set_view_mode(ViewMode::ContinuousScroll);
-            for step in 0..50 {
-                let target_p = (step as u16).min(app.total_pages().saturating_sub(1));
-                app.current_page_index = target_p;
-                app.scroll_y = 120.0;
-                app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+    /// `n`-page text PDF built with lopdf.
+    fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let font_id = ldoc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = ldoc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let mut kids = Vec::new();
+        for i in 1..=n {
+            let content = format!("BT /F1 14 Tf 72 720 Td (Text page {i}) Tj ET");
+            let content_id = ldoc.add_object(lopdf::Stream::new(dictionary! {}, content.into_bytes()));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => resources_id, "Contents" => content_id,
+                })
+                .into(),
+            );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// `n`-page scan PDF: each page a distinct 300-dpi A4 JPEG (about 1.1 MB), like a real
+    /// office scanner produces. Built with lopdf so PDFium allocations don't pollute the
+    /// measurement that follows.
+    fn build_scan_pdf(n: u32) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let (w, h) = (2480u32, 3508u32);
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let mut kids = Vec::new();
+        for p in 0..n {
+            let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([245, 243, 238]));
+            let mut seed: u32 = 12345 + p;
+            for row in (300..h - 300).step_by(60) {
+                let mut x = 250;
+                while x < w - 250 {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let word = 40 + (seed % 160);
+                    for yy in row..row + 34 {
+                        for xx in x..(x + word).min(w - 250) {
+                            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                            if seed % 2 == 0 {
+                                img.put_pixel(xx, yy, image::Rgb([25 + (seed % 40) as u8, 25, 30]));
+                            }
+                        }
+                    }
+                    x += word + 30;
+                }
             }
-            let rss_cont_50 = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.continuous_page_cache.len() <= 5,
-                "{label}: Continuous scroll cache must hold only visible +-1 pages (got {})",
-                app.continuous_page_cache.len()
+            let mut jpg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 60).encode_image(&img)?;
+            let img_id = ldoc.add_object(
+                lopdf::Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w as i64, "Height" => h as i64,
+                        "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+                    },
+                    jpg,
+                )
+                .with_compression(false),
             );
-
-            // Scenario 3: At 400% zoom while panning across the page
-            app.set_view_mode(ViewMode::FitPage);
-            app.set_zoom_around_cursor(4.0, 512.0, 384.0);
-            for pan_step in 0..8 {
-                app.pan_x = (pan_step as f32) * 320.0;
-                app.scroll_y = (pan_step as f32) * 280.0;
-                app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
-            }
-            let rss_zoom_400 = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES,
-                "{label}: Tile cache must never exceed 48 entries"
+            let content_id = ldoc.add_object(lopdf::Stream::new(
+                dictionary! {},
+                b"q 595 0 0 842 0 0 cm /Im0 Do Q".to_vec(),
+            ));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+                    "Contents" => content_id,
+                })
+                .into(),
             );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
 
-            // Scenario 4: Thumbnail grid scrolled to the end
-            app.reset_zoom();
-            app.set_view_mode(ViewMode::ThumbnailGrid);
-            let total_rows = ((app.total_pages() as u32) + 3) / 4;
-            let row_stride = state::THUMB_H + 36;
-            let max_grid_scroll = (total_rows * row_stride) as f32;
-            let mut cur_scroll = 0.0_f32;
-            while cur_scroll <= max_grid_scroll {
-                app.grid_scroll_y = cur_scroll;
-                app.update_visible_thumbnails(vw, vh, sw, th, sb);
-                cur_scroll += 600.0;
-            }
-            let rss_thumb_end = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.thumbnail_cache.len() <= state::MAX_THUMB_CACHE_ENTRIES,
-                "{label}: Thumbnail cache must never exceed 300 entries (got {})",
-                app.thumbnail_cache.len()
-            );
+    /// Helper for `ram_realistic_measurement` (runs in a child process).
+    #[test]
+    #[ignore]
+    fn ram_build_scan_fixture() -> Result<()> {
+        let scan = std::env::temp_dir().join("micropdf_ram_scan.pdf");
+        PdfEngine::write_atomic(&scan, &build_scan_pdf(100)?)
+    }
 
-            let max_allowed = file_mb + 120.0;
-            // If running in parallel with other heavy tests (e.g. test_phase0_manual_checks_suite's 64MB undo test),
-            // account for any pre-existing process RSS above a clean 22 MB baseline so parallel test order never flakes.
-            let parallel_overhead = (baseline_rss - 22.0).max(0.0);
-            let adj_idle = (rss_idle - parallel_overhead).max(0.0);
-            let adj_cont_50 = (rss_cont_50 - parallel_overhead).max(0.0);
-            let adj_zoom_400 = (rss_zoom_400 - parallel_overhead).max(0.0);
-            let adj_thumb_end = (rss_thumb_end - parallel_overhead).max(0.0);
-            eprintln!(
-                "| {:<24} | {:>6.2} MB | {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | <= {:>6.2} MB |",
-                label, file_mb, adj_idle, adj_cont_50, adj_zoom_400, adj_thumb_end, max_allowed
-            );
+    /// Real RAM measurement: raw, unadjusted process RSS at 1920x1080 (headless, so the window
+    /// frame buffer, about 8 MB at 1080p, is not included). Run it on its own:
+    ///   cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
+    /// Targets: small text PDF idle <= 25 MB; 100-page 300-dpi scan <= file size + 120 MB in
+    /// every scenario. Known in v1.2.1: zoom and grid on the scan exceed the target.
+    #[test]
+    #[ignore]
+    fn ram_realistic_measurement() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let (vw, vh, sw, th, sb) = (1920u32, 1080u32, 0u32, 52u32, 22u32);
+        let rss = || get_current_rss_mb().unwrap_or(0.0);
+        let dir = std::env::temp_dir();
 
-            assert!(adj_idle <= max_allowed, "{label} idle RSS {adj_idle:.2} > {max_allowed:.2}");
-            assert!(adj_cont_50 <= max_allowed, "{label} cont50 RSS {adj_cont_50:.2} > {max_allowed:.2}");
-            assert!(adj_zoom_400 <= max_allowed, "{label} zoom400 RSS {adj_zoom_400:.2} > {max_allowed:.2}");
-            assert!(adj_thumb_end <= max_allowed, "{label} thumb_end RSS {adj_thumb_end:.2} > {max_allowed:.2}");
-
-            Ok((rss_idle, rss_cont_50, rss_zoom_400, rss_thumb_end))
+        let small = dir.join("micropdf_ram_small.pdf");
+        PdfEngine::write_atomic(&small, &build_text_pdf(15)?)?;
+        let before_small = rss();
+        let small_idle = {
+            let mut app = PdfViewerApp::new(&engine, Some(small.clone()))?;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            rss()
         };
 
-        eprintln!("\n=== PHASE 4: WORKING-SET RAM MEASUREMENT TABLE ===");
-        eprintln!("| Document                 | File Size | Idle Open   | Scroll 50p  | 400% Zoom   | Grid to End | Target Cap   |");
-        eprintln!("|--------------------------|-----------|-------------|-------------|-------------|-------------|--------------|");
-        let (small_idle, _, _, _) = measure_scenarios("1. Small Text (15p)", &small_pdf, small_file_mb)?;
-
-        // 2. 300-page scanned PDF: create a 10-page scanned chunk and combine 30 copies
-        {
-            let scanned_chunk = tmp_dir.join("scanned_chunk_10p.pdf");
-            let mut doc = engine.pdfium.create_new_pdf()?;
-            let mut img = image::RgbaImage::new(320, 450);
-            for (x, y, px) in img.enumerate_pixels_mut() {
-                let v = if (x % 37 == 0) || (y % 23 < 3 && x > 30 && x < 290) {
-                    30u8
-                } else {
-                    245u8
-                };
-                *px = image::Rgba([v, v, v, 255]);
-            }
-            let stamp = crate::engine::StampImageBuffer {
-                width: 320,
-                height: 450,
-                image: image::DynamicImage::ImageRgba8(img),
-            };
-            let full_rect =
-                pdfium_render::prelude::PdfRect::new_from_values(36.0, 36.0, 805.0, 559.0);
-            for p_idx in 0..10u16 {
-                let _ = doc
-                    .pages_mut()
-                    .create_page_at_end(pdfium_render::prelude::PdfPagePaperSize::a4())?;
-                engine.stamp_image_on_page(&mut doc, p_idx, &stamp, full_rect)?;
-            }
-            PdfEngine::save_doc(&doc, &scanned_chunk)?;
-            let chunks: Vec<std::path::PathBuf> = (0..30).map(|_| scanned_chunk.clone()).collect();
-            let (raw_combined, total_p) = engine.combine_multiple_pdfs(&chunks)?;
-            assert_eq!(total_p, 300);
-            let compact = PdfEngine::compress_pdf(&raw_combined).unwrap_or(raw_combined);
-            PdfEngine::write_atomic(&scanned_pdf, &compact)?;
+        // Build the 116 MB fixture in a child process; building it here would leave about
+        // 100 MB of freed-but-resident heap in this process and distort every scan figure.
+        let scan = dir.join("micropdf_ram_scan.pdf");
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--ignored", "--exact", "viewer::tests::ram_build_scan_fixture", "--test-threads=1"])
+            .status()?;
+        assert!(status.success() && scan.exists(), "fixture build failed");
+        let file_mb = std::fs::metadata(&scan)?.len() as f64 / 1048576.0;
+        let before_scan = rss();
+        let mut app = PdfViewerApp::new(&engine, Some(scan.clone()))?;
+        app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+        let idle = rss();
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        let mut scroll = 0.0f64;
+        for p in 0..50u16 {
+            app.current_page_index = p;
+            app.scroll_y = 120.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            scroll = scroll.max(rss());
         }
-        let scanned_file_mb =
-            (std::fs::metadata(&scanned_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        let _ = measure_scenarios("2. Scanned PDF (300p)", &scanned_pdf, scanned_file_mb)?;
-
-        // 3. 1,000+ page PDF: build a 1,050-page document via lopdf sharing a single Type1 Helvetica font resource
-        {
-            let mut ldoc = lopdf::Document::with_version("1.5");
-            let pages_id = ldoc.new_object_id();
-            let font_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => "Helvetica",
-            });
-            let resources_id = ldoc.add_object(lopdf::dictionary! {
-                "Font" => lopdf::dictionary! {
-                    "F1" => font_id,
-                },
-            });
-            let mut kids = Vec::with_capacity(1050);
-            for i in 1..=1050u32 {
-                let content_str = format!(
-                    "BT /F1 18 Tf 72 720 Td (Large Benchmark Document - Page {i} of 1050) Tj 0 -30 Td /F1 12 Tf (MicroPDF lightweight 1000+ page RAM benchmark test.) Tj ET"
-                );
-                let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content_str.into_bytes());
-                let _ = stream.compress();
-                let content_id = ldoc.add_object(stream);
-                let page_id = ldoc.add_object(lopdf::dictionary! {
-                    "Type" => "Page",
-                    "Parent" => pages_id,
-                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-                    "Resources" => resources_id,
-                    "Contents" => content_id,
-                });
-                kids.push(page_id.into());
-            }
-            ldoc.objects.insert(
-                pages_id,
-                lopdf::Object::Dictionary(lopdf::dictionary! {
-                    "Type" => "Pages",
-                    "Kids" => kids,
-                    "Count" => 1050,
-                }),
-            );
-            let catalog_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Catalog",
-                "Pages" => pages_id,
-            });
-            ldoc.trailer.set("Root", catalog_id);
-            let mut out = Vec::new();
-            ldoc.save_to(&mut out)?;
-            PdfEngine::write_atomic(&large_pdf, &out)?;
+        app.set_view_mode(ViewMode::FitPage);
+        app.set_zoom_around_cursor(4.0, 960.0, 540.0);
+        let mut zoom = 0.0f64;
+        for k in 0..12 {
+            app.pan_x = k as f32 * 400.0;
+            app.scroll_y = k as f32 * 350.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            zoom = zoom.max(rss());
         }
-        let large_file_mb =
-            (std::fs::metadata(&large_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        let _ = measure_scenarios("3. Large PDF (1,050p)", &large_pdf, large_file_mb)?;
-        eprintln!("==================================================\n");
+        app.reset_zoom();
+        app.set_view_mode(ViewMode::ThumbnailGrid);
+        let mut grid = 0.0f64;
+        let mut gs = 0.0f32;
+        while gs < 30_000.0 {
+            app.grid_scroll_y = gs;
+            app.update_visible_thumbnails(vw, vh, sw, th, sb);
+            grid = grid.max(rss());
+            gs += 600.0;
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&small);
+        let _ = std::fs::remove_file(&scan);
 
-        let _ = small_idle;
+        eprintln!("\n| Raw RSS, 1920x1080, headless | Value |");
+        eprintln!("|---|---|");
+        eprintln!("| Small text PDF: process before open | {before_small:.1} MB |");
+        eprintln!("| Small text PDF: idle after open | {small_idle:.1} MB |");
+        eprintln!("| Scan ({file_mb:.1} MB, 100 pages): process before open | {before_scan:.1} MB |");
+        eprintln!("| Scan: idle after open | {idle:.1} MB |");
+        eprintln!("| Scan: peak while scrolling 50 pages | {scroll:.1} MB |");
+        eprintln!("| Scan: peak at 400% zoom, panning | {zoom:.1} MB |");
+        eprintln!("| Scan: peak in thumbnail grid | {grid:.1} MB |");
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let cap = file_mb + 120.0;
+        assert!(small_idle <= 25.0, "small text idle {small_idle:.1} MB > 25 MB");
+        assert!(idle <= cap, "scan idle {idle:.1} > {cap:.1}");
+        assert!(scroll <= cap, "scan scroll {scroll:.1} > {cap:.1}");
+        assert!(zoom <= cap, "scan zoom {zoom:.1} > {cap:.1}");
+        assert!(grid <= cap, "scan grid {grid:.1} > {cap:.1}");
         Ok(())
     }
 }

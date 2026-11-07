@@ -124,7 +124,7 @@ BATCH COMBINE & DOCUMENT STRUCTURAL TOOLS
   R       : Rotate current (or hovered thumbnail) page 90° clockwise.
   D       : Delete current page.
   X       : Split / Extract Page Range (e.g. `1-3` or `2,4,6`) into a new PDF file.
-  Z       : Compress & Optimize PDF (`<filename>_compressed.pdf`).
+  Z       : Optimize PDF: downsample/recompress images, clean scans (`<filename>_optimized.pdf`).
   O       : Open PDF File in a new tab.
   S       : Save Modified PDF (sanitizes metadata and embeds `/PageLabels` &
             hierarchical `/Outlines` bookmarks).

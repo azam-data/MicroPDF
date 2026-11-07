@@ -1530,7 +1530,7 @@ pub(super) fn draw_help_overlay(buffer: &mut [u32], buf_w: u32, buf_h: u32, scal
         "SMART JUMP   : 'G' or 0-9 (Logical '5', Roman 'ii', or Physical '#5')",
         "MARGINS & #  : 'N' Roman/Arabic # | 'H' Header/Footer | 'C' Clear Zone",
         "PAGE TOOLS   : 'W' Watermark | 'K' Grayscale [BW] | 'I' Insert | 'R' Rot",
-        "FILE & UNDO  : 'O' Open | 'S' Save | 'Z' Compress | 'X' Split | Cmd+Z Undo",
+        "FILE & UNDO  : 'O' Open | 'S' Save | 'Z' Optimize | 'X' Split | Cmd+Z Undo",
         "? / F1 / ESC : Toggle or Close this Help Overlay",
     ];
 

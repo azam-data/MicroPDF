@@ -401,10 +401,23 @@ impl PdfEngine {
         0
     }
 
-    pub fn read_page_labels_roman_end_from_path(path: &Path) -> usize {
-        std::fs::read(path)
-            .map(|b| Self::read_page_labels_roman_end(&b))
-            .unwrap_or(0)
+    /// Number of leading pages labelled i, ii, iii, ... read through PDFium from the already
+    /// open document. v1.2.1: replaces `read_page_labels_roman_end_from_path`, which read and
+    /// fully parsed the whole file a second time with lopdf on every open and auto-reload.
+    /// Like the lopdf version, returns 0 when there is no roman front matter or when the whole
+    /// document is roman-numbered.
+    pub fn read_page_labels_roman_end_from_doc(doc: &PdfDocument) -> usize {
+        let total = doc.pages().len();
+        let mut count: u16 = 0;
+        while count < total {
+            let Ok(page) = doc.pages().get(count) else { break };
+            let expected = Self::to_roman(count + 1);
+            if page.label() != Some(expected.as_str()) {
+                break;
+            }
+            count += 1;
+        }
+        if count == total { 0 } else { count as usize }
     }
 
     /// Parses hierarchical bookmarks from a `--` delimited `.txt` string (`Serial -- Title -- LogicalPage`),
@@ -1658,160 +1671,6 @@ impl PdfEngine {
         Ok((best_bytes, orig_len, new_len))
     }
 
-    /// Converts a specific page (`page_index`, 0-based) to 8-bit grayscale (`[BW]`):
-    /// 1. Converts all text, path fill, stroke, and annotation RGB colors on `page_index` to
-    ///    8-bit grayscale luminance (`Y = (0.299*R + 0.587*G + 0.114*B) as u8`, `(Y, Y, Y)`).
-    /// 2. Converts embedded raster images on that page to 8-bit grayscale (`/DeviceGray` / 1-channel luma)
-    ///    and compresses their streams so color pages shrink in byte size while keeping vector text razor-sharp.
-    pub fn convert_page_to_bw(&self, doc_bytes: &[u8], page_index: u16) -> Result<Vec<u8>> {
-        let mut doc = self.load_pdf_from_bytes_safe(doc_bytes.to_vec())?;
-        let to_gray = |c: PdfColor| -> PdfColor {
-            let y = (0.299 * (c.red() as f32)
-                + 0.587 * (c.green() as f32)
-                + 0.114 * (c.blue() as f32))
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            PdfColor::new(y, y, y, c.alpha())
-        };
-
-        {
-            let mut page = doc
-                .pages_mut()
-                .get(page_index)
-                .context("Page index out of bounds for BW conversion")?;
-            let prev_strategy = page.content_regeneration_strategy();
-            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-
-            let obj_count = page.objects().len();
-            for i in 0..obj_count {
-                if let Ok(mut obj) = page.objects_mut().get(i) {
-                    if let Ok(fc) = obj.fill_color() {
-                        let _ = obj.set_fill_color(to_gray(fc));
-                    }
-                    if let Ok(sc) = obj.stroke_color() {
-                        let _ = obj.set_stroke_color(to_gray(sc));
-                    }
-                }
-            }
-
-            let annot_count = page.annotations().len();
-            for a_idx in 0..annot_count {
-                if let Ok(mut annot) = page.annotations_mut().get(a_idx) {
-                    if let Ok(fc) = annot.fill_color() {
-                        let _ = annot.set_fill_color(to_gray(fc));
-                    }
-                    if let Ok(sc) = annot.stroke_color() {
-                        let _ = annot.set_stroke_color(to_gray(sc));
-                    }
-                }
-            }
-
-            let _ = page.regenerate_content();
-            page.set_content_regeneration_strategy(prev_strategy);
-        }
-
-        let step1_bytes = doc
-            .save_to_bytes()
-            .context("Failed to serialize PDF after PDFium BW conversion")?;
-
-        // Pass through lopdf to convert any remaining /DeviceRGB image streams on that page to /DeviceGray and compress
-        if let Ok(mut ldoc) = lopdf::Document::load_mem(&step1_bytes) {
-            let page_num_1based = (page_index as u32) + 1;
-            if let Some(&page_obj_id) = ldoc.get_pages().get(&page_num_1based) {
-                // Collect XObject image ObjectIds referenced by this page
-                let mut image_ids = Vec::new();
-                if let Ok(page_dict) = ldoc.get_object(page_obj_id).and_then(|o| o.as_dict()) {
-                    let res_dict = page_dict
-                        .get(b"Resources")
-                        .ok()
-                        .and_then(|r| match r {
-                            lopdf::Object::Reference(id) => {
-                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
-                            }
-                            lopdf::Object::Dictionary(d) => Some(d),
-                            _ => None,
-                        });
-                    if let Some(res) = res_dict {
-                        let xobj_dict = res.get(b"XObject").ok().and_then(|x| match x {
-                            lopdf::Object::Reference(id) => {
-                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
-                            }
-                            lopdf::Object::Dictionary(d) => Some(d),
-                            _ => None,
-                        });
-                        if let Some(xobjs) = xobj_dict {
-                            for (_k, val) in xobjs.iter() {
-                                if let Ok(id) = val.as_reference() {
-                                    image_ids.push(id);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for img_id in image_ids {
-                    if let Ok(lopdf::Object::Stream(stream)) =
-                        ldoc.get_object_mut(img_id)
-                    {
-                        let is_image = stream
-                            .dict
-                            .get(b"Subtype")
-                            .ok()
-                            .and_then(|s| s.as_name_str().ok())
-                            .map(|n| n == "Image")
-                            .unwrap_or(false);
-                        let is_rgb = stream
-                            .dict
-                            .get(b"ColorSpace")
-                            .ok()
-                            .and_then(|s| s.as_name_str().ok())
-                            .map(|n| n == "DeviceRGB")
-                            .unwrap_or(false);
-                        let bpc = stream
-                            .dict
-                            .get(b"BitsPerComponent")
-                            .ok()
-                            .and_then(|b| b.as_i64().ok())
-                            .unwrap_or(8);
-                        if is_image && is_rgb && bpc == 8 {
-                            if let Ok(raw_pixels) = stream.decompressed_content() {
-                                if raw_pixels.len() >= 3 && raw_pixels.len() % 3 == 0 {
-                                    let mut gray_pixels = Vec::with_capacity(raw_pixels.len() / 3);
-                                    for rgb in raw_pixels.chunks_exact(3) {
-                                        let y = ((77 * (rgb[0] as u32)
-                                            + 150 * (rgb[1] as u32)
-                                            + 29 * (rgb[2] as u32))
-                                            >> 8)
-                                            as u8;
-                                        gray_pixels.push(y);
-                                    }
-                                    stream.set_plain_content(gray_pixels);
-                                    stream.dict.set(
-                                        "ColorSpace",
-                                        lopdf::Object::Name(b"DeviceGray".to_vec()),
-                                    );
-                                    let _ = stream.compress();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            ldoc.prune_objects();
-            ldoc.compress();
-            let mut out = Vec::with_capacity(step1_bytes.len());
-            if ldoc.save_to(&mut out).is_ok()
-                && !out.is_empty()
-                && self.load_pdf_from_bytes_safe(out.clone()).is_ok()
-            {
-                return Ok(out);
-            }
-        }
-
-        Ok(step1_bytes)
-    }
-
     /// Computes the union bounding box `(min_x, min_y, max_x, max_y)` in PDF points of all
     /// content objects (`page.objects().iter()`) on `page` for `FitTextWidth` mode (`3` key).
     /// Falls back to a 12% left/right margin trim if the page has no detectable content bounds.
@@ -2505,6 +2364,9 @@ mod tests {
         let raw_bytes = doc.save_to_bytes()?;
         let embedded_bytes = PdfEngine::embed_metadata_in_pdf_bytes(&raw_bytes, 4, &bms, false)?;
         assert_eq!(PdfEngine::read_page_labels_roman_end(&embedded_bytes), 4);
+        // v1.2.1: the PDFium-based reader used on open must agree with the lopdf reader.
+        let labelled = engine.load_pdf_from_bytes_safe(embedded_bytes.clone())?;
+        assert_eq!(PdfEngine::read_page_labels_roman_end_from_doc(&labelled), 4);
         let bw_bytes = engine.convert_page_to_bw(&embedded_bytes, 0)?;
         let bw_doc = engine.load_pdf_from_bytes_safe(bw_bytes)?;
         assert_eq!(bw_doc.pages().len(), 10);

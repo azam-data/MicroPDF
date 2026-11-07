@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1
+
+### New
+- **Optimize (`Z`) replaces Compress.** Downsamples and re-encodes images (Balanced: 200 dpi, JPEG 70), whitens the paper and sharpens text on scanned pages while keeping ink colour, and writes `<name>_optimized.pdf`. Nothing is written if the file would not get smaller. Images are edited in place, so page content, stacking order and images shared across pages are untouched. Gray and 1-bit black-and-white modes and Smaller/Print presets exist in the engine (`OptimizeOptions`) for the upcoming Optimize menu. `OptimizeJob::step()` processes one image at a time so the UI can avoid freezing.
+
+### Fixed
+- **B/W button did nothing to colour photos.** lopdf 0.34 refuses to decompress any image stream, so the image half of B/W never ran; JPEG and ICC-profiled images were also excluded. Images are now converted through PDFium.
+- **Auto-reload kept the old undo history**, so Ctrl+Z after a reload could silently restore the previous file content. The history is now cleared on reload.
+- **Opening a file parsed it twice.** Page labels were read by loading the whole file again with lopdf on every open and auto-reload; they now come from PDFium.
+
+### Tests
+- The Phase 4 RAM test used a 0.93 MB "300-page scan" and subtracted an overhead figure from its readings. It now only checks cache limits. A new `ram_realistic_measurement` (run on demand) measures raw memory on a real-size scan and fails on the known zoom and grid overruns.
+- New optimizer tests: whitening, signature colour, orientation, text stacking, 1-bit output, B/W on JPEG photos.
+
 ## 1.2.0
 
 ### New Features
