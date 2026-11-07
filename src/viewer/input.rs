@@ -46,6 +46,9 @@ impl<'a> PdfViewerApp<'a> {
                 ViewMode::TwoPageSpread => {
                     "View Mode: Two-Page Side-by-Side Spread (4)".to_string()
                 }
+                ViewMode::ContinuousScroll => {
+                    "View Mode: Continuous Vertical Scroll (5)".to_string()
+                }
                 ViewMode::ThumbnailGrid => "Thumbnail Grid View".to_string(),
             });
         }
@@ -66,9 +69,24 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Resolves which page (`current_page_index` vs `current_page_index + 1` in `TwoPageSpread`)
-    /// and its corresponding screen `draw_rect` contains `(sx, sy)`.
-    pub(super) fn resolve_target_page_and_draw_rect(&self, sx: f64, _sy: f64) -> (u16, (i32, i32, u32, u32)) {
+    /// Resolves which page (`current_page_index` vs `current_page_index + 1` in `TwoPageSpread`,
+    /// or the vertically hit page in `ContinuousScroll`) and its corresponding screen `draw_rect` contains `(sx, sy)`.
+    pub(super) fn resolve_target_page_and_draw_rect(&self, sx: f64, sy: f64) -> (u16, (i32, i32, u32, u32)) {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            let iy = sy.round() as i32;
+            for &(p_idx, rect) in &self.continuous_draw_rects {
+                let (_rx, ry, _rw, rh) = rect;
+                if iy >= ry && iy <= ry + (rh as i32) {
+                    return (p_idx, rect);
+                }
+            }
+            if let Some(&(p_idx, rect)) = self.continuous_draw_rects.iter().min_by_key(|&&(_, (_, ry, _, rh))| {
+                let center = ry + (rh as i32) / 2;
+                (iy - center).abs()
+            }) {
+                return (p_idx, rect);
+            }
+        }
         if self.view_mode == ViewMode::TwoPageSpread {
             if let (Some(second_cache), Some(second_rect)) =
                 (&self.cached_second_page, self.second_page_draw_rect)
@@ -202,9 +220,14 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Scrolls vertically in `FitWidth` / `FitTextWidth` when the page bitmap exceeds the viewport height,
+    /// Scrolls vertically in `ContinuousScroll`, `FitWidth`, or `FitTextWidth` when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            self.scroll_y += scroll_delta_px;
+            self.request_redraw();
+            return true;
+        }
         if matches!(self.view_mode, ViewMode::FitWidth | ViewMode::FitTextWidth) {
             if let Some(cache) = &self.cached_page {
                 let bmp_h = cache.bitmap_height;
@@ -1411,6 +1434,8 @@ impl<'a> PdfViewerApp<'a> {
                     self.set_view_mode(ViewMode::FitTextWidth);
                 } else if s == "4" {
                     self.set_view_mode(ViewMode::TwoPageSpread);
+                } else if s == "5" {
+                    self.set_view_mode(ViewMode::ContinuousScroll);
                 } else if s.eq_ignore_ascii_case("v") {
                     self.reading_filter = self.reading_filter.next();
                     self.status_notice = Some(format!(

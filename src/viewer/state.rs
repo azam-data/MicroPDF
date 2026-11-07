@@ -76,6 +76,7 @@ impl MenuCategory {
                 "Fit Page Width (2)",
                 "Fit Text Width (3)",
                 "Two-Page Side-by-Side (4)",
+                "Continuous Vertical Scroll (5)",
                 "Toggle Thumbnail Grid (Tab)",
                 "Toggle Bookmark Sidebar (B)",
                 "Cycle Dark / Sepia / Normal Reading Mode (V)",
@@ -155,13 +156,14 @@ impl ReadingFilter {
     }
 }
 
-/// Page & Grid View Modes (`1`, `2`, `3`, `4`, and `Tab`).
+/// Page & Grid View Modes (`1`, `2`, `3`, `4`, `5`, and `Tab`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     FitPage,
     FitWidth,
     FitTextWidth,
     TwoPageSpread,
+    ContinuousScroll,
     ThumbnailGrid,
 }
 
@@ -172,6 +174,7 @@ impl ViewMode {
             ViewMode::FitWidth => "FitWidth",
             ViewMode::FitTextWidth => "FitText",
             ViewMode::TwoPageSpread => "2-Page",
+            ViewMode::ContinuousScroll => "Cont",
             ViewMode::ThumbnailGrid => "Grid",
         }
     }
@@ -318,6 +321,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) cached_page: Option<CachedPageBitmap>,
     /// Second page bitmap used ONLY in `ViewMode::TwoPageSpread` (`4` key).
     pub(super) cached_second_page: Option<CachedPageBitmap>,
+    /// Visible pages + 1 above/below cache used ONLY in `ViewMode::ContinuousScroll` (`5` key).
+    pub(super) continuous_page_cache: HashMap<u16, CachedPageBitmap>,
+    /// Screen draw rectangles `(page_index, (draw_x, draw_y, bmp_w, bmp_h))` for visible pages in `ContinuousScroll`.
+    pub(super) continuous_draw_rects: Vec<(u16, (i32, i32, u32, u32))>,
     /// Signed screen draw rectangle `(draw_x, draw_y, bmp_w, bmp_h)` for the primary page.
     pub(super) page_draw_rect: (i32, i32, u32, u32),
     /// Signed screen draw rectangle `(draw_x, draw_y, bmp_w, bmp_h)` for the right page in `TwoPageSpread`.
@@ -393,6 +400,8 @@ impl<'a> PdfViewerApp<'a> {
             flatten_confirm_at: None,
             cached_page: None,
             cached_second_page: None,
+            continuous_page_cache: HashMap::new(),
+            continuous_draw_rects: Vec::new(),
             page_draw_rect: (0, 0, 0, 0),
             second_page_draw_rect: None,
             cursor_pos: (0.0, 0.0),
@@ -448,6 +457,13 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.cached_second_page = None;
         self.second_page_draw_rect = None;
+        for (_, old) in self.continuous_page_cache.drain() {
+            if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                self.spare_pixel_buf = old.pixels;
+            }
+        }
+        self.continuous_page_cache.shrink_to_fit();
+        self.continuous_draw_rects.clear();
     }
 
 

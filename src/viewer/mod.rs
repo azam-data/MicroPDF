@@ -308,4 +308,50 @@ mod tests {
         let _ = std::fs::remove_file(PdfEngine::bookmarks_sidecar_path(&signed_path));
         Ok(())
     }
+
+    #[test]
+    fn test_continuous_scroll_eviction_and_centre_tracking() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_cont_scroll.pdf");
+        engine.create_sample_pdf(&tmp, 20)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        assert_eq!(app.view_mode, ViewMode::ContinuousScroll);
+
+        // Render initial frame at 1024x1080
+        app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+        assert_eq!(app.current_page_index, 0);
+        let first_vis = app.continuous_draw_rects.first().unwrap().0;
+        let last_vis = app.continuous_draw_rects.last().unwrap().0;
+        assert!(app.continuous_page_cache.len() <= (last_vis - first_vis + 3) as usize);
+
+        // Scroll down through 10 pages smoothly and verify cache eviction and page counter tracking
+        for _ in 0..50 {
+            app.scroll_or_turn_page_vertical(220.0);
+            app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+            let fv = app.continuous_draw_rects.first().unwrap().0;
+            let lv = app.continuous_draw_rects.last().unwrap().0;
+            let keep_start = fv.saturating_sub(1);
+            let keep_end = (lv + 1).min(19);
+            for &cached_idx in app.continuous_page_cache.keys() {
+                assert!(
+                    cached_idx >= keep_start && cached_idx <= keep_end,
+                    "Page {cached_idx} outside allowed range {keep_start}..={keep_end}"
+                );
+            }
+        }
+        assert!(app.current_page_index >= 8);
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 1 Continuous Scroll RAM] before: {:.2} MB, after scrolling 10+ pages: {:.2} MB (cached pages: {})",
+            ram_before,
+            ram_after,
+            app.continuous_page_cache.len()
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

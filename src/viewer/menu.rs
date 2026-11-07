@@ -267,8 +267,9 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 1) => self.set_view_mode(ViewMode::FitWidth),
             (MenuCategory::View, 2) => self.set_view_mode(ViewMode::FitTextWidth),
             (MenuCategory::View, 3) => self.set_view_mode(ViewMode::TwoPageSpread),
-            (MenuCategory::View, 4) => self.toggle_view_mode(),
-            (MenuCategory::View, 5) => {
+            (MenuCategory::View, 4) => self.set_view_mode(ViewMode::ContinuousScroll),
+            (MenuCategory::View, 5) => self.toggle_view_mode(),
+            (MenuCategory::View, 6) => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
                 self.status_notice = Some(if self.show_bookmarks {
@@ -277,7 +278,7 @@ impl<'a> PdfViewerApp<'a> {
                     "Bookmarks Sidebar OFF".to_string()
                 });
             }
-            (MenuCategory::View, 6) => {
+            (MenuCategory::View, 7) => {
                 self.reading_filter = self.reading_filter.next();
                 self.status_notice = Some(format!(
                     "Reading Filter: {} (Zero-RAM CPU Blit Filter)",

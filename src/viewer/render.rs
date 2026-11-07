@@ -96,9 +96,10 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         let scale = match mode {
-            ViewMode::FitPage | ViewMode::TwoPageSpread | ViewMode::ThumbnailGrid => {
-                (avail_w / page_w_pts).min(avail_h / page_h_pts)
-            }
+            ViewMode::FitPage
+            | ViewMode::TwoPageSpread
+            | ViewMode::ContinuousScroll
+            | ViewMode::ThumbnailGrid => (avail_w / page_w_pts).min(avail_h / page_h_pts),
             ViewMode::FitWidth => avail_w / page_w_pts,
             ViewMode::FitTextWidth => {
                 let text_w = (content_max_x - content_min_x).max(page_w_pts * 0.25);
@@ -183,6 +184,162 @@ impl<'a> PdfViewerApp<'a> {
             .max(1);
         let total = self.total_pages();
         if total == 0 || self.doc.is_none() {
+            return Ok(());
+        }
+
+        if self.view_mode == ViewMode::ContinuousScroll {
+            if let Some(old) = self.cached_page.take() {
+                if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                    self.spare_pixel_buf = old.pixels;
+                }
+            }
+            self.cached_second_page = None;
+            self.second_page_draw_rect = None;
+
+            let avail_w = content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+            let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+            let gap = SPREAD_GAP_PX as f32;
+            let min_screen_y = top_bars_h as f32;
+            let max_screen_y = (viewport_h.saturating_sub(status_bar_h)) as f32;
+            let center_y = min_screen_y + (content_h as f32) * 0.5;
+
+            let ensure_page_cached = |app: &mut Self, p: u16| -> Result<(u32, u32)> {
+                let rot = app.page_rotation_degrees(p);
+                let need = app.continuous_page_cache.get(&p).map_or(true, |c| {
+                    c.view_mode != ViewMode::ContinuousScroll
+                        || c.viewport_width != content_w
+                        || c.viewport_height != content_h
+                        || c.rotation_deg != rot
+                });
+                if need {
+                    let reused = app
+                        .continuous_page_cache
+                        .remove(&p)
+                        .map(|c| c.pixels)
+                        .unwrap_or_else(|| std::mem::take(&mut app.spare_pixel_buf));
+                    let bmp = app.rasterize_page_for_mode(
+                        p,
+                        ViewMode::ContinuousScroll,
+                        content_w,
+                        content_h,
+                        avail_w,
+                        avail_h,
+                        reused,
+                    )?;
+                    let dims = (bmp.bitmap_width, bmp.bitmap_height);
+                    app.continuous_page_cache.insert(p, bmp);
+                    Ok(dims)
+                } else {
+                    let c = &app.continuous_page_cache[&p];
+                    Ok((c.bitmap_width, c.bitmap_height))
+                }
+            };
+
+            // Normalize `(current_page_index, scroll_y)` so `current_page_index` follows the page at the viewport centre.
+            for _ in 0..total {
+                let (_, cur_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                let cur_h = cur_h_u32 as f32;
+                let cur_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+                let cur_bottom = cur_top + cur_h;
+
+                if center_y > cur_bottom + gap * 0.5 && self.current_page_index + 1 < total {
+                    self.current_page_index += 1;
+                    self.scroll_y -= cur_h + gap;
+                } else if center_y < cur_top - gap * 0.5 && self.current_page_index > 0 {
+                    let prev_idx = self.current_page_index - 1;
+                    let (_, prev_h_u32) = ensure_page_cached(self, prev_idx)?;
+                    self.current_page_index = prev_idx;
+                    self.scroll_y += (prev_h_u32 as f32) + gap;
+                } else {
+                    break;
+                }
+            }
+
+            // Clamp scroll at document top/bottom boundaries.
+            if self.current_page_index == 0 && self.scroll_y < 0.0 {
+                self.scroll_y = 0.0;
+            }
+            if self.current_page_index + 1 == total {
+                let (_, last_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                let max_s = (last_h_u32 as f32 - avail_h).max(0.0);
+                if self.scroll_y > max_s {
+                    self.scroll_y = max_s;
+                }
+            }
+
+            // Collect visible pages above and below `current_page_index`.
+            self.continuous_draw_rects.clear();
+            let anchor_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+
+            // Walk upward from `current_page_index - 1` while visible.
+            let mut up_bottom = anchor_top - gap;
+            let mut p_up = self.current_page_index;
+            let mut upper_pages = Vec::new();
+            while p_up > 0 && up_bottom > min_screen_y {
+                p_up -= 1;
+                let (bw, bh) = ensure_page_cached(self, p_up)?;
+                let py = (up_bottom - bh as f32).round() as i32;
+                let px = (sidebar_w as i32) + ((content_w as i32 - bw as i32) / 2);
+                upper_pages.push((p_up, (px, py, bw, bh)));
+                up_bottom -= (bh as f32) + gap;
+            }
+            for item in upper_pages.into_iter().rev() {
+                self.continuous_draw_rects.push(item);
+            }
+
+            // Walk downward from `current_page_index` while visible.
+            let mut down_top = anchor_top;
+            let mut p_down = self.current_page_index;
+            while p_down < total && down_top < max_screen_y {
+                let (bw, bh) = ensure_page_cached(self, p_down)?;
+                let py = down_top.round() as i32;
+                let px = (sidebar_w as i32) + ((content_w as i32 - bw as i32) / 2);
+                let rect = (px, py, bw, bh);
+                if p_down == self.current_page_index {
+                    self.page_draw_rect = rect;
+                }
+                self.continuous_draw_rects.push((p_down, rect));
+                down_top += (bh as f32) + gap;
+                p_down += 1;
+            }
+
+            let first_vis = self
+                .continuous_draw_rects
+                .first()
+                .map(|&(idx, _)| idx)
+                .unwrap_or(self.current_page_index);
+            let last_vis = self
+                .continuous_draw_rects
+                .last()
+                .map(|&(idx, _)| idx)
+                .unwrap_or(self.current_page_index);
+
+            // RAM rule: Cache only the visible pages plus 1 above and below. Evict everything else immediately.
+            let keep_start = first_vis.saturating_sub(1);
+            let keep_end = (last_vis + 1).min(total - 1);
+
+            // Evict pages outside `[keep_start..=keep_end]` first so their buffer can be reused by neighbor prefetch.
+            let evicted_keys: Vec<u16> = self
+                .continuous_page_cache
+                .keys()
+                .copied()
+                .filter(|&k| k < keep_start || k > keep_end)
+                .collect();
+            for k in evicted_keys {
+                if let Some(old) = self.continuous_page_cache.remove(&k) {
+                    if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                        self.spare_pixel_buf = old.pixels;
+                    }
+                }
+            }
+
+            if keep_start < first_vis {
+                let _ = ensure_page_cached(self, keep_start);
+            }
+            if keep_end > last_vis {
+                let _ = ensure_page_cached(self, keep_end);
+            }
+
             return Ok(());
         }
 
@@ -573,35 +730,34 @@ impl<'a> PdfViewerApp<'a> {
                     scale,
                 );
             } else if self.view_mode.is_page_view() {
-                // 1. Blit primary page bitmap (with zero-RAM ReadingFilter applied inline)
-                if let Some(cache) = &self.cached_page {
-                    Self::blit_cached_page(
-                        &mut buffer,
-                        width,
-                        height,
-                        sidebar_w,
-                        top_bars_h,
-                        status_bar_h,
-                        self.page_draw_rect,
-                        &cache.pixels,
-                        self.reading_filter,
-                    );
-                    self.draw_search_overlays_on_page(
-                        &mut buffer,
-                        width,
-                        height,
-                        top_bars_h,
-                        status_bar_h,
-                        cache.page_index,
-                        self.page_draw_rect,
-                    );
-                }
-
-                // 1b. If in TwoPageSpread mode, blit right-hand page bitmap as well
-                if self.view_mode == ViewMode::TwoPageSpread {
-                    if let (Some(second_cache), Some(second_rect)) =
-                        (&self.cached_second_page, self.second_page_draw_rect)
-                    {
+                if self.view_mode == ViewMode::ContinuousScroll {
+                    for &(page_idx, draw_rect) in &self.continuous_draw_rects {
+                        if let Some(cache) = self.continuous_page_cache.get(&page_idx) {
+                            Self::blit_cached_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                sidebar_w,
+                                top_bars_h,
+                                status_bar_h,
+                                draw_rect,
+                                &cache.pixels,
+                                self.reading_filter,
+                            );
+                            self.draw_search_overlays_on_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                top_bars_h,
+                                status_bar_h,
+                                page_idx,
+                                draw_rect,
+                            );
+                        }
+                    }
+                } else {
+                    // 1. Blit primary page bitmap (with zero-RAM ReadingFilter applied inline)
+                    if let Some(cache) = &self.cached_page {
                         Self::blit_cached_page(
                             &mut buffer,
                             width,
@@ -609,8 +765,8 @@ impl<'a> PdfViewerApp<'a> {
                             sidebar_w,
                             top_bars_h,
                             status_bar_h,
-                            second_rect,
-                            &second_cache.pixels,
+                            self.page_draw_rect,
+                            &cache.pixels,
                             self.reading_filter,
                         );
                         self.draw_search_overlays_on_page(
@@ -619,9 +775,37 @@ impl<'a> PdfViewerApp<'a> {
                             height,
                             top_bars_h,
                             status_bar_h,
-                            second_cache.page_index,
-                            second_rect,
+                            cache.page_index,
+                            self.page_draw_rect,
                         );
+                    }
+
+                    // 1b. If in TwoPageSpread mode, blit right-hand page bitmap as well
+                    if self.view_mode == ViewMode::TwoPageSpread {
+                        if let (Some(second_cache), Some(second_rect)) =
+                            (&self.cached_second_page, self.second_page_draw_rect)
+                        {
+                            Self::blit_cached_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                sidebar_w,
+                                top_bars_h,
+                                status_bar_h,
+                                second_rect,
+                                &second_cache.pixels,
+                                self.reading_filter,
+                            );
+                            self.draw_search_overlays_on_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                top_bars_h,
+                                status_bar_h,
+                                second_cache.page_index,
+                                second_rect,
+                            );
+                        }
                     }
                 }
 
