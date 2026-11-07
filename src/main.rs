@@ -101,6 +101,28 @@ fn verify_external_pdfs_with_load_pdf_safe(engine: &PdfEngine) {
 }
 
 fn main() -> Result<()> {
+    // Single-instance check: if a PDF path is passed on the CLI and MicroPDF is already running,
+    // forward the path over the local socket and exit within 200 ms before loading PDFium.
+    let mut cli_pdf_for_ipc: Option<PathBuf> = None;
+    let mut is_self_test = false;
+    for arg in std::env::args_os().skip(1) {
+        if arg == "--self-test" {
+            is_self_test = true;
+        } else if cli_pdf_for_ipc.is_none() {
+            let candidate = PathBuf::from(&arg);
+            if candidate.exists() {
+                cli_pdf_for_ipc = Some(candidate);
+            }
+        }
+    }
+    if !is_self_test {
+        if let Some(ref pdf_path) = cli_pdf_for_ipc {
+            if viewer::try_forward_to_running_instance(pdf_path, None) {
+                return Ok(());
+            }
+        }
+    }
+
     let engine = PdfEngine::new()?;
     let (startup_pdf, run_self_test) = resolve_startup_pdf(&engine)?;
 

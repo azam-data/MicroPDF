@@ -2365,7 +2365,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_single_instance_listener();
+        if self.single_instance_listener.is_some() {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(120),
+            ));
+        }
+
         if let Some(dialog) = self.pending_dialog.take() {
             match dialog {
                 PendingDialog::Open => self.open_file_dialog(),
@@ -2387,6 +2394,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                self.stop_single_instance_listener();
                 self.save_session_to_ini();
                 self.invalidate_page_caches();
                 self.thumbnail_cache.clear();

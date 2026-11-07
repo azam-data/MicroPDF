@@ -468,6 +468,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) pending_restore_active_tab: usize,
     /// Optional custom path override for `micropdf.ini` (used by unit tests).
     pub(super) custom_session_ini_path: Option<PathBuf>,
+    /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
+    pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -556,6 +558,7 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_tabs: Vec::new(),
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
+            single_instance_listener: None,
             open_menu: None,
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
@@ -838,6 +841,98 @@ impl<'a> PdfViewerApp<'a> {
         ));
         self.update_title_bar();
         self.request_redraw();
+    }
+
+    pub fn default_single_instance_lock_path() -> PathBuf {
+        std::env::temp_dir().join("micropdf_instance.lock")
+    }
+
+    /// Starts the local loopback single-instance listener (`127.0.0.1:0`) and writes `port|token`
+    /// to the lock file so a second process can forward a PDF path and exit within 200 ms.
+    pub(super) fn start_single_instance_listener(
+        &mut self,
+        custom_lock_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let token = format!("{:x}_{}", nanos, std::process::id());
+        let lock_path =
+            custom_lock_path.unwrap_or_else(Self::default_single_instance_lock_path);
+        std::fs::write(&lock_path, format!("{port}|{token}\n").as_bytes())?;
+        self.single_instance_listener = Some((listener, token, lock_path));
+        Ok(())
+    }
+
+    pub(super) fn stop_single_instance_listener(&mut self) {
+        if let Some((listener, token, lock_path)) = self.single_instance_listener.take() {
+            if let Ok(addr) = listener.local_addr() {
+                let expected = format!("{}|{}", addr.port(), token);
+                if let Ok(existing) = std::fs::read_to_string(&lock_path) {
+                    if existing.trim() == expected {
+                        let _ = std::fs::remove_file(&lock_path);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Polls the non-blocking single-instance listener and opens any forwarded PDF paths as new tabs.
+    pub(super) fn poll_single_instance_listener(&mut self) -> usize {
+        use std::io::{BufRead, BufReader};
+
+        let mut received_paths: Vec<PathBuf> = Vec::new();
+        if let Some((ref listener, ref expected_token, _)) = self.single_instance_listener {
+            while let Ok((mut stream, _peer)) = listener.accept() {
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+                let mut line = String::new();
+                {
+                    let mut reader = BufReader::new(&mut stream);
+                    let _ = reader.read_line(&mut line);
+                }
+                let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
+                if let Some((tok, path_str)) = trimmed.split_once('|') {
+                    if tok == expected_token && !path_str.is_empty() {
+                        received_paths.push(PathBuf::from(path_str));
+                    }
+                }
+            }
+        }
+
+        let mut opened = 0usize;
+        for path in received_paths {
+            if !path.exists() {
+                continue;
+            }
+            let fname = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("document.pdf")
+                .to_string();
+            let res = if self.doc.is_none() {
+                self.load_document(path)
+            } else {
+                self.open_document_in_new_tab(path)
+            };
+            if res.is_ok() {
+                opened += 1;
+                self.status_notice = Some(format!(
+                    "Opened '{fname}' in Tab {} from external launch",
+                    self.active_tab + 1
+                ));
+                if let Some(w) = self.window.as_ref() {
+                    w.focus_window();
+                }
+                self.update_title_bar();
+                self.request_redraw();
+            }
+        }
+        opened
     }
 
     pub(super) fn invalidate_page_caches(&mut self) {

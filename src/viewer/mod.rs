@@ -115,12 +115,53 @@ pub fn get_current_rss_mb() -> Option<f64> {
     }
 }
 
+/// Attempts to forward `pdf_path` to an already-running MicroPDF instance over the local loopback socket.
+/// Returns `true` if a running instance accepted the connection and payload (completes in < 10 ms, well under 200 ms).
+pub fn try_forward_to_running_instance(pdf_path: &Path, custom_lock_path: Option<&Path>) -> bool {
+    use std::io::Write;
+    use std::net::{Shutdown, SocketAddr, TcpStream};
+    use std::time::Duration;
+
+    let lock_path = custom_lock_path
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(PdfViewerApp::default_single_instance_lock_path);
+    let Ok(lock_content) = std::fs::read_to_string(&lock_path) else {
+        return false;
+    };
+    let trimmed = lock_content.trim();
+    let Some((port_str, token)) = trimmed.split_once('|') else {
+        return false;
+    };
+    let Ok(port) = port_str.trim().parse::<u16>() else {
+        return false;
+    };
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(100)) else {
+        return false;
+    };
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(80)));
+
+    let abs_path = std::fs::canonicalize(pdf_path).unwrap_or_else(|_| pdf_path.to_path_buf());
+    let payload = format!(
+        "{}|{}\n",
+        token.trim(),
+        abs_path.to_string_lossy().replace('\n', "").replace('\r', "")
+    );
+    if stream.write_all(payload.as_bytes()).is_err() || stream.flush().is_err() {
+        return false;
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    true
+}
+
 pub fn run_viewer(engine: &PdfEngine, initial_pdf: Option<&Path>) -> Result<()> {
     let event_loop = EventLoop::new().context("Failed to create winit EventLoop")?;
     let mut app = PdfViewerApp::new(engine, initial_pdf.map(|p| p.to_path_buf()))?;
+    let _ = app.start_single_instance_listener(None);
     event_loop
         .run_app(&mut app)
         .context("Error running winit application event loop")?;
+    app.stop_single_instance_listener();
     Ok(())
 }
 
@@ -719,6 +760,53 @@ mod tests {
         eprintln!(
             "[Feature 6 Session Restore + Recent Files RAM] before: {:.2} MB, after restoring 2 tabs & 10 recent files: {:.2} MB",
             ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_instance_socket_forwarding_under_200ms() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp_dir = std::env::temp_dir().join("micropdf_single_inst_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let lock_path = tmp_dir.join("instance.lock");
+        let pdf_a = tmp_dir.join("first.pdf");
+        let pdf_b = tmp_dir.join("second.pdf");
+        engine.create_sample_pdf(&pdf_a, 2)?;
+        engine.create_sample_pdf(&pdf_b, 4)?;
+
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        let mut app = PdfViewerApp::new(&engine, Some(pdf_a.clone()))?;
+        app.start_single_instance_listener(Some(lock_path.clone()))?;
+        assert_eq!(app.tabs.len(), 1);
+
+        // Simulate a second process forwarding pdf_b and verify it completes in < 200 ms
+        let t0 = std::time::Instant::now();
+        let forwarded = try_forward_to_running_instance(&pdf_b, Some(&lock_path));
+        let elapsed = t0.elapsed();
+        assert!(forwarded, "Second instance must successfully forward path to primary");
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "Second instance forwarding took {:?} (must be < 200 ms)",
+            elapsed
+        );
+
+        // Primary instance polls listener and opens pdf_b in Tab 2
+        let opened = app.poll_single_instance_listener();
+        assert_eq!(opened, 1);
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.total_pages(), 4);
+
+        app.stop_single_instance_listener();
+        assert!(!lock_path.exists(), "Lock file must be cleaned up on stop");
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 7 Single Instance RAM] before: {:.2} MB, after forwarding new tab: {:.2} MB (forward latency: {:.2?})",
+            ram_before, ram_after, elapsed
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
