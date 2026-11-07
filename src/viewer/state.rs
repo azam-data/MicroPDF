@@ -119,6 +119,7 @@ impl MenuCategory {
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
                 "Flatten & Unlock PDF (U)",
+                "Optimize...",
             ],
             MenuCategory::Help => &["Toggle Shortcuts Overlay (? / F1)"],
         }
@@ -398,6 +399,22 @@ pub(super) enum InputMode {
     RestoreSessionPrompt {
         tab_count: usize,
     },
+    OptimizePrompt {
+        preset: crate::optimize::OptimizePreset,
+        mode: crate::optimize::ColorMode,
+        clean_scans: bool,
+        previewing: bool,
+    },
+}
+
+pub(super) struct ActiveOptimizeJob {
+    pub(super) job: crate::optimize::OptimizeJob,
+    pub(super) out_path: PathBuf,
+    pub(super) out_name: String,
+    pub(super) disk_size: usize,
+    pub(super) roman_end: usize,
+    pub(super) bookmarks: Vec<Bookmark>,
+    pub(super) redacted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -508,6 +525,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) current_search_match: usize,
     /// Time-sliced (~8 ms/frame) incremental search state on the main thread (`Esc` cancels).
     pub(super) incremental_search: Option<IncrementalSearchState>,
+    /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
+    pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
     pub(super) thumbnail_cache: HashMap<u16, ThumbnailEntry>,
     /// Vertical scroll offset in physical pixels for Thumbnail Grid View.
@@ -603,6 +622,7 @@ impl<'a> PdfViewerApp<'a> {
             search_matches: Vec::new(),
             current_search_match: 0,
             incremental_search: None,
+            optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
             hovered_thumb: None,

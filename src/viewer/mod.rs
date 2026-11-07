@@ -1095,6 +1095,121 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn test_phase1_optimize_menu_step_and_cancel() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_phase1_opt_menu");
+        let _ = std::fs::create_dir_all(&dir);
+        let src_path = dir.join("scan_doc.pdf");
+        let opt_path = dir.join("scan_doc_optimized.pdf");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&opt_path);
+
+        let scan_bytes = build_scan_pdf(3)?;
+        PdfEngine::write_atomic(&src_path, &scan_bytes)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
+        app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
+
+        // 1. Open Tools -> Optimize... (item 7 in Tools menu)
+        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        assert_eq!(
+            app.input_mode,
+            state::InputMode::OptimizePrompt {
+                preset: crate::optimize::OptimizePreset::Balanced,
+                mode: crate::optimize::ColorMode::Color,
+                clean_scans: true,
+                previewing: false,
+            }
+        );
+        let prompt0 = app.format_active_prompt_text().unwrap();
+        assert!(prompt0.contains("Balanced(200dpi)"));
+        assert!(prompt0.contains("Color"));
+        assert!(prompt0.contains("Clean:ON"));
+
+        // 2. Toggle preset ('1' -> Smaller), colour mode ('b' -> B/W), clean scans ('s' -> OFF)
+        app.handle_key_input(winit::keyboard::Key::Character("1".into()), Some("1"));
+        app.handle_key_input(winit::keyboard::Key::Character("b".into()), Some("b"));
+        app.handle_key_input(winit::keyboard::Key::Character("s".into()), Some("s"));
+        let prompt_bw = app.format_active_prompt_text().unwrap();
+        assert!(prompt_bw.contains("Smaller(150dpi)"));
+        assert!(
+            prompt_bw.contains("signatures will look jagged"),
+            "B/W mode must show 'signatures will look jagged' warning, got: {prompt_bw}"
+        );
+        assert!(prompt_bw.contains("Clean:OFF"));
+
+        // 3. Toggle Preview current page ('p' -> ON, then 'p' -> OFF)
+        app.handle_key_input(winit::keyboard::Key::Character("p".into()), Some("p"));
+        assert!(app.format_active_prompt_text().unwrap().contains("[P]Preview:ON"));
+        assert!(app.cached_page.is_some());
+        app.handle_key_input(winit::keyboard::Key::Character("p".into()), Some("p"));
+        assert!(!app.format_active_prompt_text().unwrap().contains("[P]Preview:ON"));
+
+        // 4. Switch back to Balanced + Color + Clean:ON, press Enter -> starts OptimizeJob
+        app.handle_key_input(winit::keyboard::Key::Character("2".into()), Some("2"));
+        app.handle_key_input(winit::keyboard::Key::Character("c".into()), Some("c"));
+        app.handle_key_input(winit::keyboard::Key::Character("s".into()), Some("s"));
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert!(app.optimize_job.is_some(), "Enter must start an active OptimizeJob");
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Optimizing image 0 / 3")
+        );
+
+        // Step once (1 of 3 images) and verify progress string "Optimizing image 1 / 3"
+        assert!(app.step_optimize_job(), "Should still have 2 images remaining");
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Optimizing image 1 / 3"),
+            "got status: {:?}",
+            app.status_notice
+        );
+
+        // Press Esc to cancel -> job is dropped and nothing is written
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            None,
+        );
+        assert!(app.optimize_job.is_none(), "Esc must drop the active OptimizeJob");
+        assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
+
+        // 5. Re-open Tools -> Optimize... and run all steps to completion
+        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        let mut steps = 0usize;
+        while app.optimize_job.is_some() {
+            app.step_optimize_job();
+            steps += 1;
+        }
+        assert_eq!(steps, 3, "Must execute exactly 1 step per image");
+        assert!(opt_path.exists(), "Finished OptimizeJob must write <name>_optimized.pdf");
+        assert_eq!(
+            std::fs::read(&src_path)?,
+            scan_bytes,
+            "Original PDF on disk must never be modified"
+        );
+        let done_msg = app.status_notice.as_deref().unwrap_or("");
+        assert!(
+            done_msg.contains("Optimized") && done_msg.contains("->") && done_msg.contains("scan_doc_optimized.pdf"),
+            "Completion notice must show before/after sizes and output filename, got: {done_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// `n`-page text PDF built with lopdf.
     fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
         use lopdf::dictionary;

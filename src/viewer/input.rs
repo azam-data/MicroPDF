@@ -1555,6 +1555,22 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    /// Opens the interactive Optimize menu in the bottom command bar (`Tools -> Optimize...`).
+    pub(super) fn open_optimize_prompt(&mut self) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.input_mode = InputMode::OptimizePrompt {
+            preset: crate::optimize::OptimizePreset::Balanced,
+            mode: crate::optimize::ColorMode::Color,
+            clean_scans: true,
+            previewing: false,
+        };
+        self.status_notice = None;
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
     /// `Z`: optimize images (Balanced preset: 200 dpi, JPEG 70, scan cleanup) and write
     /// `<name>_optimized.pdf` next to the original. The open document and the original file
     /// are never modified. Nothing is written when optimizing would not make the file smaller.
@@ -1563,6 +1579,16 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn optimize_current_pdf(&mut self, opts: crate::optimize::OptimizeOptions) {
+        self.start_optimize_job(opts);
+        if self.window.is_none() {
+            while self.optimize_job.is_some() {
+                self.step_optimize_job();
+            }
+        }
+    }
+
+    /// Starts an incremental `OptimizeJob` to be stepped one image per event-loop iteration.
+    pub(super) fn start_optimize_job(&mut self, opts: crate::optimize::OptimizeOptions) {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
@@ -1591,7 +1617,93 @@ impl<'a> PdfViewerApp<'a> {
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
-        let report = match self.engine.optimize_doc(doc, &opts) {
+        let raw_bytes = match doc.save_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let job = match crate::optimize::OptimizeJob::new(raw_bytes, opts) {
+            Ok(j) => j,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let total = job.total();
+        let is_done = job.is_done();
+        self.optimize_job = Some(ActiveOptimizeJob {
+            job,
+            out_path,
+            out_name,
+            disk_size,
+            roman_end: self.roman_end,
+            bookmarks: self.bookmarks.clone(),
+            redacted: self.redacted,
+        });
+
+        if is_done {
+            self.finish_active_optimize_job();
+        } else {
+            self.status_notice = Some(format!(
+                "Optimizing image 0 / {} (Esc to cancel)",
+                total
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Runs a single `OptimizeJob::step()` per event-loop iteration. Returns `true` if more steps remain.
+    pub(super) fn step_optimize_job(&mut self) -> bool {
+        let Some(active) = self.optimize_job.as_mut() else {
+            return false;
+        };
+        if !active.job.is_done() {
+            active.job.step();
+        }
+        let processed = active.job.processed();
+        let total = active.job.total();
+        let done = active.job.is_done();
+        if !done {
+            self.status_notice = Some(format!(
+                "Optimizing image {} / {} (Esc to cancel)",
+                processed, total
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            true
+        } else {
+            self.finish_active_optimize_job();
+            false
+        }
+    }
+
+    /// Cancels an active `OptimizeJob` (`Esc` key), dropping the job and writing nothing.
+    pub(super) fn cancel_optimize_job(&mut self) {
+        if let Some(active) = self.optimize_job.take() {
+            self.status_notice = Some(format!(
+                "Optimize cancelled at image {} / {} (nothing written)",
+                active.job.processed(),
+                active.job.total()
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    pub(super) fn finish_active_optimize_job(&mut self) {
+        let Some(active) = self.optimize_job.take() else {
+            return;
+        };
+        let report = match active.job.finish() {
             Ok(r) => r,
             Err(e) => {
                 self.status_notice = Some(format!("Optimize error: {e:#}"));
@@ -1600,7 +1712,7 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
         };
-        let orig_len = disk_size.max(report.original_len);
+        let orig_len = active.disk_size.max(report.original_len);
         if report.kept_original {
             self.status_notice = Some(format!(
                 "Optimize: no size gain ({} image(s) checked); nothing written",
@@ -1613,12 +1725,12 @@ impl<'a> PdfViewerApp<'a> {
 
         let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
             &report.bytes,
-            self.roman_end,
-            &self.bookmarks,
-            self.redacted,
+            active.roman_end,
+            &active.bookmarks,
+            active.redacted,
         ) {
             Ok(b) => (b, None),
-            Err(e) if self.redacted => {
+            Err(e) if active.redacted => {
                 self.status_notice = Some(format!(
                     "Optimize refused: post-redaction cleanup failed ({e}). Nothing was written."
                 ));
@@ -1626,10 +1738,13 @@ impl<'a> PdfViewerApp<'a> {
                 self.request_redraw();
                 return;
             }
-            Err(e) => (report.bytes, Some(format!(" (WARNING: metadata not sanitized: {e})"))),
+            Err(e) => (
+                report.bytes,
+                Some(format!(" (WARNING: metadata not sanitized: {e})")),
+            ),
         };
         let new_len = final_bytes.len();
-        match PdfEngine::write_atomic(&out_path, &final_bytes) {
+        match PdfEngine::write_atomic(&active.out_path, &final_bytes) {
             Ok(()) => {
                 let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
                 let new_mb = (new_len as f64) / (1024.0 * 1024.0);
@@ -1645,16 +1760,114 @@ impl<'a> PdfViewerApp<'a> {
                     saved_pct,
                     report.images_rewritten,
                     report.images_skipped,
-                    out_name,
+                    active.out_name,
                     warning.unwrap_or_default()
                 ));
             }
             Err(e) => {
-                self.status_notice = Some(format!("Failed to write '{}': {e}", out_name));
+                self.status_notice = Some(format!("Failed to write '{}': {e}", active.out_name));
             }
         }
         self.update_title_bar();
         self.request_redraw();
+    }
+
+    /// Renders a transient 1-page preview of the current page with the selected `OptimizeOptions`
+    /// directly into `self.cached_page` and drops all temporary buffers immediately (zero permanent RAM).
+    pub(super) fn render_optimize_preview_current_page(
+        &mut self,
+        preset: crate::optimize::OptimizePreset,
+        mode: crate::optimize::ColorMode,
+        clean_scans: bool,
+    ) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let total = doc.pages().len();
+        if total == 0 {
+            return;
+        }
+        let page_idx = self.current_page_index.min(total - 1);
+
+        let mut opts = crate::optimize::OptimizeOptions::preset(preset);
+        opts.mode = mode;
+        opts.clean_scans = clean_scans;
+
+        let preview_bytes_res: anyhow::Result<Vec<u8>> = (|| {
+            let mut temp_doc = self.engine.pdfium.create_new_pdf()?;
+            temp_doc
+                .pages_mut()
+                .copy_page_from_document(doc, page_idx, 0)?;
+            let raw_bytes = temp_doc.save_to_bytes()?;
+            drop(temp_doc);
+
+            let mut job = crate::optimize::OptimizeJob::new(raw_bytes.clone(), opts)?;
+            while !job.is_done() {
+                job.step();
+            }
+            let report = job.finish()?;
+            if report.kept_original || report.bytes.is_empty() {
+                Ok(raw_bytes)
+            } else {
+                Ok(report.bytes)
+            }
+        })();
+
+        let preview_bytes = match preview_bytes_res {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_notice = Some(format!("Preview error: {e}"));
+                return;
+            }
+        };
+
+        let Ok(opt_doc) = self.engine.load_pdf_from_bytes_safe(preview_bytes) else {
+            return;
+        };
+
+        let (win_w, win_h, sidebar_w, top_bars_h, status_bar_h) =
+            if let Some(w) = self.window.as_ref() {
+                let sz = w.inner_size();
+                let sf = w.scale_factor();
+                (
+                    sz.width.max(1),
+                    sz.height.max(1),
+                    self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
+                    self.top_bars_height_px(sf).min(sz.height.saturating_sub(32)),
+                    self.status_bar_height_px(sf),
+                )
+            } else {
+                (
+                    1024,
+                    1080,
+                    0,
+                    MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL,
+                    STATUS_BAR_HEIGHT_LOGICAL,
+                )
+            };
+
+        if !matches!(
+            self.view_mode,
+            ViewMode::FitPage | ViewMode::FitWidth | ViewMode::FitTextWidth
+        ) {
+            self.view_mode = ViewMode::FitPage;
+        }
+        let orig_doc = self.doc.replace(opt_doc);
+        let orig_page = self.current_page_index;
+        self.current_page_index = 0;
+        self.invalidate_page_caches();
+        let _ = self.ensure_current_page_rendered(
+            win_w,
+            win_h,
+            sidebar_w,
+            top_bars_h,
+            status_bar_h,
+        );
+        if let Some(c) = self.cached_page.as_mut() {
+            c.page_index = orig_page;
+        }
+        self.current_page_index = orig_page;
+        self.doc = orig_doc;
     }
 
     pub(super) fn parse_page_range_input(&self, input: &str) -> Option<(u16, u16)> {
@@ -2007,6 +2220,21 @@ impl<'a> PdfViewerApp<'a> {
                 self.restore_pending_session();
                 return;
             }
+            InputMode::OptimizePrompt {
+                preset,
+                mode,
+                clean_scans,
+                previewing,
+            } => {
+                if previewing {
+                    self.invalidate_page_caches();
+                }
+                let mut opts = crate::optimize::OptimizeOptions::preset(preset);
+                opts.mode = mode;
+                opts.clean_scans = clean_scans;
+                self.start_optimize_job(opts);
+                return;
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -2017,12 +2245,19 @@ impl<'a> PdfViewerApp<'a> {
         if self.input_mode != InputMode::Normal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    if let InputMode::PasswordPrompt {
-                        mut password_input, ..
-                    } = std::mem::replace(&mut self.input_mode, InputMode::Normal)
-                    {
-                        password_input.clear();
-                        password_input.shrink_to_fit();
+                    match std::mem::replace(&mut self.input_mode, InputMode::Normal) {
+                        InputMode::PasswordPrompt {
+                            mut password_input, ..
+                        } => {
+                            password_input.clear();
+                            password_input.shrink_to_fit();
+                        }
+                        InputMode::OptimizePrompt {
+                            previewing: true, ..
+                        } => {
+                            self.invalidate_page_caches();
+                        }
+                        _ => {}
                     }
                     self.pending_restore_tabs.clear();
                     self.status_notice = Some("Cancelled".to_string());
@@ -2059,6 +2294,7 @@ impl<'a> PdfViewerApp<'a> {
                         }
                         InputMode::ConfirmExternalUrl { .. }
                         | InputMode::RestoreSessionPrompt { .. }
+                        | InputMode::OptimizePrompt { .. }
                         | InputMode::Normal => {}
                     }
                     self.update_title_bar();
@@ -2087,6 +2323,11 @@ impl<'a> PdfViewerApp<'a> {
 
                     if !typed.is_empty() {
                         let mut auto_submit_clear = false;
+                        let mut opt_preview_action: Option<Option<(
+                            crate::optimize::OptimizePreset,
+                            crate::optimize::ColorMode,
+                            bool,
+                        )>> = None;
                         match &mut self.input_mode {
                             InputMode::SearchText { query_input } => {
                                 query_input.push_str(&typed);
@@ -2161,7 +2402,71 @@ impl<'a> PdfViewerApp<'a> {
                                     self.pending_restore_tabs.clear();
                                 }
                             }
+                            InputMode::OptimizePrompt {
+                                preset,
+                                mode,
+                                clean_scans,
+                                previewing,
+                            } => {
+                                let mut changed_opts = false;
+                                let mut toggled_preview = false;
+                                for ch in typed.chars() {
+                                    match ch {
+                                        '1' => {
+                                            *preset = crate::optimize::OptimizePreset::Smaller;
+                                            changed_opts = true;
+                                        }
+                                        '2' => {
+                                            *preset = crate::optimize::OptimizePreset::Balanced;
+                                            changed_opts = true;
+                                        }
+                                        '3' => {
+                                            *preset = crate::optimize::OptimizePreset::Print;
+                                            changed_opts = true;
+                                        }
+                                        'c' | 'C' => {
+                                            *mode = crate::optimize::ColorMode::Color;
+                                            changed_opts = true;
+                                        }
+                                        'g' | 'G' => {
+                                            *mode = crate::optimize::ColorMode::Gray;
+                                            changed_opts = true;
+                                        }
+                                        'b' | 'B' => {
+                                            *mode = crate::optimize::ColorMode::BlackWhite;
+                                            changed_opts = true;
+                                        }
+                                        's' | 'S' | ' ' => {
+                                            *clean_scans = !*clean_scans;
+                                            changed_opts = true;
+                                        }
+                                        'p' | 'P' => {
+                                            *previewing = !*previewing;
+                                            toggled_preview = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if toggled_preview || (changed_opts && *previewing) {
+                                    if *previewing {
+                                        opt_preview_action =
+                                            Some(Some((*preset, *mode, *clean_scans)));
+                                    } else {
+                                        opt_preview_action = Some(None);
+                                    }
+                                }
+                            }
                             InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
+                        }
+                        if let Some(action) = opt_preview_action {
+                            match action {
+                                Some((p, m, cs)) => {
+                                    self.render_optimize_preview_current_page(p, m, cs);
+                                }
+                                None => {
+                                    self.invalidate_page_caches();
+                                }
+                            }
                         }
                         if auto_submit_clear {
                             self.handle_prompt_submission();
@@ -2269,6 +2574,8 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.incremental_search.is_some() {
                     self.cancel_incremental_search();
+                } else if self.optimize_job.is_some() {
+                    self.cancel_optimize_job();
                 } else if self.is_presentation || self.is_fullscreen {
                     self.exit_presentation_or_fullscreen();
                 } else if !self.selected_text_rects.is_empty() {
@@ -2525,13 +2832,20 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_single_instance_listener();
         self.poll_auto_reload_if_due();
+        if self.optimize_job.is_some() {
+            let still_running = self.step_optimize_job();
+            if still_running {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            }
+        }
         if self.incremental_search.is_some() {
             let still_searching = self.step_incremental_search(Duration::from_millis(8));
             if still_searching {
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
-        } else if self.single_instance_listener.is_some()
-            || (self.window_focused && self.doc.is_some())
+        } else if self.optimize_job.is_none()
+            && (self.single_instance_listener.is_some()
+                || (self.window_focused && self.doc.is_some()))
         {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(120),

@@ -424,6 +424,7 @@ impl<'a> PdfViewerApp<'a> {
                 };
             }
             (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
+            (MenuCategory::Tools, 7) => self.open_optimize_prompt(),
 
             // Help menu
             (MenuCategory::Help, 0) => {
