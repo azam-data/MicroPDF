@@ -63,10 +63,187 @@ impl<'a> PdfViewerApp<'a> {
         Ok(pixels)
     }
 
+    /// Returns true if `(virtual_w, virtual_h)` exceeds 2x the viewport size `(content_w, content_h)`.
+    /// Above 2x the screen size, MicroPDF never allocates a full-page bitmap and renders only
+    /// visible 512x512 tiles on demand into the 48 MB LRU `tile_cache`.
+    pub(super) fn is_tiled_for_viewport(
+        virtual_w: u32,
+        virtual_h: u32,
+        content_w: u32,
+        content_h: u32,
+    ) -> bool {
+        virtual_w > content_w.max(1).saturating_mul(2)
+            || virtual_h > content_h.max(1).saturating_mul(2)
+    }
+
+    /// Renders a single 512x512 tile `key` into `self.tile_cache`, evicting the least-recently-used
+    /// tile (and reusing its pixel buffer) if `tile_cache` reaches `MAX_TILE_CACHE_ENTRIES` (48 MB).
+    pub(super) fn ensure_tile_rendered(&mut self, key: TileKey) -> Result<()> {
+        self.tile_lru_tick = self.tile_lru_tick.wrapping_add(1);
+        let tick = self.tile_lru_tick;
+        if let Some(entry) = self.tile_cache.get_mut(&key) {
+            entry.last_used = tick;
+            return Ok(());
+        }
+
+        let mut reused_pixels = if self.tile_cache.len() >= MAX_TILE_CACHE_ENTRIES {
+            let lru_key = self
+                .tile_cache
+                .iter()
+                .min_by_key(|(_, v)| v.last_used)
+                .map(|(&k, _)| k);
+            if let Some(evict_k) = lru_key {
+                self.tile_cache
+                    .remove(&evict_k)
+                    .map(|e| e.pixels)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            std::mem::take(&mut self.spare_pixel_buf)
+        };
+
+        let doc = self
+            .doc
+            .as_ref()
+            .context("No active PDF document to render tile")?;
+        let page = doc
+            .pages()
+            .get(key.page_index)
+            .context("Page index out of bounds for tile")?;
+
+        let page_w_pts = page.width().value.max(1.0);
+        let page_h_pts = page.height().value.max(1.0);
+        let sx = (key.virtual_w as f32) / page_w_pts;
+        let sy = (key.virtual_h as f32) / page_h_pts;
+
+        let tile_x = (key.tile_col as u32) * TILE_SIZE_PX;
+        let tile_y = (key.tile_row as u32) * TILE_SIZE_PX;
+        let tile_w = (key.virtual_w.saturating_sub(tile_x)).min(TILE_SIZE_PX).max(1) as i32;
+        let tile_h = (key.virtual_h.saturating_sub(tile_y)).min(TILE_SIZE_PX).max(1) as i32;
+
+        let pixel_count = (tile_w as usize) * (tile_h as usize);
+        reused_pixels.clear();
+        reused_pixels.resize(pixel_count, 0x00FFFFFF);
+
+        let bindings = self.engine.pdfium.bindings();
+        let config = PdfRenderConfig::new()
+            .set_fixed_width(tile_w)
+            .set_fixed_height(tile_h)
+            .render_form_data(false)
+            .render_annotations(true)
+            .use_lcd_text_rendering(true)
+            .set_reverse_byte_order(false)
+            .reset_matrix(PdfMatrix::new(
+                sx,
+                0.0,
+                0.0,
+                sy,
+                -(tile_x as f32),
+                -(tile_y as f32),
+            ))
+            .context("Invalid tile transformation matrix")?;
+
+        {
+            let byte_slice: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    reused_pixels.as_mut_ptr() as *mut u8,
+                    pixel_count * 4,
+                )
+            };
+            let mut bitmap = unsafe {
+                PdfBitmap::from_bytes(
+                    tile_w,
+                    tile_h,
+                    PdfBitmapFormat::BGRx,
+                    byte_slice,
+                    bindings,
+                )
+            }
+            .context("Failed to wrap tile buffer in PdfBitmap")?;
+
+            page.render_into_bitmap_with_config(&mut bitmap, &config)
+                .context("Failed to render PDF tile into bitmap")?;
+        }
+
+        for px in &mut reused_pixels {
+            #[cfg(target_endian = "little")]
+            {
+                *px &= 0x00FFFFFF;
+            }
+            #[cfg(target_endian = "big")]
+            {
+                let [b, g, r, _] = px.to_be_bytes();
+                *px = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            }
+        }
+
+        self.tile_cache.insert(
+            key,
+            TileEntry {
+                width: tile_w as u32,
+                height: tile_h as u32,
+                last_used: tick,
+                pixels: reused_pixels,
+            },
+        );
+        Ok(())
+    }
+
+    /// Renders all visible 512x512 tiles for `page_idx` at `draw_rect` within the viewport.
+    pub(super) fn ensure_visible_tiles_for_page(
+        &mut self,
+        page_idx: u16,
+        draw_rect: (i32, i32, u32, u32),
+        rotation_deg: i32,
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+    ) -> Result<()> {
+        let (draw_x, draw_y, virtual_w, virtual_h) = draw_rect;
+        let min_screen_x = sidebar_w as i32;
+        let max_screen_x = buf_w as i32;
+        let min_screen_y = top_bars_h as i32;
+        let max_screen_y = (buf_h.saturating_sub(status_bar_h)) as i32;
+
+        let vis_x0 = (min_screen_x - draw_x).max(0) as u32;
+        let vis_x1 = ((max_screen_x - draw_x).max(0) as u32).min(virtual_w);
+        let vis_y0 = (min_screen_y - draw_y).max(0) as u32;
+        let vis_y1 = ((max_screen_y - draw_y).max(0) as u32).min(virtual_h);
+
+        if vis_x0 >= vis_x1 || vis_y0 >= vis_y1 {
+            return Ok(());
+        }
+
+        let col_start = (vis_x0 / TILE_SIZE_PX) as u16;
+        let col_end = ((vis_x1 + TILE_SIZE_PX - 1) / TILE_SIZE_PX) as u16;
+        let row_start = (vis_y0 / TILE_SIZE_PX) as u16;
+        let row_end = ((vis_y1 + TILE_SIZE_PX - 1) / TILE_SIZE_PX) as u16;
+
+        for tile_row in row_start..row_end {
+            for tile_col in col_start..col_end {
+                let key = TileKey {
+                    page_index: page_idx,
+                    virtual_w,
+                    virtual_h,
+                    rotation_deg,
+                    tile_col,
+                    tile_row,
+                };
+                self.ensure_tile_rendered(key)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Rasterizes a single `page_idx` for the specified `mode` and available `(avail_w, avail_h)`,
-    /// reusing `reused_pixels` when provided.
+    /// reusing `reused_pixels` when provided. Above 2x the screen size, returns an empty `pixels`
+    /// Vec and delegates rendering to `ensure_visible_tiles_for_page` (512x512 LRU tile cache).
     pub(super) fn rasterize_page_for_mode(
-        &self,
+        &mut self,
         page_idx: u16,
         mode: ViewMode,
         content_w: u32,
@@ -95,7 +272,7 @@ impl<'a> PdfViewerApp<'a> {
             (0.0, page_w_pts)
         };
 
-        let scale = match mode {
+        let base_scale = match mode {
             ViewMode::FitPage
             | ViewMode::TwoPageSpread
             | ViewMode::ContinuousScroll
@@ -107,25 +284,34 @@ impl<'a> PdfViewerApp<'a> {
             }
         };
 
-        // Cap maximum rasterized dimension to 3600px to keep RAM strictly bounded
-        let max_dim = 3600.0_f32;
-        let clamped_scale = scale
-            .min(max_dim / page_w_pts)
-            .min(max_dim / page_h_pts)
-            .max(0.05);
+        let zoom = self.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        let scale = (base_scale * zoom).max(0.05);
 
-        let target_w = ((page_w_pts * clamped_scale).round() as i32).max(1);
-        let target_h = ((page_h_pts * clamped_scale).round() as i32).max(1);
+        let target_w = ((page_w_pts * scale).round() as i32).max(1);
+        let target_h = ((page_h_pts * scale).round() as i32).max(1);
+        let virtual_w = target_w as u32;
+        let virtual_h = target_h as u32;
 
-        let pixels = self.render_page_into_u32_vec(&page, target_w, target_h, true, reused_pixels)?;
+        // RAM rule: Above 2x the screen size, never render the whole page bitmap; use 512x512 tiles.
+        let pixels = if Self::is_tiled_for_viewport(virtual_w, virtual_h, content_w, content_h) {
+            if reused_pixels.capacity() > self.spare_pixel_buf.capacity()
+                && reused_pixels.capacity() <= (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4
+            {
+                self.spare_pixel_buf = reused_pixels;
+            }
+            Vec::new()
+        } else {
+            self.render_page_into_u32_vec(&page, target_w, target_h, true, reused_pixels)?
+        };
 
         Ok(CachedPageBitmap {
             page_index: page_idx,
             view_mode: mode,
+            zoom_bits: zoom.to_bits(),
             viewport_width: content_w,
             viewport_height: content_h,
-            bitmap_width: target_w as u32,
-            bitmap_height: target_h as u32,
+            bitmap_width: virtual_w,
+            bitmap_height: virtual_h,
             content_min_x,
             content_max_x,
             rotation_deg,
@@ -134,7 +320,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Computes `(draw_x, draw_y, bmp_w, bmp_h)` for a single-page view (`FitPage`, `FitWidth`, `FitTextWidth`)
-    /// and clamps `self.scroll_y` to valid vertical bounds.
+    /// and clamps `self.pan_x` and `self.scroll_y` to valid bounds.
     pub(super) fn compute_single_page_draw_rect(
         &mut self,
         sidebar_w: u32,
@@ -147,12 +333,18 @@ impl<'a> PdfViewerApp<'a> {
         content_max_x: f32,
         page_w_pts: f32,
     ) -> (i32, i32, u32, u32) {
-        let draw_x = if self.view_mode == ViewMode::FitTextWidth && page_w_pts > 1.0 {
+        let draw_x = if bmp_w > content_w {
+            let max_pan = (bmp_w - content_w) as f32;
+            self.pan_x = self.pan_x.clamp(0.0, max_pan);
+            (sidebar_w as i32) - (self.pan_x.round() as i32)
+        } else if self.view_mode == ViewMode::FitTextWidth && page_w_pts > 1.0 {
+            self.pan_x = 0.0;
             let scale = (bmp_w as f32) / page_w_pts;
             let text_center_bx = ((content_min_x + content_max_x) * 0.5 * scale).round() as i32;
             let viewport_center_x = (sidebar_w as i32) + (content_w as i32) / 2;
             viewport_center_x - text_center_bx
         } else {
+            self.pan_x = 0.0;
             (sidebar_w as i32) + ((content_w as i32 - bmp_w as i32) / 2)
         };
 
@@ -187,6 +379,8 @@ impl<'a> PdfViewerApp<'a> {
             return Ok(());
         }
 
+        let zoom_bits = self.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL).to_bits();
+
         if self.view_mode == ViewMode::ContinuousScroll {
             if let Some(old) = self.cached_page.take() {
                 if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
@@ -207,6 +401,7 @@ impl<'a> PdfViewerApp<'a> {
                 let rot = app.page_rotation_degrees(p);
                 let need = app.continuous_page_cache.get(&p).map_or(true, |c| {
                     c.view_mode != ViewMode::ContinuousScroll
+                        || c.zoom_bits != zoom_bits
                         || c.viewport_width != content_w
                         || c.viewport_height != content_h
                         || c.rotation_deg != rot
@@ -271,6 +466,16 @@ impl<'a> PdfViewerApp<'a> {
             self.continuous_draw_rects.clear();
             let anchor_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
 
+            let compute_px = |app: &mut Self, bw: u32| -> i32 {
+                if bw > content_w {
+                    let max_pan = (bw - content_w) as f32;
+                    app.pan_x = app.pan_x.clamp(0.0, max_pan);
+                    (sidebar_w as i32) - (app.pan_x.round() as i32)
+                } else {
+                    (sidebar_w as i32) + ((content_w as i32 - bw as i32) / 2)
+                }
+            };
+
             // Walk upward from `current_page_index - 1` while visible.
             let mut up_bottom = anchor_top - gap;
             let mut p_up = self.current_page_index;
@@ -279,7 +484,7 @@ impl<'a> PdfViewerApp<'a> {
                 p_up -= 1;
                 let (bw, bh) = ensure_page_cached(self, p_up)?;
                 let py = (up_bottom - bh as f32).round() as i32;
-                let px = (sidebar_w as i32) + ((content_w as i32 - bw as i32) / 2);
+                let px = compute_px(self, bw);
                 upper_pages.push((p_up, (px, py, bw, bh)));
                 up_bottom -= (bh as f32) + gap;
             }
@@ -293,7 +498,7 @@ impl<'a> PdfViewerApp<'a> {
             while p_down < total && down_top < max_screen_y {
                 let (bw, bh) = ensure_page_cached(self, p_down)?;
                 let py = down_top.round() as i32;
-                let px = (sidebar_w as i32) + ((content_w as i32 - bw as i32) / 2);
+                let px = compute_px(self, bw);
                 let rect = (px, py, bw, bh);
                 if p_down == self.current_page_index {
                     self.page_draw_rect = rect;
@@ -340,11 +545,32 @@ impl<'a> PdfViewerApp<'a> {
                 let _ = ensure_page_cached(self, keep_end);
             }
 
+            // If any visible page is above 2x viewport size, render its visible 512x512 tiles into `tile_cache`.
+            let vis_rects = self.continuous_draw_rects.clone();
+            for (p_idx, rect) in vis_rects {
+                let is_tiled = self
+                    .continuous_page_cache
+                    .get(&p_idx)
+                    .map_or(false, |c| c.pixels.is_empty());
+                if is_tiled {
+                    let rot = self.page_rotation_degrees(p_idx);
+                    self.ensure_visible_tiles_for_page(
+                        p_idx,
+                        rect,
+                        rot,
+                        viewport_w,
+                        viewport_h,
+                        sidebar_w,
+                        top_bars_h,
+                        status_bar_h,
+                    )?;
+                }
+            }
+
             return Ok(());
         }
 
         if self.view_mode == ViewMode::TwoPageSpread {
-            self.scroll_y = 0.0;
             let avail_w = (content_w
                 .saturating_sub(PAGE_MARGIN_PX * 2 + SPREAD_GAP_PX)
                 / 2)
@@ -356,6 +582,7 @@ impl<'a> PdfViewerApp<'a> {
             let need_left = self.cached_page.as_ref().map_or(true, |c| {
                 c.page_index != left_idx
                     || c.view_mode != ViewMode::TwoPageSpread
+                    || c.zoom_bits != zoom_bits
                     || c.viewport_width != content_w
                     || c.viewport_height != content_h
                     || c.rotation_deg != left_rot
@@ -387,6 +614,7 @@ impl<'a> PdfViewerApp<'a> {
                 let need_right = self.cached_second_page.as_ref().map_or(true, |c| {
                     c.page_index != right_idx
                         || c.view_mode != ViewMode::TwoPageSpread
+                        || c.zoom_bits != zoom_bits
                         || c.viewport_width != content_w
                         || c.viewport_height != content_h
                         || c.rotation_deg != right_rot
@@ -416,21 +644,69 @@ impl<'a> PdfViewerApp<'a> {
                 let lw = left_bmp.bitmap_width;
                 let lh = left_bmp.bitmap_height;
                 let lx = if self.cached_second_page.is_some() {
-                    center_x - (SPREAD_GAP_PX as i32 / 2) - (lw as i32)
+                    center_x - (SPREAD_GAP_PX as i32 / 2) - (lw as i32) - (self.pan_x.round() as i32)
                 } else {
-                    center_x - (lw as i32 / 2)
+                    center_x - (lw as i32 / 2) - (self.pan_x.round() as i32)
                 };
-                let ly = (top_bars_h as i32) + ((content_h as i32 - lh as i32) / 2);
+                let ly = if lh > content_h {
+                    let max_s = (lh - content_h) as f32;
+                    self.scroll_y = self.scroll_y.clamp(0.0, max_s);
+                    (top_bars_h as i32) - (self.scroll_y.round() as i32)
+                } else {
+                    self.scroll_y = 0.0;
+                    (top_bars_h as i32) + ((content_h as i32 - lh as i32) / 2)
+                };
                 self.page_draw_rect = (lx, ly, lw, lh);
             }
             if let Some(right_bmp) = &self.cached_second_page {
                 let rw = right_bmp.bitmap_width;
                 let rh = right_bmp.bitmap_height;
-                let rx = center_x + (SPREAD_GAP_PX as i32 / 2);
-                let ry = (top_bars_h as i32) + ((content_h as i32 - rh as i32) / 2);
+                let rx = center_x + (SPREAD_GAP_PX as i32 / 2) - (self.pan_x.round() as i32);
+                let ry = if rh > content_h {
+                    (top_bars_h as i32) - (self.scroll_y.round() as i32)
+                } else {
+                    (top_bars_h as i32) + ((content_h as i32 - rh as i32) / 2)
+                };
                 self.second_page_draw_rect = Some((rx, ry, rw, rh));
             } else {
                 self.second_page_draw_rect = None;
+            }
+
+            if self
+                .cached_page
+                .as_ref()
+                .map_or(false, |c| c.pixels.is_empty())
+            {
+                self.ensure_visible_tiles_for_page(
+                    left_idx,
+                    self.page_draw_rect,
+                    left_rot,
+                    viewport_w,
+                    viewport_h,
+                    sidebar_w,
+                    top_bars_h,
+                    status_bar_h,
+                )?;
+            }
+            if let (Some(right_idx), Some(right_rect)) = (right_idx_opt, self.second_page_draw_rect)
+            {
+                if self
+                    .cached_second_page
+                    .as_ref()
+                    .map_or(false, |c| c.pixels.is_empty())
+                {
+                    let right_rot = self.page_rotation_degrees(right_idx);
+                    self.ensure_visible_tiles_for_page(
+                        right_idx,
+                        right_rect,
+                        right_rot,
+                        viewport_w,
+                        viewport_h,
+                        sidebar_w,
+                        top_bars_h,
+                        status_bar_h,
+                    )?;
+                }
             }
 
             return Ok(());
@@ -451,6 +727,7 @@ impl<'a> PdfViewerApp<'a> {
         let need_render = self.cached_page.as_ref().map_or(true, |cache| {
             cache.page_index != self.current_page_index
                 || cache.view_mode != self.view_mode
+                || cache.zoom_bits != zoom_bits
                 || cache.viewport_width != content_w
                 || cache.viewport_height != content_h
                 || cache.rotation_deg != rotation_deg
@@ -486,6 +763,7 @@ impl<'a> PdfViewerApp<'a> {
             let bmp_h = cache.bitmap_height;
             let c_min_x = cache.content_min_x;
             let c_max_x = cache.content_max_x;
+            let is_tiled = cache.pixels.is_empty();
             self.page_draw_rect = self.compute_single_page_draw_rect(
                 sidebar_w,
                 top_bars_h,
@@ -497,9 +775,98 @@ impl<'a> PdfViewerApp<'a> {
                 c_max_x,
                 page_w_pts,
             );
+            if is_tiled {
+                self.ensure_visible_tiles_for_page(
+                    self.current_page_index,
+                    self.page_draw_rect,
+                    rotation_deg,
+                    viewport_w,
+                    viewport_h,
+                    sidebar_w,
+                    top_bars_h,
+                    status_bar_h,
+                )?;
+            }
         }
 
         Ok(())
+    }
+
+    /// Blits either a full `CachedPageBitmap` or its visible 512x512 tiles from `self.tile_cache`
+    /// when `cache.pixels` is empty (zoomed above 2x screen size).
+    pub(super) fn blit_page_or_tiles(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        draw_rect: (i32, i32, u32, u32),
+        cache: &CachedPageBitmap,
+    ) {
+        if !cache.pixels.is_empty() {
+            Self::blit_cached_page(
+                buffer,
+                buf_w,
+                buf_h,
+                sidebar_w,
+                top_bars_h,
+                status_bar_h,
+                draw_rect,
+                &cache.pixels,
+                self.reading_filter,
+            );
+            return;
+        }
+
+        let (draw_x, draw_y, virtual_w, virtual_h) = draw_rect;
+        let min_screen_x = sidebar_w as i32;
+        let max_screen_x = buf_w as i32;
+        let min_screen_y = top_bars_h as i32;
+        let max_screen_y = (buf_h.saturating_sub(status_bar_h)) as i32;
+
+        let vis_x0 = (min_screen_x - draw_x).max(0) as u32;
+        let vis_x1 = ((max_screen_x - draw_x).max(0) as u32).min(virtual_w);
+        let vis_y0 = (min_screen_y - draw_y).max(0) as u32;
+        let vis_y1 = ((max_screen_y - draw_y).max(0) as u32).min(virtual_h);
+
+        if vis_x0 >= vis_x1 || vis_y0 >= vis_y1 {
+            return;
+        }
+
+        let col_start = (vis_x0 / TILE_SIZE_PX) as u16;
+        let col_end = ((vis_x1 + TILE_SIZE_PX - 1) / TILE_SIZE_PX) as u16;
+        let row_start = (vis_y0 / TILE_SIZE_PX) as u16;
+        let row_end = ((vis_y1 + TILE_SIZE_PX - 1) / TILE_SIZE_PX) as u16;
+
+        for tile_row in row_start..row_end {
+            for tile_col in col_start..col_end {
+                let key = TileKey {
+                    page_index: cache.page_index,
+                    virtual_w,
+                    virtual_h,
+                    rotation_deg: cache.rotation_deg,
+                    tile_col,
+                    tile_row,
+                };
+                if let Some(entry) = self.tile_cache.get(&key) {
+                    let tile_draw_x = draw_x + (tile_col as i32) * (TILE_SIZE_PX as i32);
+                    let tile_draw_y = draw_y + (tile_row as i32) * (TILE_SIZE_PX as i32);
+                    Self::blit_cached_page(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        sidebar_w,
+                        top_bars_h,
+                        status_bar_h,
+                        (tile_draw_x, tile_draw_y, entry.width, entry.height),
+                        &entry.pixels,
+                        self.reading_filter,
+                    );
+                }
+            }
+        }
     }
 
     /// Blits a `CachedPageBitmap` into `buffer` clipped to the content area
@@ -733,7 +1100,7 @@ impl<'a> PdfViewerApp<'a> {
                 if self.view_mode == ViewMode::ContinuousScroll {
                     for &(page_idx, draw_rect) in &self.continuous_draw_rects {
                         if let Some(cache) = self.continuous_page_cache.get(&page_idx) {
-                            Self::blit_cached_page(
+                            self.blit_page_or_tiles(
                                 &mut buffer,
                                 width,
                                 height,
@@ -741,8 +1108,7 @@ impl<'a> PdfViewerApp<'a> {
                                 top_bars_h,
                                 status_bar_h,
                                 draw_rect,
-                                &cache.pixels,
-                                self.reading_filter,
+                                cache,
                             );
                             self.draw_search_overlays_on_page(
                                 &mut buffer,
@@ -756,9 +1122,9 @@ impl<'a> PdfViewerApp<'a> {
                         }
                     }
                 } else {
-                    // 1. Blit primary page bitmap (with zero-RAM ReadingFilter applied inline)
+                    // 1. Blit primary page bitmap or tiles (with zero-RAM ReadingFilter applied inline)
                     if let Some(cache) = &self.cached_page {
-                        Self::blit_cached_page(
+                        self.blit_page_or_tiles(
                             &mut buffer,
                             width,
                             height,
@@ -766,8 +1132,7 @@ impl<'a> PdfViewerApp<'a> {
                             top_bars_h,
                             status_bar_h,
                             self.page_draw_rect,
-                            &cache.pixels,
-                            self.reading_filter,
+                            cache,
                         );
                         self.draw_search_overlays_on_page(
                             &mut buffer,
@@ -780,12 +1145,12 @@ impl<'a> PdfViewerApp<'a> {
                         );
                     }
 
-                    // 1b. If in TwoPageSpread mode, blit right-hand page bitmap as well
+                    // 1b. If in TwoPageSpread mode, blit right-hand page bitmap or tiles as well
                     if self.view_mode == ViewMode::TwoPageSpread {
                         if let (Some(second_cache), Some(second_rect)) =
                             (&self.cached_second_page, self.second_page_draw_rect)
                         {
-                            Self::blit_cached_page(
+                            self.blit_page_or_tiles(
                                 &mut buffer,
                                 width,
                                 height,
@@ -793,8 +1158,7 @@ impl<'a> PdfViewerApp<'a> {
                                 top_bars_h,
                                 status_bar_h,
                                 second_rect,
-                                &second_cache.pixels,
-                                self.reading_filter,
+                                second_cache,
                             );
                             self.draw_search_overlays_on_page(
                                 &mut buffer,

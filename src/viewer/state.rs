@@ -22,6 +22,12 @@ pub(super) const SPREAD_GAP_PX: u32 = 12;
 pub(super) const THUMB_W: u32 = 140;
 pub(super) const THUMB_H: u32 = 198;
 pub(super) const MAX_THUMB_CACHE_ENTRIES: usize = 300;
+pub(super) const TILE_SIZE_PX: u32 = 512;
+pub(super) const MAX_TILE_CACHE_BYTES: usize = 48 * 1024 * 1024;
+pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
+    MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
+pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
+pub(super) const MAX_ZOOM_LEVEL: f32 = 8.0;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.
@@ -77,6 +83,9 @@ impl MenuCategory {
                 "Fit Text Width (3)",
                 "Two-Page Side-by-Side (4)",
                 "Continuous Vertical Scroll (5)",
+                "Zoom In (+ / Ctrl+Wheel Up)",
+                "Zoom Out (- / Ctrl+Wheel Down)",
+                "Reset Zoom 100% (0)",
                 "Toggle Thumbnail Grid (Tab)",
                 "Toggle Bookmark Sidebar (B)",
                 "Cycle Dark / Sepia / Normal Reading Mode (V)",
@@ -188,6 +197,7 @@ impl ViewMode {
 pub(super) struct CachedPageBitmap {
     pub(super) page_index: u16,
     pub(super) view_mode: ViewMode,
+    pub(super) zoom_bits: u32,
     pub(super) viewport_width: u32,
     pub(super) viewport_height: u32,
     pub(super) bitmap_width: u32,
@@ -207,6 +217,25 @@ pub(super) struct ThumbnailEntry {
     pub(super) pixels: Vec<u32>,
 }
 
+/// Key identifying a single 512x512 rendered page tile when zoomed above 2x screen size.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct TileKey {
+    pub(super) page_index: u16,
+    pub(super) virtual_w: u32,
+    pub(super) virtual_h: u32,
+    pub(super) rotation_deg: i32,
+    pub(super) tile_col: u16,
+    pub(super) tile_row: u16,
+}
+
+/// Cached 512x512 tile bitmap with LRU access tick (`tile_cache` max 48 MB).
+pub(super) struct TileEntry {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) last_used: u64,
+    pub(super) pixels: Vec<u32>,
+}
+
 /// Zero-RAM inactive document tab slot (never stores cached bitmaps or thumbnails).
 pub(super) struct DocumentTab<'a> {
     pub(super) doc: Option<PdfDocument<'a>>,
@@ -214,6 +243,8 @@ pub(super) struct DocumentTab<'a> {
     pub(super) current_page_index: u16,
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
+    pub(super) zoom_level: f32,
+    pub(super) pan_x: f32,
     pub(super) scroll_y: f32,
     pub(super) roman_end: usize,
     pub(super) bookmarks: Vec<Bookmark>,
@@ -333,11 +364,18 @@ pub struct PdfViewerApp<'a> {
     pub(super) cursor_pos: (f64, f64),
     /// Active left-click drag state in Page View: `Some((start_x, start_y))`.
     pub(super) drag_start: Option<(f64, f64)>,
-    /// Active View Mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`, `ThumbnailGrid`).
+    /// Active View Mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`, `ContinuousScroll`, `ThumbnailGrid`).
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
-    /// Vertical scroll offset in physical pixels when zoomed in `FitWidth` or `FitTextWidth`.
+    /// Zoom factor (`0.25..=8.0`, i.e. 25%–800%, default `1.0`).
+    pub(super) zoom_level: f32,
+    /// Horizontal pan offset in physical pixels when the zoomed page width exceeds the viewport width.
+    pub(super) pan_x: f32,
+    /// Vertical scroll offset in physical pixels when zoomed or in `FitWidth` / `FitTextWidth` / `ContinuousScroll`.
     pub(super) scroll_y: f32,
+    /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 48 MB).
+    pub(super) tile_cache: HashMap<TileKey, TileEntry>,
+    pub(super) tile_lru_tick: u64,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -408,7 +446,11 @@ impl<'a> PdfViewerApp<'a> {
             drag_start: None,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            zoom_level: 1.0,
+            pan_x: 0.0,
             scroll_y: 0.0,
+            tile_cache: HashMap::new(),
+            tile_lru_tick: 0,
             open_menu: None,
             mouse_mode: MouseMode::Highlight,
             pending_stamp_image: None,
@@ -464,6 +506,12 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.continuous_page_cache.shrink_to_fit();
         self.continuous_draw_rects.clear();
+        for (_, old_tile) in self.tile_cache.drain() {
+            if old_tile.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                self.spare_pixel_buf = old_tile.pixels;
+            }
+        }
+        self.tile_cache.shrink_to_fit();
     }
 
 

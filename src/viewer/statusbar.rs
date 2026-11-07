@@ -138,8 +138,9 @@ impl<'a> PdfViewerApp<'a> {
             .as_deref()
             .unwrap_or("Ready — Click Top Menu or press 1-4 View, Ctrl+F Search, P Stamp, V Filter, U Flatten");
 
+        let zoom_pct = (self.zoom_level * 100.0).round() as u32;
         let status_line = format!(
-            "Page {cur}/{total} | Mode: {} | Mouse: {} | RAM: {ram_mb:.1}MB | {notice}",
+            "Page {cur}/{total} | Mode: {} ({zoom_pct}%) | Mouse: {} | RAM: {ram_mb:.1}MB | {notice}",
             self.view_mode.short_label(),
             self.mouse_mode.short_label()
         );

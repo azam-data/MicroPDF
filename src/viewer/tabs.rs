@@ -14,6 +14,8 @@ impl<'a> PdfViewerApp<'a> {
             slot.current_page_index = self.current_page_index;
             slot.view_mode = self.view_mode;
             slot.last_page_view_mode = self.last_page_view_mode;
+            slot.zoom_level = self.zoom_level;
+            slot.pan_x = self.pan_x;
             slot.scroll_y = self.scroll_y;
             slot.roman_end = self.roman_end;
             slot.bookmarks = self.bookmarks.clone();
@@ -36,6 +38,8 @@ impl<'a> PdfViewerApp<'a> {
             self.current_page_index = slot.current_page_index;
             self.view_mode = slot.view_mode;
             self.last_page_view_mode = slot.last_page_view_mode;
+            self.zoom_level = slot.zoom_level;
+            self.pan_x = slot.pan_x;
             self.scroll_y = slot.scroll_y;
             self.roman_end = slot.roman_end;
             self.bookmarks = slot.bookmarks.clone();
@@ -66,6 +70,8 @@ impl<'a> PdfViewerApp<'a> {
 
         self.file_path = path.clone();
         self.current_page_index = 0;
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.roman_end = roman_end;
         self.bw_pages.clear();
@@ -95,6 +101,8 @@ impl<'a> PdfViewerApp<'a> {
                 current_page_index: 0,
                 view_mode: self.view_mode,
                 last_page_view_mode: self.last_page_view_mode,
+                zoom_level: 1.0,
+                pan_x: 0.0,
                 scroll_y: 0.0,
                 roman_end,
                 bookmarks: self.bookmarks.clone(),
@@ -109,6 +117,8 @@ impl<'a> PdfViewerApp<'a> {
         } else if self.active_tab < self.tabs.len() {
             self.tabs[self.active_tab].file_path = path;
             self.tabs[self.active_tab].current_page_index = 0;
+            self.tabs[self.active_tab].zoom_level = 1.0;
+            self.tabs[self.active_tab].pan_x = 0.0;
             self.tabs[self.active_tab].scroll_y = 0.0;
             self.tabs[self.active_tab].roman_end = roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
@@ -152,6 +162,8 @@ impl<'a> PdfViewerApp<'a> {
             current_page_index: 0,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            zoom_level: 1.0,
+            pan_x: 0.0,
             scroll_y: 0.0,
             roman_end,
             bookmarks: loaded_bookmarks.clone(),
@@ -169,6 +181,8 @@ impl<'a> PdfViewerApp<'a> {
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;
         self.last_page_view_mode = ViewMode::FitPage;
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
@@ -206,6 +220,8 @@ impl<'a> PdfViewerApp<'a> {
             current_page_index: 0,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            zoom_level: 1.0,
+            pan_x: 0.0,
             scroll_y: 0.0,
             roman_end: 0,
             bookmarks: Vec::new(),
@@ -223,6 +239,8 @@ impl<'a> PdfViewerApp<'a> {
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;
         self.last_page_view_mode = ViewMode::FitPage;
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.roman_end = 0;
         self.bookmarks.clear();

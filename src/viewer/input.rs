@@ -220,7 +220,148 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Scrolls vertically in `ContinuousScroll`, `FitWidth`, or `FitTextWidth` when the page bitmap exceeds the viewport height,
+    /// Sets `self.zoom_level` (clamped to `25%..=800%`) while adjusting `self.pan_x` and `self.scroll_y`
+    /// so the document point under `(anchor_x, anchor_y)` stays fixed on screen.
+    pub(super) fn set_zoom_around_cursor(&mut self, new_zoom: f32, anchor_x: f64, anchor_y: f64) {
+        let clamped = new_zoom.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        let old_zoom = self.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        if (clamped - old_zoom).abs() < 0.001 {
+            return;
+        }
+        let ratio = clamped / old_zoom;
+
+        let (sidebar_w, top_bars_h, content_w, content_h) = if let Some(w) = self.window.as_ref() {
+            let sz = w.inner_size();
+            let sf = w.scale_factor();
+            let sw = self.sidebar_width_px(sf).min(sz.width.saturating_sub(64));
+            let th = self.top_bars_height_px(sf).min(sz.height.saturating_sub(32));
+            let sb = self
+                .status_bar_height_px(sf)
+                .min(sz.height.saturating_sub(th + 16));
+            (
+                sw,
+                th,
+                sz.width.saturating_sub(sw).max(1),
+                sz.height.saturating_sub(th + sb).max(1),
+            )
+        } else {
+            (0, 52, 1024, 1006)
+        };
+
+        let (_, (draw_x, draw_y, old_w, old_h)) =
+            self.resolve_target_page_and_draw_rect(anchor_x, anchor_y);
+
+        if old_w > 0 && old_h > 0 {
+            let in_page_x = anchor_x >= draw_x as f64 && anchor_x <= (draw_x + old_w as i32) as f64;
+            let in_page_y = anchor_y >= draw_y as f64 && anchor_y <= (draw_y + old_h as i32) as f64;
+
+            let (ax, u) = if in_page_x {
+                (
+                    anchor_x as f32,
+                    ((anchor_x as f32 - draw_x as f32) / (old_w as f32)).clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    (sidebar_w as f32) + (content_w as f32) * 0.5,
+                    0.5,
+                )
+            };
+            let (ay, v) = if in_page_y {
+                (
+                    anchor_y as f32,
+                    ((anchor_y as f32 - draw_y as f32) / (old_h as f32)).clamp(0.0, 1.0),
+                )
+            } else {
+                (
+                    (top_bars_h as f32) + (content_h as f32) * 0.5,
+                    0.5,
+                )
+            };
+
+            let new_w = (old_w as f32) * ratio;
+            let new_h = (old_h as f32) * ratio;
+            let new_draw_x = ax - u * new_w;
+            let new_draw_y = ay - v * new_h;
+
+            if new_w > content_w as f32 {
+                self.pan_x =
+                    ((sidebar_w as f32) - new_draw_x).clamp(0.0, (new_w - content_w as f32).max(0.0));
+            } else {
+                self.pan_x = 0.0;
+            }
+
+            if self.view_mode == ViewMode::ContinuousScroll {
+                self.scroll_y = ((top_bars_h + PAGE_MARGIN_PX) as f32) - new_draw_y;
+            } else if new_h > content_h as f32 {
+                self.scroll_y = ((top_bars_h as f32) - new_draw_y)
+                    .clamp(0.0, (new_h - content_h as f32).max(0.0));
+            } else {
+                self.scroll_y = 0.0;
+            }
+        }
+
+        self.zoom_level = clamped;
+        for (_, old_tile) in self.tile_cache.drain() {
+            if old_tile.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                self.spare_pixel_buf = old_tile.pixels;
+            }
+        }
+        let pct = (self.zoom_level * 100.0).round() as u32;
+        self.status_notice = Some(format!(
+            "Zoom: {pct}% ('+'/'-' or Ctrl+Wheel to zoom, '0' to reset to 100%)"
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn zoom_by_step(&mut self, factor: f32) {
+        let target = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+        let (cx, cy) = self.cursor_pos;
+        self.set_zoom_around_cursor(target, cx, cy);
+    }
+
+    pub(super) fn reset_zoom(&mut self) {
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
+        for (_, old_tile) in self.tile_cache.drain() {
+            if old_tile.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                self.spare_pixel_buf = old_tile.pixels;
+            }
+        }
+        self.status_notice = Some("Zoom reset to 100%".to_string());
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn pan_horizontal(&mut self, delta_x: f32) -> bool {
+        if !self.view_mode.is_page_view() {
+            return false;
+        }
+        let (_, _, bmp_w, _) = self.page_draw_rect;
+        let content_w = self
+            .cached_page
+            .as_ref()
+            .map(|c| c.viewport_width)
+            .or_else(|| {
+                self.continuous_page_cache
+                    .get(&self.current_page_index)
+                    .map(|c| c.viewport_width)
+            })
+            .unwrap_or(1024);
+        if bmp_w > content_w {
+            let max_pan = (bmp_w - content_w) as f32;
+            let new_pan = (self.pan_x + delta_x).clamp(0.0, max_pan);
+            if (new_pan - self.pan_x).abs() > 0.5 {
+                self.pan_x = new_pan;
+                self.request_redraw();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Scrolls vertically in `ContinuousScroll`, or in any page view when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
         if self.view_mode == ViewMode::ContinuousScroll {
@@ -228,7 +369,7 @@ impl<'a> PdfViewerApp<'a> {
             self.request_redraw();
             return true;
         }
-        if matches!(self.view_mode, ViewMode::FitWidth | ViewMode::FitTextWidth) {
+        if self.view_mode.is_page_view() {
             if let Some(cache) = &self.cached_page {
                 let bmp_h = cache.bitmap_height;
                 let content_h = cache.viewport_height;
@@ -240,7 +381,9 @@ impl<'a> PdfViewerApp<'a> {
                             self.scroll_y = new_scroll.min(max_scroll);
                             self.request_redraw();
                             return true;
-                        } else if self.current_page_index + 1 < self.total_pages() {
+                        } else if matches!(self.view_mode, ViewMode::FitWidth | ViewMode::FitTextWidth)
+                            && self.current_page_index + 1 < self.total_pages()
+                        {
                             self.current_page_index += 1;
                             self.scroll_y = 0.0;
                             self.invalidate_page_caches();
@@ -253,7 +396,9 @@ impl<'a> PdfViewerApp<'a> {
                             self.scroll_y = new_scroll.max(0.0);
                             self.request_redraw();
                             return true;
-                        } else if self.current_page_index > 0 {
+                        } else if matches!(self.view_mode, ViewMode::FitWidth | ViewMode::FitTextWidth)
+                            && self.current_page_index > 0
+                        {
                             self.current_page_index -= 1;
                             self.scroll_y = 99999.0; // Clamped to bottom of previous page on render
                             self.invalidate_page_caches();
@@ -1404,12 +1549,20 @@ impl<'a> PdfViewerApp<'a> {
                     self.step_pages_backward();
                 }
             }
-            Key::Named(NamedKey::ArrowRight)
-            | Key::Named(NamedKey::PageDown)
-            | Key::Named(NamedKey::Space) => {
+            Key::Named(NamedKey::ArrowRight) => {
+                if !self.pan_horizontal(64.0) {
+                    self.step_pages_forward();
+                }
+            }
+            Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
                 self.step_pages_forward();
             }
-            Key::Named(NamedKey::ArrowLeft) | Key::Named(NamedKey::PageUp) => {
+            Key::Named(NamedKey::ArrowLeft) => {
+                if !self.pan_horizontal(-64.0) {
+                    self.step_pages_backward();
+                }
+            }
+            Key::Named(NamedKey::PageUp) => {
                 self.step_pages_backward();
             }
             Key::Named(NamedKey::Home) => {
@@ -1461,9 +1614,13 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if s.eq_ignore_ascii_case("l") {
                     self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
-                } else if (s == "+" || s == "=" || s.eq_ignore_ascii_case("a"))
-                    && self.show_bookmarks
-                {
+                } else if s == "+" || s == "=" {
+                    self.zoom_by_step(1.25);
+                } else if s == "-" || s == "_" {
+                    self.zoom_by_step(0.8);
+                } else if s == "0" {
+                    self.reset_zoom();
+                } else if s.eq_ignore_ascii_case("a") && self.show_bookmarks {
                     self.input_mode = InputMode::AddBookmark {
                         title_input: String::new(),
                     };
@@ -1740,10 +1897,21 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let dy = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => (y as f64) * 36.0,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y,
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ((x as f64) * 36.0, (y as f64) * 36.0),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
+
+                // Ctrl/Cmd + MouseWheel zooms around the cursor position (25%..=800%)
+                if self.cmd_or_ctrl_pressed && self.view_mode.is_page_view() {
+                    if dy.abs() > 0.1 {
+                        let factor = if dy > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                        let target = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+                        let (cx, cy) = self.cursor_pos;
+                        self.set_zoom_around_cursor(target, cx, cy);
+                    }
+                    return;
+                }
 
                 // If cursor is over the Bookmark Sidebar, scroll bookmarks
                 if let Some(w) = self.window.as_ref() {
@@ -1767,7 +1935,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
-                // In FitWidth or FitTextWidth, smoothly scroll `scroll_y` vertically first
+                if dx.abs() > 0.5 {
+                    let _ = self.pan_horizontal((-dx) as f32);
+                }
+
+                // Smoothly scroll `scroll_y` vertically when zoomed or in ContinuousScroll / FitWidth / FitTextWidth
                 if self.scroll_or_turn_page_vertical((-dy) as f32) {
                     return;
                 }

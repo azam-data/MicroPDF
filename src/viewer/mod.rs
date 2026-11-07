@@ -354,4 +354,59 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_zoom_tile_rendering_and_lru_48mb_cap() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_zoom_tiles.pdf");
+        engine.create_sample_pdf(&tmp, 4)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+
+        // Zoom to 400% around cursor (500, 500) -> above 2x screen size, must use 512x512 tiles only
+        app.set_zoom_around_cursor(4.0, 500.0, 500.0);
+        assert!((app.zoom_level - 4.0).abs() < 0.001);
+        app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+        let cache = app.cached_page.as_ref().unwrap();
+        assert!(
+            cache.pixels.is_empty(),
+            "Full page bitmap must NEVER be allocated above 2x screen size"
+        );
+        assert!(!app.tile_cache.is_empty(), "Visible tiles must be rendered");
+        assert!(app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES);
+
+        // Zoom to 800% (max) and pan across the entire huge virtual page to exceed 48 tiles and trigger LRU eviction
+        app.set_zoom_around_cursor(10.0, 500.0, 500.0); // Clamps to 8.0 (800%)
+        assert!((app.zoom_level - 8.0).abs() < 0.001);
+        for x_step in 0..8 {
+            for y_step in 0..8 {
+                app.pan_x = (x_step * 512) as f32;
+                app.scroll_y = (y_step * 512) as f32;
+                app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+                assert!(
+                    app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES,
+                    "Tile cache exceeded 48 MB cap: {} entries",
+                    app.tile_cache.len()
+                );
+            }
+        }
+        let ram_at_800_zoom = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 2 Zoom RAM] before: {:.2} MB, after panning full page at 800% zoom: {:.2} MB (tiles cached: {}/{})",
+            ram_before,
+            ram_at_800_zoom,
+            app.tile_cache.len(),
+            state::MAX_TILE_CACHE_ENTRIES
+        );
+
+        // Reset zoom ('0')
+        app.reset_zoom();
+        assert!((app.zoom_level - 1.0).abs() < 0.001);
+        assert!(app.tile_cache.is_empty());
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }
