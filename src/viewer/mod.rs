@@ -534,4 +534,109 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_password_prompt_masked_3_attempts() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_encrypted_pwd.pdf");
+        {
+            // Create a valid PDF and attach a standard /Encrypt dictionary so PDFium returns PasswordError
+            engine.create_sample_pdf(&tmp, 1)?;
+            let raw = std::fs::read(&tmp)?;
+            let mut ldoc = lopdf::Document::load_mem(&raw)?;
+            let mut enc = lopdf::Dictionary::new();
+            enc.set("Filter", lopdf::Object::Name(b"Standard".to_vec()));
+            enc.set("V", lopdf::Object::Integer(2));
+            enc.set("R", lopdf::Object::Integer(3));
+            enc.set("Length", lopdf::Object::Integer(128));
+            enc.set("P", lopdf::Object::Integer(-4));
+            enc.set("O", lopdf::Object::String(vec![0x11; 32], lopdf::StringFormat::Hexadecimal));
+            enc.set("U", lopdf::Object::String(vec![0x22; 32], lopdf::StringFormat::Hexadecimal));
+            let enc_id = ldoc.add_object(lopdf::Object::Dictionary(enc));
+            ldoc.trailer.set("Encrypt", lopdf::Object::Reference(enc_id));
+            ldoc.trailer.set(
+                "ID",
+                lopdf::Object::Array(vec![
+                    lopdf::Object::String(vec![0x33; 16], lopdf::StringFormat::Hexadecimal),
+                    lopdf::Object::String(vec![0x33; 16], lopdf::StringFormat::Hexadecimal),
+                ]),
+            );
+            let mut out = Vec::new();
+            ldoc.save_to(&mut out)?;
+            std::fs::write(&tmp, &out)?;
+        }
+
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        assert!(
+            matches!(
+                app.input_mode,
+                state::InputMode::PasswordPrompt {
+                    attempts_left: 3,
+                    ..
+                }
+            ),
+            "Opening encrypted PDF must enter PasswordPrompt with 3 attempts left"
+        );
+
+        // Type secret password characters and verify prompt text is masked with '*'
+        app.handle_key_input(winit::keyboard::Key::Character("s".into()), Some("s"));
+        app.handle_key_input(winit::keyboard::Key::Character("e".into()), Some("e"));
+        app.handle_key_input(winit::keyboard::Key::Character("c".into()), Some("c"));
+        let prompt_str = app.format_active_prompt_text().unwrap();
+        assert!(prompt_str.contains("***_"));
+        assert!(!prompt_str.contains("sec"));
+
+        // Attempt 1 (wrong password) -> 2 attempts left
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert!(matches!(
+            app.input_mode,
+            state::InputMode::PasswordPrompt {
+                attempts_left: 2,
+                ref password_input,
+                ..
+            } if password_input.is_empty()
+        ));
+
+        // Attempt 2 (wrong password) -> 1 attempt left
+        app.handle_key_input(winit::keyboard::Key::Character("x".into()), Some("x"));
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert!(matches!(
+            app.input_mode,
+            state::InputMode::PasswordPrompt {
+                attempts_left: 1,
+                ref password_input,
+                ..
+            } if password_input.is_empty()
+        ));
+
+        // Attempt 3 (wrong password) -> exits PasswordPrompt back to Normal
+        app.handle_key_input(winit::keyboard::Key::Character("y".into()), Some("y"));
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("maximum 3 password attempts exceeded")
+        );
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 5 Password Prompt RAM] before: {:.2} MB, after 3 attempts: {:.2} MB",
+            ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

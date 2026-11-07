@@ -87,6 +87,18 @@ pub struct FlattenReport {
     pub permissions_removed: bool,
 }
 
+/// Error returned when a PDF file is encrypted and requires a user/owner password.
+#[derive(Debug)]
+pub struct PasswordRequiredError;
+
+impl std::fmt::Display for PasswordRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "This PDF requires a password to open")
+    }
+}
+
+impl std::error::Error for PasswordRequiredError {}
+
 pub struct PdfEngine {
     pub pdfium: Pdfium,
 }
@@ -140,12 +152,27 @@ impl PdfEngine {
         )
     }
 
+    /// Returns true if `err` (or any cause in its chain) is a `PasswordRequiredError`.
+    pub fn is_password_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<PasswordRequiredError>().is_some()
+    }
+
     /// Unified, safe PDF loader that never passes file paths to PDFium's C loader.
     /// 1. Cleans/canonicalizes `path` (stripping any trailing newlines or surrounding quotes).
     /// 2. Reads the entire file into memory via `std::fs::read`.
     /// 3. Strips leading junk/BOM bytes before `%PDF-` (within the first 1 KB) in place.
     /// 4. Hands the single buffer to PDFium (v1.1: no `bytes.clone()`, so peak RAM is 1x file size).
     pub fn load_pdf_safe<'a>(&'a self, path: &Path) -> Result<PdfDocument<'a>> {
+        self.load_pdf_with_password(path, None)
+    }
+
+    /// Loads `path` with an optional password (`None` tries the empty password first).
+    /// Never stores `password`.
+    pub fn load_pdf_with_password<'a>(
+        &'a self,
+        path: &Path,
+        password: Option<&str>,
+    ) -> Result<PdfDocument<'a>> {
         let cleaned_path = if let Some(raw_str) = path.to_str() {
             let trimmed = raw_str
                 .trim_matches(|c: char| c == '\n' || c == '\r' || c == '"' || c == '\'');
@@ -164,7 +191,7 @@ impl PdfEngine {
         }
 
         Self::strip_leading_junk(&mut bytes);
-        self.load_pdf_from_bytes_safe(bytes)
+        self.load_pdf_from_bytes_with_password(bytes, password)
             .with_context(|| format!("Could not open {:?}", resolved_path))
     }
 
@@ -185,12 +212,21 @@ impl PdfEngine {
 
     /// Loads a `PdfDocument` from an in-memory buffer without copying it.
     /// PDFium already tries the empty user password, so no second attempt is needed.
-    /// Password-protected files get a clear message instead of a raw error code.
+    /// Password-protected files return `PasswordRequiredError`.
     pub fn load_pdf_from_bytes_safe<'a>(&'a self, bytes: Vec<u8>) -> Result<PdfDocument<'a>> {
-        match self.pdfium.load_pdf_from_byte_vec(bytes, None) {
+        self.load_pdf_from_bytes_with_password(bytes, None)
+    }
+
+    /// Loads a `PdfDocument` from an in-memory buffer with an optional password.
+    pub fn load_pdf_from_bytes_with_password<'a>(
+        &'a self,
+        bytes: Vec<u8>,
+        password: Option<&str>,
+    ) -> Result<PdfDocument<'a>> {
+        match self.pdfium.load_pdf_from_byte_vec(bytes, password) {
             Ok(doc) => Ok(doc),
             Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
-                anyhow::bail!("This PDF needs a password to open (password prompt not supported yet)")
+                Err(anyhow::Error::new(PasswordRequiredError))
             }
             Err(e) => Err(anyhow::anyhow!("PDFium could not parse the document: {e:?}")),
         }

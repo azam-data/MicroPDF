@@ -66,6 +66,23 @@ impl<'a> PdfViewerApp<'a> {
                 "OPEN EXTERNAL URL IN BROWSER? {}  (Press Enter to confirm, Esc to cancel)",
                 url
             )),
+            InputMode::PasswordPrompt {
+                path,
+                password_input,
+                attempts_left,
+                ..
+            } => {
+                let fname = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document.pdf");
+                let masked: String = std::iter::repeat('*')
+                    .take(password_input.chars().count())
+                    .collect();
+                Some(format!(
+                    "PASSWORD REQUIRED for '{fname}' ({attempts_left} attempt(s) left): {masked}_  (Enter unlock, Esc cancel)"
+                ))
+            }
         }
     }
 

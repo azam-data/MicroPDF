@@ -1812,6 +1812,53 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
+            InputMode::PasswordPrompt {
+                path,
+                mut password_input,
+                attempts_left,
+                open_in_new_tab,
+            } => {
+                let fname = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document.pdf")
+                    .to_string();
+                let res = if open_in_new_tab && !self.tabs.is_empty() {
+                    self.open_document_in_new_tab_with_password(path.clone(), Some(&password_input))
+                } else {
+                    self.load_document_with_password(path.clone(), Some(&password_input))
+                };
+                // Never store the password after attempting to open the PDF
+                password_input.clear();
+                password_input.shrink_to_fit();
+
+                match res {
+                    Ok(()) => {
+                        self.status_notice = Some(format!("Unlocked and opened '{fname}'"));
+                    }
+                    Err(e) if PdfEngine::is_password_error(&e) => {
+                        let rem = attempts_left.saturating_sub(1);
+                        if rem > 0 {
+                            self.input_mode = InputMode::PasswordPrompt {
+                                path,
+                                password_input: String::new(),
+                                attempts_left: rem,
+                                open_in_new_tab,
+                            };
+                            self.status_notice = Some(format!(
+                                "Incorrect password for '{fname}' ({rem} attempt(s) left)"
+                            ));
+                        } else {
+                            self.status_notice = Some(format!(
+                                "Failed to open '{fname}': maximum 3 password attempts exceeded"
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        self.status_notice = Some(format!("ERROR opening '{fname}': {e}"));
+                    }
+                }
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -1822,7 +1869,13 @@ impl<'a> PdfViewerApp<'a> {
         if self.input_mode != InputMode::Normal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    self.input_mode = InputMode::Normal;
+                    if let InputMode::PasswordPrompt {
+                        mut password_input, ..
+                    } = std::mem::replace(&mut self.input_mode, InputMode::Normal)
+                    {
+                        password_input.clear();
+                        password_input.shrink_to_fit();
+                    }
                     self.status_notice = Some("Cancelled".to_string());
                     self.update_title_bar();
                     self.request_redraw();
@@ -1851,6 +1904,9 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::AddBookmark { title_input }
                         | InputMode::EditBookmark { title_input, .. } => {
                             title_input.pop();
+                        }
+                        InputMode::PasswordPrompt { password_input, .. } => {
+                            password_input.pop();
                         }
                         InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                     }
@@ -1942,6 +1998,9 @@ impl<'a> PdfViewerApp<'a> {
                             }
                             InputMode::Watermark { input } => {
                                 input.push_str(&typed);
+                            }
+                            InputMode::PasswordPrompt { password_input, .. } => {
+                                password_input.push_str(&typed);
                             }
                             InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                         }

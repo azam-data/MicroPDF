@@ -344,6 +344,12 @@ pub(super) enum InputMode {
     ConfirmExternalUrl {
         url: String,
     },
+    PasswordPrompt {
+        path: PathBuf,
+        password_input: String,
+        attempts_left: u8,
+        open_in_new_tab: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]

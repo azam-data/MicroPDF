@@ -62,8 +62,40 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Loads `path` into the current tab (or creates the first tab on startup).
+    /// If `path` is encrypted and requires a password, enters `InputMode::PasswordPrompt` (3 attempts) instead of failing.
     pub fn load_document(&mut self, path: PathBuf) -> Result<()> {
-        let loaded = self.engine.load_pdf_safe(&path)?;
+        match self.load_document_with_password(path.clone(), None) {
+            Ok(()) => Ok(()),
+            Err(e) if PdfEngine::is_password_error(&e) => {
+                let fname = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document.pdf")
+                    .to_string();
+                self.input_mode = InputMode::PasswordPrompt {
+                    path,
+                    password_input: String::new(),
+                    attempts_left: 3,
+                    open_in_new_tab: false,
+                };
+                self.status_notice = Some(format!(
+                    "Password required to open '{fname}' (3 attempts left)"
+                ));
+                self.update_title_bar();
+                self.request_redraw();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Loads `path` into the current tab using an optional `password` (never stored after loading).
+    pub(super) fn load_document_with_password(
+        &mut self,
+        path: PathBuf,
+        password: Option<&str>,
+    ) -> Result<()> {
+        let loaded = self.engine.load_pdf_with_password(&path, password)?;
         let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
 
@@ -148,11 +180,45 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Opens `path` in a brand-new tab and switches to it immediately, freeing the previous tab's bitmaps.
+    /// If `path` is encrypted and requires a password, enters `InputMode::PasswordPrompt` (3 attempts).
     pub fn open_document_in_new_tab(&mut self, path: PathBuf) -> Result<()> {
         if self.tabs.is_empty() {
             return self.load_document(path);
         }
-        let loaded = self.engine.load_pdf_safe(&path)?;
+        match self.open_document_in_new_tab_with_password(path.clone(), None) {
+            Ok(()) => Ok(()),
+            Err(e) if PdfEngine::is_password_error(&e) => {
+                let fname = path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document.pdf")
+                    .to_string();
+                self.input_mode = InputMode::PasswordPrompt {
+                    path,
+                    password_input: String::new(),
+                    attempts_left: 3,
+                    open_in_new_tab: true,
+                };
+                self.status_notice = Some(format!(
+                    "Password required to open '{fname}' (3 attempts left)"
+                ));
+                self.update_title_bar();
+                self.request_redraw();
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(super) fn open_document_in_new_tab_with_password(
+        &mut self,
+        path: PathBuf,
+        password: Option<&str>,
+    ) -> Result<()> {
+        if self.tabs.is_empty() {
+            return self.load_document_with_password(path, password);
+        }
+        let loaded = self.engine.load_pdf_with_password(&path, password)?;
         let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
         let selected_bookmark = if loaded_bookmarks.is_empty() {
