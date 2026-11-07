@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.3.0
+
+### New
+- **Printing (`Ctrl/Cmd+P`, `File -> Print...`).** Prints the document as it is in the app, so unsaved edits and redactions are what reaches the paper.
+  - **Windows:** the native print dialog (page range, copies), then GDI. One page is rendered and sent per frame, so the window stays responsive; the status bar shows `Printing page 3 / 20` and `Esc` cancels. Each page is rendered at the printer's resolution in 256-row strips (about 5 MB at 600 dpi instead of about 140 MB for a whole page), fitted to the printable area, with the paper turned to match portrait or landscape pages.
+  - **macOS:** a print bar at the bottom (printer, copies, page range such as `1-3,5,8-`, `F` toggles fit-to-page) that hands a temporary PDF to `lp` in the background. The temporary file is deleted as soon as `lp` has it, and also after any error.
+  - Filled-in form fields are printed. Temporary print files left behind by a crash are removed the next time the app starts.
+- **`Tools -> Optimize...`**: choose a preset (Smaller 150 dpi, Balanced 200 dpi, Print 300 dpi), colour, gray or black-and-white (with a warning that signatures look jagged), and whether to clean scans, in the bottom bar. Runs one image per frame with progress and `Esc` to cancel (nothing is written), shows before/after sizes, and can preview the current page first. `Z` still runs Balanced directly.
+
+### Memory
+- **Large files are no longer loaded into memory.** PDFium now reads the file on demand. On a 116 MB, 100-page scan: 50 MB after opening (was 129), 118 MB peak while scrolling (was 228), 134 MB at 400% zoom (was 274) and 188 MB in the thumbnail grid (was 301), all within the target of file size + 120 MB.
+- Zoom tiles and thumbnails reuse their buffers, and each page is closed right after it is drawn, so PDFium's image cache for that page is freed.
+
+### Fixed
+- **A file overwritten by another program while open** (for example `cp other.pdf open.pdf`) could make pages you had not viewed yet show the other file's content. Such pages now show an error in the status bar instead, and auto-reload opens the new file.
+- **Saving no longer rewrites a file in place.** Where the file system refuses to replace a file that is open (FAT32/exFAT USB sticks, some network shares), the app closes its own copy and tries again; if it still fails, the original is left untouched and the status bar names the saved copy next to it (`<name>.micropdf-save.pdf`). Tabs with unsaved edits of their own are never closed for this.
+- **Filled-in form fields disappeared when zoomed in** above 2x the screen size.
+- A page that cannot be drawn now leaves that page blank with an error in the status bar instead of skipping the whole window redraw.
+- A save that failed while writing left its temporary file behind.
+
+### Security
+- **Single instance:** the token in the lock file is now 16 random bytes from the operating system (it was based on the time and process ID), and the lock file is readable only by you on macOS. Only existing `.pdf` files are opened. A program that connects and sends nothing, or too much, can no longer freeze the window; it is dropped after one frame.
+
+### Tests
+- 55 tests (plus 3 memory measurements run on demand), including: files changed, overwritten or deleted while open; saving when the file system refuses to replace an open file; printing state, page ranges, strip sizes and temporary-file cleanup without a printer; form fields in every view; single-instance abuse cases.
+- `test_single_instance_socket_forwarding_under_200ms` now polls until the forwarded file opens within its existing 200 ms budget, because reads no longer block (agreed change), and also checks the file is not opened twice.
+- New on-demand measurement: `ram_print_600dpi_scan_measurement`.
+
 ## 1.2.1
 
 ### New
