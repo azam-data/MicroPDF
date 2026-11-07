@@ -75,7 +75,7 @@ pub struct SearchMatch {
 pub struct StampImageBuffer {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub image: image::DynamicImage,
 }
 
 /// Result of `flatten_and_unlock_doc`.
@@ -2249,23 +2249,33 @@ impl PdfEngine {
     }
 
     /// Decodes a PNG or JPEG image file from `path` into an RGBA `StampImageBuffer`, preserving PNG alpha transparency.
+    /// Downscales any image over 2,000 px on its longest side so a large photo stamp never explodes RAM.
     pub fn load_stamp_image(path: &Path) -> Result<StampImageBuffer> {
-        let dyn_img = image::open(path)
+        let mut dyn_img = image::open(path)
             .with_context(|| format!("Failed to decode image file {:?}", path))?;
-        let rgba_img = dyn_img.to_rgba8();
-        let (width, height) = rgba_img.dimensions();
-        if width == 0 || height == 0 {
+        let (orig_w, orig_h) = (dyn_img.width(), dyn_img.height());
+        if orig_w == 0 || orig_h == 0 {
             anyhow::bail!("Image has zero width or height");
         }
+        const MAX_STAMP_SIDE: u32 = 2000;
+        if orig_w.max(orig_h) > MAX_STAMP_SIDE {
+            dyn_img = dyn_img.resize(
+                MAX_STAMP_SIDE,
+                MAX_STAMP_SIDE,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+        let rgba_img = dyn_img.into_rgba8();
+        let (width, height) = rgba_img.dimensions();
         Ok(StampImageBuffer {
             width,
             height,
-            rgba: rgba_img.into_raw(),
+            image: image::DynamicImage::ImageRgba8(rgba_img),
         })
     }
 
     /// Stamps `stamp` (preserving PNG alpha transparency via `image::DynamicImage` + `PdfPageImageObject`)
-    /// onto `page_index` inside `target_rect` in PDF coordinates.
+    /// onto `page_index` inside `target_rect` in PDF coordinates without copying the decoded buffer.
     pub fn stamp_image_on_page(
         &self,
         doc: &mut PdfDocument,
@@ -2280,14 +2290,9 @@ impl PdfEngine {
         let rect_w = (right - left).max(8.0);
         let rect_h = (top - bottom).max(8.0);
 
-        let rgba_img =
-            image::RgbaImage::from_raw(stamp.width, stamp.height, stamp.rgba.clone())
-                .context("Invalid RGBA image dimensions for stamp")?;
-        let dyn_img = image::DynamicImage::ImageRgba8(rgba_img);
-
         let mut img_obj = PdfPageImageObject::new_with_size(
             doc,
-            &dyn_img,
+            &stamp.image,
             PdfPoints::new(rect_w),
             PdfPoints::new(rect_h),
         )
@@ -2537,12 +2542,14 @@ mod tests {
             assert!(p0.height().value > 800.0);
         }
 
-        // 6. Signature / Image Stamp (with RGBA alpha transparency)
-        let stamp = StampImageBuffer {
-            width: 32,
-            height: 16,
-            rgba: [20u8, 80, 200, 180].repeat(32 * 16),
-        };
+        // 6. Signature / Image Stamp (with RGBA alpha transparency & >2000px downscale cap)
+        let big_img_path = std::env::temp_dir().join("test_big_stamp.png");
+        let big_rgba = image::RgbaImage::from_pixel(2500, 1250, image::Rgba([20, 80, 200, 180]));
+        big_rgba.save(&big_img_path)?;
+        let stamp = PdfEngine::load_stamp_image(&big_img_path)?;
+        let _ = std::fs::remove_file(&big_img_path);
+        assert!(stamp.width <= 2000 && stamp.height <= 2000);
+        assert_eq!(stamp.width, 2000);
         let stamp_rect = PdfRect::new_from_values(100.0, 100.0, 140.0, 180.0);
         engine.stamp_image_on_page(&mut doc, 0, &stamp, stamp_rect)?;
 

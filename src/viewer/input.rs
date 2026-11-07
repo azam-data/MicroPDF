@@ -2209,7 +2209,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                             }
                                         }
                                         MouseMode::StampImage => {
-                                            if let Some(stamp) = self.pending_stamp_image.clone() {
+                                            if let Some(stamp) = self.pending_stamp_image.take() {
                                                 self.push_undo_snapshot();
                                                 if let Some(doc) = self.doc.as_mut() {
                                                     match self.engine.stamp_image_on_page(
@@ -2225,6 +2225,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                             ));
                                                         }
                                                         Err(e) => {
+                                                            self.pending_stamp_image = Some(stamp);
                                                             let _ = self.undo_stack.pop_back();
                                                             self.status_notice = Some(format!(
                                                                 "Image stamp error: {e}"
