@@ -17,6 +17,8 @@ impl<'a> PdfViewerApp<'a> {
             slot.zoom_level = self.zoom_level;
             slot.pan_x = self.pan_x;
             slot.scroll_y = self.scroll_y;
+            slot.nav_back_stack = std::mem::take(&mut self.nav_back_stack);
+            slot.nav_forward_stack = std::mem::take(&mut self.nav_forward_stack);
             slot.roman_end = self.roman_end;
             slot.bookmarks = self.bookmarks.clone();
             slot.selected_bookmark = self.selected_bookmark;
@@ -41,6 +43,9 @@ impl<'a> PdfViewerApp<'a> {
             self.zoom_level = slot.zoom_level;
             self.pan_x = slot.pan_x;
             self.scroll_y = slot.scroll_y;
+            self.nav_back_stack = std::mem::take(&mut slot.nav_back_stack);
+            self.nav_forward_stack = std::mem::take(&mut slot.nav_forward_stack);
+            self.hovered_link = None;
             self.roman_end = slot.roman_end;
             self.bookmarks = slot.bookmarks.clone();
             self.selected_bookmark = slot.selected_bookmark;
@@ -73,6 +78,9 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
         self.roman_end = roman_end;
         self.bw_pages.clear();
         self.undo_stack.clear();
@@ -104,6 +112,8 @@ impl<'a> PdfViewerApp<'a> {
                 zoom_level: 1.0,
                 pan_x: 0.0,
                 scroll_y: 0.0,
+                nav_back_stack: VecDeque::new(),
+                nav_forward_stack: Vec::new(),
                 roman_end,
                 bookmarks: self.bookmarks.clone(),
                 selected_bookmark: self.selected_bookmark,
@@ -120,6 +130,8 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].zoom_level = 1.0;
             self.tabs[self.active_tab].pan_x = 0.0;
             self.tabs[self.active_tab].scroll_y = 0.0;
+            self.tabs[self.active_tab].nav_back_stack.clear();
+            self.tabs[self.active_tab].nav_forward_stack.clear();
             self.tabs[self.active_tab].roman_end = roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].selected_bookmark = self.selected_bookmark;
@@ -165,6 +177,8 @@ impl<'a> PdfViewerApp<'a> {
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
             roman_end,
             bookmarks: loaded_bookmarks.clone(),
             selected_bookmark,
@@ -184,6 +198,9 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = selected_bookmark;
@@ -223,6 +240,8 @@ impl<'a> PdfViewerApp<'a> {
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
             roman_end: 0,
             bookmarks: Vec::new(),
             selected_bookmark: None,
@@ -242,6 +261,9 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
         self.roman_end = 0;
         self.bookmarks.clear();
         self.selected_bookmark = None;

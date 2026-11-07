@@ -409,4 +409,67 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_links_and_history_cap() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_links_history.pdf");
+        engine.create_sample_pdf(&tmp, 10)?;
+
+        // Add an external URI link annotation on page 0 using PDFium
+        {
+            let mut doc = engine.load_pdf_safe(&tmp)?;
+            let mut p0 = doc.pages_mut().get(0)?;
+            let mut annot = p0
+                .annotations_mut()
+                .create_link_annotation("https://example.com/micropdf")?;
+            annot.set_bounds(PdfRect::new_from_values(400.0, 100.0, 450.0, 300.0))?;
+            PdfEngine::save_doc(&doc, &tmp)?;
+        }
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+
+        // Convert PDF link midpoint (200, 425) to screen coordinates and verify link resolution
+        let (dx, dy, bw, bh) = app.page_draw_rect;
+        let sx = dx as f64 + (200.0 / 595.0) * (bw as f64);
+        let sy = dy as f64 + (1.0 - (425.0 / 842.0)) * (bh as f64);
+        let resolved = app.resolve_link_at_screen_pos(sx, sy);
+        assert_eq!(
+            resolved,
+            Some(state::ResolvedLinkTarget::ExternalUrl(
+                "https://example.com/micropdf".to_string()
+            ))
+        );
+
+        // Push 65 navigation jumps and verify history is strictly capped at 50 entries
+        for i in 0..65u16 {
+            app.push_nav_history();
+            app.current_page_index = (i + 1) % 10;
+            app.scroll_y = (i as f32) * 3.5;
+            assert!(
+                app.nav_back_stack.len() + app.nav_forward_stack.len() <= state::MAX_NAV_HISTORY
+            );
+        }
+        assert_eq!(app.nav_back_stack.len(), state::MAX_NAV_HISTORY);
+
+        let cur_before_back = (app.current_page_index, app.scroll_y);
+        app.navigate_back();
+        assert_ne!((app.current_page_index, app.scroll_y), cur_before_back);
+        assert!(app.nav_back_stack.len() + app.nav_forward_stack.len() <= state::MAX_NAV_HISTORY);
+
+        app.navigate_forward();
+        assert_eq!((app.current_page_index, app.scroll_y), cur_before_back);
+        assert!(app.nav_back_stack.len() + app.nav_forward_stack.len() <= state::MAX_NAV_HISTORY);
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 3 Links + History RAM] before: {:.2} MB, after 65 history entries & link test: {:.2} MB",
+            ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

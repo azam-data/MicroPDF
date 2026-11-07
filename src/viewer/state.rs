@@ -28,6 +28,7 @@ pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
     MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
 pub(super) const MAX_ZOOM_LEVEL: f32 = 8.0;
+pub(super) const MAX_NAV_HISTORY: usize = 50;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.
@@ -236,6 +237,13 @@ pub(super) struct TileEntry {
     pub(super) pixels: Vec<u32>,
 }
 
+/// Resolved target of a PDF link annotation under the cursor.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum ResolvedLinkTarget {
+    InternalPage(u16),
+    ExternalUrl(String),
+}
+
 /// Zero-RAM inactive document tab slot (never stores cached bitmaps or thumbnails).
 pub(super) struct DocumentTab<'a> {
     pub(super) doc: Option<PdfDocument<'a>>,
@@ -246,6 +254,8 @@ pub(super) struct DocumentTab<'a> {
     pub(super) zoom_level: f32,
     pub(super) pan_x: f32,
     pub(super) scroll_y: f32,
+    pub(super) nav_back_stack: VecDeque<(u16, f32)>,
+    pub(super) nav_forward_stack: Vec<(u16, f32)>,
     pub(super) roman_end: usize,
     pub(super) bookmarks: Vec<Bookmark>,
     pub(super) selected_bookmark: Option<usize>,
@@ -320,6 +330,9 @@ pub(super) enum InputMode {
         bookmark_idx: usize,
         title_input: String,
     },
+    ConfirmExternalUrl {
+        url: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -376,6 +389,11 @@ pub struct PdfViewerApp<'a> {
     /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 48 MB).
     pub(super) tile_cache: HashMap<TileKey, TileEntry>,
     pub(super) tile_lru_tick: u64,
+    /// Navigation history of `(page_index, scroll_y)` entries (capped at `MAX_NAV_HISTORY = 50`).
+    pub(super) nav_back_stack: VecDeque<(u16, f32)>,
+    pub(super) nav_forward_stack: Vec<(u16, f32)>,
+    /// Currently hovered link target on the page (triggers `CursorIcon::Pointer` hand cursor).
+    pub(super) hovered_link: Option<ResolvedLinkTarget>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -409,6 +427,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) shift_pressed: bool,
     pub(super) cmd_or_ctrl_pressed: bool,
     pub(super) ctrl_pressed: bool,
+    pub(super) alt_pressed: bool,
     pub(super) input_mode: InputMode,
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
@@ -451,6 +470,9 @@ impl<'a> PdfViewerApp<'a> {
             scroll_y: 0.0,
             tile_cache: HashMap::new(),
             tile_lru_tick: 0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
+            hovered_link: None,
             open_menu: None,
             mouse_mode: MouseMode::Highlight,
             pending_stamp_image: None,
@@ -472,6 +494,7 @@ impl<'a> PdfViewerApp<'a> {
             shift_pressed: false,
             cmd_or_ctrl_pressed: false,
             ctrl_pressed: false,
+            alt_pressed: false,
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,

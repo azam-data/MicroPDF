@@ -62,6 +62,10 @@ impl<'a> PdfViewerApp<'a> {
                     page_num, title_input
                 ))
             }
+            InputMode::ConfirmExternalUrl { url } => Some(format!(
+                "OPEN EXTERNAL URL IN BROWSER? {}  (Press Enter to confirm, Esc to cancel)",
+                url
+            )),
         }
     }
 

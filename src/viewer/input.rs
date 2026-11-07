@@ -9,7 +9,7 @@ use winit::dpi::LogicalSize;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{Key, NamedKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorIcon, Window, WindowId};
 use super::state::*;
 
 impl<'a> PdfViewerApp<'a> {
@@ -174,6 +174,203 @@ impl<'a> PdfViewerApp<'a> {
         let right = pt1_x.max(pt2_x);
 
         Some((page_idx, PdfRect::new_from_values(bottom, left, top, right)))
+    }
+
+    /// Converts screen coordinates `(sx, sy)` into `(page_idx, x_pts, y_pts)` if `(sx, sy)` lies inside a rendered page.
+    pub(super) fn screen_point_to_pdf_point(&self, sx: f64, sy: f64) -> Option<(u16, PdfPoints, PdfPoints)> {
+        let doc = self.doc.as_ref()?;
+        let (page_idx, (px, py, pw, ph)) = self.resolve_target_page_and_draw_rect(sx, sy);
+        if pw == 0 || ph == 0 {
+            return None;
+        }
+        let ix = sx.round() as i32;
+        let iy = sy.round() as i32;
+        if ix < px || ix > px + (pw as i32) || iy < py || iy > py + (ph as i32) {
+            return None;
+        }
+        let bx = (ix - px).clamp(0, pw as i32);
+        let by = (iy - py).clamp(0, ph as i32);
+        let page = doc.pages().get(page_idx).ok()?;
+        let config = PdfRenderConfig::new()
+            .set_fixed_width(pw as i32)
+            .set_fixed_height(ph as i32);
+        match page.pixels_to_points(bx, by, &config) {
+            Ok((pt_x, pt_y)) => Some((page_idx, pt_x, pt_y)),
+            Err(_) => {
+                let page_w = page.width().value;
+                let page_h = page.height().value;
+                let u = (bx as f32) / (pw as f32);
+                let v = (by as f32) / (ph as f32);
+                Some((
+                    page_idx,
+                    PdfPoints::new(u * page_w),
+                    PdfPoints::new((1.0 - v) * page_h),
+                ))
+            }
+        }
+    }
+
+    /// Resolves any internal destination or external URI link at screen coordinates `(sx, sy)`.
+    pub(super) fn resolve_link_at_screen_pos(&self, sx: f64, sy: f64) -> Option<ResolvedLinkTarget> {
+        let (page_idx, pt_x, pt_y) = self.screen_point_to_pdf_point(sx, sy)?;
+        let doc = self.doc.as_ref()?;
+        let page = doc.pages().get(page_idx).ok()?;
+
+        let extract_target = |link: &PdfLink<'_>| -> Option<ResolvedLinkTarget> {
+            if let Some(dest) = link.destination() {
+                if let Ok(target_p) = dest.page_index() {
+                    return Some(ResolvedLinkTarget::InternalPage(target_p));
+                }
+            }
+            if let Some(action) = link.action() {
+                match action {
+                    PdfAction::LocalDestination(local) => {
+                        if let Ok(dest) = local.destination() {
+                            if let Ok(target_p) = dest.page_index() {
+                                return Some(ResolvedLinkTarget::InternalPage(target_p));
+                            }
+                        }
+                    }
+                    PdfAction::Uri(uri_act) => {
+                        if let Ok(url) = uri_act.uri() {
+                            let trimmed = url.trim().to_string();
+                            if !trimmed.is_empty() {
+                                return Some(ResolvedLinkTarget::ExternalUrl(trimmed));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        };
+
+        if let Some(link) = page.links().link_at_point(pt_x, pt_y) {
+            if let Some(t) = extract_target(&link) {
+                return Some(t);
+            }
+        }
+
+        for link in page.links().iter() {
+            if let Ok(r) = link.rect() {
+                let left = r.left().value.min(r.right().value);
+                let right = r.left().value.max(r.right().value);
+                let bottom = r.bottom().value.min(r.top().value);
+                let top = r.bottom().value.max(r.top().value);
+                if pt_x.value >= left
+                    && pt_x.value <= right
+                    && pt_y.value >= bottom
+                    && pt_y.value <= top
+                {
+                    if let Some(t) = extract_target(&link) {
+                        return Some(t);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Pushes `(self.current_page_index, self.scroll_y)` onto `self.nav_back_stack`,
+    /// clears `self.nav_forward_stack`, and enforces the hard 50-entry history cap.
+    pub(super) fn push_nav_history(&mut self) {
+        let entry = (self.current_page_index, self.scroll_y);
+        if self.nav_back_stack.back() != Some(&entry) {
+            while self.nav_back_stack.len() >= MAX_NAV_HISTORY {
+                self.nav_back_stack.pop_front();
+            }
+            self.nav_back_stack.push_back(entry);
+        }
+        self.nav_forward_stack.clear();
+    }
+
+    /// Navigates back in the `(page, scroll)` history (`Alt+Left`).
+    pub(super) fn navigate_back(&mut self) {
+        let Some((prev_page, prev_scroll)) = self.nav_back_stack.pop_back() else {
+            self.status_notice = Some("No previous location in navigation history".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        };
+        while self.nav_back_stack.len() + self.nav_forward_stack.len() >= MAX_NAV_HISTORY {
+            if !self.nav_forward_stack.is_empty() {
+                self.nav_forward_stack.remove(0);
+            } else {
+                break;
+            }
+        }
+        self.nav_forward_stack
+            .push((self.current_page_index, self.scroll_y));
+        let total = self.total_pages();
+        if total > 0 {
+            self.current_page_index = prev_page.min(total - 1);
+            self.scroll_y = prev_scroll;
+            self.invalidate_page_caches();
+            self.status_notice = Some(format!(
+                "Navigated Back to Page {} (Alt+Right to go Forward)",
+                self.current_page_index + 1
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Navigates forward in the `(page, scroll)` history (`Alt+Right`).
+    pub(super) fn navigate_forward(&mut self) {
+        let Some((next_page, next_scroll)) = self.nav_forward_stack.pop() else {
+            self.status_notice = Some("No forward location in navigation history".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        };
+        while self.nav_back_stack.len() + self.nav_forward_stack.len() >= MAX_NAV_HISTORY {
+            if self.nav_back_stack.pop_front().is_none() {
+                break;
+            }
+        }
+        self.nav_back_stack
+            .push_back((self.current_page_index, self.scroll_y));
+        let total = self.total_pages();
+        if total > 0 {
+            self.current_page_index = next_page.min(total - 1);
+            self.scroll_y = next_scroll;
+            self.invalidate_page_caches();
+            self.status_notice = Some(format!(
+                "Navigated Forward to Page {}",
+                self.current_page_index + 1
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Opens an external HTTP/HTTPS/mailto URL in the OS default browser after user confirmation.
+    pub(super) fn open_external_url_in_browser(url: &str) -> anyhow::Result<()> {
+        let trimmed = url.trim();
+        let lower = trimmed.to_ascii_lowercase();
+        if !(lower.starts_with("http://")
+            || lower.starts_with("https://")
+            || lower.starts_with("mailto:"))
+            || trimmed.chars().any(|c| c.is_control())
+        {
+            anyhow::bail!("Refused unsafe URL scheme (only http://, https://, and mailto: allowed)");
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("open").arg(trimmed).spawn()?;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            std::process::Command::new("rundll32")
+                .args(["url.dll,FileProtocolHandler", trimmed])
+                .spawn()?;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::process::Command::new("xdg-open").arg(trimmed).spawn()?;
+        }
+        Ok(())
     }
 
     pub(super) fn navigate_to_page(&mut self, new_index: u16) {
@@ -1035,6 +1232,7 @@ impl<'a> PdfViewerApp<'a> {
                 if let Some(target_idx) =
                     PdfEngine::resolve_logical_page_str(&input, self.roman_end, total)
                 {
+                    self.push_nav_history();
                     self.current_page_index = target_idx as u16;
                     self.scroll_y = 0.0;
                     self.invalidate_page_caches();
@@ -1284,6 +1482,17 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
+            InputMode::ConfirmExternalUrl { url } => {
+                match Self::open_external_url_in_browser(&url) {
+                    Ok(()) => {
+                        self.status_notice =
+                            Some(format!("Opened external URL in browser: {url}"));
+                    }
+                    Err(e) => {
+                        self.status_notice = Some(format!("Failed to open URL: {e}"));
+                    }
+                }
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -1324,7 +1533,7 @@ impl<'a> PdfViewerApp<'a> {
                         | InputMode::EditBookmark { title_input, .. } => {
                             title_input.pop();
                         }
-                        InputMode::Normal => {}
+                        InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                     }
                     self.update_title_bar();
                     self.request_redraw();
@@ -1415,7 +1624,7 @@ impl<'a> PdfViewerApp<'a> {
                             InputMode::Watermark { input } => {
                                 input.push_str(&typed);
                             }
-                            InputMode::Normal => {}
+                            InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                         }
                         if auto_submit_clear {
                             self.handle_prompt_submission();
@@ -1550,7 +1759,9 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             Key::Named(NamedKey::ArrowRight) => {
-                if !self.pan_horizontal(64.0) {
+                if self.alt_pressed {
+                    self.navigate_forward();
+                } else if !self.pan_horizontal(64.0) {
                     self.step_pages_forward();
                 }
             }
@@ -1558,7 +1769,9 @@ impl<'a> PdfViewerApp<'a> {
                 self.step_pages_forward();
             }
             Key::Named(NamedKey::ArrowLeft) => {
-                if !self.pan_horizontal(-64.0) {
+                if self.alt_pressed {
+                    self.navigate_back();
+                } else if !self.pan_horizontal(-64.0) {
                     self.step_pages_backward();
                 }
             }
@@ -1789,6 +2002,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 let st = modifiers.state();
                 self.shift_pressed = st.shift_key();
                 self.ctrl_pressed = st.control_key();
+                self.alt_pressed = st.alt_key();
                 self.cmd_or_ctrl_pressed = st.super_key() || st.control_key();
             }
             WindowEvent::DroppedFile(dropped_path) => {
@@ -1985,6 +2199,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
 
                 if self.drag_start.is_some() || self.grid_drag_page.is_some() {
                     self.request_redraw();
+                } else if self.view_mode.is_page_view() {
+                    let new_link = self.resolve_link_at_screen_pos(position.x, position.y);
+                    if new_link != self.hovered_link {
+                        let is_over_link = new_link.is_some();
+                        self.hovered_link = new_link;
+                        if let Some(w) = self.window.as_ref() {
+                            w.set_cursor(if is_over_link {
+                                CursorIcon::Pointer
+                            } else {
+                                CursorIcon::Default
+                            });
+                        }
+                    }
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
                     if let Some(w) = self.window.as_ref() {
                         let sz = w.inner_size();
@@ -2168,6 +2395,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                             self.selected_bookmark = Some(bm_idx);
                                             let target_page =
                                                 self.bookmarks[bm_idx].page_index as u16;
+                                            self.push_nav_history();
                                             self.current_page_index = target_page
                                                 .min(self.total_pages().saturating_sub(1));
                                             self.scroll_y = 0.0;
@@ -2307,6 +2535,36 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         ElementState::Released => {
                             if let Some((sx1, sy1)) = self.drag_start.take() {
                                 let (sx2, sy2) = self.cursor_pos;
+                                let is_click = (sx2 - sx1).abs() < 5.0 && (sy2 - sy1).abs() < 5.0;
+                                if is_click && self.mouse_mode != MouseMode::StampImage {
+                                    if let Some(link_target) =
+                                        self.resolve_link_at_screen_pos(sx2, sy2)
+                                    {
+                                        match link_target {
+                                            ResolvedLinkTarget::InternalPage(target_p) => {
+                                                let total = self.total_pages();
+                                                if total > 0 {
+                                                    self.push_nav_history();
+                                                    self.current_page_index =
+                                                        target_p.min(total - 1);
+                                                    self.scroll_y = 0.0;
+                                                    self.invalidate_page_caches();
+                                                    self.status_notice = Some(format!(
+                                                        "Followed link to Page {} (Alt+Left to go Back)",
+                                                        self.current_page_index + 1
+                                                    ));
+                                                }
+                                            }
+                                            ResolvedLinkTarget::ExternalUrl(url) => {
+                                                self.input_mode =
+                                                    InputMode::ConfirmExternalUrl { url };
+                                            }
+                                        }
+                                        self.update_title_bar();
+                                        self.request_redraw();
+                                        return;
+                                    }
+                                }
                                 let allow_click = self.mouse_mode == MouseMode::StampImage;
                                 if let Some((page_idx, pdf_rect)) = self.screen_drag_to_pdf_rect(
                                     sx1,
