@@ -440,11 +440,13 @@ impl<'a> PdfViewerApp<'a> {
                 if center_y > cur_bottom + gap * 0.5 && self.current_page_index + 1 < total {
                     self.current_page_index += 1;
                     self.scroll_y -= cur_h + gap;
+                    self.cached_char_boxes = None;
                 } else if center_y < cur_top - gap * 0.5 && self.current_page_index > 0 {
                     let prev_idx = self.current_page_index - 1;
                     let (_, prev_h_u32) = ensure_page_cached(self, prev_idx)?;
                     self.current_page_index = prev_idx;
                     self.scroll_y += (prev_h_u32 as f32) + gap;
+                    self.cached_char_boxes = None;
                 } else {
                     break;
                 }
@@ -1021,6 +1023,84 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    /// Draws translucent blue text selection overlays for `self.selected_text_rects` on `page_idx`.
+    pub(super) fn draw_text_selection_overlays_on_page(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        page_idx: u16,
+        draw_rect: (i32, i32, u32, u32),
+    ) {
+        if self.selected_text_page != Some(page_idx) || self.selected_text_rects.is_empty() {
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let Ok(page) = doc.pages().get(page_idx) else {
+            return;
+        };
+        let (draw_x, draw_y, bmp_w, bmp_h) = draw_rect;
+        if bmp_w == 0 || bmp_h == 0 {
+            return;
+        }
+        let page_w = page.width().value.max(1.0);
+        let page_h = page.height().value.max(1.0);
+        let config = PdfRenderConfig::new()
+            .set_fixed_width(bmp_w as i32)
+            .set_fixed_height(bmp_h as i32);
+
+        let min_y_bound = top_bars_h as i32;
+        let max_y_bound = (buf_h.saturating_sub(status_bar_h)) as i32;
+
+        for r in &self.selected_text_rects {
+            let (bx1, by1, bx2, by2) = match (
+                page.points_to_pixels(r.left(), r.top(), &config),
+                page.points_to_pixels(r.right(), r.bottom(), &config),
+            ) {
+                (Ok((x1, y1)), Ok((x2, y2))) => (x1, y1, x2, y2),
+                _ => {
+                    let x1 = ((r.left().value / page_w) * (bmp_w as f32)).round() as i32;
+                    let y1 = ((1.0 - (r.top().value / page_h)) * (bmp_h as f32)).round() as i32;
+                    let x2 = ((r.right().value / page_w) * (bmp_w as f32)).round() as i32;
+                    let y2 = ((1.0 - (r.bottom().value / page_h)) * (bmp_h as f32)).round() as i32;
+                    (x1, y1, x2, y2)
+                }
+            };
+
+            let sx1 = (draw_x + bx1.min(bx2) - 1).clamp(0, buf_w as i32) as u32;
+            let sx2 = (draw_x + bx1.max(bx2) + 1).clamp(0, buf_w as i32) as u32;
+            let sy1 = (draw_y + by1.min(by2) - 1).clamp(min_y_bound, max_y_bound) as u32;
+            let sy2 = (draw_y + by1.max(by2) + 1).clamp(min_y_bound, max_y_bound) as u32;
+
+            if sx2 > sx1 && sy2 > sy1 {
+                blend_rect_rgba(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    sx1,
+                    sy1,
+                    sx2 - sx1,
+                    sy2 - sy1,
+                    (33, 150, 243, 95),
+                );
+                draw_rect_border(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    sx1,
+                    sy1,
+                    sx2 - sx1,
+                    sy2 - sy1,
+                    0x001E88E5,
+                );
+            }
+        }
+    }
+
     pub(super) fn render_to_window(&mut self) -> Result<()> {
         let Some(window) = self.window.as_ref().cloned() else {
             return Ok(());
@@ -1119,6 +1199,15 @@ impl<'a> PdfViewerApp<'a> {
                                 page_idx,
                                 draw_rect,
                             );
+                            self.draw_text_selection_overlays_on_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                top_bars_h,
+                                status_bar_h,
+                                page_idx,
+                                draw_rect,
+                            );
                         }
                     }
                 } else {
@@ -1135,6 +1224,15 @@ impl<'a> PdfViewerApp<'a> {
                             cache,
                         );
                         self.draw_search_overlays_on_page(
+                            &mut buffer,
+                            width,
+                            height,
+                            top_bars_h,
+                            status_bar_h,
+                            cache.page_index,
+                            self.page_draw_rect,
+                        );
+                        self.draw_text_selection_overlays_on_page(
                             &mut buffer,
                             width,
                             height,
@@ -1161,6 +1259,15 @@ impl<'a> PdfViewerApp<'a> {
                                 second_cache,
                             );
                             self.draw_search_overlays_on_page(
+                                &mut buffer,
+                                width,
+                                height,
+                                top_bars_h,
+                                status_bar_h,
+                                second_cache.page_index,
+                                second_rect,
+                            );
+                            self.draw_text_selection_overlays_on_page(
                                 &mut buffer,
                                 width,
                                 height,
@@ -1196,6 +1303,7 @@ impl<'a> PdfViewerApp<'a> {
 
                         if max_x > min_x && max_y > min_y {
                             let (fill_rgba, border_col) = match self.mouse_mode {
+                                MouseMode::Select => ((33, 150, 243, 45), 0x0042A5F5),
                                 MouseMode::Highlight => ((255, 235, 59, 90), 0x00FBC02D),
                                 MouseMode::Redact => ((229, 57, 53, 110), 0x00FF1744),
                                 MouseMode::Crop => ((0, 230, 118, 85), 0x0000E676),

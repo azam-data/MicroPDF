@@ -93,8 +93,10 @@ impl MenuCategory {
             ],
             MenuCategory::Edit => &[
                 "Undo (Ctrl+Z / Cmd+Z)",
+                "Copy Selected Text (Ctrl+C / Cmd+C)",
                 "Find Text in PDF... (Ctrl+F / Cmd+F)",
-                "Mouse Mode: Highlight Text (default)",
+                "Mouse Mode: Select Text (default)",
+                "Mouse Mode: Highlight Text",
                 "Mouse Mode: Black-Box Redact",
                 "Mouse Mode: Crop Page Area",
             ],
@@ -123,6 +125,7 @@ impl MenuCategory {
 /// Interactive Mouse Drag Mode in Single-Page / Spread Views.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseMode {
+    Select,
     Highlight,
     Redact,
     Crop,
@@ -132,6 +135,7 @@ pub enum MouseMode {
 impl MouseMode {
     pub fn short_label(self) -> &'static str {
         match self {
+            MouseMode::Select => "Select",
             MouseMode::Highlight => "Highlight",
             MouseMode::Redact => "REDACT",
             MouseMode::Crop => "CROP",
@@ -242,6 +246,13 @@ pub(super) struct TileEntry {
 pub(super) enum ResolvedLinkTarget {
     InternalPage(u16),
     ExternalUrl(String),
+}
+
+/// Cached PDFium character box for the current page only (freed immediately on page change).
+#[derive(Copy, Clone, Debug)]
+pub(super) struct PageCharBox {
+    pub(super) ch: char,
+    pub(super) rect: Option<PdfRect>,
 }
 
 /// Zero-RAM inactive document tab slot (never stores cached bitmaps or thumbnails).
@@ -394,9 +405,17 @@ pub struct PdfViewerApp<'a> {
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     /// Currently hovered link target on the page (triggers `CursorIcon::Pointer` hand cursor).
     pub(super) hovered_link: Option<ResolvedLinkTarget>,
+    /// Cached character boxes `(page_index, chars)` for the current page only (freed on page change).
+    pub(super) cached_char_boxes: Option<(u16, Vec<PageCharBox>)>,
+    /// Currently selected text string and its page/line highlight rectangles in `MouseMode::Select`.
+    pub(super) selected_text: String,
+    pub(super) selected_text_page: Option<u16>,
+    pub(super) selected_text_rects: Vec<PdfRect>,
+    /// Tracks the last click `(page_idx, sx, sy, timestamp)` in `MouseMode::Select` to detect double-clicks.
+    pub(super) last_select_click: Option<(u16, f64, f64, Instant)>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
-    /// Active Mouse Mode (`Highlight`, `Redact`, `Crop`, `StampImage`).
+    /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
     pub(super) mouse_mode: MouseMode,
     /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
     pub(super) pending_stamp_image: Option<StampImageBuffer>,
@@ -473,8 +492,13 @@ impl<'a> PdfViewerApp<'a> {
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             hovered_link: None,
+            cached_char_boxes: None,
+            selected_text: String::new(),
+            selected_text_page: None,
+            selected_text_rects: Vec::new(),
+            last_select_click: None,
             open_menu: None,
-            mouse_mode: MouseMode::Highlight,
+            mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
             search_query: String::new(),
@@ -535,6 +559,11 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         self.tile_cache.shrink_to_fit();
+        // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
+        self.cached_char_boxes = None;
+        self.selected_text.clear();
+        self.selected_text_page = None;
+        self.selected_text_rects.clear();
     }
 
 

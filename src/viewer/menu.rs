@@ -84,6 +84,7 @@ impl<'a> PdfViewerApp<'a> {
         let (_, last_menu_x1) = self.menu_header_x_range(MenuCategory::Help, scale);
         if buf_w > last_menu_x1 + info_w + 12 * scale {
             let info_col = match self.mouse_mode {
+                MouseMode::Select => 0x00B3E5FC,
                 MouseMode::Highlight => 0x0080DEEA,
                 MouseMode::Redact => 0x00FF8A80,
                 MouseMode::Crop => 0x0069F0AE,
@@ -291,24 +292,32 @@ impl<'a> PdfViewerApp<'a> {
 
             // Edit menu
             (MenuCategory::Edit, 0) => self.perform_undo(),
-            (MenuCategory::Edit, 1) => {
+            (MenuCategory::Edit, 1) => self.copy_selected_text_to_clipboard(),
+            (MenuCategory::Edit, 2) => {
                 self.input_mode = InputMode::SearchText {
                     query_input: self.search_query.clone(),
                 };
             }
-            (MenuCategory::Edit, 2) => {
+            (MenuCategory::Edit, 3) => {
+                self.mouse_mode = MouseMode::Select;
+                self.status_notice = Some(
+                    "Mouse Mode: Select Text (Drag or double-click text, Ctrl/Cmd+C to copy)"
+                        .to_string(),
+                );
+            }
+            (MenuCategory::Edit, 4) => {
                 self.mouse_mode = MouseMode::Highlight;
                 self.status_notice =
                     Some("Mouse Mode: Highlight Text (Drag across text)".to_string());
             }
-            (MenuCategory::Edit, 3) => {
+            (MenuCategory::Edit, 5) => {
                 self.mouse_mode = MouseMode::Redact;
                 self.status_notice = Some(
                     "Mouse Mode: Black-Box Redact (Drag red box to permanently purge & black out)"
                         .to_string(),
                 );
             }
-            (MenuCategory::Edit, 4) => {
+            (MenuCategory::Edit, 6) => {
                 self.mouse_mode = MouseMode::Crop;
                 self.status_notice = Some(
                     "Mouse Mode: Crop Page Area (Drag green box to crop page)".to_string(),

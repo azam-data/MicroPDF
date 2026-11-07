@@ -472,4 +472,66 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_text_selection_word_double_click_and_page_eviction() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_text_select.pdf");
+        engine.create_sample_pdf(&tmp, 3)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        assert_eq!(
+            app.mouse_mode,
+            MouseMode::Select,
+            "Select must be the default mouse mode"
+        );
+        app.ensure_current_page_rendered(1024, 1080, 0, 52, 22)?;
+
+        // Drag-select text across the entire page 0
+        let count = app.select_text_in_pdf_rect(
+            0,
+            PdfRect::new_from_values(0.0, 0.0, 842.0, 595.0),
+        );
+        assert!(count > 0, "Drag selection must select text on page 0");
+        assert!(app.selected_text.contains("MicroPDF"));
+        assert_eq!(app.selected_text_page, Some(0));
+        assert!(!app.selected_text_rects.is_empty());
+        assert_eq!(app.cached_char_boxes.as_ref().map(|(p, _)| *p), Some(0));
+
+        // Double-click word selection at the first non-whitespace character's center
+        let word_pt = app
+            .cached_char_boxes
+            .as_ref()
+            .unwrap()
+            .1
+            .iter()
+            .find(|c| c.ch.is_alphabetic() && c.rect.is_some())
+            .and_then(|c| c.rect)
+            .unwrap();
+        let mid_x = PdfPoints::new((word_pt.left().value + word_pt.right().value) * 0.5);
+        let mid_y = PdfPoints::new((word_pt.bottom().value + word_pt.top().value) * 0.5);
+        assert!(app.select_word_at_pdf_point(0, mid_x, mid_y));
+        assert!(!app.selected_text.is_empty());
+        assert!(!app.selected_text.contains(' '));
+
+        let ram_during = get_current_rss_mb().unwrap_or(0.0);
+
+        // RAM rule: Navigating to another page immediately frees character boxes and clears selection
+        app.navigate_to_page(1);
+        assert!(
+            app.cached_char_boxes.is_none(),
+            "Character boxes must be freed immediately on page change"
+        );
+        assert!(app.selected_text.is_empty());
+        assert!(app.selected_text_rects.is_empty());
+
+        eprintln!(
+            "[Feature 4 Text Selection RAM] before: {:.2} MB, during selection: {:.2} MB",
+            ram_before, ram_during
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

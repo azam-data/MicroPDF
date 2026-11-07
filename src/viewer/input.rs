@@ -373,6 +373,325 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    /// Populates `self.cached_char_boxes` for `page_idx` ONLY, immediately dropping any previous page's character boxes.
+    pub(super) fn ensure_page_char_boxes(&mut self, page_idx: u16) {
+        if self
+            .cached_char_boxes
+            .as_ref()
+            .map_or(false, |(cached_p, _)| *cached_p == page_idx)
+        {
+            return;
+        }
+        self.cached_char_boxes = None;
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let Ok(page) = doc.pages().get(page_idx) else {
+            return;
+        };
+        let Ok(text_page) = page.text() else {
+            return;
+        };
+
+        let mut boxes = Vec::new();
+        for ch in text_page.chars().iter() {
+            let Some(uc) = ch.unicode_char() else {
+                continue;
+            };
+            if uc == '\0' {
+                continue;
+            }
+            let rect_opt = ch
+                .loose_bounds()
+                .or_else(|_| ch.tight_bounds())
+                .ok()
+                .and_then(|b| {
+                    let bottom = b.bottom().value.min(b.top().value);
+                    let top = b.bottom().value.max(b.top().value);
+                    let left = b.left().value.min(b.right().value);
+                    let right = b.left().value.max(b.right().value);
+                    if (right - left) >= 0.05 && (top - bottom) >= 0.05 {
+                        Some(PdfRect::new_from_values(bottom, left, top, right))
+                    } else {
+                        None
+                    }
+                });
+            boxes.push(PageCharBox {
+                ch: uc,
+                rect: rect_opt,
+            });
+        }
+        self.cached_char_boxes = Some((page_idx, boxes));
+    }
+
+    pub(super) fn clear_text_selection(&mut self) {
+        self.selected_text.clear();
+        self.selected_text_page = None;
+        self.selected_text_rects.clear();
+    }
+
+    /// Selects all characters on `page_idx` whose bounding boxes intersect `pdf_rect`
+    /// and populates `self.selected_text` and `self.selected_text_rects`.
+    pub(super) fn select_text_in_pdf_rect(&mut self, page_idx: u16, pdf_rect: PdfRect) -> usize {
+        self.ensure_page_char_boxes(page_idx);
+        let Some((cached_p, ref chars)) = self.cached_char_boxes else {
+            self.clear_text_selection();
+            return 0;
+        };
+        if cached_p != page_idx || chars.is_empty() {
+            self.clear_text_selection();
+            return 0;
+        }
+
+        let sel_bottom = pdf_rect.bottom().value.min(pdf_rect.top().value);
+        let sel_top = pdf_rect.bottom().value.max(pdf_rect.top().value);
+        let sel_left = pdf_rect.left().value.min(pdf_rect.right().value);
+        let sel_right = pdf_rect.left().value.max(pdf_rect.right().value);
+
+        let mut text_out = String::new();
+        let mut line_rects: Vec<PdfRect> = Vec::new();
+        let mut prev_rect: Option<PdfRect> = None;
+
+        for item in chars.iter() {
+            let Some(cb) = item.rect else {
+                continue;
+            };
+            let cx = (cb.left().value + cb.right().value) * 0.5;
+            let cy = (cb.bottom().value + cb.top().value) * 0.5;
+            let overlaps = cb.left().value <= sel_right
+                && cb.right().value >= sel_left
+                && cb.bottom().value <= sel_top
+                && cb.top().value >= sel_bottom;
+            let center_in =
+                cx >= sel_left && cx <= sel_right && cy >= sel_bottom && cy <= sel_top;
+
+            if !(center_in || overlaps) {
+                continue;
+            }
+
+            if item.ch == '\r' {
+                continue;
+            }
+
+            if let Some(pr) = prev_rect {
+                let pr_mid_y = (pr.bottom().value + pr.top().value) * 0.5;
+                let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                let lh = (pr.top().value - pr.bottom().value).max(4.0);
+                if (pr_mid_y - cb_mid_y).abs() >= lh * 0.65 {
+                    if !text_out.ends_with('\n') && !text_out.is_empty() {
+                        text_out.push('\n');
+                    }
+                } else {
+                    let gap_x = cb.left().value - pr.right().value;
+                    let cw = (pr.right().value - pr.left().value).max(2.0);
+                    if gap_x > cw * 0.45
+                        && !text_out.ends_with(' ')
+                        && !text_out.ends_with('\n')
+                        && !item.ch.is_whitespace()
+                    {
+                        text_out.push(' ');
+                    }
+                }
+            }
+
+            text_out.push(item.ch);
+            if !item.ch.is_whitespace() {
+                prev_rect = Some(cb);
+            }
+
+            if let Some(last) = line_rects.last_mut() {
+                let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                let lh = (last.top().value - last.bottom().value).max(4.0);
+                if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
+                    *last = PdfRect::new_from_values(
+                        last.bottom().value.min(cb.bottom().value),
+                        last.left().value.min(cb.left().value),
+                        last.top().value.max(cb.top().value),
+                        last.right().value.max(cb.right().value),
+                    );
+                    continue;
+                }
+            }
+            line_rects.push(cb);
+        }
+
+        let trimmed = text_out.trim().to_string();
+        if trimmed.is_empty() || line_rects.is_empty() {
+            self.clear_text_selection();
+            return 0;
+        }
+
+        let char_count = trimmed.chars().count();
+        self.selected_text = trimmed;
+        self.selected_text_page = Some(page_idx);
+        self.selected_text_rects = line_rects;
+        char_count
+    }
+
+    /// Selects the contiguous word under `(pt_x, pt_y)` on `page_idx` (triggered by double-click in `MouseMode::Select`).
+    pub(super) fn select_word_at_pdf_point(
+        &mut self,
+        page_idx: u16,
+        pt_x: PdfPoints,
+        pt_y: PdfPoints,
+    ) -> bool {
+        self.ensure_page_char_boxes(page_idx);
+        let Some((cached_p, ref chars)) = self.cached_char_boxes else {
+            return false;
+        };
+        if cached_p != page_idx || chars.is_empty() {
+            return false;
+        }
+
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+        let x = pt_x.value;
+        let y = pt_y.value;
+
+        let mut hit_idx: Option<usize> = None;
+        let mut best_dist_sq = 64.0_f32; // Within 8pt tolerance
+        for (idx, item) in chars.iter().enumerate() {
+            if !is_word_char(item.ch) {
+                continue;
+            }
+            let Some(r) = item.rect else {
+                continue;
+            };
+            let dx = if x < r.left().value {
+                r.left().value - x
+            } else if x > r.right().value {
+                x - r.right().value
+            } else {
+                0.0
+            };
+            let dy = if y < r.bottom().value {
+                r.bottom().value - y
+            } else if y > r.top().value {
+                y - r.top().value
+            } else {
+                0.0
+            };
+            let d2 = dx * dx + dy * dy;
+            if d2 <= best_dist_sq {
+                best_dist_sq = d2;
+                hit_idx = Some(idx);
+                if d2 == 0.0 {
+                    break;
+                }
+            }
+        }
+
+        let Some(center_idx) = hit_idx else {
+            return false;
+        };
+
+        let mut start = center_idx;
+        while start > 0 && is_word_char(chars[start - 1].ch) {
+            if let (Some(r_cur), Some(r_prev)) = (chars[start].rect, chars[start - 1].rect) {
+                let lh = (r_cur.top().value - r_cur.bottom().value).max(4.0);
+                if ((r_cur.bottom().value - r_prev.bottom().value).abs() > lh * 0.8)
+                    || ((r_cur.left().value - r_prev.right().value) > lh * 0.6)
+                {
+                    break;
+                }
+            }
+            start -= 1;
+        }
+
+        let mut end = center_idx;
+        while end + 1 < chars.len() && is_word_char(chars[end + 1].ch) {
+            if let (Some(r_cur), Some(r_next)) = (chars[end].rect, chars[end + 1].rect) {
+                let lh = (r_cur.top().value - r_cur.bottom().value).max(4.0);
+                if ((r_cur.bottom().value - r_next.bottom().value).abs() > lh * 0.8)
+                    || ((r_next.left().value - r_cur.right().value) > lh * 0.6)
+                {
+                    break;
+                }
+            }
+            end += 1;
+        }
+
+        let mut word = String::new();
+        let mut union_rect: Option<PdfRect> = None;
+        for item in &chars[start..=end] {
+            word.push(item.ch);
+            if let Some(cb) = item.rect {
+                union_rect = Some(match union_rect {
+                    Some(u) => PdfRect::new_from_values(
+                        u.bottom().value.min(cb.bottom().value),
+                        u.left().value.min(cb.left().value),
+                        u.top().value.max(cb.top().value),
+                        u.right().value.max(cb.right().value),
+                    ),
+                    None => cb,
+                });
+            }
+        }
+
+        if word.is_empty() {
+            return false;
+        }
+        self.selected_text = word;
+        self.selected_text_page = Some(page_idx);
+        self.selected_text_rects = union_rect.into_iter().collect();
+        true
+    }
+
+    /// Copies `text` to the OS system clipboard without external crate dependencies.
+    pub(super) fn copy_text_to_os_clipboard(text: &str) -> anyhow::Result<()> {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        #[cfg(target_os = "macos")]
+        let mut child = Command::new("pbcopy").stdin(Stdio::piped()).spawn()?;
+
+        #[cfg(target_os = "windows")]
+        let mut child = Command::new("clip").stdin(Stdio::piped()).spawn()?;
+
+        #[cfg(target_os = "linux")]
+        let mut child = Command::new("wl-copy")
+            .stdin(Stdio::piped())
+            .spawn()
+            .or_else(|_| {
+                Command::new("xclip")
+                    .args(["-selection", "clipboard"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+            })?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let status = child.wait()?;
+        if !status.success() {
+            anyhow::bail!("Clipboard command exited with status {status}");
+        }
+        Ok(())
+    }
+
+    /// Copies `self.selected_text` to the OS clipboard (`Ctrl/Cmd+C`).
+    pub(super) fn copy_selected_text_to_clipboard(&mut self) {
+        if self.selected_text.is_empty() {
+            self.status_notice = Some(
+                "No text selected — Drag or double-click text in Select mode first".to_string(),
+            );
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+        let count = self.selected_text.chars().count();
+        match Self::copy_text_to_os_clipboard(&self.selected_text) {
+            Ok(()) => {
+                self.status_notice = Some(format!("Copied {count} character(s) to clipboard"));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Clipboard copy failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
     pub(super) fn navigate_to_page(&mut self, new_index: u16) {
         let total = self.total_pages();
         if total == 0 {
@@ -1638,12 +1957,15 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
 
-        // 2. OS-native modifier shortcuts: Cmd+Z / Ctrl+Z (Undo), Cmd+F / Ctrl+F (Find), Cmd+G / Ctrl+G (Next Match), Cmd+W / Ctrl+W (Close Tab)
+        // 2. OS-native modifier shortcuts: Cmd+Z / Ctrl+Z (Undo), Cmd+C / Ctrl+C (Copy), Cmd+F / Ctrl+F (Find), Cmd+G / Ctrl+G (Next Match), Cmd+W / Ctrl+W (Close Tab)
         if self.cmd_or_ctrl_pressed {
             if let Key::Character(ch) = &logical_key {
                 let s = ch.as_str();
                 if s.eq_ignore_ascii_case("z") {
                     self.perform_undo();
+                    return;
+                } else if s.eq_ignore_ascii_case("c") {
+                    self.copy_selected_text_to_clipboard();
                     return;
                 } else if s.eq_ignore_ascii_case("f") {
                     self.input_mode = InputMode::SearchText {
@@ -1717,11 +2039,16 @@ impl<'a> PdfViewerApp<'a> {
                 } else if self.show_help_overlay {
                     self.show_help_overlay = false;
                     self.request_redraw();
-                } else if self.mouse_mode != MouseMode::Highlight {
-                    self.mouse_mode = MouseMode::Highlight;
+                } else if !self.selected_text_rects.is_empty() {
+                    self.clear_text_selection();
+                    self.status_notice = Some("Cleared text selection".to_string());
+                    self.update_title_bar();
+                    self.request_redraw();
+                } else if self.mouse_mode != MouseMode::Select {
+                    self.mouse_mode = MouseMode::Select;
                     self.pending_stamp_image = None;
                     self.status_notice =
-                        Some("Returned to Mouse Mode: Highlight Text".to_string());
+                        Some("Returned to Mouse Mode: Select Text".to_string());
                     self.update_title_bar();
                     self.request_redraw();
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
@@ -2198,6 +2525,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 if self.drag_start.is_some() || self.grid_drag_page.is_some() {
+                    if let Some((sx1, sy1)) = self.drag_start {
+                        if self.mouse_mode == MouseMode::Select && self.view_mode.is_page_view() {
+                            if let Some((page_idx, pdf_rect)) = self.screen_drag_to_pdf_rect(
+                                sx1,
+                                sy1,
+                                position.x,
+                                position.y,
+                                false,
+                            ) {
+                                self.select_text_in_pdf_rect(page_idx, pdf_rect);
+                            }
+                        }
+                    }
                     self.request_redraw();
                 } else if self.view_mode.is_page_view() {
                     let new_link = self.resolve_link_at_screen_pos(position.x, position.y);
@@ -2564,6 +2904,46 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                         self.request_redraw();
                                         return;
                                     }
+
+                                    if self.mouse_mode == MouseMode::Select {
+                                        let now = Instant::now();
+                                        if let Some((page_idx, pt_x, pt_y)) =
+                                            self.screen_point_to_pdf_point(sx2, sy2)
+                                        {
+                                            let is_double_click = self
+                                                .last_select_click
+                                                .map_or(false, |(lp, lx, ly, lt)| {
+                                                    lp == page_idx
+                                                        && now.duration_since(lt)
+                                                            < Duration::from_millis(380)
+                                                        && (sx2 - lx).abs() < 8.0
+                                                        && (sy2 - ly).abs() < 8.0
+                                                });
+                                            if is_double_click {
+                                                self.last_select_click = None;
+                                                if self
+                                                    .select_word_at_pdf_point(page_idx, pt_x, pt_y)
+                                                {
+                                                    self.status_notice = Some(format!(
+                                                        "Selected word \"{}\" ({} chars) — Ctrl/Cmd+C to copy",
+                                                        self.selected_text,
+                                                        self.selected_text.chars().count()
+                                                    ));
+                                                } else {
+                                                    self.clear_text_selection();
+                                                }
+                                            } else {
+                                                self.last_select_click =
+                                                    Some((page_idx, sx2, sy2, now));
+                                                self.clear_text_selection();
+                                            }
+                                        } else {
+                                            self.clear_text_selection();
+                                        }
+                                        self.update_title_bar();
+                                        self.request_redraw();
+                                        return;
+                                    }
                                 }
                                 let allow_click = self.mouse_mode == MouseMode::StampImage;
                                 if let Some((page_idx, pdf_rect)) = self.screen_drag_to_pdf_rect(
@@ -2574,6 +2954,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     allow_click,
                                 ) {
                                     match self.mouse_mode {
+                                        MouseMode::Select => {
+                                            let count =
+                                                self.select_text_in_pdf_rect(page_idx, pdf_rect);
+                                            if count > 0 {
+                                                self.status_notice = Some(format!(
+                                                    "Selected {count} character(s) on Page {} — Ctrl/Cmd+C to copy",
+                                                    page_idx + 1
+                                                ));
+                                            } else {
+                                                self.clear_text_selection();
+                                            }
+                                        }
                                         MouseMode::Highlight => {
                                             self.push_undo_snapshot();
                                             if let Some(doc) = self.doc.as_mut() {
@@ -2637,7 +3029,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                             Ok(new_doc) => {
                                                                 self.doc = Some(new_doc);
                                                                 self.mouse_mode =
-                                                                    MouseMode::Highlight;
+                                                                    MouseMode::Select;
                                                                 self.scroll_y = 0.0;
                                                                 self.invalidate_page_caches();
                                                                 self.thumbnail_cache
@@ -2671,7 +3063,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                         doc, page_idx, &stamp, pdf_rect,
                                                     ) {
                                                         Ok(()) => {
-                                                            self.mouse_mode = MouseMode::Highlight;
+                                                            self.mouse_mode = MouseMode::Select;
                                                             self.invalidate_page_caches();
                                                             self.thumbnail_cache.remove(&page_idx);
                                                             self.status_notice = Some(format!(
@@ -2689,7 +3081,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                     }
                                                 }
                                             } else {
-                                                self.mouse_mode = MouseMode::Highlight;
+                                                self.mouse_mode = MouseMode::Select;
                                             }
                                         }
                                     }
