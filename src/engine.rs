@@ -122,15 +122,21 @@ pub(crate) struct ChangeGuardedFile {
     file: std::fs::File,
     len: u64,
     modified: Option<std::time::SystemTime>,
+    #[cfg(test)]
+    path: PathBuf,
 }
 
 impl ChangeGuardedFile {
-    pub(crate) fn new(file: std::fs::File) -> std::io::Result<Self> {
+    pub(crate) fn new(file: std::fs::File, _path: &Path) -> std::io::Result<Self> {
         let meta = file.metadata()?;
+        #[cfg(test)]
+        let path = open_file_registry::opened(_path);
         Ok(Self {
             len: meta.len(),
             modified: meta.modified().ok(),
             file,
+            #[cfg(test)]
+            path,
         })
     }
 
@@ -152,6 +158,48 @@ impl std::io::Read for ChangeGuardedFile {
         // original ones. A change during the read moves the length or mtime and is caught here.
         self.check_unchanged()?;
         Ok(buf.len())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ChangeGuardedFile {
+    fn drop(&mut self) {
+        open_file_registry::closed(&self.path);
+    }
+}
+
+/// Test-only record of which files this process holds open through `ChangeGuardedFile`, so
+/// tests can simulate file systems that refuse to replace a file while it is open (FAT32,
+/// exFAT, some network shares, Windows without POSIX rename semantics).
+#[cfg(test)]
+pub(crate) mod open_file_registry {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OPEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    fn key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Records `path` as open; returns the key to pass to `closed`.
+    pub(crate) fn opened(path: &Path) -> PathBuf {
+        let k = key(path);
+        OPEN.lock().unwrap_or_else(|e| e.into_inner()).push(k.clone());
+        k
+    }
+
+    /// `opened_key` as returned by `opened` (the file may have been renamed or deleted since).
+    pub(crate) fn closed(opened_key: &Path) {
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = open.iter().position(|p| p == opened_key) {
+            open.swap_remove(i);
+        }
+    }
+
+    pub(crate) fn is_open(path: &Path) -> bool {
+        let k = key(path);
+        OPEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&k)
     }
 }
 
@@ -267,7 +315,7 @@ impl PdfEngine {
         if junk_offset == 0 && password.is_none() {
             file.seek(SeekFrom::Start(0))
                 .with_context(|| format!("FS Error seeking {:?}", resolved_path))?;
-            let reader = ChangeGuardedFile::new(file)
+            let reader = ChangeGuardedFile::new(file, &resolved_path)
                 .with_context(|| format!("FS Error reading metadata {:?}", resolved_path))?;
             match self.pdfium.load_pdf_from_reader(reader, None) {
                 Ok(doc) => return Ok(doc),
@@ -328,32 +376,41 @@ impl PdfEngine {
         }
     }
 
-    /// Writes `bytes` to `path` atomically: write a sibling temp file, flush it to disk, then
-    /// rename over the target. A crash or full disk mid-save can no longer leave a truncated PDF.
-    pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let file_name = path
-            .file_name()
+    /// The temporary file a save of `path` is written to before it replaces `path`:
+    /// `<stem>.micropdf-save.pdf` in the same folder (same drive, so the rename is atomic).
+    /// Visible and ending in `.pdf`, because when the final rename fails it is left in place as
+    /// the user's saved copy.
+    pub fn save_temp_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "output.pdf".to_string());
-        let tmp = path.with_file_name(format!(".{file_name}.micropdf-tmp"));
-        {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
-            if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
-                drop(f);
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e).with_context(|| format!("Failed to write temp file {:?}", tmp));
-            }
+            .unwrap_or_else(|| "output".to_string());
+        path.with_file_name(format!("{stem}.micropdf-save.pdf"))
+    }
+
+    /// Writes `bytes` to `save_temp_path(path)` and flushes it to disk. On failure the partial
+    /// temp file is removed. Returns the temp path.
+    pub fn write_temp_next_to(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        use std::io::Write;
+        let tmp = Self::save_temp_path(path);
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("Failed to write temp file {:?}", tmp));
         }
+        Ok(tmp)
+    }
+
+    /// Writes `bytes` to `path` atomically: write a sibling temp file, flush it to disk, then
+    /// rename over the target. A crash or full disk mid-save can never leave a truncated file:
+    /// if the rename fails, the temp file is removed and `path` is left exactly as it was.
+    /// (Saving over a document the viewer has open goes through `save_active_doc_to`, which
+    /// closes the open handle and retries before giving up.)
+    pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+        let tmp = Self::write_temp_next_to(path, bytes)?;
         if let Err(e) = std::fs::rename(&tmp, path) {
-            #[cfg(windows)]
-            {
-                if std::fs::write(path, bytes).is_ok() {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Ok(());
-                }
-            }
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("Failed to replace {:?}", path));
         }
@@ -856,11 +913,31 @@ impl PdfEngine {
         Self::write_atomic(output_path.as_ref(), &bytes)
     }
 
-    /// Saves `doc` with `/PageLabels`, `/Outlines` and sanitized metadata.
+    /// Serializes `doc` with `/PageLabels`, `/Outlines` and sanitized metadata.
     ///
-    /// Returns `Ok(None)` on a clean save, or `Ok(Some(warning))` when the file was written but
-    /// metadata could not be sanitized. When `redacted` is true the save is refused instead of
-    /// writing a file that might still contain redacted content.
+    /// Returns the bytes plus `Some(warning)` when metadata could not be sanitized (the raw
+    /// bytes are returned then). When `redacted` is true that case is an error instead, so a file
+    /// that might still contain redacted content is never produced.
+    pub fn serialize_doc_with_metadata(
+        doc: &PdfDocument,
+        roman_end: usize,
+        bookmarks: &[Bookmark],
+        redacted: bool,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let raw_bytes = doc
+            .save_to_bytes()
+            .context("Failed to serialize PDF document to bytes")?;
+        match Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks, redacted) {
+            Ok(final_bytes) => Ok((final_bytes, None)),
+            Err(e) if redacted => Err(e.context(
+                "Save refused: post-redaction cleanup failed, nothing was written",
+            )),
+            Err(e) => Ok((raw_bytes, Some(format!("metadata was NOT sanitized ({e})")))),
+        }
+    }
+
+    /// Saves `doc` with `/PageLabels`, `/Outlines` and sanitized metadata (see
+    /// `serialize_doc_with_metadata`), written with `write_atomic`.
     pub fn save_doc_with_metadata<P: AsRef<Path>>(
         doc: &PdfDocument,
         output_path: P,
@@ -868,22 +945,10 @@ impl PdfEngine {
         bookmarks: &[Bookmark],
         redacted: bool,
     ) -> Result<Option<String>> {
-        let raw_bytes = doc
-            .save_to_bytes()
-            .context("Failed to serialize PDF document to bytes")?;
-        match Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks, redacted) {
-            Ok(final_bytes) => {
-                Self::write_atomic(output_path.as_ref(), &final_bytes)?;
-                Ok(None)
-            }
-            Err(e) if redacted => Err(e.context(
-                "Save refused: post-redaction cleanup failed, nothing was written",
-            )),
-            Err(e) => {
-                Self::write_atomic(output_path.as_ref(), &raw_bytes)?;
-                Ok(Some(format!("metadata was NOT sanitized ({e})")))
-            }
-        }
+        let (bytes, warning) =
+            Self::serialize_doc_with_metadata(doc, roman_end, bookmarks, redacted)?;
+        Self::write_atomic(output_path.as_ref(), &bytes)?;
+        Ok(warning)
     }
 
     /// Sidecar file path (`<pdf_filename>.bookmarks.txt`) used to persist user bookmark edits.

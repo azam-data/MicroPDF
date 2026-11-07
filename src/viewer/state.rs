@@ -521,6 +521,9 @@ pub struct PdfViewerApp<'a> {
     pub(super) custom_session_ini_path: Option<PathBuf>,
     /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
+    /// Renames a finished save's temp file over its target. `std::fs::rename` except in tests,
+    /// which substitute file-system behaviour (e.g. refusing to replace a file that is open).
+    pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -624,6 +627,7 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
             single_instance_listener: None,
+            rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,

@@ -1,7 +1,7 @@
 use crate::engine::{Bookmark, MarginPosition, MarginZone, PdfEngine};
 use pdfium_render::prelude::*;
 use softbuffer::{Context as SoftContext, Surface};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -1526,49 +1526,131 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Saves the active document to `save_path` (which may be the open file itself), then
     /// reopens it from there. Shows the outcome in the status bar.
+    /// Saves the active document to `save_path` (which may be the open file itself), then
+    /// reopens it from there. Shows the outcome in the status bar.
+    ///
+    /// The bytes go to a temp file next to `save_path` first, which then replaces `save_path` by
+    /// rename, so the original is never rewritten in place. If the rename fails (FAT32/exFAT and
+    /// some network shares refuse to replace a file that is open), the documents this app has
+    /// open on `save_path` are closed and the rename is retried. If it still fails, the original
+    /// is left untouched, the temp file stays next to it as the saved copy, and the active tab
+    /// keeps working from that copy with its edits still marked unsaved.
     pub(super) fn save_active_doc_to(&mut self, save_path: std::path::PathBuf) {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
-        {
-            match PdfEngine::save_doc_with_metadata(
-                doc,
-                &save_path,
-                self.roman_end,
-                &self.bookmarks,
-                self.redacted,
-            ) {
-                Ok(warning) => {
-                    if let Ok(reloaded) = self.engine.load_pdf_safe(&save_path) {
-                        self.doc = Some(reloaded);
-                        self.invalidate_page_caches();
-                    }
-                    let saved_mtime = Self::read_file_mtime(&save_path);
-                    self.record_recent_file(&save_path);
-                    self.file_path = save_path.clone();
-                    self.has_unsaved_edits = false;
-                    self.last_file_mtime = saved_mtime;
-                    if self.active_tab < self.tabs.len() {
-                        self.tabs[self.active_tab].file_path = save_path;
-                        self.tabs[self.active_tab].has_unsaved_edits = false;
-                        self.tabs[self.active_tab].last_file_mtime = saved_mtime;
-                    }
-                    self.persist_bookmarks();
-                    self.status_notice = Some(match warning {
-                        None if self.redacted => {
-                            "Saved PDF (redaction finalized: orphaned objects, /Info & thumbnails removed)".to_string()
-                        }
-                        None => "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)".to_string(),
-                        Some(w) => format!("Saved PDF, but WARNING: {w}"),
-                    });
-                }
-                Err(e) => {
-                    self.status_notice = Some(format!("Save error: {e}"));
-                }
+        let serialized = PdfEngine::serialize_doc_with_metadata(
+            doc,
+            self.roman_end,
+            &self.bookmarks,
+            self.redacted,
+        );
+        let temp = serialized.and_then(|(bytes, warning)| {
+            PdfEngine::write_temp_next_to(&save_path, &bytes).map(|t| (t, warning))
+        });
+        match temp {
+            Err(e) => {
+                self.status_notice = Some(format!("Save error: {e:#}"));
             }
-            self.update_title_bar();
-            self.request_redraw();
+            Ok((temp, warning)) => match self.replace_with_saved_temp(&temp, &save_path) {
+                Ok(()) => self.finish_successful_save(save_path, warning),
+                Err(e) => {
+                    let fname = save_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.status_notice = Some(format!(
+                        "Could not replace '{fname}' ({e}). The original is unchanged; your saved copy is {}",
+                        temp.display()
+                    ));
+                }
+            },
         }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Renames the saved `temp` file over `target`, closing and reopening this app's documents
+    /// on `target` if the first attempt fails. On success the active document is reopened by
+    /// `finish_successful_save`; on failure it is reopened from `temp` (it holds the edits).
+    fn replace_with_saved_temp(&mut self, temp: &Path, target: &Path) -> std::io::Result<()> {
+        let first_err = match (self.rename_for_save)(temp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+
+        let active_holds = self.doc.is_some() && same_file(&self.file_path, target);
+        // Other tabs on the same file are closed too, unless they have unsaved edits of their
+        // own: those are never dropped (the retry may then fail and is reported).
+        let other_tabs: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| {
+                i != self.active_tab
+                    && self.tabs[i].doc.is_some()
+                    && !self.tabs[i].has_unsaved_edits
+                    && same_file(&self.tabs[i].file_path, target)
+            })
+            .collect();
+        if !active_holds && other_tabs.is_empty() {
+            return Err(first_err);
+        }
+
+        if active_holds {
+            self.invalidate_page_caches();
+            self.thumbnail_cache.clear();
+            self.doc = None;
+        }
+        for &i in &other_tabs {
+            self.tabs[i].doc = None;
+        }
+
+        let result = (self.rename_for_save)(temp, target);
+
+        for &i in &other_tabs {
+            self.tabs[i].doc = self.engine.load_pdf_safe(target).ok();
+            if result.is_ok() {
+                self.tabs[i].last_file_mtime = Self::read_file_mtime(target);
+            }
+        }
+        if active_holds && result.is_err() {
+            self.doc = self
+                .engine
+                .load_pdf_safe(temp)
+                .or_else(|_| self.engine.load_pdf_safe(target))
+                .ok();
+        }
+        result
+    }
+
+    fn finish_successful_save(&mut self, save_path: std::path::PathBuf, warning: Option<String>) {
+        let mut reopen_error = None;
+        match self.engine.load_pdf_safe(&save_path) {
+            Ok(reloaded) => {
+                self.doc = Some(reloaded);
+                self.invalidate_page_caches();
+            }
+            // Keep the document already open, unless it was closed for the rename.
+            Err(e) if self.doc.is_none() => reopen_error = Some(e),
+            Err(_) => {}
+        }
+        let saved_mtime = Self::read_file_mtime(&save_path);
+        self.record_recent_file(&save_path);
+        self.file_path = save_path.clone();
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = saved_mtime;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].file_path = save_path;
+            self.tabs[self.active_tab].has_unsaved_edits = false;
+            self.tabs[self.active_tab].last_file_mtime = saved_mtime;
+        }
+        self.persist_bookmarks();
+        self.status_notice = Some(match (reopen_error, warning) {
+            (Some(e), _) => format!("Saved PDF, but could not reopen it: {e:#}"),
+            (None, None) if self.redacted => {
+                "Saved PDF (redaction finalized: orphaned objects, /Info & thumbnails removed)".to_string()
+            }
+            (None, None) => "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)".to_string(),
+            (None, Some(w)) => format!("Saved PDF, but WARNING: {w}"),
+        });
     }
 
     /// Opens the interactive Optimize menu in the bottom command bar (`Tools -> Optimize...`).
@@ -3875,5 +3957,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             }
             _ => {}
         }
+    }
+}
+
+/// Whether `a` and `b` name the same file (compared after resolving links and `..`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
     }
 }

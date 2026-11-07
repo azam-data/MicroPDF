@@ -1283,7 +1283,7 @@ mod tests {
         app.save_active_doc_to(path.clone());
         assert!(!app.has_unsaved_edits, "save failed: {:?}", app.status_notice);
         assert!(
-            !dir.join(".doc.pdf.micropdf-tmp").exists(),
+            !PdfEngine::save_temp_path(&path).exists(),
             "atomic save must not leave its temp file behind"
         );
 
@@ -1422,6 +1422,162 @@ mod tests {
         assert_eq!(app.total_pages(), 20);
 
         drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Simulates FAT32/exFAT (and Windows without POSIX rename): replacing a file fails while
+    /// this process still has it open.
+    fn rename_refusing_open_target(from: &Path, to: &Path) -> std::io::Result<()> {
+        if crate::engine::open_file_registry::is_open(to) {
+            return Err(std::io::Error::other("simulated: the file is in use"));
+        }
+        std::fs::rename(from, to)
+    }
+
+    fn rename_always_failing(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("simulated: access denied"))
+    }
+
+    fn pdf_page_count(path: &Path, engine: &PdfEngine) -> Result<u16> {
+        Ok(engine.load_pdf_from_bytes_safe(std::fs::read(path)?)?.pages().len())
+    }
+
+    /// Rename refused while the file is open: the save closes the app's handles on that file
+    /// (the active tab and a clean second tab on the same file), renames, and reopens them.
+    #[test]
+    fn test_save_over_open_file_when_fs_refuses_replacing_open_files() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_refuse_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.open_document_in_new_tab(path.clone())?;
+        assert_eq!((app.tabs.len(), app.active_tab), (2, 1));
+        assert!(crate::engine::open_file_registry::is_open(&path));
+        app.rename_for_save = rename_refusing_open_target;
+
+        assert!(render_page_like_frame(&mut app, 0));
+        app.insert_blank_page_after_current();
+        app.save_active_doc_to(path.clone());
+
+        assert!(!app.has_unsaved_edits, "save failed: {:?}", app.status_notice);
+        assert!(app.status_notice.as_deref().unwrap_or("").starts_with("Saved PDF"));
+        assert!(!PdfEngine::save_temp_path(&path).exists(), "temp file must be renamed away");
+        assert_eq!(pdf_page_count(&path, &engine)?, 21, "the file on disk is the saved version");
+
+        // Active tab reopened from the saved file: unviewed pages render the saved content.
+        assert_eq!(app.total_pages(), 21);
+        for idx in [10u16, 20] {
+            assert!(render_page_like_frame(&mut app, idx), "{:?}", app.status_notice);
+            assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {idx}"));
+        }
+        // The other tab on the same file was reopened too.
+        app.switch_to_tab(0);
+        assert_eq!(app.total_pages(), 21);
+        assert!(render_page_like_frame(&mut app, 15), "{:?}", app.status_notice);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Rename keeps failing: the original is untouched, the saved copy stays next to it, the
+    /// status bar names it, and the tab keeps working (from the copy) with its edits unsaved.
+    /// A later save that can rename then succeeds normally.
+    #[test]
+    fn test_save_when_replace_keeps_failing_keeps_original_and_copy() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_rename_fails");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        let original = build_labeled_padded_pdf(20, "Alpha")?;
+        std::fs::write(&path, &original)?;
+        let temp = PdfEngine::save_temp_path(&path);
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.rename_for_save = rename_always_failing;
+        assert!(render_page_like_frame(&mut app, 0));
+        app.insert_blank_page_after_current();
+        app.save_active_doc_to(path.clone());
+
+        assert_eq!(std::fs::read(&path)?, original, "original must be byte-for-byte unchanged");
+        assert!(temp.exists(), "the saved copy must stay next to the original");
+        assert_eq!(pdf_page_count(&temp, &engine)?, 21);
+        let notice = app.status_notice.clone().unwrap_or_default();
+        assert!(notice.contains("original is unchanged"), "{notice}");
+        assert!(notice.contains(&temp.display().to_string()), "must name the copy: {notice}");
+        assert!(notice.contains("simulated: access denied"), "{notice}");
+        assert!(app.has_unsaved_edits, "the edits did not reach the file");
+        assert_eq!(app.file_path, path, "the tab still belongs to the original file");
+
+        // The tab keeps the edits and can render pages it never showed.
+        assert_eq!(app.total_pages(), 21);
+        assert!(render_page_like_frame(&mut app, 18), "{:?}", app.status_notice);
+        assert_eq!(active_page_text(&app, 18)?, "Alpha page 18");
+
+        // Next save on a file system that allows the rename.
+        app.rename_for_save = |from, to| std::fs::rename(from, to);
+        app.save_active_doc_to(path.clone());
+        assert!(!app.has_unsaved_edits, "{:?}", app.status_notice);
+        assert!(!temp.exists());
+        assert_eq!(pdf_page_count(&path, &engine)?, 21);
+        assert!(render_page_like_frame(&mut app, 20), "{:?}", app.status_notice);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A second tab on the same file with unsaved edits of its own is never closed to make the
+    /// rename work; the save then fails safely and that tab keeps its edits.
+    #[test]
+    fn test_save_never_drops_another_tabs_unsaved_edits() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_dirty_tab");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        let original = build_labeled_padded_pdf(20, "Alpha")?;
+        std::fs::write(&path, &original)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.insert_blank_page_after_current(); // tab 0: 21 pages, unsaved
+        app.open_document_in_new_tab(path.clone())?;
+        app.delete_current_page(); // tab 1: 19 pages, unsaved
+        assert_eq!(app.total_pages(), 19);
+        app.rename_for_save = rename_refusing_open_target;
+        app.save_active_doc_to(path.clone());
+
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(PdfEngine::save_temp_path(&path).exists());
+        assert!(app.has_unsaved_edits);
+        assert_eq!(app.total_pages(), 19);
+        app.switch_to_tab(0);
+        assert!(app.has_unsaved_edits, "the other tab's edits must survive");
+        assert_eq!(app.total_pages(), 21);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `write_atomic` never falls back to rewriting the target in place.
+    #[test]
+    fn test_write_atomic_failed_rename_leaves_target_and_no_temp() -> Result<()> {
+        let dir = std::env::temp_dir().join("micropdf_write_atomic_fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A non-empty directory cannot be replaced by a file on any platform.
+        let target = dir.join("busy.pdf");
+        std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("keep.txt"), b"keep")?;
+        assert!(PdfEngine::write_atomic(&target, b"%PDF-1.4 new").is_err());
+        assert_eq!(std::fs::read(target.join("keep.txt"))?, b"keep");
+        assert!(!PdfEngine::save_temp_path(&target).exists(), "temp must be removed");
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
