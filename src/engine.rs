@@ -75,8 +75,29 @@ pub struct SearchMatch {
 pub struct StampImageBuffer {
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub image: image::DynamicImage,
 }
+
+/// Result of `flatten_and_unlock_doc`.
+pub struct FlattenReport {
+    pub bytes: Vec<u8>,
+    /// 1-based page numbers whose annotations/forms could not be flattened.
+    pub failed_pages: Vec<u16>,
+    /// False when the encryption/permission dictionaries could not be stripped.
+    pub permissions_removed: bool,
+}
+
+/// Error returned when a PDF file is encrypted and requires a user/owner password.
+#[derive(Debug)]
+pub struct PasswordRequiredError;
+
+impl std::fmt::Display for PasswordRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "This PDF requires a password to open")
+    }
+}
+
+impl std::error::Error for PasswordRequiredError {}
 
 pub struct PdfEngine {
     pub pdfium: Pdfium,
@@ -84,8 +105,12 @@ pub struct PdfEngine {
 
 #[allow(dead_code)]
 impl PdfEngine {
-    /// Initializes PDFium by looking for the library in the executable's directory first,
-    /// falling back to `./` (current working directory), and then system library paths.
+    /// Initializes PDFium from the executable's own directory only.
+    ///
+    /// v1.1: the current working directory, `./lib` and system library paths are no longer
+    /// searched. A PDF viewer is often launched with the working directory set to a folder of
+    /// untrusted downloads, and loading `pdfium.dll` from there would be a DLL-planting risk.
+    /// Developers can point at a different folder with the `MICROPDF_PDFIUM_DIR` env var.
     pub fn new() -> Result<Self> {
         let bindings = Self::bind_pdfium()?;
         Ok(Self {
@@ -94,45 +119,60 @@ impl PdfEngine {
     }
 
     fn bind_pdfium() -> Result<Box<dyn PdfiumLibraryBindings>> {
-        // 1. Try executable's directory first
+        let mut tried: Vec<PathBuf> = Vec::new();
+
+        if let Some(dir) = std::env::var_os("MICROPDF_PDFIUM_DIR") {
+            let lib = Pdfium::pdfium_platform_library_name_at_path(&PathBuf::from(dir));
+            match Pdfium::bind_to_library(&lib) {
+                Ok(b) => return Ok(b),
+                Err(_) => tried.push(lib),
+            }
+        }
+
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(exe_dir) = exe_path.parent() {
-                if let Ok(bindings) =
-                    Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path(exe_dir))
-                {
-                    return Ok(bindings);
+                #[allow(unused_mut)]
+                let mut candidates = vec![exe_dir.to_path_buf()];
+                // macOS .app bundle layout: Contents/MacOS/micro_pdf + Contents/Frameworks/
+                #[cfg(target_os = "macos")]
+                candidates.push(exe_dir.join("../Frameworks"));
+                for dir in candidates {
+                    let lib = Pdfium::pdfium_platform_library_name_at_path(&dir);
+                    match Pdfium::bind_to_library(&lib) {
+                        Ok(b) => return Ok(b),
+                        Err(_) => tried.push(lib),
+                    }
                 }
             }
         }
 
-        // 2. Fallback to current working directory `./`
-        if let Ok(bindings) =
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
-        {
-            return Ok(bindings);
-        }
-
-        // Also check `./lib` or `./bin` just in case, before system library
-        if let Ok(bindings) =
-            Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./lib"))
-        {
-            return Ok(bindings);
-        }
-
-        // 3. Fallback to system library paths
-        Pdfium::bind_to_system_library().context(
-            "Failed to bind to PDFium library in executable dir, current working dir, or system paths",
+        anyhow::bail!(
+            "PDFium library not found. Place it next to the MicroPDF executable. Looked in: {:?}",
+            tried
         )
     }
 
-    /// Unified, safe PDF loader that NEVER passes file paths to PDFium's C loader (`load_pdf_from_file`).
+    /// Returns true if `err` (or any cause in its chain) is a `PasswordRequiredError`.
+    pub fn is_password_error(err: &anyhow::Error) -> bool {
+        err.downcast_ref::<PasswordRequiredError>().is_some()
+    }
+
+    /// Unified, safe PDF loader that never passes file paths to PDFium's C loader.
     /// 1. Cleans/canonicalizes `path` (stripping any trailing newlines or surrounding quotes).
     /// 2. Reads the entire file into memory via `std::fs::read`.
-    /// 3. Calls `self.pdfium.load_pdf_from_byte_vec(bytes.clone(), None)`.
-    /// 4. If that fails, immediately retries with `Some("")` (empty password).
-    /// 5. If it still fails, logs the exact `PdfiumError` variant and file path to `eprintln!`
-    ///    and returns it in `Err` so the Window Title Bar displays `FS Error` vs `Pdfium Error`.
+    /// 3. Strips leading junk/BOM bytes before `%PDF-` (within the first 1 KB) in place.
+    /// 4. Hands the single buffer to PDFium (v1.1: no `bytes.clone()`, so peak RAM is 1x file size).
     pub fn load_pdf_safe<'a>(&'a self, path: &Path) -> Result<PdfDocument<'a>> {
+        self.load_pdf_with_password(path, None)
+    }
+
+    /// Loads `path` with an optional password (`None` tries the empty password first).
+    /// Never stores `password`.
+    pub fn load_pdf_with_password<'a>(
+        &'a self,
+        path: &Path,
+        password: Option<&str>,
+    ) -> Result<PdfDocument<'a>> {
         let cleaned_path = if let Some(raw_str) = path.to_str() {
             let trimmed = raw_str
                 .trim_matches(|c: char| c == '\n' || c == '\r' || c == '"' || c == '\'');
@@ -143,61 +183,16 @@ impl PdfEngine {
 
         let resolved_path = std::fs::canonicalize(&cleaned_path).unwrap_or(cleaned_path);
 
-        let bytes = match std::fs::read(&resolved_path) {
-            Ok(b) => b,
-            Err(fs_err) => {
-                eprintln!(
-                    "[load_pdf_safe] FS Error reading {:?}: {}",
-                    resolved_path, fs_err
-                );
-                anyhow::bail!("FS Error reading {:?}: {}", resolved_path, fs_err);
-            }
-        };
+        let mut bytes = std::fs::read(&resolved_path)
+            .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
 
         if bytes.is_empty() {
-            eprintln!("[load_pdf_safe] FS Error: file {:?} is empty (0 bytes)", resolved_path);
             anyhow::bail!("FS Error: file {:?} is empty (0 bytes)", resolved_path);
         }
 
-        match self.pdfium.load_pdf_from_byte_vec(bytes.clone(), None) {
-            Ok(doc) => return Ok(doc),
-            Err(err_none) => {
-                match self.pdfium.load_pdf_from_byte_vec(bytes.clone(), Some("")) {
-                    Ok(doc) => return Ok(doc),
-                    Err(err_empty) => {
-                        // Also check if the file has leading junk/BOM bytes before `%PDF-`
-                        if let Some(pdf_offset) = bytes
-                            .windows(5)
-                            .position(|w| w == b"%PDF-")
-                            .filter(|&pos| pos > 0)
-                        {
-                            let sliced = bytes[pdf_offset..].to_vec();
-                            if let Ok(doc) = self.pdfium.load_pdf_from_byte_vec(sliced.clone(), None)
-                            {
-                                return Ok(doc);
-                            }
-                            if let Ok(doc) = self.pdfium.load_pdf_from_byte_vec(sliced, Some("")) {
-                                return Ok(doc);
-                            }
-                        }
-
-                        eprintln!(
-                            "[load_pdf_safe] Pdfium Error opening {:?} ({} bytes): initial={:?}, empty_password_retry={:?}",
-                            resolved_path,
-                            bytes.len(),
-                            err_none,
-                            err_empty
-                        );
-                        anyhow::bail!(
-                            "Pdfium Error ({:?} / {:?}) on {:?}",
-                            err_none,
-                            err_empty,
-                            resolved_path
-                        );
-                    }
-                }
-            }
-        }
+        Self::strip_leading_junk(&mut bytes);
+        self.load_pdf_from_bytes_with_password(bytes, password)
+            .with_context(|| format!("Could not open {:?}", resolved_path))
     }
 
     /// Alias for `load_pdf_safe` so all callers use the safe in-memory byte vector loader.
@@ -205,15 +200,59 @@ impl PdfEngine {
         self.load_pdf_safe(path)
     }
 
-    /// Loads a `PdfDocument` directly from an in-memory `Vec<u8>` buffer (used for Undo/Redo and
-    /// in-memory grayscale conversion), retrying with `Some("")` if `None` fails.
-    pub fn load_pdf_from_bytes_safe<'a>(&'a self, bytes: Vec<u8>) -> Result<PdfDocument<'a>> {
-        if let Ok(doc) = self.pdfium.load_pdf_from_byte_vec(bytes.clone(), None) {
-            return Ok(doc);
+    /// Removes bytes before `%PDF-` when the header appears within the first 1 KB (BOMs, mail junk).
+    fn strip_leading_junk(bytes: &mut Vec<u8>) {
+        let window = &bytes[..bytes.len().min(1024)];
+        if let Some(pos) = window.windows(5).position(|w| w == b"%PDF-") {
+            if pos > 0 {
+                bytes.drain(..pos);
+            }
         }
-        self.pdfium
-            .load_pdf_from_byte_vec(bytes, Some(""))
-            .context("Failed to load PDF from in-memory byte vector")
+    }
+
+    /// Loads a `PdfDocument` from an in-memory buffer without copying it.
+    /// PDFium already tries the empty user password, so no second attempt is needed.
+    /// Password-protected files return `PasswordRequiredError`.
+    pub fn load_pdf_from_bytes_safe<'a>(&'a self, bytes: Vec<u8>) -> Result<PdfDocument<'a>> {
+        self.load_pdf_from_bytes_with_password(bytes, None)
+    }
+
+    /// Loads a `PdfDocument` from an in-memory buffer with an optional password.
+    pub fn load_pdf_from_bytes_with_password<'a>(
+        &'a self,
+        bytes: Vec<u8>,
+        password: Option<&str>,
+    ) -> Result<PdfDocument<'a>> {
+        match self.pdfium.load_pdf_from_byte_vec(bytes, password) {
+            Ok(doc) => Ok(doc),
+            Err(PdfiumError::PdfiumLibraryInternalError(PdfiumInternalError::PasswordError)) => {
+                Err(anyhow::Error::new(PasswordRequiredError))
+            }
+            Err(e) => Err(anyhow::anyhow!("PDFium could not parse the document: {e:?}")),
+        }
+    }
+
+    /// Writes `bytes` to `path` atomically: write a sibling temp file, flush it to disk, then
+    /// rename over the target. A crash or full disk mid-save can no longer leave a truncated PDF.
+    pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let file_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "output.pdf".to_string());
+        let tmp = path.with_file_name(format!(".{file_name}.micropdf-tmp"));
+        {
+            let mut f = std::fs::File::create(&tmp)
+                .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
+            f.write_all(bytes)
+                .and_then(|_| f.sync_all())
+                .with_context(|| format!("Failed to write temp file {:?}", tmp))?;
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("Failed to replace {:?}", path));
+        }
+        Ok(())
     }
 
     /// Parses a valid Roman numeral (`i`, `ii`, `iii`, `iv`, `v`... case-insensitive) into a 1-based `usize`.
@@ -457,14 +496,34 @@ impl PdfEngine {
     }
 
     /// Embeds `/PageLabels` and hierarchical `/Outlines` into `pdf_bytes` using `lopdf`.
+    /// Encodes a PDF text string: plain literal for ASCII, UTF-16BE with BOM otherwise, so
+    /// Bengali and other non-Latin bookmark titles display correctly in every reader.
+    fn pdf_text_string(text: String) -> lopdf::Object {
+        if text.is_ascii() {
+            lopdf::Object::string_literal(text)
+        } else {
+            let mut bytes = vec![0xFE, 0xFF];
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            lopdf::Object::String(bytes, lopdf::StringFormat::Hexadecimal)
+        }
+    }
+
+    /// Embeds `/PageLabels` and `/Outlines`, strips XMP and identifying `/Info` keys.
+    ///
+    /// v1.1: returns an error instead of silently handing back the unsanitized input.
+    /// With `deep_clean` (used after redaction) it also removes the whole `/Info` dictionary,
+    /// embedded page thumbnails (`/Thumb`) and every object no longer reachable from the
+    /// trailer, so orphaned pre-redaction content streams cannot survive in the saved file.
     pub fn embed_metadata_in_pdf_bytes(
         pdf_bytes: &[u8],
         roman_end: usize,
         bookmarks: &[Bookmark],
+        deep_clean: bool,
     ) -> Result<Vec<u8>> {
-        let Ok(mut ldoc) = lopdf::Document::load_mem(pdf_bytes) else {
-            return Ok(pdf_bytes.to_vec());
-        };
+        let mut ldoc = lopdf::Document::load_mem(pdf_bytes)
+            .context("lopdf could not parse the document for metadata sanitizing")?;
 
         // 1. Build `/PageLabels` dictionary
         let mut nums_arr = Vec::new();
@@ -537,7 +596,7 @@ impl PdfEngine {
                     let mut chap_dict = lopdf::Dictionary::new();
                     chap_dict.set(
                         "Title",
-                        lopdf::Object::string_literal(format_bm_title(&chapters[i].bm)),
+                        Self::pdf_text_string(format_bm_title(&chapters[i].bm)),
                     );
                     chap_dict.set("Parent", lopdf::Object::Reference(outlines_root_id));
                     chap_dict.set(
@@ -574,7 +633,7 @@ impl PdfEngine {
                             let mut c_dict = lopdf::Dictionary::new();
                             c_dict.set(
                                 "Title",
-                                lopdf::Object::string_literal(format_bm_title(c_bm)),
+                                Self::pdf_text_string(format_bm_title(c_bm)),
                             );
                             c_dict.set("Parent", lopdf::Object::Reference(chap_id));
                             c_dict.set(
@@ -649,40 +708,64 @@ impl PdfEngine {
             }
         }
 
-        let mut out_bytes = Vec::with_capacity(pdf_bytes.len() + 1024);
-        if ldoc.save_to(&mut out_bytes).is_ok() && !out_bytes.is_empty() {
-            Ok(out_bytes)
-        } else {
-            Ok(pdf_bytes.to_vec())
+        if deep_clean {
+            ldoc.trailer.remove(b"Info");
+            let page_ids: Vec<lopdf::ObjectId> = ldoc.get_pages().values().copied().collect();
+            for pid in page_ids {
+                if let Ok(lopdf::Object::Dictionary(page_dict)) = ldoc.get_object_mut(pid) {
+                    page_dict.remove(b"Thumb");
+                    page_dict.remove(b"PieceInfo");
+                }
+            }
+            ldoc.prune_objects();
         }
+
+        let mut out_bytes = Vec::with_capacity(pdf_bytes.len() + 1024);
+        ldoc.save_to(&mut out_bytes)
+            .context("lopdf could not write the sanitized document")?;
+        if out_bytes.is_empty() {
+            anyhow::bail!("lopdf produced an empty file while sanitizing");
+        }
+        Ok(out_bytes)
     }
 
-    /// Safely saves a `PdfDocument` to disk by buffering into memory first so that
-    /// in-place saves (`input_path == output_path`) never truncate a file currently mapped by PDFium.
+    /// Safely saves a `PdfDocument` to disk by buffering into memory first, then writing
+    /// atomically (temp file + rename).
     pub fn save_doc<P: AsRef<Path>>(doc: &PdfDocument, output_path: P) -> Result<()> {
         let bytes = doc
             .save_to_bytes()
             .context("Failed to serialize PDF document to bytes")?;
-        std::fs::write(output_path.as_ref(), bytes)
-            .with_context(|| format!("Failed to write PDF to {:?}", output_path.as_ref()))?;
-        Ok(())
+        Self::write_atomic(output_path.as_ref(), &bytes)
     }
 
-    /// Saves `doc` to `output_path` and embeds `/PageLabels` (`roman_end`) and `/Outlines` (`bookmarks`).
+    /// Saves `doc` with `/PageLabels`, `/Outlines` and sanitized metadata.
+    ///
+    /// Returns `Ok(None)` on a clean save, or `Ok(Some(warning))` when the file was written but
+    /// metadata could not be sanitized. When `redacted` is true the save is refused instead of
+    /// writing a file that might still contain redacted content.
     pub fn save_doc_with_metadata<P: AsRef<Path>>(
         doc: &PdfDocument,
         output_path: P,
         roman_end: usize,
         bookmarks: &[Bookmark],
-    ) -> Result<()> {
+        redacted: bool,
+    ) -> Result<Option<String>> {
         let raw_bytes = doc
             .save_to_bytes()
             .context("Failed to serialize PDF document to bytes")?;
-        let final_bytes = Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks)
-            .unwrap_or(raw_bytes);
-        std::fs::write(output_path.as_ref(), final_bytes)
-            .with_context(|| format!("Failed to write PDF to {:?}", output_path.as_ref()))?;
-        Ok(())
+        match Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks, redacted) {
+            Ok(final_bytes) => {
+                Self::write_atomic(output_path.as_ref(), &final_bytes)?;
+                Ok(None)
+            }
+            Err(e) if redacted => Err(e.context(
+                "Save refused: post-redaction cleanup failed, nothing was written",
+            )),
+            Err(e) => {
+                Self::write_atomic(output_path.as_ref(), &raw_bytes)?;
+                Ok(Some(format!("metadata was NOT sanitized ({e})")))
+            }
+        }
     }
 
     /// Sidecar file path (`<pdf_filename>.bookmarks.txt`) used to persist user bookmark edits.
@@ -1548,8 +1631,11 @@ impl PdfEngine {
         Ok(compressed)
     }
 
-    /// Compresses the active `PdfDocument`, combining PDFium clean-document rebuild (stripping
-    /// incremental revision history) with `lopdf` object pruning and stream compression.
+    /// Compresses the active `PdfDocument` using `lopdf` object pruning and stream compression.
+    ///
+    /// v1.2: The `clean_doc.pages_mut().append(doc)` rebuild branch was removed because copying
+    /// only pages into a blank PDFium document drops catalog-level `/Outlines` (bookmarks),
+    /// `/PageLabels`, and `/AcroForm` (form fields).
     /// Returns `(compressed_bytes, original_size_bytes, compressed_size_bytes)`.
     pub fn compress_doc(&self, doc: &PdfDocument) -> Result<(Vec<u8>, usize, usize)> {
         let raw_bytes = doc
@@ -1559,33 +1645,11 @@ impl PdfEngine {
 
         let mut best_bytes = raw_bytes.clone();
 
-        // 1. Try lopdf structural pruning + deflate stream compression on raw_bytes
+        // Try lopdf structural pruning + deflate stream compression on raw_bytes
         if let Ok(lopdf_out) = Self::compress_pdf(&raw_bytes) {
             if !lopdf_out.is_empty() && lopdf_out.len() < best_bytes.len() {
                 if self.pdfium.load_pdf_from_byte_vec(lopdf_out.clone(), None).is_ok() {
                     best_bytes = lopdf_out;
-                }
-            }
-        }
-
-        // 2. Also try rebuilding into a fresh PDFium document (strips dead revisions) + lopdf compression
-        if let Ok(mut clean_doc) = self.pdfium.create_new_pdf() {
-            if clean_doc.pages_mut().append(doc).is_ok() {
-                if let Ok(rebuilt_bytes) = clean_doc.save_to_bytes() {
-                    if !rebuilt_bytes.is_empty() && rebuilt_bytes.len() < best_bytes.len() {
-                        best_bytes = rebuilt_bytes.clone();
-                    }
-                    if let Ok(rebuilt_lopdf) = Self::compress_pdf(&rebuilt_bytes) {
-                        if !rebuilt_lopdf.is_empty() && rebuilt_lopdf.len() < best_bytes.len() {
-                            if self
-                                .pdfium
-                                .load_pdf_from_byte_vec(rebuilt_lopdf.clone(), None)
-                                .is_ok()
-                            {
-                                best_bytes = rebuilt_lopdf;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -1824,6 +1888,110 @@ impl PdfEngine {
         Ok((bytes, total_pages))
     }
 
+    /// Searches `page.text()` on a single page `page_idx` (case-insensitive) against pre-lowercased
+    /// `q_chars` and returns all `SearchMatch` entries found on that page.
+    /// Does not retain any per-page character buffer after returning.
+    pub fn search_text_on_single_page(
+        doc: &PdfDocument,
+        page_idx: u16,
+        q_chars: &[char],
+    ) -> Vec<SearchMatch> {
+        if q_chars.is_empty() {
+            return Vec::new();
+        }
+        let Ok(page) = doc.pages().get(page_idx) else {
+            return Vec::new();
+        };
+        let Ok(text_page) = page.text() else {
+            return Vec::new();
+        };
+
+        let mut page_chars: Vec<(char, Option<PdfRect>)> = Vec::new();
+        for ch in text_page.chars().iter() {
+            let Some(uc) = ch.unicode_char() else {
+                continue;
+            };
+            if uc == '\r' || uc == '\n' {
+                page_chars.push((' ', None));
+                continue;
+            }
+            if uc.is_control() {
+                continue;
+            }
+            let rect_opt = ch
+                .loose_bounds()
+                .or_else(|_| ch.tight_bounds())
+                .ok()
+                .and_then(|b| {
+                    let bottom = b.bottom().value.min(b.top().value);
+                    let top = b.bottom().value.max(b.top().value);
+                    let left = b.left().value.min(b.right().value);
+                    let right = b.left().value.max(b.right().value);
+                    if (right - left) >= 0.1 && (top - bottom) >= 0.1 {
+                        Some(PdfRect::new_from_values(bottom, left, top, right))
+                    } else {
+                        None
+                    }
+                });
+            for lc in uc.to_lowercase() {
+                page_chars.push((lc, rect_opt));
+            }
+        }
+
+        if page_chars.len() < q_chars.len() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let mut i = 0;
+        while i + q_chars.len() <= page_chars.len() {
+            let mut matched = true;
+            for j in 0..q_chars.len() {
+                let pc = page_chars[i + j].0;
+                let qc = q_chars[j];
+                if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
+                    matched = false;
+                    break;
+                }
+            }
+
+            if matched {
+                let mut line_rects: Vec<PdfRect> = Vec::new();
+                for j in 0..q_chars.len() {
+                    if let Some(cb) = page_chars[i + j].1 {
+                        if let Some(last) = line_rects.last_mut() {
+                            let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                            let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                            let lh = (last.top().value - last.bottom().value).max(4.0);
+                            if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
+                                *last = PdfRect::new_from_values(
+                                    last.bottom().value.min(cb.bottom().value),
+                                    last.left().value.min(cb.left().value),
+                                    last.top().value.max(cb.top().value),
+                                    last.right().value.max(cb.right().value),
+                                );
+                                continue;
+                            }
+                        }
+                        line_rects.push(cb);
+                    }
+                }
+
+                if !line_rects.is_empty() {
+                    matches.push(SearchMatch {
+                        page_index: page_idx,
+                        rects: line_rects,
+                    });
+                }
+                i += q_chars.len();
+            } else {
+                i += 1;
+            }
+        }
+
+        matches
+    }
+
     /// Searches `page.text()` across all pages in `doc` (case-insensitive) and returns all matches
     /// with their line-level character bounding boxes (`SearchMatch`).
     pub fn search_text_in_doc(doc: &PdfDocument, query: &str) -> Vec<SearchMatch> {
@@ -1840,102 +2008,25 @@ impl PdfEngine {
         let total = doc.pages().len();
 
         for page_idx in 0..total {
-            let Ok(page) = doc.pages().get(page_idx) else {
-                continue;
-            };
-            let Ok(text_page) = page.text() else {
-                continue;
-            };
-
-            let mut page_chars: Vec<(char, Option<PdfRect>)> = Vec::new();
-            for ch in text_page.chars().iter() {
-                let Some(uc) = ch.unicode_char() else {
-                    continue;
-                };
-                if uc == '\r' || uc == '\n' {
-                    page_chars.push((' ', None));
-                    continue;
-                }
-                if uc.is_control() {
-                    continue;
-                }
-                let rect_opt = ch
-                    .loose_bounds()
-                    .or_else(|_| ch.tight_bounds())
-                    .ok()
-                    .and_then(|b| {
-                        let bottom = b.bottom().value.min(b.top().value);
-                        let top = b.bottom().value.max(b.top().value);
-                        let left = b.left().value.min(b.right().value);
-                        let right = b.left().value.max(b.right().value);
-                        if (right - left) >= 0.1 && (top - bottom) >= 0.1 {
-                            Some(PdfRect::new_from_values(bottom, left, top, right))
-                        } else {
-                            None
-                        }
-                    });
-                for lc in uc.to_lowercase() {
-                    page_chars.push((lc, rect_opt));
-                }
-            }
-
-            if page_chars.len() < q_chars.len() {
-                continue;
-            }
-
-            let mut i = 0;
-            while i + q_chars.len() <= page_chars.len() {
-                let mut matched = true;
-                for j in 0..q_chars.len() {
-                    let pc = page_chars[i + j].0;
-                    let qc = q_chars[j];
-                    if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
-                        matched = false;
-                        break;
-                    }
-                }
-
-                if matched {
-                    let mut line_rects: Vec<PdfRect> = Vec::new();
-                    for j in 0..q_chars.len() {
-                        if let Some(cb) = page_chars[i + j].1 {
-                            if let Some(last) = line_rects.last_mut() {
-                                let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
-                                let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
-                                let lh = (last.top().value - last.bottom().value).max(4.0);
-                                if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
-                                    *last = PdfRect::new_from_values(
-                                        last.bottom().value.min(cb.bottom().value),
-                                        last.left().value.min(cb.left().value),
-                                        last.top().value.max(cb.top().value),
-                                        last.right().value.max(cb.right().value),
-                                    );
-                                    continue;
-                                }
-                            }
-                            line_rects.push(cb);
-                        }
-                    }
-
-                    if !line_rects.is_empty() {
-                        matches.push(SearchMatch {
-                            page_index: page_idx,
-                            rects: line_rects,
-                        });
-                    }
-                    i += q_chars.len();
-                } else {
-                    i += 1;
-                }
-            }
+            matches.extend(Self::search_text_on_single_page(doc, page_idx, &q_chars));
         }
 
         matches
     }
 
-    /// True Black-Box Redaction (`Mouse Mode: Redact`):
-    /// 1. Deletes any text or path objects on `page_index` whose bounding box intersects `pdf_rect`.
-    /// 2. Draws a permanent solid black rectangle (`0, 0, 0`) over `pdf_rect` in PDF coordinates.
+    /// Black-box redaction (`Mouse Mode: Redact`), v1.1.
+    ///
+    /// Everything that overlaps the selection is dealt with, failing closed:
+    /// * text, shading, form XObjects and unsupported objects: removed;
+    /// * images: pixels under the box are painted black inside the image itself; if the image
+    ///   is rotated/skewed or cannot be decoded, the whole image is removed instead;
+    /// * paths: removed, except simple shapes (<= 5 segments) that fully enclose the box, such
+    ///   as page or table backgrounds, which carry no hidden content;
+    /// * annotations (links, comments, form widgets) whose rectangle overlaps: deleted.
+    /// A solid black rectangle is then drawn over the area.
+    ///
+    /// Save with `redacted = true` afterwards so orphaned objects are pruned from the file.
+    /// Returns the number of objects/annotations removed or modified.
     pub fn redact_rect_on_page(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1951,46 +2042,114 @@ impl PdfEngine {
         }
 
         let normalized_sel = PdfRect::new_from_values(sel_bottom, sel_left, sel_top, sel_right);
+        let overlaps = |l: f32, b: f32, r: f32, t: f32| {
+            l <= sel_right && r >= sel_left && b <= sel_top && t >= sel_bottom
+        };
 
         let mut page = doc
             .pages_mut()
             .get(page_index)
             .context("Page index out of bounds for redaction")?;
 
-        let mut to_remove = Vec::new();
-        let obj_count = page.objects().len();
-        for i in 0..obj_count {
-            if let Ok(obj) = page.objects().get(i) {
-                if matches!(
-                    obj.object_type(),
-                    PdfPageObjectType::Text | PdfPageObjectType::Path
-                ) {
-                    if let Ok(b) = obj.bounds() {
-                        let b_bottom = b.bottom().value.min(b.top().value);
-                        let b_top = b.bottom().value.max(b.top().value);
-                        let b_left = b.left().value.min(b.right().value);
-                        let b_right = b.left().value.max(b.right().value);
-
-                        let intersects = b_left <= sel_right
-                            && b_right >= sel_left
-                            && b_bottom <= sel_top
-                            && b_top >= sel_bottom;
-                        if intersects {
-                            to_remove.push(i);
-                        }
-                    }
-                }
-            }
-        }
-
         let prev_strategy = page.content_regeneration_strategy();
         page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
 
-        let mut removed_count = 0usize;
+        // 1. Classify every overlapping page object.
+        let mut to_remove: Vec<usize> = Vec::new();
+        let mut to_mask: Vec<(usize, (u32, u32, u32, u32))> = Vec::new();
+        let obj_count = page.objects().len();
+        for i in 0..obj_count {
+            let Ok(obj) = page.objects().get(i) else {
+                continue;
+            };
+            let Ok(q) = obj.bounds() else {
+                // Unknown geometry: cannot prove it is outside the box, so remove it.
+                to_remove.push(i);
+                continue;
+            };
+            let (l, r) = (q.left().value.min(q.right().value), q.left().value.max(q.right().value));
+            let (b, t) = (q.bottom().value.min(q.top().value), q.bottom().value.max(q.top().value));
+            if !overlaps(l, b, r, t) {
+                continue;
+            }
+            match obj.object_type() {
+                PdfPageObjectType::Image => {
+                    match obj
+                        .as_image_object()
+                        .and_then(|io| Self::image_mask_region(io, sel_left, sel_bottom, sel_right, sel_top))
+                    {
+                        Some(region) => to_mask.push((i, region)),
+                        None => to_remove.push(i),
+                    }
+                }
+                PdfPageObjectType::Path => {
+                    let simple = obj
+                        .as_path_object()
+                        .map(|p| p.segments().len() <= 5)
+                        .unwrap_or(false);
+                    let encloses = l <= sel_left && r >= sel_right && b <= sel_bottom && t >= sel_top;
+                    if !(simple && encloses) {
+                        to_remove.push(i);
+                    }
+                }
+                _ => to_remove.push(i),
+            }
+        }
+
+        // 2. Burn black pixels into overlapping images (indices are still valid here).
+        let mut touched = 0usize;
+        for (idx, (x0, y0, x1, y1)) in &to_mask {
+            let mut masked = false;
+            if let Ok(mut obj) = page.objects().get(*idx) {
+                if let Some(io) = obj.as_image_object_mut() {
+                    if let Ok(img) = io.get_raw_image() {
+                        let mut rgba = img.to_rgba8();
+                        for y in *y0..(*y1).min(rgba.height()) {
+                            for x in *x0..(*x1).min(rgba.width()) {
+                                rgba.put_pixel(x, y, image::Rgba([0, 0, 0, 255]));
+                            }
+                        }
+                        masked = io
+                            .set_image(&image::DynamicImage::ImageRgba8(rgba))
+                            .is_ok();
+                    }
+                }
+            }
+            if masked {
+                touched += 1;
+            } else {
+                to_remove.push(*idx);
+            }
+        }
+
+        // 3. Remove objects in descending index order so earlier indices stay valid.
+        to_remove.sort_unstable();
+        to_remove.dedup();
         for &idx in to_remove.iter().rev() {
             if let Ok(obj) = page.objects_mut().remove_object_at_index(idx) {
+                // Dropping a detached object here segfaults with pdfium-render 0.8.37 (verified
+                // in testing), so it is intentionally leaked. Revisit when upgrading the crate.
                 std::mem::forget(obj);
-                removed_count += 1;
+                touched += 1;
+            }
+        }
+
+        // 4. Delete overlapping annotations (links, notes, form widgets).
+        let annot_count = page.annotations().len();
+        for i in (0..annot_count).rev() {
+            let Ok(annot) = page.annotations().get(i) else {
+                continue;
+            };
+            let hit = annot
+                .bounds()
+                .map(|rb| {
+                    let (l, r) = (rb.left().value.min(rb.right().value), rb.left().value.max(rb.right().value));
+                    let (b, t) = (rb.bottom().value.min(rb.top().value), rb.bottom().value.max(rb.top().value));
+                    overlaps(l, b, r, t)
+                })
+                .unwrap_or(true);
+            if hit && page.annotations_mut().delete_annotation(annot).is_ok() {
+                touched += 1;
             }
         }
 
@@ -2007,7 +2166,39 @@ impl PdfEngine {
         black_rect_res.context("Failed to draw black redaction rectangle")?;
         regen_res.context("Failed to regenerate page content after redaction")?;
 
-        Ok(removed_count)
+        Ok(touched)
+    }
+
+    /// Maps the selection into an image's own pixel grid, returning `(x0, y0, x1, y1)` with a
+    /// 1-pixel safety margin. Returns `None` (caller removes the image) when the image is
+    /// rotated or skewed, or its size cannot be read.
+    fn image_mask_region(
+        io: &PdfPageImageObject,
+        sel_left: f32,
+        sel_bottom: f32,
+        sel_right: f32,
+        sel_top: f32,
+    ) -> Option<(u32, u32, u32, u32)> {
+        let m = io.matrix().ok()?;
+        let (a, b, c, d, e, f) = (m.a(), m.b(), m.c(), m.d(), m.e(), m.f());
+        if b.abs() > 1e-3 || c.abs() > 1e-3 || a.abs() < 1e-6 || d.abs() < 1e-6 {
+            return None;
+        }
+        let w = io.width().ok()? as f32;
+        let h = io.height().ok()? as f32;
+        if w < 1.0 || h < 1.0 {
+            return None;
+        }
+        // Image space: u,v in [0,1]; x = a*u + e, y = d*v + f; pixel row 0 is the top (v = 1).
+        let (u_a, u_b) = ((sel_left - e) / a, (sel_right - e) / a);
+        let (v_a, v_b) = ((sel_bottom - f) / d, (sel_top - f) / d);
+        let (u0, u1) = (u_a.min(u_b).clamp(0.0, 1.0), u_a.max(u_b).clamp(0.0, 1.0));
+        let (v0, v1) = (v_a.min(v_b).clamp(0.0, 1.0), v_a.max(v_b).clamp(0.0, 1.0));
+        let x0 = ((u0 * w).floor() - 1.0).max(0.0) as u32;
+        let x1 = ((u1 * w).ceil() + 1.0).min(w) as u32;
+        let y0 = (((1.0 - v1) * h).floor() - 1.0).max(0.0) as u32;
+        let y1 = (((1.0 - v0) * h).ceil() + 1.0).min(h) as u32;
+        Some((x0, y0, x1, y1))
     }
 
     /// Crops `page_index` (0-based) to `crop_rect` by setting `/CropBox` (while preserving `/MediaBox`
@@ -2092,23 +2283,33 @@ impl PdfEngine {
     }
 
     /// Decodes a PNG or JPEG image file from `path` into an RGBA `StampImageBuffer`, preserving PNG alpha transparency.
+    /// Downscales any image over 2,000 px on its longest side so a large photo stamp never explodes RAM.
     pub fn load_stamp_image(path: &Path) -> Result<StampImageBuffer> {
-        let dyn_img = image::open(path)
+        let mut dyn_img = image::open(path)
             .with_context(|| format!("Failed to decode image file {:?}", path))?;
-        let rgba_img = dyn_img.to_rgba8();
-        let (width, height) = rgba_img.dimensions();
-        if width == 0 || height == 0 {
+        let (orig_w, orig_h) = (dyn_img.width(), dyn_img.height());
+        if orig_w == 0 || orig_h == 0 {
             anyhow::bail!("Image has zero width or height");
         }
+        const MAX_STAMP_SIDE: u32 = 2000;
+        if orig_w.max(orig_h) > MAX_STAMP_SIDE {
+            dyn_img = dyn_img.resize(
+                MAX_STAMP_SIDE,
+                MAX_STAMP_SIDE,
+                image::imageops::FilterType::Triangle,
+            );
+        }
+        let rgba_img = dyn_img.into_rgba8();
+        let (width, height) = rgba_img.dimensions();
         Ok(StampImageBuffer {
             width,
             height,
-            rgba: rgba_img.into_raw(),
+            image: image::DynamicImage::ImageRgba8(rgba_img),
         })
     }
 
     /// Stamps `stamp` (preserving PNG alpha transparency via `image::DynamicImage` + `PdfPageImageObject`)
-    /// onto `page_index` inside `target_rect` in PDF coordinates.
+    /// onto `page_index` inside `target_rect` in PDF coordinates without copying the decoded buffer.
     pub fn stamp_image_on_page(
         &self,
         doc: &mut PdfDocument,
@@ -2123,14 +2324,9 @@ impl PdfEngine {
         let rect_w = (right - left).max(8.0);
         let rect_h = (top - bottom).max(8.0);
 
-        let rgba_img =
-            image::RgbaImage::from_raw(stamp.width, stamp.height, stamp.rgba.clone())
-                .context("Invalid RGBA image dimensions for stamp")?;
-        let dyn_img = image::DynamicImage::ImageRgba8(rgba_img);
-
         let mut img_obj = PdfPageImageObject::new_with_size(
             doc,
-            &dyn_img,
+            &stamp.image,
             PdfPoints::new(rect_w),
             PdfPoints::new(rect_h),
         )
@@ -2153,13 +2349,19 @@ impl PdfEngine {
         Ok(())
     }
 
-    /// Flattens all annotations and form fields across all pages into page content streams,
-    /// and strips any encryption/permissions dictionaries so the resulting PDF is 100% unlocked.
-    pub fn flatten_and_unlock_doc(&self, doc: &mut PdfDocument) -> Result<Vec<u8>> {
+    /// Flattens annotations/form fields on every page and strips encryption/permission
+    /// dictionaries. v1.1: reports pages that failed to flatten and whether the permission
+    /// removal step actually succeeded, instead of swallowing both.
+    pub fn flatten_and_unlock_doc(&self, doc: &mut PdfDocument) -> Result<FlattenReport> {
         let total = doc.pages().len();
+        let mut failed_pages = Vec::new();
         for idx in 0..total {
-            if let Ok(mut page) = doc.pages_mut().get(idx) {
-                let _ = page.flatten();
+            let ok = match doc.pages_mut().get(idx) {
+                Ok(mut page) => page.flatten().is_ok(),
+                Err(_) => false,
+            };
+            if !ok {
+                failed_pages.push(idx + 1);
             }
         }
 
@@ -2167,22 +2369,31 @@ impl PdfEngine {
             .save_to_bytes()
             .context("Failed to serialize flattened PDF")?;
 
-        if let Ok(mut ldoc) = lopdf::Document::load_mem(&flattened_bytes) {
+        let unlocked = (|| -> Result<Vec<u8>> {
+            let mut ldoc = lopdf::Document::load_mem(&flattened_bytes)?;
             ldoc.trailer.remove(b"Encrypt");
             if let Ok(cat) = ldoc.catalog_mut() {
                 cat.remove(b"AcroForm");
                 cat.remove(b"Perms");
             }
             let mut out = Vec::with_capacity(flattened_bytes.len());
-            if ldoc.save_to(&mut out).is_ok()
-                && !out.is_empty()
-                && self.load_pdf_from_bytes_safe(out.clone()).is_ok()
-            {
-                return Ok(out);
+            ldoc.save_to(&mut out)?;
+            if out.is_empty() {
+                anyhow::bail!("empty output");
             }
-        }
+            // Verify PDFium can still open the result before trusting it.
+            self.load_pdf_from_bytes_safe(out.clone())?;
+            Ok(out)
+        })();
 
-        Ok(flattened_bytes)
+        Ok(match unlocked {
+            Ok(bytes) => FlattenReport { bytes, failed_pages, permissions_removed: true },
+            Err(_) => FlattenReport {
+                bytes: flattened_bytes,
+                failed_pages,
+                permissions_removed: false,
+            },
+        })
     }
 
     /// Converts a positive integer into lowercase Roman numerals (e.g. 1 -> "i", 4 -> "iv").
@@ -2292,7 +2503,7 @@ mod tests {
 
         // 6. Test /PageLabels and /Outlines metadata embedding + BW page conversion
         let raw_bytes = doc.save_to_bytes()?;
-        let embedded_bytes = PdfEngine::embed_metadata_in_pdf_bytes(&raw_bytes, 4, &bms)?;
+        let embedded_bytes = PdfEngine::embed_metadata_in_pdf_bytes(&raw_bytes, 4, &bms, false)?;
         assert_eq!(PdfEngine::read_page_labels_roman_end(&embedded_bytes), 4);
         let bw_bytes = engine.convert_page_to_bw(&embedded_bytes, 0)?;
         let bw_doc = engine.load_pdf_from_bytes_safe(bw_bytes)?;
@@ -2365,22 +2576,195 @@ mod tests {
             assert!(p0.height().value > 800.0);
         }
 
-        // 6. Signature / Image Stamp (with RGBA alpha transparency)
-        let stamp = StampImageBuffer {
-            width: 32,
-            height: 16,
-            rgba: [20u8, 80, 200, 180].repeat(32 * 16),
-        };
+        // 6. Signature / Image Stamp (with RGBA alpha transparency & >2000px downscale cap)
+        let big_img_path = std::env::temp_dir().join("test_big_stamp.png");
+        let big_rgba = image::RgbaImage::from_pixel(2500, 1250, image::Rgba([20, 80, 200, 180]));
+        big_rgba.save(&big_img_path)?;
+        let stamp = PdfEngine::load_stamp_image(&big_img_path)?;
+        let _ = std::fs::remove_file(&big_img_path);
+        assert!(stamp.width <= 2000 && stamp.height <= 2000);
+        assert_eq!(stamp.width, 2000);
         let stamp_rect = PdfRect::new_from_values(100.0, 100.0, 140.0, 180.0);
         engine.stamp_image_on_page(&mut doc, 0, &stamp, stamp_rect)?;
 
         // 7. Flatten & Unlock PDF
-        let flat_bytes = engine.flatten_and_unlock_doc(&mut doc)?;
-        let flat_doc = engine.load_pdf_from_bytes_safe(flat_bytes)?;
+        let report = engine.flatten_and_unlock_doc(&mut doc)?;
+        assert!(report.failed_pages.is_empty());
+        let flat_doc = engine.load_pdf_from_bytes_safe(report.bytes)?;
         assert_eq!(flat_doc.pages().len(), 5);
 
         let _ = std::fs::remove_file(&pdf_a);
         let _ = std::fs::remove_file(&pdf_b);
+        Ok(())
+    }
+
+    /// v1.1 regression test: redaction must remove text AND image pixels under the box,
+    /// keep unrelated text, and leave no trace of the secret anywhere in the saved bytes.
+    #[test]
+    fn test_redaction_leaves_no_trace() -> Result<()> {
+        const SECRET: &str = "TOPSECRET42";
+        let engine = PdfEngine::new()?;
+
+        let src = {
+            let mut doc = engine.pdfium.create_new_pdf()?;
+            let font = doc.fonts_mut().helvetica();
+            let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::a4())?;
+            let mut t = PdfPageTextObject::new(&doc, SECRET, font, PdfPoints::new(14.0))?;
+            t.translate(PdfPoints::new(100.0), PdfPoints::new(700.0))?;
+            page.objects_mut().add_text_object(t)?;
+            let mut keep = PdfPageTextObject::new(&doc, "Public line stays", font, PdfPoints::new(14.0))?;
+            keep.translate(PdfPoints::new(100.0), PdfPoints::new(500.0))?;
+            page.objects_mut().add_text_object(keep)?;
+            // Solid red 200x200 px image covering x 100..300, y 550..750 (overlaps the secret).
+            let red = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                200, 200, image::Rgba([255, 0, 0, 255]),
+            ));
+            let mut io = PdfPageImageObject::new_with_size(&doc, &red, PdfPoints::new(200.0), PdfPoints::new(200.0))?;
+            io.translate(PdfPoints::new(100.0), PdfPoints::new(550.0))?;
+            page.objects_mut().add_image_object(io)?;
+            doc.save_to_bytes()?
+        };
+
+        let mut doc = engine.load_pdf_from_bytes_safe(src)?;
+        let box_rect = PdfRect::new_from_values(690.0, 90.0, 720.0, 320.0);
+        assert!(PdfEngine::redact_rect_on_page(&mut doc, 0, box_rect)? >= 2);
+
+        let out = std::env::temp_dir().join("micropdf_redaction_test.pdf");
+        assert!(PdfEngine::save_doc_with_metadata(&doc, &out, 0, &[], true)?.is_none());
+        let saved = std::fs::read(&out)?;
+        let _ = std::fs::remove_file(&out);
+
+        // (a) no secret in any decompressed stream or object
+        let mut ldoc = lopdf::Document::load_mem(&saved)?;
+        ldoc.decompress();
+        let mut flat = Vec::new();
+        ldoc.save_to(&mut flat)?;
+        let hay = String::from_utf8_lossy(&flat).to_uppercase();
+        let hex: String = SECRET.bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(!hay.contains(SECRET) && !hay.contains(&hex), "secret survives in file bytes");
+
+        // (b) no secret in extracted text, unrelated text intact
+        let reloaded = engine.load_pdf_from_bytes_safe(saved)?;
+        let page = reloaded.pages().get(0)?;
+        let text = page.text()?.all();
+        assert!(!text.contains(SECRET));
+        assert!(text.contains("Public line stays"));
+
+        // (c) image survives outside the box, but no red pixels remain under it
+        let mut red_outside = 0usize;
+        for obj in page.objects().iter() {
+            if let Some(io) = obj.as_image_object() {
+                let px = io.get_raw_image()?.to_rgba8();
+                for y in 0..px.height() {
+                    for x in 0..px.width() {
+                        let p = px.get_pixel(x, y);
+                        let is_red = p[0] > 200 && p[1] < 50;
+                        let under_box = (32..58).contains(&y) && (2..198).contains(&x);
+                        assert!(!(is_red && under_box), "image pixel under the box survived");
+                        if is_red && !under_box {
+                            red_outside += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(red_outside > 20_000, "image outside the box should be preserved");
+        Ok(())
+    }
+
+    /// v1.2 regression test: bookmarks (`/Outlines`), `/PageLabels`, and `/AcroForm` form fields
+    /// must survive `compress_doc`.
+    #[test]
+    fn test_compress_doc_preserves_bookmarks_pagelabels_and_forms() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_compress_preserve.pdf");
+        engine.create_sample_pdf(&tmp, 4)?;
+        let raw = std::fs::read(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+
+        let bms = vec![
+            Bookmark {
+                serial: "1".to_string(),
+                title: "Preface".to_string(),
+                logical_page: "i".to_string(),
+                page_index: 0,
+                level: 0,
+            },
+            Bookmark {
+                serial: "2".to_string(),
+                title: "Main Chapter".to_string(),
+                logical_page: "1".to_string(),
+                page_index: 2,
+                level: 0,
+            },
+        ];
+
+        // Embed /PageLabels (roman_end = 2) and /Outlines (bookmarks), then add an /AcroForm field
+        let with_meta = PdfEngine::embed_metadata_in_pdf_bytes(&raw, 2, &bms, false)?;
+        let mut ldoc = lopdf::Document::load_mem(&with_meta)?;
+        let page1_id = *ldoc.get_pages().get(&1).unwrap();
+        let mut field = lopdf::Dictionary::new();
+        field.set("Type", lopdf::Object::Name(b"Annot".to_vec()));
+        field.set("Subtype", lopdf::Object::Name(b"Widget".to_vec()));
+        field.set("FT", lopdf::Object::Name(b"Tx".to_vec()));
+        field.set("T", lopdf::Object::string_literal("CustomerName"));
+        field.set("V", lopdf::Object::string_literal("Alice"));
+        field.set(
+            "Rect",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(50),
+                lopdf::Object::Integer(50),
+                lopdf::Object::Integer(200),
+                lopdf::Object::Integer(80),
+            ]),
+        );
+        field.set("P", lopdf::Object::Reference(page1_id));
+        let field_id = ldoc.add_object(lopdf::Object::Dictionary(field));
+        if let Ok(lopdf::Object::Dictionary(pdict)) = ldoc.get_object_mut(page1_id) {
+            pdict.set(
+                "Annots",
+                lopdf::Object::Array(vec![lopdf::Object::Reference(field_id)]),
+            );
+        }
+        let mut acro = lopdf::Dictionary::new();
+        acro.set(
+            "Fields",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(field_id)]),
+        );
+        let acro_id = ldoc.add_object(lopdf::Object::Dictionary(acro));
+        if let Ok(cat) = ldoc.catalog_mut() {
+            cat.set("AcroForm", lopdf::Object::Reference(acro_id));
+        }
+        // Add an unreferenced dead object so compress_doc actually shrinks the file
+        ldoc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            vec![b'X'; 4096],
+        )));
+        let mut input_bytes = Vec::new();
+        ldoc.save_to(&mut input_bytes)?;
+
+        let doc = engine.load_pdf_from_bytes_safe(input_bytes)?;
+        let (compressed_bytes, _orig, _new) = engine.compress_doc(&doc)?;
+
+        // Verify /PageLabels survived
+        assert_eq!(PdfEngine::read_page_labels_roman_end(&compressed_bytes), 2);
+
+        // Verify /Outlines (bookmarks) survived
+        let reloaded = engine.load_pdf_from_bytes_safe(compressed_bytes.clone())?;
+        let dummy_path = Path::new("nonexistent_for_outline_check.pdf");
+        let loaded_bms = PdfEngine::load_bookmarks(&reloaded, dummy_path, 2);
+        assert_eq!(loaded_bms.len(), 2);
+        assert_eq!(loaded_bms[0].title, "Preface");
+        assert_eq!(loaded_bms[1].title, "Main Chapter");
+
+        // Verify /AcroForm and widget annotation survived
+        let check_ldoc = lopdf::Document::load_mem(&compressed_bytes)?;
+        let cat = check_ldoc.catalog()?;
+        assert!(cat.has(b"AcroForm"), "/AcroForm must survive compress_doc");
+        assert!(
+            reloaded.pages().get(0)?.annotations().len() >= 1,
+            "Form widget annotation must survive compress_doc"
+        );
         Ok(())
     }
 }
