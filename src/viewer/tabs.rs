@@ -28,6 +28,8 @@ impl<'a> PdfViewerApp<'a> {
             // v1.1: move, don't deep-clone, up to 8 full-document snapshots on every tab switch.
             slot.undo_stack = std::mem::take(&mut self.undo_stack);
             slot.redacted = self.redacted;
+            slot.has_unsaved_edits = self.has_unsaved_edits;
+            slot.last_file_mtime = self.last_file_mtime;
         }
     }
 
@@ -54,6 +56,8 @@ impl<'a> PdfViewerApp<'a> {
             self.bw_pages = slot.bw_pages.clone();
             self.undo_stack = std::mem::take(&mut slot.undo_stack);
             self.redacted = slot.redacted;
+            self.has_unsaved_edits = slot.has_unsaved_edits;
+            self.last_file_mtime = slot.last_file_mtime;
             self.flatten_confirm_at = None;
             self.search_query.clear();
             self.search_matches.clear();
@@ -105,6 +109,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
 
+        let file_mtime = Self::read_file_mtime(&path);
         self.file_path = path.clone();
         self.current_page_index = 0;
         self.zoom_level = 1.0;
@@ -117,6 +122,8 @@ impl<'a> PdfViewerApp<'a> {
         self.bw_pages.clear();
         self.undo_stack.clear();
         self.redacted = false;
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = file_mtime;
         self.flatten_confirm_at = None;
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
@@ -156,6 +163,8 @@ impl<'a> PdfViewerApp<'a> {
                 bw_pages: HashSet::new(),
                 undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
                 redacted: false,
+                has_unsaved_edits: false,
+                last_file_mtime: file_mtime,
             });
             self.active_tab = 0;
         } else if self.active_tab < self.tabs.len() {
@@ -174,6 +183,8 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].bw_pages.clear();
             self.tabs[self.active_tab].undo_stack.clear();
             self.tabs[self.active_tab].redacted = false;
+            self.tabs[self.active_tab].has_unsaved_edits = false;
+            self.tabs[self.active_tab].last_file_mtime = file_mtime;
         }
 
         self.update_title_bar();
@@ -237,6 +248,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
 
+        let file_mtime = Self::read_file_mtime(&path);
         let new_idx = self.tabs.len();
         self.tabs.push(DocumentTab {
             doc: None,
@@ -257,6 +269,8 @@ impl<'a> PdfViewerApp<'a> {
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             redacted: false,
+            has_unsaved_edits: false,
+            last_file_mtime: file_mtime,
         });
 
         self.active_tab = new_idx;
@@ -279,6 +293,8 @@ impl<'a> PdfViewerApp<'a> {
         self.bw_pages.clear();
         self.undo_stack.clear();
         self.redacted = false;
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = file_mtime;
         self.flatten_confirm_at = None;
         self.search_query.clear();
         self.search_matches.clear();
@@ -320,6 +336,8 @@ impl<'a> PdfViewerApp<'a> {
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             redacted: false,
+            has_unsaved_edits: true,
+            last_file_mtime: None,
         });
 
         self.active_tab = new_idx;
@@ -342,6 +360,8 @@ impl<'a> PdfViewerApp<'a> {
         self.bw_pages.clear();
         self.undo_stack.clear();
         self.redacted = false;
+        self.has_unsaved_edits = true;
+        self.last_file_mtime = None;
         self.flatten_confirm_at = None;
         self.search_query.clear();
         self.search_matches.clear();

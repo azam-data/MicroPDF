@@ -812,4 +812,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_auto_reload_preserves_page_scroll_and_respects_unsaved_edits() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_auto_reload.pdf");
+        engine.create_sample_pdf(&tmp, 3)?;
+
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        let mut app = PdfViewerApp::new(&engine, Some(tmp.clone()))?;
+        app.navigate_to_page(2);
+        app.scroll_y = 145.5;
+        assert_eq!(app.total_pages(), 3);
+        assert!(!app.has_unsaved_edits);
+
+        // Simulate external modification on disk (e.g. LaTeX recompile producing 6 pages)
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        engine.create_sample_pdf(&tmp, 6)?;
+        // Force stored mtime 2 seconds in the past so filesystem mtime granularity never flakes
+        app.last_file_mtime = Some(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2),
+        );
+
+        // 1. While unfocused, poll_auto_reload_if_due must not reload
+        app.window_focused = false;
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), 3, "Must not poll/reload while window is unfocused");
+
+        // 2. When focused and no unsaved edits, reloads and preserves page & scroll_y
+        app.window_focused = true;
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), 6, "Must auto-reload updated 6-page PDF from disk");
+        assert_eq!(app.current_page_index, 2, "Must preserve current_page_index");
+        assert!((app.scroll_y - 145.5).abs() < 0.01, "Must preserve scroll_y");
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Auto-reloaded")
+        );
+
+        // 3. Make an unsaved edit (insert blank page -> 7 pages), then modify disk file (to 4 pages):
+        // must NOT reload and must show status-bar notice about unsaved edits
+        app.insert_blank_page_after_current();
+        assert_eq!(app.total_pages(), 7);
+        assert!(app.has_unsaved_edits);
+
+        engine.create_sample_pdf(&tmp, 4)?;
+        app.last_file_mtime = Some(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(2),
+        );
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(
+            app.total_pages(),
+            7,
+            "Must NOT overwrite unsaved in-memory edits on disk change"
+        );
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("unsaved edits")
+        );
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 8 Auto-Reload RAM] before: {:.2} MB, after auto-reload & unsaved check: {:.2} MB",
+            ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_file(&tmp);
+        Ok(())
+    }
 }

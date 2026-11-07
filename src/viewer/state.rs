@@ -315,6 +315,10 @@ pub(super) struct DocumentTab<'a> {
     pub(super) undo_stack: VecDeque<Vec<u8>>,
     /// True once any redaction has been applied; forces the strict save path.
     pub(super) redacted: bool,
+    /// True once any unsaved edit has been made to this tab since load/save.
+    pub(super) has_unsaved_edits: bool,
+    /// Last observed disk modification time of `file_path` for 1s auto-reload polling.
+    pub(super) last_file_mtime: Option<std::time::SystemTime>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -419,6 +423,14 @@ pub struct PdfViewerApp<'a> {
     pub(super) undo_stack: VecDeque<Vec<u8>>,
     /// True once any redaction has been applied to the active document.
     pub(super) redacted: bool,
+    /// True once any unsaved edit has been made to the active document since load/save.
+    pub(super) has_unsaved_edits: bool,
+    /// Last observed disk modification time of `self.file_path` for 1s auto-reload polling.
+    pub(super) last_file_mtime: Option<std::time::SystemTime>,
+    /// True while the MicroPDF window is focused (auto-reload mtime polling runs only while focused).
+    pub(super) window_focused: bool,
+    /// Timestamp of the last 1s file mtime poll.
+    pub(super) last_mtime_poll: Instant,
     /// Set by the first `U` press on a signed document; a second press confirms.
     pub(super) flatten_confirm_at: Option<Instant>,
     pub(super) cached_page: Option<CachedPageBitmap>,
@@ -530,6 +542,10 @@ impl<'a> PdfViewerApp<'a> {
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             redacted: false,
+            has_unsaved_edits: false,
+            last_file_mtime: None,
+            window_focused: true,
+            last_mtime_poll: Instant::now(),
             flatten_confirm_at: None,
             cached_page: None,
             cached_second_page: None,
@@ -935,6 +951,111 @@ impl<'a> PdfViewerApp<'a> {
         opened
     }
 
+    pub(super) fn read_file_mtime(path: &std::path::Path) -> Option<std::time::SystemTime> {
+        std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+    }
+
+    /// Checks if the active tab's file changed on disk (`mtime > self.last_file_mtime`).
+    /// - If `self.has_unsaved_edits` is false, reloads the file from disk keeping `current_page_index` and `scroll_y`.
+    /// - If `self.has_unsaved_edits` is true, shows a status-bar notice instead of reloading.
+    pub(super) fn check_and_auto_reload_active_file(&mut self) -> bool {
+        if self.doc.is_none() || self.file_path.as_os_str().is_empty() {
+            return false;
+        }
+        let Some(disk_mtime) = Self::read_file_mtime(&self.file_path) else {
+            return false;
+        };
+        let Some(prev_mtime) = self.last_file_mtime else {
+            self.last_file_mtime = Some(disk_mtime);
+            return false;
+        };
+        if disk_mtime <= prev_mtime {
+            return false;
+        }
+
+        if self.has_unsaved_edits {
+            self.last_file_mtime = Some(disk_mtime);
+            if self.active_tab < self.tabs.len() {
+                self.tabs[self.active_tab].last_file_mtime = Some(disk_mtime);
+            }
+            self.status_notice = Some(
+                "File changed on disk — Not auto-reloaded because you have unsaved edits (Save 'S' first)"
+                    .to_string(),
+            );
+            self.update_title_bar();
+            self.request_redraw();
+            return false;
+        }
+
+        let saved_page = self.current_page_index;
+        let saved_scroll_y = self.scroll_y;
+        let saved_pan_x = self.pan_x;
+        let saved_zoom = self.zoom_level;
+        let saved_view_mode = self.view_mode;
+
+        // If the external writer (e.g. pdflatex) is mid-write, leave last_file_mtime unchanged so the next poll retries.
+        let Ok(new_doc) = self.engine.load_pdf_safe(&self.file_path) else {
+            return false;
+        };
+        let new_total = new_doc.pages().len();
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&self.file_path);
+        let loaded_bookmarks = PdfEngine::load_bookmarks(&new_doc, &self.file_path, roman_end);
+
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+
+        self.doc = Some(new_doc);
+        self.last_file_mtime = Some(disk_mtime);
+        self.roman_end = roman_end;
+        self.bookmarks = loaded_bookmarks;
+        self.selected_bookmark = if self.bookmarks.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        self.current_page_index = if new_total > 0 {
+            saved_page.min(new_total - 1)
+        } else {
+            0
+        };
+        self.scroll_y = saved_scroll_y;
+        self.pan_x = saved_pan_x;
+        self.zoom_level = saved_zoom;
+        self.view_mode = saved_view_mode;
+
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].last_file_mtime = Some(disk_mtime);
+            self.tabs[self.active_tab].current_page_index = self.current_page_index;
+            self.tabs[self.active_tab].scroll_y = self.scroll_y;
+            self.tabs[self.active_tab].pan_x = self.pan_x;
+            self.tabs[self.active_tab].zoom_level = self.zoom_level;
+            self.tabs[self.active_tab].view_mode = self.view_mode;
+            self.tabs[self.active_tab].roman_end = self.roman_end;
+            self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+        }
+
+        let fname = self.filename_display();
+        self.status_notice = Some(format!(
+            "Auto-reloaded '{fname}' from disk (Page {}, scroll preserved)",
+            self.current_page_index + 1
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+        true
+    }
+
+    /// Polls the active file's modification time every 1 s while the window is focused.
+    pub(super) fn poll_auto_reload_if_due(&mut self) {
+        if !self.window_focused || self.doc.is_none() {
+            return;
+        }
+        if self.last_mtime_poll.elapsed() >= Duration::from_secs(1) {
+            self.last_mtime_poll = Instant::now();
+            self.check_and_auto_reload_active_file();
+        }
+    }
+
     pub(super) fn invalidate_page_caches(&mut self) {
         if let Some(old) = self.cached_page.take() {
             if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
@@ -971,6 +1092,7 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
         if let Ok(bytes) = doc.save_to_bytes() {
+            self.has_unsaved_edits = true;
             if self.undo_stack.len() >= MAX_UNDO_STATES {
                 self.undo_stack.pop_front();
             }
@@ -1001,6 +1123,9 @@ impl<'a> PdfViewerApp<'a> {
                     self.current_page_index = new_total - 1;
                 }
                 self.doc = Some(restored_doc);
+                if self.undo_stack.is_empty() {
+                    self.has_unsaved_edits = false;
+                }
                 self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 let steps_left = self.undo_stack.len();

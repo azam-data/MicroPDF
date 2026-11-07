@@ -1422,10 +1422,15 @@ impl<'a> PdfViewerApp<'a> {
                 self.redacted,
             ) {
                 Ok(warning) => {
+                    let saved_mtime = Self::read_file_mtime(&save_path);
                     self.record_recent_file(&save_path);
                     self.file_path = save_path.clone();
+                    self.has_unsaved_edits = false;
+                    self.last_file_mtime = saved_mtime;
                     if self.active_tab < self.tabs.len() {
                         self.tabs[self.active_tab].file_path = save_path;
+                        self.tabs[self.active_tab].has_unsaved_edits = false;
+                        self.tabs[self.active_tab].last_file_mtime = saved_mtime;
                     }
                     self.persist_bookmarks();
                     self.status_notice = Some(match warning {
@@ -2367,7 +2372,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_single_instance_listener();
-        if self.single_instance_listener.is_some() {
+        self.poll_auto_reload_if_due();
+        if self.single_instance_listener.is_some()
+            || (self.window_focused && self.doc.is_some())
+        {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(120),
             ));
@@ -2408,6 +2416,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
                 self.invalidate_page_caches();
                 self.request_redraw();
+            }
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.poll_auto_reload_if_due();
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 let st = modifiers.state();
