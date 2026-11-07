@@ -417,6 +417,77 @@ pub(super) enum InputMode {
     },
 }
 
+/// A single-instance connection being read without blocking (see `poll_single_instance_listener`).
+pub(super) struct PendingIpcConnection {
+    pub(super) stream: std::net::TcpStream,
+    pub(super) buf: Vec<u8>,
+    pub(super) accepted_at: Instant,
+    pub(super) polls: u32,
+}
+
+/// Longest accepted request line (`token|absolute path`); longer connections are dropped.
+pub(super) const IPC_MAX_LINE_BYTES: usize = 8 * 1024;
+/// At most this many connections are kept waiting for their request line at once.
+pub(super) const IPC_MAX_PENDING: usize = 8;
+/// One frame at 60 Hz: a connection that has not sent its whole request line by the poll after
+/// the one that accepted it, and at least this long after being accepted, is dropped.
+pub(super) const IPC_FRAME: Duration = Duration::from_millis(16);
+
+/// 16 random bytes from the OS as 32 hex characters: `/dev/urandom` on macOS/Linux,
+/// `BCryptGenRandom` (system-preferred RNG) on Windows.
+pub(super) fn random_token_hex() -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut std::ffi::c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::other(format!(
+                "BCryptGenRandom failed (NTSTATUS {status:#x})"
+            )));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(std::io::Error::other("no OS random source on this platform"));
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Compares two tokens in time independent of where they first differ.
+pub(super) fn tokens_match(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A forwarded path is opened only if it is an existing file ending in `.pdf` (any case).
+pub(super) fn is_acceptable_forwarded_pdf(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        && path.is_file()
+}
+
 pub(super) struct ActiveOptimizeJob {
     pub(super) job: crate::optimize::OptimizeJob,
     pub(super) out_path: PathBuf,
@@ -521,6 +592,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) custom_session_ini_path: Option<PathBuf>,
     /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
+    /// Accepted single-instance connections whose request line has not fully arrived yet.
+    pub(super) pending_ipc: Vec<PendingIpcConnection>,
     /// Renames a finished save's temp file over its target. `std::fs::rename` except in tests,
     /// which substitute file-system behaviour (e.g. refusing to replace a file that is open).
     pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
@@ -627,6 +700,7 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
             single_instance_listener: None,
+            pending_ipc: Vec::new(),
             rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
@@ -930,19 +1004,22 @@ impl<'a> PdfViewerApp<'a> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let token = format!("{:x}_{}", nanos, std::process::id());
+        // Random, so another local program cannot guess it and push files into the viewer.
+        let token = random_token_hex()?;
         let lock_path =
             custom_lock_path.unwrap_or_else(Self::default_single_instance_lock_path);
         std::fs::write(&lock_path, format!("{port}|{token}\n").as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         self.single_instance_listener = Some((listener, token, lock_path));
         Ok(())
     }
 
     pub(super) fn stop_single_instance_listener(&mut self) {
+        self.pending_ipc.clear();
         if let Some((listener, token, lock_path)) = self.single_instance_listener.take() {
             if let Ok(addr) = listener.local_addr() {
                 let expected = format!("{}|{}", addr.port(), token);
@@ -955,32 +1032,76 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Polls the non-blocking single-instance listener and opens any forwarded PDF paths as new tabs.
+    /// Polls the single-instance listener and opens forwarded PDF paths as new tabs. Never
+    /// blocks: connections are accepted and read without blocking, a request line is at most
+    /// `IPC_MAX_LINE_BYTES`, at most `IPC_MAX_PENDING` connections wait at once, and one that has
+    /// not sent its whole line within one frame (`IPC_FRAME`, and at least one later poll) is
+    /// dropped. Only lines with the right token naming an existing `.pdf` file are opened.
     pub(super) fn poll_single_instance_listener(&mut self) -> usize {
-        use std::io::{BufRead, BufReader};
+        use std::io::Read;
 
         let mut received_paths: Vec<PathBuf> = Vec::new();
         if let Some((ref listener, ref expected_token, _)) = self.single_instance_listener {
-            while let Ok((mut stream, _peer)) = listener.accept() {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                let mut line = String::new();
-                {
-                    let mut reader = BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut line);
+            while let Ok((stream, _peer)) = listener.accept() {
+                if self.pending_ipc.len() >= IPC_MAX_PENDING || stream.set_nonblocking(true).is_err() {
+                    continue; // dropped: closes the connection
                 }
-                let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
-                if let Some((tok, path_str)) = trimmed.split_once('|') {
-                    if tok == expected_token && !path_str.is_empty() {
-                        received_paths.push(PathBuf::from(path_str));
+                self.pending_ipc.push(PendingIpcConnection {
+                    stream,
+                    buf: Vec::new(),
+                    accepted_at: Instant::now(),
+                    polls: 0,
+                });
+            }
+
+            let mut chunk = [0u8; 1024];
+            self.pending_ipc.retain_mut(|conn| {
+                conn.polls += 1;
+                let mut eof = false;
+                loop {
+                    match conn.stream.read(&mut chunk) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            conn.buf.extend_from_slice(&chunk[..n]);
+                            if conn.buf.len() > IPC_MAX_LINE_BYTES || conn.buf.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            eof = true; // reset or other error: drop it
+                            break;
+                        }
                     }
                 }
-            }
+                if let Some(end) = conn.buf.iter().position(|&b| b == b'\n') {
+                    if end <= IPC_MAX_LINE_BYTES {
+                        let line = String::from_utf8_lossy(&conn.buf[..end]);
+                        let line = line.trim_end_matches('\r');
+                        if let Some((tok, path_str)) = line.split_once('|') {
+                            if tokens_match(tok.as_bytes(), expected_token.as_bytes())
+                                && !path_str.is_empty()
+                            {
+                                received_paths.push(PathBuf::from(path_str));
+                            }
+                        }
+                    }
+                    return false;
+                }
+                let expired = conn.polls >= 2 && conn.accepted_at.elapsed() >= IPC_FRAME;
+                !(eof || conn.buf.len() > IPC_MAX_LINE_BYTES || expired)
+            });
+        } else {
+            self.pending_ipc.clear();
         }
 
         let mut opened = 0usize;
         for path in received_paths {
-            if !path.exists() {
+            if !is_acceptable_forwarded_pdf(&path) {
                 continue;
             }
             let fname = path

@@ -793,9 +793,23 @@ mod tests {
             elapsed
         );
 
-        // Primary instance polls listener and opens pdf_b in Tab 2
-        let opened = app.poll_single_instance_listener();
+        // Primary instance polls listener and opens pdf_b in Tab 2. Reads are non-blocking
+        // (Phase 4) and loopback data can arrive just after the client's write returns, so
+        // poll until it opens, within the same 200 ms budget.
+        let t_poll = std::time::Instant::now();
+        let mut opened = 0;
+        while opened == 0 && t_poll.elapsed() < std::time::Duration::from_millis(200) {
+            opened += app.poll_single_instance_listener();
+            if opened == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         assert_eq!(opened, 1);
+        // Further polls must not open the same file again.
+        for _ in 0..5 {
+            assert_eq!(app.poll_single_instance_listener(), 0, "forwarded file opened twice");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active_tab, 1);
         assert_eq!(app.total_pages(), 4);
@@ -1578,6 +1592,189 @@ mod tests {
         assert!(PdfEngine::write_atomic(&target, b"%PDF-1.4 new").is_err());
         assert_eq!(std::fs::read(target.join("keep.txt"))?, b"keep");
         assert!(!PdfEngine::save_temp_path(&target).exists(), "temp must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn lock_port_and_token(lock: &Path) -> (u16, String) {
+        let s = std::fs::read_to_string(lock).unwrap();
+        let (port, token) = s.trim().split_once('|').unwrap();
+        (port.parse().unwrap(), token.to_string())
+    }
+
+    fn send_ipc_line(port: u16, line: &str) {
+        use std::io::Write;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(line.as_bytes()).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+
+    #[test]
+    fn test_single_instance_token_is_random() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_token");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let (lock_a, lock_b) = (dir.join("a.lock"), dir.join("b.lock"));
+        let mut a = PdfViewerApp::new(&engine, None)?;
+        let mut b = PdfViewerApp::new(&engine, None)?;
+        a.start_single_instance_listener(Some(lock_a.clone()))?;
+        b.start_single_instance_listener(Some(lock_b.clone()))?;
+        let (_, ta) = lock_port_and_token(&lock_a);
+        let (_, tb) = lock_port_and_token(&lock_b);
+        for t in [&ta, &tb] {
+            assert_eq!(t.len(), 32, "16 random bytes as hex: {t}");
+            assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(ta, tb);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&lock_a)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "lock file holds the token: owner-only");
+        }
+        a.stop_single_instance_listener();
+        b.stop_single_instance_listener();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_instance_opens_only_existing_pdfs_with_the_token() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_accept");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let pdf = dir.join("ok.PDF");
+        engine.create_sample_pdf(&pdf, 2)?;
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"hello")?;
+        let fake_pdf_dir = dir.join("folder.pdf");
+        std::fs::create_dir_all(&fake_pdf_dir)?;
+
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, token) = lock_port_and_token(&lock);
+        let send = |line: String| send_ipc_line(port, &line);
+
+        send(format!("wrong{}|{}\n", &token[5..], pdf.display()));
+        send(format!("{token}|{}\n", txt.display()));
+        send(format!("{token}|{}\n", dir.join("missing.pdf").display()));
+        send(format!("{token}|{}\n", fake_pdf_dir.display()));
+        send(format!("{token}|\n"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        assert!(app.doc.is_none());
+
+        send(format!("{token}|{}\n", pdf.display()));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(app.poll_single_instance_listener(), 1, "{:?}", app.status_notice);
+        assert_eq!(app.total_pages(), 2);
+
+        app.stop_single_instance_listener();
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Phase 4: one local client that connects and sends nothing must not make any single poll
+    /// take more than a few milliseconds (the old blocking read waited 50 ms per connection),
+    /// and it is dropped after one frame.
+    #[test]
+    fn test_single_instance_silent_client_does_not_stall_a_poll() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_silent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, _) = lock_port_and_token(&lock);
+
+        let silent = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        std::thread::sleep(std::time::Duration::from_millis(10)); // surely in the accept queue
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        let first = t0.elapsed();
+        assert_eq!(app.pending_ipc.len(), 1, "accepted and waiting, not read with a block");
+        assert!(first < std::time::Duration::from_millis(5), "poll took {first:?}");
+
+        std::thread::sleep(state::IPC_FRAME + std::time::Duration::from_millis(2));
+        let t1 = std::time::Instant::now();
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        let second = t1.elapsed();
+        assert!(second < std::time::Duration::from_millis(5), "poll took {second:?}");
+        assert!(app.pending_ipc.is_empty(), "silent for a frame: dropped");
+
+        drop(silent);
+        app.stop_single_instance_listener();
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Silent, slow and flooding local connections never block a poll, are dropped after one
+    /// frame (or when too long), and a normal forward still works afterwards.
+    #[test]
+    fn test_single_instance_slow_or_silent_clients_never_block() -> Result<()> {
+        use std::io::Write;
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_slow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let pdf = dir.join("doc.pdf");
+        engine.create_sample_pdf(&pdf, 3)?;
+
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, token) = lock_port_and_token(&lock);
+        let connect = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        // Silent connections, more than the pending cap.
+        let silent: Vec<_> = (0..20).map(|_| connect()).collect();
+        // Half a request line, never finished.
+        let mut slow = connect();
+        slow.write_all(token.as_bytes())?;
+        // 1 MB without a newline, written from another thread (it may block on a full socket).
+        let flood = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = s.write_all(&vec![b'x'; 1 << 20]);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let mut slowest = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            assert_eq!(app.poll_single_instance_listener(), 0);
+            slowest = slowest.max(t0.elapsed());
+            assert!(app.pending_ipc.len() <= state::IPC_MAX_PENDING);
+            assert!(app.pending_ipc.iter().all(|c| c.buf.len() <= state::IPC_MAX_LINE_BYTES + 1024));
+            std::thread::sleep(state::IPC_FRAME + std::time::Duration::from_millis(5));
+        }
+        assert!(slowest < std::time::Duration::from_millis(15), "a poll took {slowest:?}");
+        assert!(app.pending_ipc.is_empty(), "stalled connections must be dropped after one frame");
+        let _ = flood.join();
+        drop(silent);
+        drop(slow);
+
+        // A normal forward still works.
+        assert!(try_forward_to_running_instance(&pdf, Some(&lock)));
+        let mut opened = 0;
+        for _ in 0..3 {
+            opened += app.poll_single_instance_listener();
+            if opened > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(opened, 1);
+        assert_eq!(app.total_pages(), 3);
+
+        app.stop_single_instance_listener();
+        drop(app);
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }
