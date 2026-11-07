@@ -77,6 +77,7 @@ impl MenuCategory {
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
                 "Optimize -> _optimized.pdf (Z)",
+                "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
             ],
             MenuCategory::View => &[
@@ -403,6 +404,16 @@ pub(super) enum InputMode {
         mode: crate::optimize::ColorMode,
         clean_scans: bool,
         previewing: bool,
+    },
+    /// Bottom-bar print prompt (macOS/Linux; Windows uses the native dialog).
+    #[cfg_attr(windows, allow(dead_code))]
+    PrintPrompt {
+        printers: Vec<String>,
+        selected_printer: usize,
+        copies: u16,
+        range_input: String,
+        /// Scale each page to the paper (`lp -o fit-to-page`).
+        fit_to_page: bool,
     },
 }
 

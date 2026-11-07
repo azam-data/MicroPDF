@@ -340,9 +340,11 @@ impl PdfEngine {
         {
             let mut f = std::fs::File::create(&tmp)
                 .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
-            f.write_all(bytes)
-                .and_then(|_| f.sync_all())
-                .with_context(|| format!("Failed to write temp file {:?}", tmp))?;
+            if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+                drop(f);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e).with_context(|| format!("Failed to write temp file {:?}", tmp));
+            }
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             #[cfg(windows)]

@@ -114,6 +114,29 @@ impl<'a> PdfViewerApp<'a> {
                     "OPTIMIZE: [1/2/3]{preset_lbl} [C/G/B]{mode_lbl} [S]Clean:{clean_lbl} {prev_lbl} | Enter=Run Esc=Cancel"
                 ))
             }
+            InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies,
+                range_input,
+                fit_to_page,
+            } => {
+                let fit_lbl = if *fit_to_page { "ON" } else { "OFF" };
+                let printer_lbl = printers
+                    .get(*selected_printer)
+                    .map(|s| s.as_str())
+                    .unwrap_or("(no printer)");
+                let range_lbl = if range_input.is_empty() {
+                    "all"
+                } else {
+                    range_input.as_str()
+                };
+                Some(format!(
+                    "PRINT: Printer [Tab]: {printer_lbl} ({}/{}) | Copies [+/-]: {copies} | [F]Fit:{fit_lbl} | Pages (e.g. 1-3,5): {range_lbl}_ | Enter=Print Esc=Cancel",
+                    if printers.is_empty() { 0 } else { selected_printer + 1 },
+                    printers.len()
+                ))
+            }
         }
     }
 

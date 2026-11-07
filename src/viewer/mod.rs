@@ -1525,6 +1525,74 @@ mod tests {
         Ok(out)
     }
 
+    /// Raw process RSS while printing a 20-page, 300-dpi scan at 600 dpi:
+    /// - Windows path: every page rendered in 256-row strips (the GDI calls are replaced by a
+    ///   no-op sink, so this measures MicroPDF + PDFium, not the printer driver);
+    /// - macOS path: the in-memory document written to the temporary PDF handed to `lp`.
+    /// Run: cargo test --release ram_print -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn ram_print_600dpi_scan_measurement() -> Result<()> {
+        let rss = || get_current_rss_mb().unwrap_or(0.0);
+        let dir = std::env::temp_dir().join("micropdf_ram_print");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("scan20.pdf");
+        std::fs::write(&path, build_scan_pdf(20)?)?;
+        let file_mb = std::fs::metadata(&path)?.len() as f64 / 1_048_576.0;
+
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_safe(&path)?;
+        let opened = rss();
+
+        let mut strip_buf = Vec::new();
+        let mut peak_strips = opened;
+        let start = std::time::Instant::now();
+        for page_idx in 0..doc.pages().len() {
+            // A4 at 600 dpi with ~4 mm margins.
+            crate::print::render_page_in_horizontal_strips(
+                &engine,
+                &doc,
+                page_idx,
+                600,
+                600,
+                4800,
+                6814,
+                true,
+                crate::print::PRINT_STRIP_ROWS,
+                &mut strip_buf,
+                |_, _, _, _, px| {
+                    std::hint::black_box(px);
+                    peak_strips = peak_strips.max(rss());
+                    Ok(())
+                },
+            )?;
+        }
+        let strips_secs = start.elapsed().as_secs_f64();
+        let after_strips = rss();
+
+        let all: Vec<u16> = (0..doc.pages().len()).collect();
+        let before_temp = rss();
+        let temp = crate::print::write_pages_to_temp_pdf(&engine, &doc, &all, false, &dir)?;
+        let after_temp = rss();
+        let temp_mb = std::fs::metadata(temp.path())?.len() as f64 / 1_048_576.0;
+        drop(temp);
+
+        eprintln!();
+        eprintln!("| Raw RSS, printing a 20-page 300-dpi scan ({file_mb:.1} MB) | Value |");
+        eprintln!("|---|---|");
+        eprintln!("| After open | {opened:.1} MB |");
+        eprintln!("| Windows path: peak while rendering 20 pages at 600 dpi in strips | {peak_strips:.1} MB |");
+        eprintln!("| Windows path: after the last page | {after_strips:.1} MB |");
+        eprintln!("| Windows path: render time (no printer) | {strips_secs:.1} s |");
+        eprintln!("| macOS path: before writing the temp PDF | {before_temp:.1} MB |");
+        eprintln!("| macOS path: after writing the temp PDF ({temp_mb:.1} MB) | {after_temp:.1} MB |");
+
+        drop(doc);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// Helper for `ram_realistic_measurement` (runs in a child process).
     #[test]
     #[ignore]

@@ -1886,6 +1886,61 @@ impl<'a> PdfViewerApp<'a> {
         self.doc = orig_doc;
     }
 
+    /// Triggers printing (`Ctrl/Cmd+P` or `File -> Print...`) of the current in-memory document.
+    pub(super) fn trigger_print(&mut self) {
+        if self.doc.is_none() || self.total_pages() == 0 {
+            self.status_notice = Some("No open PDF document to print".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let title = self.filename_display();
+            let owner_hwnd = self.window.as_ref().and_then(|w| {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                match w.window_handle().ok()?.as_raw() {
+                    RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+                    _ => None,
+                }
+            });
+            let Some(doc) = self.doc.as_ref() else {
+                return;
+            };
+            match crate::print::print_document_windows(self.engine, doc, &title, owner_hwnd) {
+                Ok(Some((pages_count, copies))) => {
+                    self.status_notice = Some(format!(
+                        "Printed {pages_count} page(s) x {copies} copy/copies of '{title}'"
+                    ));
+                }
+                Ok(None) => {
+                    self.status_notice = Some("Print cancelled".to_string());
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("Print error: {e}"));
+                }
+            }
+            self.update_title_bar();
+            self.request_redraw();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let (printers, selected_printer) = crate::print::discover_cups_printers();
+            self.input_mode = InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies: 1,
+                range_input: String::new(),
+                fit_to_page: true,
+            };
+            self.status_notice = None;
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
     pub(super) fn parse_page_range_input(&self, input: &str) -> Option<(u16, u16)> {
         let total = self.total_pages();
         if total == 0 {
@@ -2251,6 +2306,49 @@ impl<'a> PdfViewerApp<'a> {
                 self.start_optimize_job(opts);
                 return;
             }
+            InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies,
+                range_input,
+                fit_to_page,
+            } => {
+                let Some(printer) = printers.get(selected_printer).cloned() else {
+                    self.status_notice = Some(
+                        "Print failed: no CUPS printers found via 'lpstat -p -d'".to_string(),
+                    );
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                };
+                let title = self.filename_display();
+                let Some(doc) = self.doc.as_ref() else {
+                    return;
+                };
+                let req = crate::print::CupsPrintRequest {
+                    printer: &printer,
+                    copies,
+                    range_input: &range_input,
+                    fit_to_page,
+                    title: &title,
+                };
+                match crate::print::print_document_cups(self.engine, doc, &req, self.redacted) {
+                    Ok(out) => {
+                        let suffix = if out.job_info.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", out.job_info)
+                        };
+                        self.status_notice = Some(format!(
+                            "Sent {} page(s) x {} copy/copies to printer '{printer}'{suffix}",
+                            out.pages, out.copies
+                        ));
+                    }
+                    Err(e) => {
+                        self.status_notice = Some(format!("Print error: {e:#}"));
+                    }
+                }
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -2308,6 +2406,9 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::PasswordPrompt { password_input, .. } => {
                             password_input.pop();
                         }
+                        InputMode::PrintPrompt { range_input, .. } => {
+                            range_input.pop();
+                        }
                         InputMode::ConfirmExternalUrl { .. }
                         | InputMode::RestoreSessionPrompt { .. }
                         | InputMode::OptimizePrompt { .. }
@@ -2315,6 +2416,34 @@ impl<'a> PdfViewerApp<'a> {
                     }
                     self.update_title_bar();
                     self.request_redraw();
+                }
+                Key::Named(NamedKey::Tab) => {
+                    if let InputMode::PrintPrompt {
+                        printers,
+                        selected_printer,
+                        ..
+                    } = &mut self.input_mode
+                    {
+                        if !printers.is_empty() {
+                            *selected_printer = (*selected_printer + 1) % printers.len();
+                        }
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if let InputMode::PrintPrompt { copies, .. } = &mut self.input_mode {
+                        *copies = (*copies + 1).min(99);
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if let InputMode::PrintPrompt { copies, .. } = &mut self.input_mode {
+                        *copies = copies.saturating_sub(1).max(1);
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.handle_prompt_submission();
@@ -2472,6 +2601,42 @@ impl<'a> PdfViewerApp<'a> {
                                     }
                                 }
                             }
+                            InputMode::PrintPrompt {
+                                copies,
+                                range_input,
+                                fit_to_page,
+                                ..
+                            } => {
+                                for c in typed.chars() {
+                                    match c {
+                                        'f' | 'F' => {
+                                            *fit_to_page = !*fit_to_page;
+                                        }
+                                        '+' | '=' | ']' => {
+                                            *copies = (*copies + 1).min(99);
+                                        }
+                                        '[' => {
+                                            *copies = copies.saturating_sub(1).max(1);
+                                        }
+                                        '-' => {
+                                            if range_input.is_empty() {
+                                                *copies = copies.saturating_sub(1).max(1);
+                                            } else {
+                                                range_input.push('-');
+                                            }
+                                        }
+                                        _ if c.is_ascii_digit()
+                                            || c == ','
+                                            || c == ' '
+                                            || c.eq_ignore_ascii_case(&'a')
+                                            || c.eq_ignore_ascii_case(&'l') =>
+                                        {
+                                            range_input.push(c);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                         }
                         if let Some(action) = opt_preview_action {
@@ -2516,6 +2681,9 @@ impl<'a> PdfViewerApp<'a> {
                     return;
                 } else if s.eq_ignore_ascii_case("g") {
                     self.jump_to_next_search_match();
+                    return;
+                } else if s.eq_ignore_ascii_case("p") {
+                    self.trigger_print();
                     return;
                 } else if s.eq_ignore_ascii_case("w") {
                     if self.tabs.len() > 1 {

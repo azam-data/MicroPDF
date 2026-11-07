@@ -2,6 +2,7 @@
 
 mod engine;
 mod optimize;
+mod print;
 mod viewer;
 
 use anyhow::Result;

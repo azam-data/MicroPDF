@@ -274,14 +274,17 @@ impl<'a> PdfViewerApp<'a> {
                 self.compress_current_pdf();
             }
             (MenuCategory::File, 5) => {
+                self.trigger_print();
+            }
+            (MenuCategory::File, 6) => {
                 if self.tabs.len() > 1 {
                     let _ = self.close_tab(self.active_tab);
                 } else {
                     self.status_notice = Some("Cannot close the last remaining tab".to_string());
                 }
             }
-            (MenuCategory::File, idx) if idx >= 6 => {
-                let recent_idx = idx - 6;
+            (MenuCategory::File, idx) if idx >= MenuCategory::File.items().len() => {
+                let recent_idx = idx - MenuCategory::File.items().len();
                 if let Some(rpath) = self.recent_files.get(recent_idx).cloned() {
                     let fname = rpath
                         .file_name()
