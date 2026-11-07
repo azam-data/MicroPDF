@@ -473,21 +473,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.view_mode.is_page_view() {
             self.ensure_current_page_rendered(width, height, sidebar_w, top_bars_h, status_bar_h)?;
         } else {
-            // Render only the thumbnails currently visible in the scrolled viewport
-            let total = self.total_pages();
-            let mut visible_indices = Vec::new();
-            for idx in 0..total {
-                let (_, ty, _, th) =
-                    self.thumbnail_screen_rect(idx, width, sidebar_w, top_bars_h);
-                if ty + (th as i32) + 30 >= (top_bars_h as i32)
-                    && ty <= (height.saturating_sub(status_bar_h) as i32)
-                {
-                    visible_indices.push(idx);
-                }
-            }
-            for idx in visible_indices {
-                let _ = self.ensure_thumbnail_rendered(idx);
-            }
+            self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
         }
 
         let Some(mut surface) = self.surface.take() else {

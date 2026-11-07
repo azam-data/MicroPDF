@@ -21,6 +21,7 @@ pub(super) const PAGE_MARGIN_PX: u32 = 24;
 pub(super) const SPREAD_GAP_PX: u32 = 12;
 pub(super) const THUMB_W: u32 = 140;
 pub(super) const THUMB_H: u32 = 198;
+pub(super) const MAX_THUMB_CACHE_ENTRIES: usize = 300;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.

@@ -59,6 +59,81 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    /// Evicts thumbnails outside the visible grid rows plus one screen above and below,
+    /// enforcing a hard cap of `MAX_THUMB_CACHE_ENTRIES` (300 entries).
+    pub(super) fn update_visible_thumbnails(
+        &mut self,
+        viewport_w: u32,
+        viewport_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+    ) {
+        let total = self.total_pages();
+        if total == 0 {
+            self.thumbnail_cache.clear();
+            return;
+        }
+        let screen_h = viewport_h.saturating_sub(top_bars_h + status_bar_h).max(1) as i32;
+        let vis_top = top_bars_h as i32;
+        let vis_bot = viewport_h.saturating_sub(status_bar_h) as i32;
+        let keep_top = vis_top - screen_h;
+        let keep_bot = vis_bot + screen_h;
+
+        let mut keep_min = total;
+        let mut keep_max = 0u16;
+        let mut visible_indices = Vec::new();
+
+        for idx in 0..total {
+            let (_, ty, _, th) = self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, top_bars_h);
+            let cell_bot = ty + (th as i32) + 30;
+            if cell_bot >= keep_top && ty <= keep_bot {
+                keep_min = keep_min.min(idx);
+                keep_max = keep_max.max(idx);
+            }
+            if cell_bot >= vis_top && ty <= vis_bot {
+                visible_indices.push(idx);
+            }
+        }
+
+        if keep_min <= keep_max {
+            let count = (keep_max - keep_min + 1) as usize;
+            if count > MAX_THUMB_CACHE_ENTRIES {
+                let mid = if !visible_indices.is_empty() {
+                    visible_indices[visible_indices.len() / 2]
+                } else {
+                    keep_min + (keep_max - keep_min) / 2
+                };
+                let half = (MAX_THUMB_CACHE_ENTRIES / 2) as u16;
+                keep_min = mid.saturating_sub(half);
+                keep_max = (keep_min + (MAX_THUMB_CACHE_ENTRIES as u16) - 1).min(total - 1);
+            }
+            self.thumbnail_cache
+                .retain(|&idx, _| idx >= keep_min && idx <= keep_max);
+        } else {
+            self.thumbnail_cache.clear();
+        }
+
+        for idx in visible_indices {
+            if idx >= keep_min && idx <= keep_max {
+                let _ = self.ensure_thumbnail_rendered(idx);
+            }
+        }
+
+        while self.thumbnail_cache.len() > MAX_THUMB_CACHE_ENTRIES {
+            let center = self.current_page_index as i32;
+            if let Some(&farthest) = self
+                .thumbnail_cache
+                .keys()
+                .max_by_key(|&&k| (k as i32 - center).abs())
+            {
+                self.thumbnail_cache.remove(&farthest);
+            } else {
+                break;
+            }
+        }
+    }
+
     /// Computes grid layout metrics for Thumbnail Grid View.
     pub(super) fn grid_metrics(
         &self,
