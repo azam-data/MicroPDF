@@ -1976,6 +1976,14 @@ impl<'a> PdfViewerApp<'a> {
             self.request_redraw();
             return;
         }
+        if self.print_job.is_some() || self.lp_job.is_some() {
+            self.status_notice = Some(
+                "A print job is still running (Esc cancels printing)".to_string(),
+            );
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
 
         #[cfg(target_os = "windows")]
         {
@@ -1987,20 +1995,33 @@ impl<'a> PdfViewerApp<'a> {
                     _ => None,
                 }
             });
-            let Some(doc) = self.doc.as_ref() else {
-                return;
-            };
-            match crate::print::print_document_windows(self.engine, doc, &title, owner_hwnd) {
-                Ok(Some((pages_count, copies))) => {
-                    self.status_notice = Some(format!(
-                        "Printed {pages_count} page(s) x {copies} copy/copies of '{title}'"
-                    ));
-                }
+            let total = self.total_pages();
+            match crate::print::show_windows_print_dialog(&title, total, owner_hwnd) {
                 Ok(None) => {
                     self.status_notice = Some("Print cancelled".to_string());
                 }
                 Err(e) => {
-                    self.status_notice = Some(format!("Print error: {e}"));
+                    self.status_notice = Some(format!("Print error: {e:#}"));
+                }
+                Ok(Some(setup)) => {
+                    let Some(doc) = self.doc.as_ref() else {
+                        return;
+                    };
+                    match crate::print::PagedPrintJob::new(
+                        self.engine,
+                        doc,
+                        &setup.page_indices,
+                        setup.loop_copies,
+                        setup.reported_copies,
+                        self.redacted,
+                        &std::env::temp_dir(),
+                        Box::new(setup.sink),
+                    ) {
+                        Ok(job) => self.start_print_job(job, title),
+                        Err(e) => {
+                            self.status_notice = Some(format!("Print error: {e:#}"));
+                        }
+                    }
                 }
             }
             self.update_title_bar();
@@ -2021,6 +2042,87 @@ impl<'a> PdfViewerApp<'a> {
             self.update_title_bar();
             self.request_redraw();
         }
+    }
+
+    fn print_progress_notice(job: &crate::print::PagedPrintJob) -> String {
+        let (sent, total) = job.progress();
+        format!("Printing page {} / {total} (Esc to cancel)", (sent + 1).min(total))
+    }
+
+    /// Starts sending `job` to the printer, one page per event-loop iteration.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub(super) fn start_print_job(&mut self, job: crate::print::PagedPrintJob<'a>, title: String) {
+        self.status_notice = Some(Self::print_progress_notice(&job));
+        self.print_job = Some(ActivePrintJob { job, title });
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Renders and sends one page of the active print job. Returns `true` while pages remain.
+    pub(super) fn step_print_job(&mut self) -> bool {
+        let Some(active) = self.print_job.as_mut() else {
+            return false;
+        };
+        let result = active.job.step(self.engine);
+        let running = matches!(result, Ok(true));
+        self.status_notice = Some(match result {
+            Ok(true) => Self::print_progress_notice(&active.job),
+            Ok(false) => format!(
+                "Printed {} page(s) x {} copy/copies of '{}'",
+                active.job.pages_per_copy(),
+                active.job.copies(),
+                active.title
+            ),
+            Err(e) => format!("Print error: {e:#} (printing aborted)"),
+        });
+        if !running {
+            self.print_job = None;
+        }
+        self.update_title_bar();
+        self.request_redraw();
+        running
+    }
+
+    /// Cancels the active print job (`Esc`): the printer document is aborted (`AbortDoc`).
+    pub(super) fn cancel_print_job(&mut self) {
+        if let Some(mut active) = self.print_job.take() {
+            let (sent, total) = active.job.progress();
+            active.job.cancel();
+            self.status_notice = Some(format!(
+                "Printing cancelled after {sent} of {total} page(s)"
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Checks the background `lp` submission without waiting. Returns `true` while it runs.
+    pub(super) fn poll_lp_job(&mut self) -> bool {
+        let Some(active) = self.lp_job.as_mut() else {
+            return false;
+        };
+        let Some(result) = active.job.poll() else {
+            return true;
+        };
+        let printer = active.printer.clone();
+        self.lp_job = None;
+        self.status_notice = Some(match result {
+            Ok(out) => {
+                let suffix = if out.job_info.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", out.job_info)
+                };
+                format!(
+                    "Sent {} page(s) x {} copy/copies to printer '{printer}'{suffix}",
+                    out.pages, out.copies
+                )
+            }
+            Err(e) => format!("Print error: {e:#}"),
+        });
+        self.update_title_bar();
+        self.request_redraw();
+        false
     }
 
     pub(super) fn parse_page_range_input(&self, input: &str) -> Option<(u16, u16)> {
@@ -2414,17 +2516,18 @@ impl<'a> PdfViewerApp<'a> {
                     fit_to_page,
                     title: &title,
                 };
-                match crate::print::print_document_cups(self.engine, doc, &req, self.redacted) {
-                    Ok(out) => {
-                        let suffix = if out.job_info.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", out.job_info)
-                        };
-                        self.status_notice = Some(format!(
-                            "Sent {} page(s) x {} copy/copies to printer '{printer}'{suffix}",
-                            out.pages, out.copies
-                        ));
+                match crate::print::start_cups_print_with(
+                    self.engine,
+                    doc,
+                    &req,
+                    self.redacted,
+                    &self.lp_program,
+                    &std::env::temp_dir(),
+                ) {
+                    Ok(job) => {
+                        self.status_notice =
+                            Some(format!("Sending to printer '{printer}'..."));
+                        self.lp_job = Some(ActiveLpJob { job, printer });
                     }
                     Err(e) => {
                         self.status_notice = Some(format!("Print error: {e:#}"));
@@ -2842,6 +2945,8 @@ impl<'a> PdfViewerApp<'a> {
                     self.cancel_incremental_search();
                 } else if self.optimize_job.is_some() {
                     self.cancel_optimize_job();
+                } else if self.print_job.is_some() {
+                    self.cancel_print_job();
                 } else if self.is_presentation || self.is_fullscreen {
                     self.exit_presentation_or_fullscreen();
                 } else if !self.selected_text_rects.is_empty() {
@@ -3104,12 +3209,24 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
         }
+        // One printed page per iteration while a print job runs.
+        let printing = self.print_job.is_some() && self.step_print_job();
+        if printing {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        }
+        let sending_to_lp = self.lp_job.is_some() && self.poll_lp_job();
         if self.incremental_search.is_some() {
             let still_searching = self.step_incremental_search(Duration::from_millis(8));
             if still_searching {
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
+        } else if sending_to_lp && self.optimize_job.is_none() && !printing {
+            // `lp` is still running: check it again soon.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
         } else if self.optimize_job.is_none()
+            && !printing
             && (self.single_instance_listener.is_some()
                 || (self.window_focused && self.doc.is_some()))
         {

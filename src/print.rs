@@ -434,26 +434,84 @@ pub struct CupsPrintOutcome {
     pub job_info: String,
 }
 
-/// Prints the selected pages of the in-memory `doc` with
-/// `lp -d <printer> -n <copies> -t <title> [-o fit-to-page] <temp file>`.
-pub fn print_document_cups(
-    engine: &PdfEngine,
-    doc: &PdfDocument,
-    req: &CupsPrintRequest,
-    redacted: bool,
-) -> Result<CupsPrintOutcome> {
-    print_document_cups_with(engine, doc, req, redacted, "lp".as_ref(), &std::env::temp_dir())
+/// An `lp` submission running in the background. `poll` checks it without waiting; when `lp`
+/// has exited (CUPS has spooled its own copy by then) the temp PDF is deleted and the outcome
+/// returned. Dropping a job whose `lp` is still running waits for it, then deletes the file.
+#[cfg_attr(windows, allow(dead_code))] // CUPS printing is macOS/Linux-only
+pub struct PendingLpJob {
+    child: Option<std::process::Child>,
+    temp: Option<TempPrintFile>,
+    pages: usize,
+    copies: u16,
 }
 
-/// `print_document_cups` with the `lp` program and temp folder given explicitly (for tests).
-pub fn print_document_cups_with(
+#[cfg_attr(windows, allow(dead_code))]
+impl PendingLpJob {
+    /// The temp PDF handed to `lp`, while it still exists.
+    #[cfg(test)]
+    pub fn temp_path(&self) -> Option<&Path> {
+        self.temp.as_ref().map(|t| t.path())
+    }
+
+    /// `None` while `lp` is still running; otherwise deletes the temp PDF and returns the
+    /// outcome. Call until it returns `Some`, then drop the job.
+    pub fn poll(&mut self) -> Option<Result<CupsPrintOutcome>> {
+        let child = self.child.as_mut()?;
+        if let Ok(None) = child.try_wait() {
+            return None;
+        }
+        let output = self.child.take()?.wait_with_output();
+        self.temp = None; // deletes the temp PDF
+        Some(match output {
+            Err(e) => Err(anyhow::Error::new(e).context("Failed to wait for 'lp'")),
+            Ok(out) if !out.status.success() => {
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let detail = if !stderr.is_empty() { stderr } else { stdout };
+                Err(anyhow::anyhow!("lp failed: {detail}"))
+            }
+            Ok(out) => Ok(CupsPrintOutcome {
+                pages: self.pages,
+                copies: self.copies,
+                job_info: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            }),
+        })
+    }
+
+    /// Waits for `lp` to exit (tests).
+    #[cfg(test)]
+    pub fn wait(mut self) -> Result<CupsPrintOutcome> {
+        loop {
+            if let Some(r) = self.poll() {
+                return r;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for PendingLpJob {
+    fn drop(&mut self) {
+        // Never delete the file under a running `lp`: wait for it first (the temp file is
+        // deleted when `temp` is dropped right after this).
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Starts printing the selected pages of the in-memory `doc` with
+/// `lp -d <printer> -n <copies> -t <title> [-o fit-to-page] <temp file>` without waiting for
+/// `lp`; poll the returned job once per frame.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn start_cups_print_with(
     engine: &PdfEngine,
     doc: &PdfDocument,
     req: &CupsPrintRequest,
     redacted: bool,
     lp_program: &std::ffi::OsStr,
     temp_dir: &Path,
-) -> Result<CupsPrintOutcome> {
+) -> Result<PendingLpJob> {
     let printer = req.printer.trim();
     if printer.is_empty() {
         anyhow::bail!("No printer selected");
@@ -473,39 +531,231 @@ pub fn print_document_cups_with(
     if req.fit_to_page {
         cmd.arg("-o").arg("fit-to-page");
     }
-    cmd.arg(temp.path());
+    cmd.arg(temp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
 
-    // `lp` exits once CUPS has accepted and spooled its own copy of the file.
-    let output = cmd.output();
-    drop(temp);
-
-    let output = output.context("Failed to run 'lp'")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        anyhow::bail!("lp failed: {detail}");
-    }
-
-    Ok(CupsPrintOutcome {
+    // On failure `temp` is dropped here, deleting the file.
+    let child = cmd.spawn().context("Failed to run 'lp'")?;
+    Ok(PendingLpJob {
+        child: Some(child),
+        temp: Some(temp),
         pages: page_indices.len(),
         copies,
-        job_info: String::from_utf8_lossy(&output.stdout).trim().to_string(),
     })
 }
 
-/// Shows the native print dialog and prints the in-memory `doc` with GDI.
-///
-/// Page range and copies come from the dialog. Each page is fitted to the printable area and
-/// the paper orientation follows the page (portrait/landscape), switched with `ResetDCW` only
-/// when it changes. Returns `Ok(None)` if the user cancelled.
-#[cfg(target_os = "windows")]
-pub fn print_document_windows(
+/// `start_cups_print_with`, then wait for `lp` (tests).
+#[cfg(all(test, unix))]
+pub fn print_document_cups_with(
     engine: &PdfEngine,
     doc: &PdfDocument,
+    req: &CupsPrintRequest,
+    redacted: bool,
+    lp_program: &std::ffi::OsStr,
+    temp_dir: &Path,
+) -> Result<CupsPrintOutcome> {
+    start_cups_print_with(engine, doc, req, redacted, lp_program, temp_dir)?.wait()
+}
+
+/// The printer side of a `PagedPrintJob`: GDI on Windows, a recording fake in tests.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub trait PrintSink {
+    /// Starts a page with the paper in the given orientation; returns
+    /// `(dpi_x, dpi_y, printable_w, printable_h)` in device pixels.
+    fn start_page(&mut self, landscape: bool) -> Result<(u32, u32, u32, u32)>;
+    /// Sends one strip of `0x00RRGGBB` top-down rows at `(x, y)` on the printable area.
+    fn draw_strip(&mut self, x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) -> Result<()>;
+    fn end_page(&mut self) -> Result<()>;
+    /// Completes the document (`EndDoc`).
+    fn finish(&mut self) -> Result<()>;
+    /// Abandons the document (`AbortDoc`); called at most once, instead of `finish`.
+    fn abort(&mut self);
+}
+
+/// A print job that renders and sends one page per `step()`, so the window stays responsive.
+///
+/// The selected pages of the in-memory document (unsaved edits included) are snapshotted to a
+/// temp PDF when the job is created and printed from that, streamed from disk: editing,
+/// switching tabs or closing the document while printing cannot change what is printed.
+/// Each page is fitted to the printable area, in the page's orientation, rendered in strips.
+/// Cancelling, an error, or dropping an unfinished job aborts the printer document.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub struct PagedPrintJob<'e> {
+    // Field order matters: `doc` (which reads the temp file) is dropped before `temp`.
+    doc: PdfDocument<'e>,
+    /// Deleted when the job is dropped, after `doc` has closed it.
+    _temp: TempPrintFile,
+    sink: Box<dyn PrintSink>,
+    order: Vec<u16>,
+    next: usize,
+    pages_per_copy: usize,
+    copies: u16,
+    strip_buf: Vec<u32>,
+    closed: bool,
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+impl<'e> PagedPrintJob<'e> {
+    /// `page_indices` are 0-based pages of `source`, sent `loop_copies` times (collated).
+    /// `reported_copies` is what the user asked for (the driver may make the copies itself).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        engine: &'e PdfEngine,
+        source: &PdfDocument,
+        page_indices: &[u16],
+        loop_copies: u16,
+        reported_copies: u16,
+        redacted: bool,
+        temp_dir: &Path,
+        mut sink: Box<dyn PrintSink>,
+    ) -> Result<Self> {
+        let snapshot = write_pages_to_temp_pdf(engine, source, page_indices, redacted, temp_dir)
+            .and_then(|temp| {
+                let doc = engine
+                    .load_pdf_safe(temp.path())
+                    .context("Failed to reopen the print snapshot")?;
+                Ok((doc, temp))
+            });
+        let (doc, temp) = match snapshot {
+            Ok(x) => x,
+            Err(e) => {
+                sink.abort();
+                return Err(e);
+            }
+        };
+        let per_copy = doc.pages().len();
+        let loop_copies = loop_copies.max(1);
+        let order = (0..loop_copies).flat_map(|_| 0..per_copy).collect();
+        Ok(Self {
+            doc,
+            _temp: temp,
+            sink,
+            order,
+            next: 0,
+            pages_per_copy: per_copy as usize,
+            copies: reported_copies.max(loop_copies),
+            strip_buf: Vec::new(),
+            closed: false,
+        })
+    }
+
+    /// `(pages sent, pages in total)`, counting every copy.
+    pub fn progress(&self) -> (usize, usize) {
+        (self.next, self.order.len())
+    }
+
+    #[cfg(test)]
+    pub fn is_done(&self) -> bool {
+        self.closed
+    }
+
+    pub fn pages_per_copy(&self) -> usize {
+        self.pages_per_copy
+    }
+
+    pub fn copies(&self) -> u16 {
+        self.copies
+    }
+
+    /// The temp PDF the job prints from.
+    #[cfg(test)]
+    pub fn temp_path(&self) -> &Path {
+        self._temp.path()
+    }
+
+    /// Renders and sends the next page. `Ok(true)`: more pages remain; `Ok(false)`: the
+    /// document is complete. On error the printer document is aborted.
+    pub fn step(&mut self, engine: &PdfEngine) -> Result<bool> {
+        if self.closed {
+            return Ok(false);
+        }
+        let Self { doc, sink, strip_buf, order, next, .. } = self;
+        let page_idx = order[*next];
+        let page_res = (|| -> Result<()> {
+            let landscape = doc
+                .pages()
+                .page_size(page_idx)
+                .map(|s| s.width().value > s.height().value)
+                .unwrap_or(false);
+            let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(landscape)?;
+            let rendered = render_page_in_horizontal_strips(
+                engine,
+                doc,
+                page_idx,
+                dpi_x,
+                dpi_y,
+                avail_w,
+                avail_h,
+                true,
+                PRINT_STRIP_ROWS,
+                strip_buf,
+                |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
+            );
+            let ended = sink.end_page();
+            rendered?;
+            ended
+        })();
+        if let Err(e) = page_res {
+            self.sink.abort();
+            self.closed = true;
+            return Err(e.context(format!("Printing page {} failed", self.next + 1)));
+        }
+        self.next += 1;
+        if self.next < self.order.len() {
+            return Ok(true);
+        }
+        self.closed = true;
+        self.sink.finish()?;
+        Ok(false)
+    }
+
+    /// Stops the job and aborts the printer document (`AbortDoc`).
+    pub fn cancel(&mut self) {
+        if !self.closed {
+            self.sink.abort();
+            self.closed = true;
+        }
+    }
+}
+
+impl Drop for PagedPrintJob<'_> {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.sink.abort();
+        }
+    }
+}
+
+/// What the Windows print dialog returned.
+#[cfg(target_os = "windows")]
+pub struct WindowsPrintSetup {
+    pub sink: gdi::GdiPrintSink,
+    /// 0-based pages chosen in the dialog.
+    pub page_indices: Vec<u16>,
+    /// How often the pages are sent (1 when the driver makes the copies itself).
+    pub loop_copies: u16,
+    /// Copies the user asked for.
+    pub reported_copies: u16,
+}
+
+/// Shows the native print dialog (`PrintDlgW`) and starts the printer document (`StartDocW`).
+/// `Ok(None)` if the user cancelled. Pass the result to `PagedPrintJob::new`.
+#[cfg(target_os = "windows")]
+pub fn show_windows_print_dialog(
     doc_title: &str,
+    total_pages: u16,
     hwnd_owner: Option<isize>,
-) -> Result<Option<(usize, u16)>> {
+) -> Result<Option<WindowsPrintSetup>> {
+    gdi::show_dialog(doc_title, total_pages, hwnd_owner)
+}
+
+/// Win32 print dialog and GDI printing, declared by hand (no extra crate).
+#[cfg(target_os = "windows")]
+pub mod gdi {
+    use super::{PrintSink, WindowsPrintSetup};
+    use anyhow::Result;
     use std::ffi::c_void;
 
     const PD_ALLPAGES: u32 = 0x0000_0000;
@@ -586,7 +836,7 @@ pub fn print_document_windows(
         bmi_colors: [u32; 1],
     }
 
-    /// The leading fields of DEVMODEW, up to dmCopies (offsets 0..=88).
+    /// The leading fields of DEVMODEW, up to dmCopies.
     #[repr(C)]
     struct DevModeWPrefix {
         dm_device_name: [u16; 32],
@@ -642,15 +892,21 @@ pub fn print_document_windows(
         fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
     }
 
-    /// Frees what PrintDlgW returned, on every exit path.
-    struct DialogResources {
+    /// An open GDI printer document. Freed (and aborted if unfinished) on drop.
+    pub struct GdiPrintSink {
         hdc: *mut c_void,
         h_dev_mode: *mut c_void,
         h_dev_names: *mut c_void,
+        orientation: Option<i16>,
+        doc_open: bool,
     }
-    impl Drop for DialogResources {
+
+    impl Drop for GdiPrintSink {
         fn drop(&mut self) {
             unsafe {
+                if self.doc_open {
+                    AbortDoc(self.hdc);
+                }
                 if !self.hdc.is_null() {
                     DeleteDC(self.hdc);
                 }
@@ -664,186 +920,269 @@ pub fn print_document_windows(
         }
     }
 
-    let total_pages = doc.pages().len();
-    if total_pages == 0 {
-        anyhow::bail!("Document has 0 pages");
-    }
-
-    let mut pd: PrintDlgW = unsafe { std::mem::zeroed() };
-    pd.l_struct_size = std::mem::size_of::<PrintDlgW>() as u32;
-    pd.hwnd_owner = hwnd_owner.unwrap_or(0) as *mut c_void;
-    pd.flags = PD_ALLPAGES | PD_RETURNDC | PD_NOSELECTION | PD_USEDEVMODECOPIESANDCOLLATE;
-    pd.n_from_page = 1;
-    pd.n_to_page = total_pages;
-    pd.n_min_page = 1;
-    pd.n_max_page = total_pages;
-    pd.n_copies = 1;
-
-    let accepted = unsafe { PrintDlgW(&mut pd) };
-    let res = DialogResources {
-        hdc: pd.h_dc,
-        h_dev_mode: pd.h_dev_mode,
-        h_dev_names: pd.h_dev_names,
-    };
-    if accepted == 0 || res.hdc.is_null() {
-        return Ok(None);
-    }
-    let hdc = res.hdc;
-
-    let (start_1based, end_1based) = if (pd.flags & PD_PAGENUMS) != 0 {
-        let from = pd.n_from_page.clamp(1, total_pages);
-        (from, pd.n_to_page.clamp(from, total_pages))
-    } else {
-        (1, total_pages)
-    };
-
-    // With PD_USEDEVMODECOPIESANDCOLLATE, a driver that can make copies itself gets them via
-    // DEVMODE and nCopies comes back as 1; otherwise nCopies is how often we send the pages.
-    let loop_copies = pd.n_copies.max(1);
-    let mut driver_copies: u16 = 1;
-    let mut current_orientation: Option<i16> = None;
-    if !res.h_dev_mode.is_null() {
-        unsafe {
-            let dm = GlobalLock(res.h_dev_mode) as *const DevModeWPrefix;
-            if !dm.is_null() {
-                if (*dm).dm_fields & DM_COPIES != 0 {
-                    driver_copies = (*dm).dm_copies.max(1) as u16;
-                }
-                if (*dm).dm_fields & DM_ORIENTATION != 0 {
-                    current_orientation = Some((*dm).dm_orientation);
-                }
-                GlobalUnlock(res.h_dev_mode);
-            }
+    pub(super) fn show_dialog(
+        doc_title: &str,
+        total_pages: u16,
+        hwnd_owner: Option<isize>,
+    ) -> Result<Option<WindowsPrintSetup>> {
+        if total_pages == 0 {
+            anyhow::bail!("Document has 0 pages");
         }
-    }
+        let mut pd: PrintDlgW = unsafe { std::mem::zeroed() };
+        pd.l_struct_size = std::mem::size_of::<PrintDlgW>() as u32;
+        pd.hwnd_owner = hwnd_owner.unwrap_or(0) as *mut c_void;
+        pd.flags = PD_ALLPAGES | PD_RETURNDC | PD_NOSELECTION | PD_USEDEVMODECOPIESANDCOLLATE;
+        pd.n_from_page = 1;
+        pd.n_to_page = total_pages;
+        pd.n_min_page = 1;
+        pd.n_max_page = total_pages;
+        pd.n_copies = 1;
 
-    let title_utf16: Vec<u16> = doc_title.encode_utf16().chain(std::iter::once(0)).collect();
-    let doc_info = DocInfoW {
-        cb_size: std::mem::size_of::<DocInfoW>() as i32,
-        lpsz_doc_name: title_utf16.as_ptr(),
-        lpsz_output: std::ptr::null(),
-        lpsz_datatype: std::ptr::null(),
-        fw_type: 0,
-    };
-    if unsafe { StartDocW(hdc, &doc_info) } <= 0 {
-        anyhow::bail!("StartDocW failed (job cancelled or printer error)");
-    }
-
-    let mut strip_buf: Vec<u32> = Vec::new();
-    let mut print_res: Result<()> = Ok(());
-
-    'print_loop: for _copy in 0..loop_copies {
-        for page_1based in start_1based..=end_1based {
-            let page_idx = page_1based - 1;
-
-            // Paper orientation follows the page; ResetDC only between pages and on change.
-            if let Ok(sz) = doc.pages().page_size(page_idx) {
-                let want = if sz.width().value > sz.height().value {
-                    DMORIENT_LANDSCAPE
-                } else {
-                    DMORIENT_PORTRAIT
-                };
-                if current_orientation != Some(want) && !res.h_dev_mode.is_null() {
-                    unsafe {
-                        let dm = GlobalLock(res.h_dev_mode) as *mut DevModeWPrefix;
-                        if !dm.is_null() {
-                            (*dm).dm_fields |= DM_ORIENTATION;
-                            (*dm).dm_orientation = want;
-                            ResetDCW(hdc, dm as *const c_void);
-                            GlobalUnlock(res.h_dev_mode);
-                            current_orientation = Some(want);
-                        }
-                    }
-                }
-            }
-
-            let dpi_x = unsafe { GetDeviceCaps(hdc, LOGPIXELSX) }.max(72) as u32;
-            let dpi_y = unsafe { GetDeviceCaps(hdc, LOGPIXELSY) }.max(72) as u32;
-            let horz_res = unsafe { GetDeviceCaps(hdc, HORZRES) }.max(1) as u32;
-            let vert_res = unsafe { GetDeviceCaps(hdc, VERTRES) }.max(1) as u32;
-
-            if unsafe { StartPage(hdc) } <= 0 {
-                print_res = Err(anyhow::anyhow!("GDI StartPage failed on page {page_1based}"));
-                break 'print_loop;
-            }
-
-            let page_res = render_page_in_horizontal_strips(
-                engine,
-                doc,
-                page_idx,
-                dpi_x,
-                dpi_y,
-                horz_res,
-                vert_res,
-                true,
-                PRINT_STRIP_ROWS,
-                &mut strip_buf,
-                |dest_x, dest_y, strip_w, strip_h, strip_pixels| {
-                    let bmi = BitmapInfo {
-                        bmi_header: BitmapInfoHeader {
-                            bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
-                            bi_width: strip_w as i32,
-                            // Negative height: top-down rows, as PDFium renders them.
-                            bi_height: -(strip_h as i32),
-                            bi_planes: 1,
-                            bi_bit_count: 32,
-                            bi_compression: BI_RGB,
-                            bi_size_image: strip_w * strip_h * 4,
-                            bi_x_pels_per_meter: 0,
-                            bi_y_pels_per_meter: 0,
-                            bi_clr_used: 0,
-                            bi_clr_important: 0,
-                        },
-                        bmi_colors: [0],
-                    };
-                    let lines = unsafe {
-                        StretchDIBits(
-                            hdc,
-                            dest_x as i32,
-                            dest_y as i32,
-                            strip_w as i32,
-                            strip_h as i32,
-                            0,
-                            0,
-                            strip_w as i32,
-                            strip_h as i32,
-                            strip_pixels.as_ptr() as *const c_void,
-                            &bmi,
-                            DIB_RGB_COLORS,
-                            SRCCOPY,
-                        )
-                    };
-                    if lines == 0 || lines == GDI_ERROR {
-                        anyhow::bail!("StretchDIBits failed on page {page_1based}");
-                    }
-                    Ok(())
-                },
-            );
-
-            let end_ok = unsafe { EndPage(hdc) } > 0;
-            if let Err(e) = page_res {
-                print_res = Err(e);
-                break 'print_loop;
-            }
-            if !end_ok {
-                print_res = Err(anyhow::anyhow!("GDI EndPage failed on page {page_1based}"));
-                break 'print_loop;
-            }
+        let accepted = unsafe { PrintDlgW(&mut pd) };
+        let mut sink = GdiPrintSink {
+            hdc: pd.h_dc,
+            h_dev_mode: pd.h_dev_mode,
+            h_dev_names: pd.h_dev_names,
+            orientation: None,
+            doc_open: false,
+        };
+        if accepted == 0 || sink.hdc.is_null() {
+            return Ok(None);
         }
-    }
 
-    unsafe {
-        if print_res.is_ok() {
-            EndDoc(hdc);
+        let (from, to) = if (pd.flags & PD_PAGENUMS) != 0 {
+            let from = pd.n_from_page.clamp(1, total_pages);
+            (from, pd.n_to_page.clamp(from, total_pages))
         } else {
-            AbortDoc(hdc);
+            (1, total_pages)
+        };
+
+        // With PD_USEDEVMODECOPIESANDCOLLATE, a driver that can make copies itself gets them via
+        // DEVMODE and nCopies comes back as 1; otherwise nCopies is how often we send the pages.
+        let loop_copies = pd.n_copies.max(1);
+        let mut driver_copies: u16 = 1;
+        if !sink.h_dev_mode.is_null() {
+            unsafe {
+                let dm = GlobalLock(sink.h_dev_mode) as *const DevModeWPrefix;
+                if !dm.is_null() {
+                    if (*dm).dm_fields & DM_COPIES != 0 {
+                        driver_copies = (*dm).dm_copies.max(1) as u16;
+                    }
+                    if (*dm).dm_fields & DM_ORIENTATION != 0 {
+                        sink.orientation = Some((*dm).dm_orientation);
+                    }
+                    GlobalUnlock(sink.h_dev_mode);
+                }
+            }
+        }
+
+        let title_utf16: Vec<u16> = doc_title.encode_utf16().chain(std::iter::once(0)).collect();
+        let doc_info = DocInfoW {
+            cb_size: std::mem::size_of::<DocInfoW>() as i32,
+            lpsz_doc_name: title_utf16.as_ptr(),
+            lpsz_output: std::ptr::null(),
+            lpsz_datatype: std::ptr::null(),
+            fw_type: 0,
+        };
+        if unsafe { StartDocW(sink.hdc, &doc_info) } <= 0 {
+            anyhow::bail!("StartDocW failed (job cancelled or printer error)");
+        }
+        sink.doc_open = true;
+
+        Ok(Some(WindowsPrintSetup {
+            sink,
+            page_indices: (from - 1..to).collect(),
+            loop_copies,
+            reported_copies: loop_copies.max(driver_copies),
+        }))
+    }
+
+    impl PrintSink for GdiPrintSink {
+        fn start_page(&mut self, landscape: bool) -> Result<(u32, u32, u32, u32)> {
+            let want = if landscape { DMORIENT_LANDSCAPE } else { DMORIENT_PORTRAIT };
+            // Paper orientation follows the page; ResetDC only between pages and on change.
+            if self.orientation != Some(want) && !self.h_dev_mode.is_null() {
+                unsafe {
+                    let dm = GlobalLock(self.h_dev_mode) as *mut DevModeWPrefix;
+                    if !dm.is_null() {
+                        (*dm).dm_fields |= DM_ORIENTATION;
+                        (*dm).dm_orientation = want;
+                        ResetDCW(self.hdc, dm as *const c_void);
+                        GlobalUnlock(self.h_dev_mode);
+                        self.orientation = Some(want);
+                    }
+                }
+            }
+            let caps = unsafe {
+                (
+                    GetDeviceCaps(self.hdc, LOGPIXELSX).max(72) as u32,
+                    GetDeviceCaps(self.hdc, LOGPIXELSY).max(72) as u32,
+                    GetDeviceCaps(self.hdc, HORZRES).max(1) as u32,
+                    GetDeviceCaps(self.hdc, VERTRES).max(1) as u32,
+                )
+            };
+            if unsafe { StartPage(self.hdc) } <= 0 {
+                anyhow::bail!("GDI StartPage failed");
+            }
+            Ok(caps)
+        }
+
+        fn draw_strip(&mut self, x: u32, y: u32, w: u32, h: u32, pixels: &[u32]) -> Result<()> {
+            let bmi = BitmapInfo {
+                bmi_header: BitmapInfoHeader {
+                    bi_size: std::mem::size_of::<BitmapInfoHeader>() as u32,
+                    bi_width: w as i32,
+                    // Negative height: top-down rows, as PDFium renders them.
+                    bi_height: -(h as i32),
+                    bi_planes: 1,
+                    bi_bit_count: 32,
+                    bi_compression: BI_RGB,
+                    bi_size_image: w * h * 4,
+                    bi_x_pels_per_meter: 0,
+                    bi_y_pels_per_meter: 0,
+                    bi_clr_used: 0,
+                    bi_clr_important: 0,
+                },
+                bmi_colors: [0],
+            };
+            let lines = unsafe {
+                StretchDIBits(
+                    self.hdc,
+                    x as i32,
+                    y as i32,
+                    w as i32,
+                    h as i32,
+                    0,
+                    0,
+                    w as i32,
+                    h as i32,
+                    pixels.as_ptr() as *const c_void,
+                    &bmi,
+                    DIB_RGB_COLORS,
+                    SRCCOPY,
+                )
+            };
+            if lines == 0 || lines == GDI_ERROR {
+                anyhow::bail!("StretchDIBits failed");
+            }
+            Ok(())
+        }
+
+        fn end_page(&mut self) -> Result<()> {
+            if unsafe { EndPage(self.hdc) } <= 0 {
+                anyhow::bail!("GDI EndPage failed");
+            }
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            self.doc_open = false;
+            if unsafe { EndDoc(self.hdc) } <= 0 {
+                anyhow::bail!("GDI EndDoc failed");
+            }
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            if self.doc_open {
+                unsafe {
+                    AbortDoc(self.hdc);
+                }
+                self.doc_open = false;
+            }
         }
     }
-    drop(res);
-    print_res?;
+}
 
-    let pages_printed = (end_1based - start_1based + 1) as usize;
-    Ok(Some((pages_printed, loop_copies.max(driver_copies))))
+/// Test doubles shared by the print and viewer tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::PrintSink;
+    use anyhow::Result;
+    use std::cell::RefCell;
+    #[cfg(unix)]
+    use std::path::{Path, PathBuf};
+    use std::rc::Rc;
+
+    pub(crate) type PrintLog = Rc<RefCell<Vec<String>>>;
+
+    /// A printer that records every call. 72 dpi onto a 595 x 842 printable area keeps tests
+    /// fast. Logs "start portrait|landscape", "end ink" or "end blank" (whether any strip of
+    /// the page had a non-white pixel), "finish" and "abort".
+    pub(crate) struct FakeSink {
+        log: PrintLog,
+        fail_on_page: Option<usize>,
+        page: usize,
+        ink: bool,
+    }
+
+    impl FakeSink {
+        pub(crate) fn new(log: &PrintLog) -> Box<Self> {
+            Box::new(Self { log: log.clone(), fail_on_page: None, page: 0, ink: false })
+        }
+
+        /// Fails drawing on the given 1-based page.
+        pub(crate) fn failing_on_page(log: &PrintLog, page: usize) -> Box<Self> {
+            Box::new(Self { log: log.clone(), fail_on_page: Some(page), page: 0, ink: false })
+        }
+    }
+
+    impl PrintSink for FakeSink {
+        fn start_page(&mut self, landscape: bool) -> Result<(u32, u32, u32, u32)> {
+            self.page += 1;
+            self.ink = false;
+            let o = if landscape { "landscape" } else { "portrait" };
+            self.log.borrow_mut().push(format!("start {o}"));
+            Ok(if landscape { (72, 72, 842, 595) } else { (72, 72, 595, 842) })
+        }
+
+        fn draw_strip(&mut self, _x: u32, _y: u32, _w: u32, h: u32, pixels: &[u32]) -> Result<()> {
+            assert!(h <= super::PRINT_STRIP_ROWS);
+            if self.fail_on_page == Some(self.page) {
+                anyhow::bail!("fake printer: paper jam");
+            }
+            self.ink |= pixels.iter().any(|&p| p != 0x00FF_FFFF);
+            Ok(())
+        }
+
+        fn end_page(&mut self) -> Result<()> {
+            let ink = if self.ink { "ink" } else { "blank" };
+            self.log.borrow_mut().push(format!("end {ink}"));
+            Ok(())
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            self.log.borrow_mut().push("finish".into());
+            Ok(())
+        }
+
+        fn abort(&mut self) {
+            self.log.borrow_mut().push("abort".into());
+        }
+    }
+
+    /// Writes an executable fake `lp`: copies the file it is given to `received.pdf` and its
+    /// arguments to `args.txt` in `log_dir`, sleeps `delay_secs`, writes `done.txt`, then exits
+    /// with `exit_code` (printing an lp-style error on failure).
+    #[cfg(unix)]
+    pub(crate) fn fake_lp(script_dir: &Path, log_dir: &Path, exit_code: i32, delay_secs: f32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = script_dir.join(format!("fake_lp_{exit_code}_{}", (delay_secs * 1000.0) as u32));
+        let body = format!(
+            "#!/bin/sh\n\
+             for a in \"$@\"; do last=\"$a\"; done\n\
+             printf '%s\\n' \"$@\" > '{log}/args.txt'\n\
+             cp \"$last\" '{log}/received.pdf'\n\
+             sleep {delay_secs}\n\
+             echo done > '{log}/done.txt'\n\
+             if [ {exit_code} -ne 0 ]; then echo 'lp: The printer or class does not exist.' >&2; exit {exit_code}; fi\n\
+             echo 'request id is Fake-42 (1 file(s))'\n",
+            log = log_dir.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
 }
 
 #[cfg(test)]
@@ -1180,20 +1519,7 @@ mod tests {
     /// its arguments to `args.txt` in `log_dir`, then exits with `exit_code`.
     #[cfg(unix)]
     fn fake_lp(script_dir: &Path, log_dir: &Path, exit_code: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let script = script_dir.join(format!("fake_lp_{exit_code}"));
-        let body = format!(
-            "#!/bin/sh\n\
-             for a in \"$@\"; do last=\"$a\"; done\n\
-             printf '%s\\n' \"$@\" > '{log}/args.txt'\n\
-             cp \"$last\" '{log}/received.pdf'\n\
-             if [ {exit_code} -ne 0 ]; then echo 'lp: The printer or class does not exist.' >&2; exit {exit_code}; fi\n\
-             echo 'request id is Fake-42 (1 file(s))'\n",
-            log = log_dir.display()
-        );
-        std::fs::write(&script, body).unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        script
+        test_support::fake_lp(script_dir, log_dir, exit_code, 0.0)
     }
 
     #[cfg(unix)]
@@ -1340,6 +1666,229 @@ mod tests {
         assert!(fresh.exists(), "a recent one may still be in use by lp");
         assert!(unrelated.exists(), "other files are never touched");
         let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn new_log() -> test_support::PrintLog {
+        std::rc::Rc::new(std::cell::RefCell::new(Vec::new()))
+    }
+
+    fn log_of(log: &test_support::PrintLog) -> Vec<String> {
+        log.borrow().clone()
+    }
+
+    /// One page per step, in the page's orientation, form field included, then EndDoc once.
+    #[test]
+    fn paged_job_sends_one_page_per_step() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        let dir = fresh_dir("micropdf_paged_one_per_step");
+        let log = new_log();
+        let mut job = PagedPrintJob::new(
+            &engine, &doc, &[0, 1, 2, 3], 1, 1, false, &dir, test_support::FakeSink::new(&log),
+        )?;
+        let temp = job.temp_path().to_path_buf();
+        assert!(temp.exists());
+        assert_eq!(job.progress(), (0, 4));
+        assert!(log_of(&log).is_empty(), "nothing is sent before the first step");
+
+        for expected_sent in 1..=4 {
+            let more = job.step(&engine)?;
+            assert_eq!(job.progress(), (expected_sent, 4));
+            assert_eq!(more, expected_sent < 4);
+            let starts = log_of(&log).iter().filter(|l| l.starts_with("start")).count();
+            assert_eq!(starts, expected_sent, "exactly one page per step");
+        }
+        assert!(job.is_done());
+        assert!(!job.step(&engine)?, "stepping a finished job sends nothing");
+        assert_eq!(
+            log_of(&log),
+            [
+                "start portrait", "end ink",
+                "start landscape", "end ink",
+                "start landscape", "end ink", // /Rotate 90 displays landscape
+                "start portrait", "end ink",  // the form page: its field is ink
+                "finish",
+            ]
+        );
+        drop(job);
+        assert!(!temp.exists(), "the print snapshot is deleted with the job");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn paged_job_collates_copies() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        let dir = fresh_dir("micropdf_paged_copies");
+        let log = new_log();
+        let mut job = PagedPrintJob::new(
+            &engine, &doc, &[1, 3], 2, 2, false, &dir, test_support::FakeSink::new(&log),
+        )?;
+        assert_eq!((job.pages_per_copy(), job.copies(), job.progress()), (2, 2, (0, 4)));
+        while job.step(&engine)? {}
+        let starts: Vec<String> =
+            log_of(&log).into_iter().filter(|l| l.starts_with("start")).collect();
+        assert_eq!(starts, ["start landscape", "start portrait", "start landscape", "start portrait"]);
+        assert_eq!(log_of(&log).last().map(String::as_str), Some("finish"));
+
+        // The driver makes the copies itself: pages sent once, two copies reported.
+        let log2 = new_log();
+        let job2 = PagedPrintJob::new(
+            &engine, &doc, &[1, 3], 1, 2, false, &dir, test_support::FakeSink::new(&log2),
+        )?;
+        assert_eq!((job2.progress().1, job2.copies()), (2, 2));
+        drop(job2);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Esc: AbortDoc once, never EndDoc, nothing more sent, snapshot deleted.
+    #[test]
+    fn paged_job_cancel_aborts_the_printer_document() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        let dir = fresh_dir("micropdf_paged_cancel");
+        let log = new_log();
+        let mut job = PagedPrintJob::new(
+            &engine, &doc, &[0, 1, 2, 3], 1, 1, false, &dir, test_support::FakeSink::new(&log),
+        )?;
+        let temp = job.temp_path().to_path_buf();
+        assert!(job.step(&engine)?);
+        job.cancel();
+        assert!(!job.step(&engine)?, "a cancelled job sends nothing more");
+        job.cancel();
+        drop(job);
+        assert_eq!(log_of(&log), ["start portrait", "end ink", "abort"]);
+        assert!(!temp.exists());
+
+        // Dropping an unfinished job (e.g. the app quits mid-print) aborts it too.
+        let log2 = new_log();
+        let mut job2 = PagedPrintJob::new(
+            &engine, &doc, &[0, 1], 1, 1, false, &dir, test_support::FakeSink::new(&log2),
+        )?;
+        job2.step(&engine)?;
+        drop(job2);
+        assert_eq!(log_of(&log2).last().map(String::as_str), Some("abort"));
+        assert_eq!(log_of(&log2).iter().filter(|l| *l == "abort").count(), 1);
+        assert!(temp_print_files(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn paged_job_printer_error_aborts_and_reports_the_page() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        let dir = fresh_dir("micropdf_paged_error");
+        let log = new_log();
+        let mut job = PagedPrintJob::new(
+            &engine, &doc, &[0, 1, 2], 1, 1, false, &dir,
+            test_support::FakeSink::failing_on_page(&log, 2),
+        )?;
+        assert!(job.step(&engine)?);
+        let err = job.step(&engine).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("Printing page 2 failed") && msg.contains("paper jam"), "{msg}");
+        assert!(!job.step(&engine)?);
+        drop(job);
+        let log = log_of(&log);
+        assert_eq!(log.iter().filter(|l| *l == "abort").count(), 1);
+        assert!(!log.contains(&"finish".to_string()));
+        assert!(temp_print_files(&dir).is_empty());
+
+        // A job that cannot be created aborts the printer document it was given.
+        let log2 = new_log();
+        assert!(PagedPrintJob::new(
+            &engine, &doc, &[9], 1, 1, false, &dir, test_support::FakeSink::new(&log2),
+        )
+        .is_err());
+        assert_eq!(log_of(&log2), ["abort"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The job prints the document as it was when printing started (unsaved edits included);
+    /// later edits to the open document do not change what is printed.
+    #[test]
+    fn paged_job_prints_a_snapshot_of_the_in_memory_document() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let mut doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        doc.pages_mut().create_page_at_end(PdfPagePaperSize::from_points(
+            PdfPoints::new(842.0),
+            PdfPoints::new(595.0),
+        ))?; // unsaved landscape page 5
+        let dir = fresh_dir("micropdf_paged_snapshot");
+        let log = new_log();
+        let all: Vec<u16> = (0..5).collect();
+        let mut job = PagedPrintJob::new(
+            &engine, &doc, &all, 1, 1, false, &dir, test_support::FakeSink::new(&log),
+        )?;
+        job.step(&engine)?;
+        // Edit the open document mid-print.
+        doc.pages_mut().get(4)?.delete()?;
+        doc.pages_mut().get(0)?.delete()?;
+        assert_eq!(doc.pages().len(), 3);
+        while job.step(&engine)? {}
+        let starts: Vec<String> =
+            log_of(&log).into_iter().filter(|l| l.starts_with("start")).collect();
+        assert_eq!(starts.len(), 5);
+        assert_eq!(starts[4], "start landscape", "the unsaved page 5 is printed");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `lp` runs in the background: polling never waits, the temp PDF exists while `lp` runs
+    /// and is deleted when it exits, with the outcome reported then.
+    #[cfg(unix)]
+    #[test]
+    fn lp_job_is_polled_without_waiting_and_cleans_up_on_exit() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let doc = engine.load_pdf_from_bytes_safe(build_print_test_pdf()?)?;
+        let temp_dir = fresh_dir("micropdf_lp_async_tmp");
+        let log_dir = fresh_dir("micropdf_lp_async_log");
+        let req = CupsPrintRequest {
+            printer: "Office_Laser", copies: 1, range_input: "1-2", fit_to_page: true, title: "t",
+        };
+
+        for exit_code in [0, 1] {
+            let lp = test_support::fake_lp(&log_dir, &log_dir, exit_code, 0.4);
+            let _ = std::fs::remove_file(log_dir.join("done.txt"));
+            let mut job = start_cups_print_with(&engine, &doc, &req, false, lp.as_os_str(), &temp_dir)?;
+            let temp = job.temp_path().unwrap().to_path_buf();
+            let t0 = std::time::Instant::now();
+            assert!(job.poll().is_none(), "lp is still running");
+            assert!(t0.elapsed() < std::time::Duration::from_millis(50), "poll must not wait");
+            assert!(temp.exists(), "the file must stay while lp is reading it");
+
+            let outcome = loop {
+                if let Some(r) = job.poll() {
+                    break r;
+                }
+                assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            assert!(log_dir.join("done.txt").exists());
+            assert!(!temp.exists(), "deleted once lp exited (exit code {exit_code})");
+            match exit_code {
+                0 => assert_eq!(outcome?.job_info, "request id is Fake-42 (1 file(s))"),
+                _ => assert!(format!("{:#}", outcome.unwrap_err()).contains("does not exist")),
+            }
+            assert!(job.poll().is_none());
+        }
+        assert!(temp_print_files(&temp_dir).is_empty());
+
+        // Dropping a job while lp runs (e.g. the app quits) waits for lp, then deletes the file.
+        let slow = test_support::fake_lp(&log_dir, &log_dir, 0, 0.4);
+        let _ = std::fs::remove_file(log_dir.join("done.txt"));
+        let job = start_cups_print_with(&engine, &doc, &req, false, slow.as_os_str(), &temp_dir)?;
+        drop(job);
+        assert!(log_dir.join("done.txt").exists(), "drop must wait for lp to finish");
+        assert!(temp_print_files(&temp_dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+        let _ = std::fs::remove_dir_all(&log_dir);
         Ok(())
     }
 }

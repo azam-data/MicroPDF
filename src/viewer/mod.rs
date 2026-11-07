@@ -1945,6 +1945,130 @@ mod tests {
         Ok(())
     }
 
+    /// Windows printing state machine through the app, with a fake printer: one page per
+    /// event-loop step, "Printing page N / M" in the status bar, Esc cancels with AbortDoc,
+    /// and a second Ctrl/Cmd+P while printing is refused.
+    #[test]
+    fn test_print_job_steps_one_page_per_frame_and_esc_cancels() -> Result<()> {
+        use crate::print::test_support::{FakeSink, PrintLog};
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_print_job");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let notice = |app: &PdfViewerApp| app.status_notice.clone().unwrap_or_default();
+
+        // Run 1: cancelled with Esc after the first page.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 1, 1, false, &dir, FakeSink::new(&log),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        assert!(notice(&app).starts_with("Printing page 1 / 3"), "{}", notice(&app));
+        assert!(app.step_print_job());
+        assert!(notice(&app).starts_with("Printing page 2 / 3"), "{}", notice(&app));
+        assert_eq!(log.borrow().len(), 2, "one page sent per step");
+
+        app.trigger_print();
+        assert!(notice(&app).contains("still running"), "{}", notice(&app));
+        assert!(app.print_job.is_some(), "the running job is untouched");
+
+        app.handle_key_input(Key::Named(NamedKey::Escape), None);
+        assert!(app.print_job.is_none());
+        assert_eq!(notice(&app), "Printing cancelled after 1 of 3 page(s)");
+        assert_eq!(*log.borrow(), ["start portrait", "end ink", "abort"]);
+
+        // Run 2: to completion, one step per frame.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 2, 2, false, &dir, FakeSink::new(&log),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        let mut frames = 1;
+        while app.step_print_job() {
+            frames += 1;
+            let (sent, total) = app.print_job.as_ref().unwrap().job.progress();
+            assert_eq!(notice(&app), format!("Printing page {} / {total} (Esc to cancel)", sent + 1));
+        }
+        assert_eq!(frames, 6, "3 pages x 2 copies, one per frame");
+        assert!(app.print_job.is_none());
+        assert_eq!(notice(&app), "Printed 3 page(s) x 2 copy/copies of 'doc.pdf'");
+        assert_eq!(log.borrow().last().map(String::as_str), Some("finish"));
+
+        // Run 3: a printer error ends the job with the error in the status bar.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1], 1, 1, false, &dir,
+            FakeSink::failing_on_page(&log, 1),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        assert!(!app.step_print_job());
+        assert!(app.print_job.is_none());
+        assert!(notice(&app).contains("paper jam") && notice(&app).contains("aborted"), "{}", notice(&app));
+        assert_eq!(log.borrow().last().map(String::as_str), Some("abort"));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// macOS: Enter in the print bar starts `lp` without waiting; each frame polls it; when it
+    /// exits the temp file is gone and the result is in the status bar.
+    #[cfg(unix)]
+    #[test]
+    fn test_lp_print_from_prompt_runs_in_background() -> Result<()> {
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_lp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let notice = |app: &PdfViewerApp| app.status_notice.clone().unwrap_or_default();
+
+        for (exit_code, expect) in [
+            (0, "Sent 2 page(s) x 2 copy/copies to printer 'Fake' (request id is Fake-42 (1 file(s)))"),
+            (1, "Print error: lp failed: lp: The printer or class does not exist."),
+        ] {
+            app.lp_program = crate::print::test_support::fake_lp(&dir, &dir, exit_code, 0.3).into();
+            app.input_mode = state::InputMode::PrintPrompt {
+                printers: vec!["Fake".into()],
+                selected_printer: 0,
+                copies: 2,
+                range_input: "1-2".into(),
+                fit_to_page: true,
+            };
+            let t0 = std::time::Instant::now();
+            app.handle_key_input(Key::Named(NamedKey::Enter), None);
+            assert!(t0.elapsed() < std::time::Duration::from_millis(250), "Enter must not wait for lp");
+            assert_eq!(notice(&app), "Sending to printer 'Fake'...");
+            let temp = app.lp_job.as_ref().unwrap().job.temp_path().unwrap().to_path_buf();
+            assert!(temp.exists());
+
+            app.trigger_print();
+            assert!(notice(&app).contains("still running"));
+
+            let mut frames = 0;
+            while app.poll_lp_job() {
+                frames += 1;
+                assert!(frames < 1000, "lp never finished");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(frames > 0, "lp was polled across frames, not waited for");
+            assert!(app.lp_job.is_none());
+            assert!(!temp.exists(), "temp PDF deleted when lp exited");
+            assert_eq!(notice(&app), expect);
+        }
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// `n`-page text PDF built with lopdf.
     fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
         use lopdf::dictionary;

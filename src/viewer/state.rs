@@ -488,6 +488,18 @@ pub(super) fn is_acceptable_forwarded_pdf(path: &std::path::Path) -> bool {
         && path.is_file()
 }
 
+/// A print job in progress, with the name shown in status messages.
+pub(super) struct ActivePrintJob<'a> {
+    pub(super) job: crate::print::PagedPrintJob<'a>,
+    pub(super) title: String,
+}
+
+/// An `lp` submission in progress.
+pub(super) struct ActiveLpJob {
+    pub(super) job: crate::print::PendingLpJob,
+    pub(super) printer: String,
+}
+
 pub(super) struct ActiveOptimizeJob {
     pub(super) job: crate::optimize::OptimizeJob,
     pub(super) out_path: PathBuf,
@@ -596,6 +608,12 @@ pub struct PdfViewerApp<'a> {
     pub(super) pending_ipc: Vec<PendingIpcConnection>,
     /// Flattened one-page copy of the form page being tiled (see `ensure_tile_rendered`).
     pub(super) tile_form_copy: Option<(u16, PdfDocument<'a>)>,
+    /// Paged print job sent one page per frame (Windows GDI; a fake printer in tests).
+    pub(super) print_job: Option<ActivePrintJob<'a>>,
+    /// `lp` submission running in the background (macOS/Linux).
+    pub(super) lp_job: Option<ActiveLpJob>,
+    /// The `lp` program to run; replaced by a fake in tests.
+    pub(super) lp_program: std::ffi::OsString,
     /// Renames a finished save's temp file over its target. `std::fs::rename` except in tests,
     /// which substitute file-system behaviour (e.g. refusing to replace a file that is open).
     pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
@@ -704,6 +722,9 @@ impl<'a> PdfViewerApp<'a> {
             single_instance_listener: None,
             pending_ipc: Vec::new(),
             tile_form_copy: None,
+            print_job: None,
+            lp_job: None,
+            lp_program: "lp".into(),
             rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
