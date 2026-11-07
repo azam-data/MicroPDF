@@ -378,13 +378,13 @@ pub struct PdfViewerApp<'a> {
 
 
 impl<'a> PdfViewerApp<'a> {
-    pub fn new(engine: &'a PdfEngine, initial_path: PathBuf) -> Result<Self> {
+    pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
         let mut app = Self {
             engine,
             tabs: Vec::new(),
             active_tab: 0,
             doc: None,
-            file_path: initial_path.clone(),
+            file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
             bw_pages: HashSet::new(),
@@ -424,13 +424,19 @@ impl<'a> PdfViewerApp<'a> {
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
-            status_notice: None,
+            status_notice: if initial_path.is_none() {
+                Some("Open PDF (O) or drag and drop a file into this window".to_string())
+            } else {
+                None
+            },
             spare_pixel_buf: Vec::new(),
             surface: None,
             context: None,
             window: None,
         };
-        app.load_document(initial_path)?;
+        if let Some(path) = initial_path {
+            app.load_document(path)?;
+        }
         Ok(app)
     }
 
@@ -522,6 +528,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn filename_display(&self) -> String {
+        if self.doc.is_none() && self.file_path.as_os_str().is_empty() {
+            return "No PDF Open".to_string();
+        }
         self.file_path
             .file_name()
             .and_then(|s| s.to_str())

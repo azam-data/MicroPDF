@@ -115,9 +115,9 @@ pub fn get_current_rss_mb() -> Option<f64> {
     }
 }
 
-pub fn run_viewer(engine: &PdfEngine, initial_pdf: &Path) -> Result<()> {
+pub fn run_viewer(engine: &PdfEngine, initial_pdf: Option<&Path>) -> Result<()> {
     let event_loop = EventLoop::new().context("Failed to create winit EventLoop")?;
-    let mut app = PdfViewerApp::new(engine, initial_pdf.to_path_buf())?;
+    let mut app = PdfViewerApp::new(engine, initial_pdf.map(|p| p.to_path_buf()))?;
     event_loop
         .run_app(&mut app)
         .context("Error running winit application event loop")?;
@@ -155,7 +155,7 @@ mod tests {
             PdfEngine::save_doc(&doc, &scanned_path)?;
         }
 
-        let mut app = PdfViewerApp::new(&engine, scanned_path.clone())?;
+        let mut app = PdfViewerApp::new(&engine, Some(scanned_path.clone()))?;
         let box_rect = PdfRect::new_from_values(500.0, 150.0, 600.0, 250.0);
         if let Some(doc) = app.doc.as_mut() {
             let removed = PdfEngine::redact_rect_on_page(doc, 0, box_rect)?;

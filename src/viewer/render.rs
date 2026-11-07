@@ -543,7 +543,36 @@ impl<'a> PdfViewerApp<'a> {
             // Fill background with #2B2B2B
             buffer.fill(BG_COLOR_U32);
 
-            if self.view_mode.is_page_view() {
+            if self.doc.is_none() {
+                let scale = (scale_factor.round() as u32).clamp(1, 2);
+                let hint1 = "Open PDF (O)";
+                let hint2 = "Press 'O' or File -> Open PDF, or drag and drop a PDF file here";
+                let cy = (top_bars_h + height.saturating_sub(status_bar_h)) / 2;
+                let w1 = (hint1.len() as u32) * 8 * (scale * 2);
+                let w2 = (hint2.len() as u32) * 8 * scale;
+                let x1 = width.saturating_sub(w1) / 2;
+                let x2 = width.saturating_sub(w2) / 2;
+                draw_bitmap_str_8x8(
+                    &mut buffer,
+                    width,
+                    height,
+                    x1,
+                    cy.saturating_sub(20 * scale),
+                    hint1,
+                    0x0064B5F6,
+                    scale * 2,
+                );
+                draw_bitmap_str_8x8(
+                    &mut buffer,
+                    width,
+                    height,
+                    x2,
+                    cy + 8 * scale,
+                    hint2,
+                    0x009E9E9E,
+                    scale,
+                );
+            } else if self.view_mode.is_page_view() {
                 // 1. Blit primary page bitmap (with zero-RAM ReadingFilter applied inline)
                 if let Some(cache) = &self.cached_page {
                     Self::blit_cached_page(
