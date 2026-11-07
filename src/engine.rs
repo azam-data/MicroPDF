@@ -1595,8 +1595,11 @@ impl PdfEngine {
         Ok(compressed)
     }
 
-    /// Compresses the active `PdfDocument`, combining PDFium clean-document rebuild (stripping
-    /// incremental revision history) with `lopdf` object pruning and stream compression.
+    /// Compresses the active `PdfDocument` using `lopdf` object pruning and stream compression.
+    ///
+    /// v1.2: The `clean_doc.pages_mut().append(doc)` rebuild branch was removed because copying
+    /// only pages into a blank PDFium document drops catalog-level `/Outlines` (bookmarks),
+    /// `/PageLabels`, and `/AcroForm` (form fields).
     /// Returns `(compressed_bytes, original_size_bytes, compressed_size_bytes)`.
     pub fn compress_doc(&self, doc: &PdfDocument) -> Result<(Vec<u8>, usize, usize)> {
         let raw_bytes = doc
@@ -1606,33 +1609,11 @@ impl PdfEngine {
 
         let mut best_bytes = raw_bytes.clone();
 
-        // 1. Try lopdf structural pruning + deflate stream compression on raw_bytes
+        // Try lopdf structural pruning + deflate stream compression on raw_bytes
         if let Ok(lopdf_out) = Self::compress_pdf(&raw_bytes) {
             if !lopdf_out.is_empty() && lopdf_out.len() < best_bytes.len() {
                 if self.pdfium.load_pdf_from_byte_vec(lopdf_out.clone(), None).is_ok() {
                     best_bytes = lopdf_out;
-                }
-            }
-        }
-
-        // 2. Also try rebuilding into a fresh PDFium document (strips dead revisions) + lopdf compression
-        if let Ok(mut clean_doc) = self.pdfium.create_new_pdf() {
-            if clean_doc.pages_mut().append(doc).is_ok() {
-                if let Ok(rebuilt_bytes) = clean_doc.save_to_bytes() {
-                    if !rebuilt_bytes.is_empty() && rebuilt_bytes.len() < best_bytes.len() {
-                        best_bytes = rebuilt_bytes.clone();
-                    }
-                    if let Ok(rebuilt_lopdf) = Self::compress_pdf(&rebuilt_bytes) {
-                        if !rebuilt_lopdf.is_empty() && rebuilt_lopdf.len() < best_bytes.len() {
-                            if self
-                                .pdfium
-                                .load_pdf_from_byte_vec(rebuilt_lopdf.clone(), None)
-                                .is_ok()
-                            {
-                                best_bytes = rebuilt_lopdf;
-                            }
-                        }
-                    }
                 }
             }
         }
@@ -2635,6 +2616,102 @@ mod tests {
             }
         }
         assert!(red_outside > 20_000, "image outside the box should be preserved");
+        Ok(())
+    }
+
+    /// v1.2 regression test: bookmarks (`/Outlines`), `/PageLabels`, and `/AcroForm` form fields
+    /// must survive `compress_doc`.
+    #[test]
+    fn test_compress_doc_preserves_bookmarks_pagelabels_and_forms() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir().join("test_compress_preserve.pdf");
+        engine.create_sample_pdf(&tmp, 4)?;
+        let raw = std::fs::read(&tmp)?;
+        let _ = std::fs::remove_file(&tmp);
+
+        let bms = vec![
+            Bookmark {
+                serial: "1".to_string(),
+                title: "Preface".to_string(),
+                logical_page: "i".to_string(),
+                page_index: 0,
+                level: 0,
+            },
+            Bookmark {
+                serial: "2".to_string(),
+                title: "Main Chapter".to_string(),
+                logical_page: "1".to_string(),
+                page_index: 2,
+                level: 0,
+            },
+        ];
+
+        // Embed /PageLabels (roman_end = 2) and /Outlines (bookmarks), then add an /AcroForm field
+        let with_meta = PdfEngine::embed_metadata_in_pdf_bytes(&raw, 2, &bms, false)?;
+        let mut ldoc = lopdf::Document::load_mem(&with_meta)?;
+        let page1_id = *ldoc.get_pages().get(&1).unwrap();
+        let mut field = lopdf::Dictionary::new();
+        field.set("Type", lopdf::Object::Name(b"Annot".to_vec()));
+        field.set("Subtype", lopdf::Object::Name(b"Widget".to_vec()));
+        field.set("FT", lopdf::Object::Name(b"Tx".to_vec()));
+        field.set("T", lopdf::Object::string_literal("CustomerName"));
+        field.set("V", lopdf::Object::string_literal("Alice"));
+        field.set(
+            "Rect",
+            lopdf::Object::Array(vec![
+                lopdf::Object::Integer(50),
+                lopdf::Object::Integer(50),
+                lopdf::Object::Integer(200),
+                lopdf::Object::Integer(80),
+            ]),
+        );
+        field.set("P", lopdf::Object::Reference(page1_id));
+        let field_id = ldoc.add_object(lopdf::Object::Dictionary(field));
+        if let Ok(lopdf::Object::Dictionary(pdict)) = ldoc.get_object_mut(page1_id) {
+            pdict.set(
+                "Annots",
+                lopdf::Object::Array(vec![lopdf::Object::Reference(field_id)]),
+            );
+        }
+        let mut acro = lopdf::Dictionary::new();
+        acro.set(
+            "Fields",
+            lopdf::Object::Array(vec![lopdf::Object::Reference(field_id)]),
+        );
+        let acro_id = ldoc.add_object(lopdf::Object::Dictionary(acro));
+        if let Ok(cat) = ldoc.catalog_mut() {
+            cat.set("AcroForm", lopdf::Object::Reference(acro_id));
+        }
+        // Add an unreferenced dead object so compress_doc actually shrinks the file
+        ldoc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            vec![b'X'; 4096],
+        )));
+        let mut input_bytes = Vec::new();
+        ldoc.save_to(&mut input_bytes)?;
+
+        let doc = engine.load_pdf_from_bytes_safe(input_bytes)?;
+        let (compressed_bytes, _orig, _new) = engine.compress_doc(&doc)?;
+
+        // Verify /PageLabels survived
+        assert_eq!(PdfEngine::read_page_labels_roman_end(&compressed_bytes), 2);
+
+        // Verify /Outlines (bookmarks) survived
+        let reloaded = engine.load_pdf_from_bytes_safe(compressed_bytes.clone())?;
+        let dummy_path = Path::new("nonexistent_for_outline_check.pdf");
+        let loaded_bms = PdfEngine::load_bookmarks(&reloaded, dummy_path, 2);
+        assert_eq!(loaded_bms.len(), 2);
+        assert_eq!(loaded_bms[0].title, "Preface");
+        assert_eq!(loaded_bms[1].title, "Main Chapter");
+
+        // Verify /AcroForm and widget annotation survived
+        let check_ldoc = lopdf::Document::load_mem(&compressed_bytes)?;
+        let cat = check_ldoc.catalog()?;
+        assert!(cat.has(b"AcroForm"), "/AcroForm must survive compress_doc");
+        assert!(
+            reloaded.pages().get(0)?.annotations().len() >= 1,
+            "Form widget annotation must survive compress_doc"
+        );
         Ok(())
     }
 }
