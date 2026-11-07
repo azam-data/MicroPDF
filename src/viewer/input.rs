@@ -1422,6 +1422,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.redacted,
             ) {
                 Ok(warning) => {
+                    self.record_recent_file(&save_path);
                     self.file_path = save_path.clone();
                     if self.active_tab < self.tabs.len() {
                         self.tabs[self.active_tab].file_path = save_path;
@@ -1859,6 +1860,10 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
+            InputMode::RestoreSessionPrompt { .. } => {
+                self.restore_pending_session();
+                return;
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -1876,6 +1881,7 @@ impl<'a> PdfViewerApp<'a> {
                         password_input.clear();
                         password_input.shrink_to_fit();
                     }
+                    self.pending_restore_tabs.clear();
                     self.status_notice = Some("Cancelled".to_string());
                     self.update_title_bar();
                     self.request_redraw();
@@ -1908,7 +1914,9 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::PasswordPrompt { password_input, .. } => {
                             password_input.pop();
                         }
-                        InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
+                        InputMode::ConfirmExternalUrl { .. }
+                        | InputMode::RestoreSessionPrompt { .. }
+                        | InputMode::Normal => {}
                     }
                     self.update_title_bar();
                     self.request_redraw();
@@ -2001,6 +2009,14 @@ impl<'a> PdfViewerApp<'a> {
                             }
                             InputMode::PasswordPrompt { password_input, .. } => {
                                 password_input.push_str(&typed);
+                            }
+                            InputMode::RestoreSessionPrompt { .. } => {
+                                if typed.eq_ignore_ascii_case("y") {
+                                    auto_submit_clear = true;
+                                } else if typed.eq_ignore_ascii_case("n") {
+                                    self.input_mode = InputMode::Normal;
+                                    self.pending_restore_tabs.clear();
+                                }
                             }
                             InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
                         }
@@ -2371,6 +2387,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     ) {
         match event {
             WindowEvent::CloseRequested => {
+                self.save_session_to_ini();
                 self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
                 self.tabs.clear();

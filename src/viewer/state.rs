@@ -29,6 +29,7 @@ pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
 pub(super) const MAX_ZOOM_LEVEL: f32 = 8.0;
 pub(super) const MAX_NAV_HISTORY: usize = 50;
+pub(super) const MAX_RECENT_FILES: usize = 10;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.
@@ -196,6 +197,44 @@ impl ViewMode {
     pub fn is_page_view(self) -> bool {
         !matches!(self, ViewMode::ThumbnailGrid)
     }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            ViewMode::FitPage => "FitPage",
+            ViewMode::FitWidth => "FitWidth",
+            ViewMode::FitTextWidth => "FitTextWidth",
+            ViewMode::TwoPageSpread => "TwoPageSpread",
+            ViewMode::ContinuousScroll => "ContinuousScroll",
+            ViewMode::ThumbnailGrid => "ThumbnailGrid",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "FitWidth" => ViewMode::FitWidth,
+            "FitTextWidth" => ViewMode::FitTextWidth,
+            "TwoPageSpread" => ViewMode::TwoPageSpread,
+            "ContinuousScroll" => ViewMode::ContinuousScroll,
+            "ThumbnailGrid" => ViewMode::ThumbnailGrid,
+            _ => ViewMode::FitPage,
+        }
+    }
+}
+
+/// Saved tab state persisted in `micropdf.ini` on exit.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct SavedSessionTab {
+    pub(super) path: PathBuf,
+    pub(super) page_index: u16,
+    pub(super) view_mode: ViewMode,
+}
+
+/// Parsed contents of `micropdf.ini` (open tabs, active tab, and last 10 recent files).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) struct SessionConfig {
+    pub(super) active_tab: usize,
+    pub(super) tabs: Vec<SavedSessionTab>,
+    pub(super) recent_files: Vec<PathBuf>,
 }
 
 /// Holds a single visible page's rasterized 0x00RRGGBB pixels.
@@ -350,6 +389,9 @@ pub(super) enum InputMode {
         attempts_left: u8,
         open_in_new_tab: bool,
     },
+    RestoreSessionPrompt {
+        tab_count: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -419,6 +461,13 @@ pub struct PdfViewerApp<'a> {
     pub(super) selected_text_rects: Vec<PdfRect>,
     /// Tracks the last click `(page_idx, sx, sy, timestamp)` in `MouseMode::Select` to detect double-clicks.
     pub(super) last_select_click: Option<(u16, f64, f64, Instant)>,
+    /// Last 10 recently opened/saved PDF file paths (shown in `File -> Recent` and persisted in `micropdf.ini`).
+    pub(super) recent_files: Vec<PathBuf>,
+    /// Saved session tabs loaded from `micropdf.ini` when starting with no file argument.
+    pub(super) pending_restore_tabs: Vec<SavedSessionTab>,
+    pub(super) pending_restore_active_tab: usize,
+    /// Optional custom path override for `micropdf.ini` (used by unit tests).
+    pub(super) custom_session_ini_path: Option<PathBuf>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -503,6 +552,10 @@ impl<'a> PdfViewerApp<'a> {
             selected_text_page: None,
             selected_text_rects: Vec::new(),
             last_select_click: None,
+            recent_files: Vec::new(),
+            pending_restore_tabs: Vec::new(),
+            pending_restore_active_tab: 0,
+            custom_session_ini_path: None,
             open_menu: None,
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
@@ -538,10 +591,253 @@ impl<'a> PdfViewerApp<'a> {
             context: None,
             window: None,
         };
+        app.load_session_from_ini(initial_path.is_none());
         if let Some(path) = initial_path {
             app.load_document(path)?;
         }
         Ok(app)
+    }
+
+    /// Returns the portable `micropdf.ini` path next to the executable (or `custom_session_ini_path` in tests).
+    pub(super) fn portable_session_ini_path(&self) -> PathBuf {
+        if let Some(ref custom) = self.custom_session_ini_path {
+            return custom.clone();
+        }
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("micropdf.ini")))
+            .unwrap_or_else(|| PathBuf::from("micropdf.ini"))
+    }
+
+    /// Returns the fallback OS config folder `micropdf.ini` path when the executable folder is not writable.
+    pub(super) fn fallback_os_config_ini_path() -> PathBuf {
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(appdata) = std::env::var_os("APPDATA") {
+                return PathBuf::from(appdata).join("MicroPDF").join("micropdf.ini");
+            }
+            if let Some(profile) = std::env::var_os("USERPROFILE") {
+                return PathBuf::from(profile)
+                    .join(".config")
+                    .join("MicroPDF")
+                    .join("micropdf.ini");
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                return PathBuf::from(xdg).join("micropdf").join("micropdf.ini");
+            }
+            if let Some(home) = std::env::var_os("HOME") {
+                return PathBuf::from(home)
+                    .join(".config")
+                    .join("micropdf")
+                    .join("micropdf.ini");
+            }
+        }
+        std::env::temp_dir().join("micropdf.ini")
+    }
+
+    pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
+        let mut out = String::from("# MicroPDF v1.2 Session & Recent Files\n");
+        out.push_str(&format!("active_tab={}\n", cfg.active_tab));
+        for tab in &cfg.tabs {
+            let p_str = tab.path.to_string_lossy().replace('\n', "").replace('\r', "");
+            if !p_str.is_empty() {
+                out.push_str(&format!(
+                    "tab={}|{}|{}\n",
+                    tab.page_index,
+                    tab.view_mode.to_ini_str(),
+                    p_str
+                ));
+            }
+        }
+        for rec in cfg.recent_files.iter().take(MAX_RECENT_FILES) {
+            let r_str = rec.to_string_lossy().replace('\n', "").replace('\r', "");
+            if !r_str.is_empty() {
+                out.push_str(&format!("recent={}\n", r_str));
+            }
+        }
+        out
+    }
+
+    pub(super) fn parse_session_ini(content: &str) -> SessionConfig {
+        let mut cfg = SessionConfig::default();
+        for raw_line in content.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(val) = line.strip_prefix("active_tab=") {
+                if let Ok(idx) = val.trim().parse::<usize>() {
+                    cfg.active_tab = idx;
+                }
+            } else if let Some(val) = line.strip_prefix("tab=") {
+                let mut parts = val.splitn(3, '|');
+                if let (Some(p_str), Some(vm_str), Some(path_str)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    let page_index = p_str.trim().parse::<u16>().unwrap_or(0);
+                    let view_mode = ViewMode::from_ini_str(vm_str);
+                    let path = PathBuf::from(path_str.trim());
+                    if !path.as_os_str().is_empty() {
+                        cfg.tabs.push(SavedSessionTab {
+                            path,
+                            page_index,
+                            view_mode,
+                        });
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("recent=") {
+                let path = PathBuf::from(val.trim());
+                if !path.as_os_str().is_empty()
+                    && cfg.recent_files.len() < MAX_RECENT_FILES
+                    && !cfg.recent_files.contains(&path)
+                {
+                    cfg.recent_files.push(path);
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Adds `path` to the front of `self.recent_files` (deduplicated, capped at `MAX_RECENT_FILES = 10`).
+    pub(super) fn record_recent_file(&mut self, path: &std::path::Path) {
+        if path.as_os_str().is_empty() || !path.exists() {
+            return;
+        }
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.recent_files.retain(|p| p != &resolved && p != path);
+        self.recent_files.insert(0, resolved);
+        self.recent_files.truncate(MAX_RECENT_FILES);
+    }
+
+    /// Saves open tabs, current page, view mode, and recent files to `micropdf.ini` next to the executable,
+    /// falling back to the OS config folder (and setting a status bar notice) if the exe folder isn't writable.
+    pub(super) fn save_session_to_ini(&mut self) {
+        self.sync_active_tab_to_slot();
+        let mut saved_tabs = Vec::new();
+        for tab in &self.tabs {
+            if !tab.file_path.as_os_str().is_empty() && tab.file_path.exists() {
+                saved_tabs.push(SavedSessionTab {
+                    path: tab.file_path.clone(),
+                    page_index: tab.current_page_index,
+                    view_mode: if tab.view_mode.is_page_view() {
+                        tab.view_mode
+                    } else {
+                        tab.last_page_view_mode
+                    },
+                });
+            }
+        }
+        let cfg = SessionConfig {
+            active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),
+            tabs: saved_tabs,
+            recent_files: self.recent_files.clone(),
+        };
+        let ini_text = Self::serialize_session_ini(&cfg);
+        let primary_path = self.portable_session_ini_path();
+
+        if std::fs::write(&primary_path, ini_text.as_bytes()).is_ok() {
+            return;
+        }
+
+        // Fallback to OS config folder when portable directory is not writable
+        let fallback_path = Self::fallback_os_config_ini_path();
+        if let Some(parent) = fallback_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&fallback_path, ini_text.as_bytes()).is_ok() {
+            self.status_notice = Some(format!(
+                "Exe folder not writable — saved micropdf.ini to OS config folder ({})",
+                fallback_path.display()
+            ));
+        }
+    }
+
+    /// Loads `micropdf.ini` (from next to executable or OS config fallback) and optionally offers
+    /// to restore the saved session when starting with no file argument.
+    pub(super) fn load_session_from_ini(&mut self, offer_restore: bool) {
+        let primary_path = self.portable_session_ini_path();
+        let fallback_path = Self::fallback_os_config_ini_path();
+
+        let (content, used_fallback) = if let Ok(s) = std::fs::read_to_string(&primary_path) {
+            (s, false)
+        } else if let Ok(s) = std::fs::read_to_string(&fallback_path) {
+            (s, true)
+        } else {
+            return;
+        };
+
+        let cfg = Self::parse_session_ini(&content);
+        self.recent_files = cfg
+            .recent_files
+            .into_iter()
+            .filter(|p| p.exists())
+            .take(MAX_RECENT_FILES)
+            .collect();
+
+        if used_fallback {
+            self.status_notice = Some(format!(
+                "Loaded micropdf.ini from OS config folder ({})",
+                fallback_path.display()
+            ));
+        }
+
+        if offer_restore {
+            let valid_tabs: Vec<SavedSessionTab> =
+                cfg.tabs.into_iter().filter(|t| t.path.exists()).collect();
+            if !valid_tabs.is_empty() {
+                let count = valid_tabs.len();
+                self.pending_restore_tabs = valid_tabs;
+                self.pending_restore_active_tab = cfg.active_tab.min(count.saturating_sub(1));
+                self.input_mode = InputMode::RestoreSessionPrompt { tab_count: count };
+            }
+        }
+    }
+
+    /// Restores the saved session tabs from `self.pending_restore_tabs`.
+    pub(super) fn restore_pending_session(&mut self) {
+        let tabs_to_restore = std::mem::take(&mut self.pending_restore_tabs);
+        let target_active = self.pending_restore_active_tab;
+        if tabs_to_restore.is_empty() {
+            return;
+        }
+        let mut restored_count = 0usize;
+        for (idx, saved) in tabs_to_restore.into_iter().enumerate() {
+            let res = if idx == 0 && self.tabs.is_empty() {
+                self.load_document(saved.path)
+            } else {
+                self.open_document_in_new_tab(saved.path)
+            };
+            if res.is_ok() {
+                let total = self.total_pages();
+                if total > 0 {
+                    self.current_page_index = saved.page_index.min(total - 1);
+                }
+                self.view_mode = saved.view_mode;
+                self.last_page_view_mode = if saved.view_mode.is_page_view() {
+                    saved.view_mode
+                } else {
+                    ViewMode::FitPage
+                };
+                if self.active_tab < self.tabs.len() {
+                    self.tabs[self.active_tab].current_page_index = self.current_page_index;
+                    self.tabs[self.active_tab].view_mode = self.view_mode;
+                    self.tabs[self.active_tab].last_page_view_mode = self.last_page_view_mode;
+                }
+                restored_count += 1;
+            }
+        }
+        if target_active < self.tabs.len() && target_active != self.active_tab {
+            self.switch_to_tab(target_active);
+        }
+        self.invalidate_page_caches();
+        self.status_notice = Some(format!(
+            "Restored previous session ({restored_count} tab(s))"
+        ));
+        self.update_title_bar();
+        self.request_redraw();
     }
 
     pub(super) fn invalidate_page_caches(&mut self) {

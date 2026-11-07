@@ -134,6 +134,8 @@ impl<'a> PdfViewerApp<'a> {
         self.bookmark_scroll_y = 0;
         self.doc = Some(loaded);
 
+        self.record_recent_file(&path);
+
         if self.tabs.is_empty() {
             self.tabs.push(DocumentTab {
                 doc: None,
@@ -226,6 +228,8 @@ impl<'a> PdfViewerApp<'a> {
         } else {
             Some(0)
         };
+
+        self.record_recent_file(&path);
 
         // Save current active tab into its slot and release all cached bitmaps
         self.sync_active_tab_to_slot();

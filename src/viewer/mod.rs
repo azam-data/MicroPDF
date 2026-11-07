@@ -639,4 +639,89 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         Ok(())
     }
+
+    #[test]
+    fn test_session_restore_and_recent_files_ini() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp_dir = std::env::temp_dir().join("micropdf_session_test");
+        let _ = std::fs::create_dir_all(&tmp_dir);
+        let ini_path = tmp_dir.join("micropdf.ini");
+        let _ = std::fs::remove_file(&ini_path);
+
+        // Create 12 small test PDFs to verify Recent Files cap at 10
+        let mut pdf_paths = Vec::new();
+        for i in 0..12 {
+            let p = tmp_dir.join(format!("recent_{i}.pdf"));
+            engine.create_sample_pdf(&p, 5)?;
+            pdf_paths.push(p);
+        }
+
+        let ram_before = get_current_rss_mb().unwrap_or(0.0);
+        let mut app = PdfViewerApp::new(&engine, Some(pdf_paths[0].clone()))?;
+        app.custom_session_ini_path = Some(ini_path.clone());
+        for p in &pdf_paths[1..12] {
+            app.record_recent_file(p);
+        }
+        assert_eq!(
+            app.recent_files.len(),
+            state::MAX_RECENT_FILES,
+            "Recent files must be capped at 10"
+        );
+        let file_menu_items = app.menu_items_for_category(state::MenuCategory::File);
+        assert!(file_menu_items.iter().any(|s| s.starts_with("Recent 1:")));
+        assert!(file_menu_items.iter().any(|s| s.starts_with("Recent 10:")));
+
+        // Open a second tab, set different pages and view modes, and save session to micropdf.ini
+        app.navigate_to_page(3);
+        app.set_view_mode(ViewMode::FitWidth);
+        app.open_document_in_new_tab(pdf_paths[1].clone())?;
+        app.navigate_to_page(2);
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        app.save_session_to_ini();
+        assert!(ini_path.exists(), "micropdf.ini must be written on save_session_to_ini");
+
+        // Launch a new empty viewer instance and load the saved session -> offers to restore
+        let mut app2 = PdfViewerApp::new(&engine, None)?;
+        app2.custom_session_ini_path = Some(ini_path.clone());
+        app2.load_session_from_ini(true);
+        assert_eq!(
+            app2.input_mode,
+            state::InputMode::RestoreSessionPrompt { tab_count: 2 }
+        );
+        assert_eq!(app2.recent_files.len(), 10);
+
+        // Press Enter to confirm restoring the session
+        app2.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert_eq!(app2.tabs.len(), 2);
+        assert_eq!(app2.active_tab, 1);
+        assert_eq!(app2.current_page_index, 2);
+        assert_eq!(app2.view_mode, ViewMode::ContinuousScroll);
+        app2.switch_to_tab(0);
+        assert_eq!(app2.current_page_index, 3);
+        assert_eq!(app2.view_mode, ViewMode::FitWidth);
+
+        // Verify fallback to OS config folder when portable path is unwritable (e.g., points to a directory)
+        app2.custom_session_ini_path = Some(tmp_dir.clone()); // Writing a file over a directory fails
+        app2.save_session_to_ini();
+        assert!(
+            app2.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("OS config folder"),
+            "Fallback to OS config folder must notify the user in the status bar"
+        );
+        let _ = std::fs::remove_file(PdfViewerApp::fallback_os_config_ini_path());
+
+        let ram_after = get_current_rss_mb().unwrap_or(0.0);
+        eprintln!(
+            "[Feature 6 Session Restore + Recent Files RAM] before: {:.2} MB, after restoring 2 tabs & 10 recent files: {:.2} MB",
+            ram_before, ram_after
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
 }

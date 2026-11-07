@@ -103,6 +103,24 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    pub(super) fn menu_items_for_category(&self, cat: MenuCategory) -> Vec<String> {
+        let mut list: Vec<String> = cat.items().iter().map(|s| (*s).to_string()).collect();
+        if cat == MenuCategory::File {
+            if self.recent_files.is_empty() {
+                list.push("Recent: (none)".to_string());
+            } else {
+                for (idx, rpath) in self.recent_files.iter().take(MAX_RECENT_FILES).enumerate() {
+                    let fname = rpath
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("document.pdf");
+                    list.push(format!("Recent {}: {}", idx + 1, fname));
+                }
+            }
+        }
+        list
+    }
+
     pub(super) fn draw_open_menu_dropdown(
         &self,
         buffer: &mut [u32],
@@ -113,7 +131,7 @@ impl<'a> PdfViewerApp<'a> {
         scale_factor: f64,
     ) {
         let scale = (scale_factor.round() as u32).clamp(1, 2);
-        let items = cat.items();
+        let items = self.menu_items_for_category(cat);
         if items.is_empty() {
             return;
         }
@@ -150,7 +168,7 @@ impl<'a> PdfViewerApp<'a> {
         let mx = self.cursor_pos.0.round() as u32;
         let my = self.cursor_pos.1.round() as u32;
 
-        for (idx, &item_str) in items.iter().enumerate() {
+        for (idx, item_str) in items.iter().enumerate() {
             let ry = drop_y + 2 * scale + (idx as u32) * row_h;
             let hovered =
                 mx >= drop_x && mx < drop_x + drop_w && my >= ry && my < ry + row_h;
@@ -213,7 +231,7 @@ impl<'a> PdfViewerApp<'a> {
     ) -> Option<(MenuCategory, usize)> {
         let cat = self.open_menu?;
         let scale = (scale_factor.round() as u32).clamp(1, 2);
-        let items = cat.items();
+        let items = self.menu_items_for_category(cat);
         let (hx0, _) = self.menu_header_x_range(cat, scale);
         let row_h = 22 * scale;
         let max_chars = items.iter().map(|s| s.chars().count()).max().unwrap_or(20) as u32;
@@ -260,6 +278,24 @@ impl<'a> PdfViewerApp<'a> {
                     let _ = self.close_tab(self.active_tab);
                 } else {
                     self.status_notice = Some("Cannot close the last remaining tab".to_string());
+                }
+            }
+            (MenuCategory::File, idx) if idx >= 6 => {
+                let recent_idx = idx - 6;
+                if let Some(rpath) = self.recent_files.get(recent_idx).cloned() {
+                    let fname = rpath
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("document.pdf")
+                        .to_string();
+                    let res = if self.doc.is_none() {
+                        self.load_document(rpath)
+                    } else {
+                        self.open_document_in_new_tab(rpath)
+                    };
+                    if let Err(e) = res {
+                        self.status_notice = Some(format!("Failed to open recent '{fname}': {e}"));
+                    }
                 }
             }
 

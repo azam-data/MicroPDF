@@ -83,6 +83,9 @@ impl<'a> PdfViewerApp<'a> {
                     "PASSWORD REQUIRED for '{fname}' ({attempts_left} attempt(s) left): {masked}_  (Enter unlock, Esc cancel)"
                 ))
             }
+            InputMode::RestoreSessionPrompt { tab_count } => Some(format!(
+                "RESTORE PREVIOUS SESSION ({tab_count} saved tab(s))? Press Enter or Y to restore, Esc or N to dismiss"
+            )),
         }
     }
 
