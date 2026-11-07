@@ -27,6 +27,11 @@ const SPREAD_GAP_PX: u32 = 12;
 const THUMB_W: u32 = 140;
 const THUMB_H: u32 = 198;
 const MAX_UNDO_STATES: usize = 8;
+/// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
+/// the most recent one is always kept even if it alone exceeds the budget.
+const UNDO_BYTES_BUDGET: usize = 64 * 1024 * 1024;
+/// Window in which a second `U` press confirms Flatten & Unlock on a signed document.
+const FLATTEN_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
 /// Top Menu Bar categories (`#1E1E1E` bar at the very top of the window).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -218,6 +223,8 @@ struct DocumentTab<'a> {
     grid_scroll_y: f32,
     bw_pages: HashSet<u16>,
     undo_stack: VecDeque<Vec<u8>>,
+    /// True once any redaction has been applied; forces the strict save path.
+    redacted: bool,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -308,6 +315,10 @@ pub struct PdfViewerApp<'a> {
     roman_end: usize,
     bw_pages: HashSet<u16>,
     undo_stack: VecDeque<Vec<u8>>,
+    /// True once any redaction has been applied to the active document.
+    redacted: bool,
+    /// Set by the first `U` press on a signed document; a second press confirms.
+    flatten_confirm_at: Option<Instant>,
     cached_page: Option<CachedPageBitmap>,
     /// Second page bitmap used ONLY in `ViewMode::TwoPageSpread` (`4` key).
     cached_second_page: Option<CachedPageBitmap>,
@@ -379,6 +390,8 @@ impl<'a> PdfViewerApp<'a> {
             roman_end: 0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redacted: false,
+            flatten_confirm_at: None,
             cached_page: None,
             cached_second_page: None,
             page_draw_rect: (0, 0, 0, 0),
@@ -442,7 +455,9 @@ impl<'a> PdfViewerApp<'a> {
             slot.bookmark_scroll_y = self.bookmark_scroll_y;
             slot.grid_scroll_y = self.grid_scroll_y;
             slot.bw_pages = self.bw_pages.clone();
-            slot.undo_stack = self.undo_stack.clone();
+            // v1.1: move, don't deep-clone, up to 8 full-document snapshots on every tab switch.
+            slot.undo_stack = std::mem::take(&mut self.undo_stack);
+            slot.redacted = self.redacted;
         }
     }
 
@@ -462,7 +477,9 @@ impl<'a> PdfViewerApp<'a> {
             self.bookmark_scroll_y = slot.bookmark_scroll_y;
             self.grid_scroll_y = slot.grid_scroll_y;
             self.bw_pages = slot.bw_pages.clone();
-            self.undo_stack = slot.undo_stack.clone();
+            self.undo_stack = std::mem::take(&mut slot.undo_stack);
+            self.redacted = slot.redacted;
+            self.flatten_confirm_at = None;
             self.search_query.clear();
             self.search_matches.clear();
             self.current_search_match = 0;
@@ -487,6 +504,8 @@ impl<'a> PdfViewerApp<'a> {
         self.roman_end = roman_end;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redacted = false;
+        self.flatten_confirm_at = None;
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
@@ -518,6 +537,7 @@ impl<'a> PdfViewerApp<'a> {
                 grid_scroll_y: 0.0,
                 bw_pages: HashSet::new(),
                 undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+                redacted: false,
             });
             self.active_tab = 0;
         } else if self.active_tab < self.tabs.len() {
@@ -531,6 +551,7 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].grid_scroll_y = 0.0;
             self.tabs[self.active_tab].bw_pages.clear();
             self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redacted = false;
         }
 
         self.update_title_bar();
@@ -573,6 +594,7 @@ impl<'a> PdfViewerApp<'a> {
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redacted: false,
         });
 
         self.active_tab = new_idx;
@@ -589,6 +611,8 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redacted = false;
+        self.flatten_confirm_at = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -624,6 +648,7 @@ impl<'a> PdfViewerApp<'a> {
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redacted: false,
         });
 
         self.active_tab = new_idx;
@@ -640,6 +665,8 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redacted = false;
+        self.flatten_confirm_at = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -731,6 +758,14 @@ impl<'a> PdfViewerApp<'a> {
                 self.undo_stack.pop_front();
             }
             self.undo_stack.push_back(bytes);
+            // v1.1: cap total snapshot memory (large scans would otherwise cost 8x file size).
+            let mut total: usize = self.undo_stack.iter().map(|b| b.len()).sum();
+            while self.undo_stack.len() > 1 && total > UNDO_BYTES_BUDGET {
+                if let Some(old) = self.undo_stack.pop_front() {
+                    total -= old.len();
+                }
+            }
+            self.undo_stack.shrink_to(MAX_UNDO_STATES);
         }
     }
 
@@ -3101,20 +3136,50 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn flatten_and_unlock_current_pdf(&mut self) {
+        // v1.1: signed documents need a second press, because flattening and removing
+        // /Perms invalidates digital signatures.
+        let sig_count = self.doc.as_ref().map(|d| d.signatures().len()).unwrap_or(0);
+        if sig_count > 0 {
+            let confirmed = self
+                .flatten_confirm_at
+                .is_some_and(|t| t.elapsed() <= FLATTEN_CONFIRM_WINDOW);
+            if !confirmed {
+                self.flatten_confirm_at = Some(Instant::now());
+                self.status_notice = Some(format!(
+                    "This PDF has {sig_count} digital signature(s). Flatten & Unlock will INVALIDATE them. Press U again within 5 s to continue."
+                ));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        }
+        self.flatten_confirm_at = None;
+
         self.push_undo_snapshot();
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
         match self.engine.flatten_and_unlock_doc(doc) {
-            Ok(flat_bytes) => match self.engine.load_pdf_from_bytes_safe(flat_bytes) {
+            Ok(report) => match self.engine.load_pdf_from_bytes_safe(report.bytes) {
                 Ok(new_doc) => {
                     self.doc = Some(new_doc);
                     self.invalidate_page_caches();
                     self.thumbnail_cache.clear();
-                    self.status_notice = Some(
-                        "Flattened all annotations/forms & unlocked PDF permissions (Press 'S' to save)"
-                            .to_string(),
-                    );
+                    let mut notice = String::from("Flattened annotations/forms");
+                    if report.permissions_removed {
+                        notice.push_str(" & removed permission restrictions");
+                    } else {
+                        notice.push_str("; WARNING: permission restrictions could NOT be removed");
+                    }
+                    if !report.failed_pages.is_empty() {
+                        notice.push_str(&format!(
+                            "; WARNING: {} page(s) failed to flatten (first: p.{})",
+                            report.failed_pages.len(),
+                            report.failed_pages[0]
+                        ));
+                    }
+                    notice.push_str(" (Press 'S' to save)");
+                    self.status_notice = Some(notice);
                     self.update_title_bar();
                     self.request_redraw();
                 }
@@ -3646,17 +3711,21 @@ impl<'a> PdfViewerApp<'a> {
                 &save_path,
                 self.roman_end,
                 &self.bookmarks,
+                self.redacted,
             ) {
-                Ok(()) => {
+                Ok(warning) => {
                     self.file_path = save_path.clone();
                     if self.active_tab < self.tabs.len() {
                         self.tabs[self.active_tab].file_path = save_path;
                     }
                     self.persist_bookmarks();
-                    self.status_notice = Some(
-                        "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)!"
-                            .to_string(),
-                    );
+                    self.status_notice = Some(match warning {
+                        None if self.redacted => {
+                            "Saved PDF (redaction finalized: orphaned objects, /Info & thumbnails removed)".to_string()
+                        }
+                        None => "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)".to_string(),
+                        Some(w) => format!("Saved PDF, but WARNING: {w}"),
+                    });
                 }
                 Err(e) => {
                     self.status_notice = Some(format!("Save error: {e}"));
@@ -3688,15 +3757,26 @@ impl<'a> PdfViewerApp<'a> {
 
         match self.engine.compress_doc(doc) {
             Ok((compressed_bytes, serialized_len, _)) => {
-                let final_bytes = PdfEngine::embed_metadata_in_pdf_bytes(
+                let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
                     &compressed_bytes,
                     self.roman_end,
                     &self.bookmarks,
-                )
-                .unwrap_or(compressed_bytes);
+                    self.redacted,
+                ) {
+                    Ok(b) => (b, None),
+                    Err(e) if self.redacted => {
+                        self.status_notice = Some(format!(
+                            "Compression refused: post-redaction cleanup failed ({e}). Nothing was written."
+                        ));
+                        self.update_title_bar();
+                        self.request_redraw();
+                        return;
+                    }
+                    Err(e) => (compressed_bytes, Some(format!(" (WARNING: metadata not sanitized: {e})"))),
+                };
                 let new_len = final_bytes.len();
                 let orig_len = disk_size.max(serialized_len);
-                match std::fs::write(&out_path, &final_bytes) {
+                match PdfEngine::write_atomic(&out_path, &final_bytes) {
                     Ok(()) => {
                         let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
                         let new_mb = (new_len as f64) / (1024.0 * 1024.0);
@@ -3707,8 +3787,8 @@ impl<'a> PdfViewerApp<'a> {
                             0
                         };
                         self.status_notice = Some(format!(
-                            "Compressed! {:.2} MB -> {:.2} MB (Saved {}%) -> '{}'",
-                            orig_mb, new_mb, saved_pct, out_name
+                            "Compressed! {:.2} MB -> {:.2} MB (Saved {}%) -> '{}'{}",
+                            orig_mb, new_mb, saved_pct, out_name, warning.unwrap_or_default()
                         ));
                     }
                     Err(e) => {
@@ -5046,10 +5126,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                     doc, page_idx, pdf_rect,
                                                 ) {
                                                     Ok(removed) => {
+                                                        self.redacted = true;
                                                         self.invalidate_page_caches();
                                                         self.thumbnail_cache.remove(&page_idx);
                                                         self.status_notice = Some(format!(
-                                                            "REDACTED area on Page {} (purged {} underlying object(s) + solid black box)",
+                                                            "REDACTED area on Page {} ({} object(s)/annotation(s) removed or masked). Save to make it permanent.",
                                                             page_idx + 1,
                                                             removed
                                                         ));
