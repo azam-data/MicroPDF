@@ -173,6 +173,8 @@ impl PdfEngine {
         path: &Path,
         password: Option<&str>,
     ) -> Result<PdfDocument<'a>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let cleaned_path = if let Some(raw_str) = path.to_str() {
             let trimmed = raw_str
                 .trim_matches(|c: char| c == '\n' || c == '\r' || c == '"' || c == '\'');
@@ -183,13 +185,45 @@ impl PdfEngine {
 
         let resolved_path = std::fs::canonicalize(&cleaned_path).unwrap_or(cleaned_path);
 
-        let mut bytes = std::fs::read(&resolved_path)
+        let mut file = std::fs::File::open(&resolved_path)
             .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
-
-        if bytes.is_empty() {
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("FS Error reading metadata {:?}", resolved_path))?
+            .len();
+        if file_len == 0 {
             anyhow::bail!("FS Error: file {:?} is empty (0 bytes)", resolved_path);
         }
 
+        let mut head = [0u8; 1024];
+        let n = file
+            .read(&mut head)
+            .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
+        let junk_offset = head[..n]
+            .windows(5)
+            .position(|w| w == b"%PDF-")
+            .unwrap_or(0);
+
+        if junk_offset == 0 && password.is_none() {
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("FS Error seeking {:?}", resolved_path))?;
+            match self.pdfium.load_pdf_from_reader(file, None) {
+                Ok(doc) => return Ok(doc),
+                Err(PdfiumError::PdfiumLibraryInternalError(
+                    PdfiumInternalError::PasswordError,
+                )) => {
+                    return Err(anyhow::Error::new(PasswordRequiredError))
+                        .with_context(|| format!("Could not open {:?}", resolved_path));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("PDFium could not parse the document: {e:?}"))
+                        .with_context(|| format!("Could not open {:?}", resolved_path));
+                }
+            }
+        }
+
+        let mut bytes = std::fs::read(&resolved_path)
+            .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
         Self::strip_leading_junk(&mut bytes);
         self.load_pdf_from_bytes_with_password(bytes, password)
             .with_context(|| format!("Could not open {:?}", resolved_path))
@@ -249,6 +283,13 @@ impl PdfEngine {
                 .with_context(|| format!("Failed to write temp file {:?}", tmp))?;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
+            #[cfg(windows)]
+            {
+                if std::fs::write(path, bytes).is_ok() {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Ok(());
+                }
+            }
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("Failed to replace {:?}", path));
         }

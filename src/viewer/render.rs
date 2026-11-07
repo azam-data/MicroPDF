@@ -19,6 +19,9 @@ impl<'a> PdfViewerApp<'a> {
         let pixel_count = (target_w.max(1) as usize) * (target_h.max(1) as usize);
         pixels.clear();
         pixels.resize(pixel_count, 0x00FFFFFF);
+        if pixels.capacity() > pixel_count.saturating_mul(2) {
+            pixels.shrink_to_fit();
+        }
 
         let bindings = self.engine.pdfium.bindings();
         let config = PdfRenderConfig::new()
@@ -27,6 +30,7 @@ impl<'a> PdfViewerApp<'a> {
             .render_form_data(true)
             .render_annotations(true)
             .use_lcd_text_rendering(lcd_text)
+            .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false);
 
         {
@@ -124,8 +128,12 @@ impl<'a> PdfViewerApp<'a> {
         let tile_h = (key.virtual_h.saturating_sub(tile_y)).min(TILE_SIZE_PX).max(1) as i32;
 
         let pixel_count = (tile_w as usize) * (tile_h as usize);
+        let max_tile_pixels = (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize);
         reused_pixels.clear();
         reused_pixels.resize(pixel_count, 0x00FFFFFF);
+        if reused_pixels.capacity() > max_tile_pixels {
+            reused_pixels.shrink_to_fit();
+        }
 
         let bindings = self.engine.pdfium.bindings();
         let config = PdfRenderConfig::new()
@@ -134,6 +142,7 @@ impl<'a> PdfViewerApp<'a> {
             .render_form_data(false)
             .render_annotations(true)
             .use_lcd_text_rendering(true)
+            .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
             .reset_matrix(PdfMatrix::new(
                 sx,
@@ -166,6 +175,7 @@ impl<'a> PdfViewerApp<'a> {
             page.render_into_bitmap_with_config(&mut bitmap, &config)
                 .context("Failed to render PDF tile into bitmap")?;
         }
+        drop(page);
 
         for px in &mut reused_pixels {
             #[cfg(target_endian = "little")]
@@ -223,6 +233,34 @@ impl<'a> PdfViewerApp<'a> {
         let row_start = (vis_y0 / TILE_SIZE_PX) as u16;
         let row_end = ((vis_y1 + TILE_SIZE_PX - 1) / TILE_SIZE_PX) as u16;
 
+        // Evict off-screen tiles for this page first so their 512x512 buffers can be reused.
+        let mut evicted_bufs: Vec<Vec<u32>> = Vec::new();
+        if self.view_mode != ViewMode::ContinuousScroll && self.view_mode != ViewMode::TwoPageSpread {
+            let max_tile_pixels = (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize);
+            let stale_keys: Vec<TileKey> = self
+                .tile_cache
+                .keys()
+                .copied()
+                .filter(|k| {
+                    k.page_index != page_idx
+                        || k.virtual_w != virtual_w
+                        || k.virtual_h != virtual_h
+                        || k.rotation_deg != rotation_deg
+                        || k.tile_col < col_start
+                        || k.tile_col >= col_end
+                        || k.tile_row < row_start
+                        || k.tile_row >= row_end
+                })
+                .collect();
+            for sk in stale_keys {
+                if let Some(old_tile) = self.tile_cache.remove(&sk) {
+                    if old_tile.pixels.capacity() <= max_tile_pixels {
+                        evicted_bufs.push(old_tile.pixels);
+                    }
+                }
+            }
+        }
+
         for tile_row in row_start..row_end {
             for tile_col in col_start..col_end {
                 let key = TileKey {
@@ -233,6 +271,11 @@ impl<'a> PdfViewerApp<'a> {
                     tile_col,
                     tile_row,
                 };
+                if !self.tile_cache.contains_key(&key) && self.spare_pixel_buf.is_empty() {
+                    if let Some(buf) = evicted_bufs.pop() {
+                        self.spare_pixel_buf = buf;
+                    }
+                }
                 self.ensure_tile_rendered(key)?;
             }
         }
@@ -260,7 +303,7 @@ impl<'a> PdfViewerApp<'a> {
             .pages()
             .get(page_idx)
             .context("Page index out of bounds")?;
-        let rotation_deg = self.page_rotation_degrees(page_idx);
+        let rotation_deg = Self::rotation_degrees_of_page(&page);
 
         let page_w_pts = page.width().value.max(1.0);
         let page_h_pts = page.height().value.max(1.0);
@@ -294,14 +337,19 @@ impl<'a> PdfViewerApp<'a> {
 
         // RAM rule: Above 2x the screen size, never render the whole page bitmap; use 512x512 tiles.
         let pixels = if Self::is_tiled_for_viewport(virtual_w, virtual_h, content_w, content_h) {
+            drop(page);
+            let max_tile_pixels = (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize);
             if reused_pixels.capacity() > self.spare_pixel_buf.capacity()
-                && reused_pixels.capacity() <= (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4
+                && reused_pixels.capacity() <= max_tile_pixels
             {
                 self.spare_pixel_buf = reused_pixels;
             }
             Vec::new()
         } else {
-            self.render_page_into_u32_vec(&page, target_w, target_h, true, reused_pixels)?
+            let rendered =
+                self.render_page_into_u32_vec(&page, target_w, target_h, true, reused_pixels)?;
+            drop(page);
+            rendered
         };
 
         Ok(CachedPageBitmap {
@@ -398,13 +446,11 @@ impl<'a> PdfViewerApp<'a> {
             let center_y = min_screen_y + (content_h as f32) * 0.5;
 
             let ensure_page_cached = |app: &mut Self, p: u16| -> Result<(u32, u32)> {
-                let rot = app.page_rotation_degrees(p);
                 let need = app.continuous_page_cache.get(&p).map_or(true, |c| {
                     c.view_mode != ViewMode::ContinuousScroll
                         || c.zoom_bits != zoom_bits
                         || c.viewport_width != content_w
                         || c.viewport_height != content_h
-                        || c.rotation_deg != rot
                 });
                 if need {
                     let reused = app
@@ -718,21 +764,12 @@ impl<'a> PdfViewerApp<'a> {
         self.cached_second_page = None;
         self.second_page_draw_rect = None;
 
-        let rotation_deg = self.current_page_rotation_degrees();
-        let page_w_pts = self
-            .doc
-            .as_ref()
-            .and_then(|d| d.pages().get(self.current_page_index).ok())
-            .map(|p| p.width().value.max(1.0))
-            .unwrap_or(595.0);
-
         let need_render = self.cached_page.as_ref().map_or(true, |cache| {
             cache.page_index != self.current_page_index
                 || cache.view_mode != self.view_mode
                 || cache.zoom_bits != zoom_bits
                 || cache.viewport_width != content_w
                 || cache.viewport_height != content_h
-                || cache.rotation_deg != rotation_deg
         });
 
         if need_render {
@@ -770,7 +807,14 @@ impl<'a> PdfViewerApp<'a> {
             let bmp_h = cache.bitmap_height;
             let c_min_x = cache.content_min_x;
             let c_max_x = cache.content_max_x;
+            let rotation_deg = cache.rotation_deg;
             let is_tiled = cache.pixels.is_empty();
+            let page_w_pts = self
+                .doc
+                .as_ref()
+                .and_then(|d| d.pages().page_size(self.current_page_index).ok())
+                .map(|r| r.width().value.max(1.0))
+                .unwrap_or(595.0);
             self.page_draw_rect = self.compute_single_page_draw_rect(
                 sidebar_w,
                 top_bars_h,

@@ -23,7 +23,7 @@ pub(super) const THUMB_W: u32 = 140;
 pub(super) const THUMB_H: u32 = 198;
 pub(super) const MAX_THUMB_CACHE_ENTRIES: usize = 300;
 pub(super) const TILE_SIZE_PX: u32 = 512;
-pub(super) const MAX_TILE_CACHE_BYTES: usize = 48 * 1024 * 1024;
+pub(super) const MAX_TILE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
     MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
@@ -260,7 +260,6 @@ pub(super) struct CachedPageBitmap {
 pub(super) struct ThumbnailEntry {
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) rotation_deg: i32,
     pub(super) pixels: Vec<u32>,
 }
 
@@ -1197,6 +1196,15 @@ impl<'a> PdfViewerApp<'a> {
         self.doc.as_ref().map(|d| d.pages().len()).unwrap_or(0)
     }
 
+    pub(super) fn rotation_degrees_of_page(page: &PdfPage<'_>) -> i32 {
+        match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
+            PdfPageRenderRotation::None => 0,
+            PdfPageRenderRotation::Degrees90 => 90,
+            PdfPageRenderRotation::Degrees180 => 180,
+            PdfPageRenderRotation::Degrees270 => 270,
+        }
+    }
+
     pub(super) fn page_rotation_degrees(&self, page_idx: u16) -> i32 {
         let Some(doc) = self.doc.as_ref() else {
             return 0;
@@ -1204,12 +1212,7 @@ impl<'a> PdfViewerApp<'a> {
         let Ok(page) = doc.pages().get(page_idx) else {
             return 0;
         };
-        match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
-            PdfPageRenderRotation::None => 0,
-            PdfPageRenderRotation::Degrees90 => 90,
-            PdfPageRenderRotation::Degrees180 => 180,
-            PdfPageRenderRotation::Degrees270 => 270,
-        }
+        Self::rotation_degrees_of_page(&page)
     }
 
     pub(super) fn current_page_rotation_degrees(&self) -> i32 {

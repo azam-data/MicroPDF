@@ -22,6 +22,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.last_page_view_mode = self.view_mode;
             }
             self.invalidate_page_caches();
+            self.spare_pixel_buf = Vec::new();
             self.view_mode = ViewMode::ThumbnailGrid;
             self.status_notice = Some(
                 "Thumbnail Grid View (Click page, Drag reorder, [BW]/[R] badges, Tab/Enter to view)"
@@ -1527,6 +1528,10 @@ impl<'a> PdfViewerApp<'a> {
                 self.redacted,
             ) {
                 Ok(warning) => {
+                    if let Ok(reloaded) = self.engine.load_pdf_safe(&save_path) {
+                        self.doc = Some(reloaded);
+                        self.invalidate_page_caches();
+                    }
                     let saved_mtime = Self::read_file_mtime(&save_path);
                     self.record_recent_file(&save_path);
                     self.file_path = save_path.clone();
