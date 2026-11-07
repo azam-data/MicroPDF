@@ -309,9 +309,10 @@ impl Drop for TempPrintFile {
     }
 }
 
-/// Deletes print temp files older than an hour in `dir`, left behind if the app was killed
-/// while `lp` was running.
-fn remove_stale_print_temp_files(dir: &Path) {
+/// Deletes print temp files (macOS `lp` files and Windows print snapshots) older than an hour
+/// in `dir`, left behind if the app was killed mid-print. Runs when the app starts and before
+/// each new print temp file is written; younger files may still be in use by another instance.
+pub(crate) fn remove_stale_print_temp_files(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -1835,6 +1836,65 @@ mod tests {
             log_of(&log).into_iter().filter(|l| l.starts_with("start")).collect();
         assert_eq!(starts.len(), 5);
         assert_eq!(starts[4], "start landscape", "the unsaved page 5 is printed");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// After a redaction the print snapshot gets the same deep clean as a save: no redacted
+    /// text in any object or stream, no /Info. Without the redaction flag /Info is kept, which
+    /// shows the check can see it.
+    #[test]
+    fn paged_job_snapshot_of_redacted_document_is_deep_cleaned() -> Result<()> {
+        const SECRET: &str = "TOPSECRET42";
+        const INFO_SECRET: &str = "INFOSECRET77";
+        let engine = PdfEngine::new()?;
+        let src = {
+            let mut doc = engine.pdfium.create_new_pdf()?;
+            let font = doc.fonts_mut().helvetica();
+            let mut page = doc.pages_mut().create_page_at_end(PdfPagePaperSize::a4())?;
+            let mut t = PdfPageTextObject::new(&doc, SECRET, font, PdfPoints::new(14.0))?;
+            t.translate(PdfPoints::new(100.0), PdfPoints::new(700.0))?;
+            page.objects_mut().add_text_object(t)?;
+            let mut keep = PdfPageTextObject::new(&doc, "Public line stays", font, PdfPoints::new(14.0))?;
+            keep.translate(PdfPoints::new(100.0), PdfPoints::new(500.0))?;
+            page.objects_mut().add_text_object(keep)?;
+            drop(page);
+            let bytes = doc.save_to_bytes()?;
+            let mut ldoc = lopdf::Document::load_mem(&bytes)?;
+            let info = ldoc.add_object(lopdf::dictionary! {
+                "Title" => lopdf::Object::string_literal(INFO_SECRET),
+            });
+            ldoc.trailer.set("Info", info);
+            let mut out = Vec::new();
+            ldoc.save_to(&mut out)?;
+            out
+        };
+        let mut doc = engine.load_pdf_from_bytes_safe(src)?;
+        let box_rect = PdfRect::new_from_values(690.0, 90.0, 720.0, 320.0);
+        assert!(PdfEngine::redact_rect_on_page(&mut doc, 0, box_rect)? >= 1);
+
+        let dir = fresh_dir("micropdf_paged_redacted");
+        let snapshot_text = |redacted: bool| -> Result<String> {
+            let log = new_log();
+            let job = PagedPrintJob::new(
+                &engine, &doc, &[0], 1, 1, redacted, &dir, test_support::FakeSink::new(&log),
+            )?;
+            let mut ldoc = lopdf::Document::load_mem(&std::fs::read(job.temp_path())?)?;
+            ldoc.decompress();
+            let mut flat = Vec::new();
+            ldoc.save_to(&mut flat)?;
+            Ok(String::from_utf8_lossy(&flat).to_uppercase())
+        };
+
+        let cleaned = snapshot_text(true)?;
+        let hex: String = SECRET.bytes().map(|b| format!("{b:02X}")).collect();
+        assert!(!cleaned.contains(SECRET) && !cleaned.contains(&hex), "redacted text in snapshot");
+        assert!(!cleaned.contains(INFO_SECRET), "/Info must be removed after a redaction");
+        assert!(!cleaned.contains("/INFO"), "/Info must be removed after a redaction");
+
+        let plain = snapshot_text(false)?;
+        assert!(plain.contains(INFO_SECRET), "control: /Info is kept without the redaction flag");
+        assert!(temp_print_files(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
         Ok(())
     }

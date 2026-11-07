@@ -2015,6 +2015,92 @@ mod tests {
         Ok(())
     }
 
+    /// The Windows print snapshot is deleted however the job ends: finished, Esc (AbortDoc),
+    /// printer error, or the app quitting mid-print (the printer document is aborted too).
+    #[test]
+    fn test_print_snapshot_deleted_however_the_job_ends() -> Result<()> {
+        use crate::print::test_support::{FakeSink, PrintLog};
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_print_snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let snap_dir = dir.join("tmp");
+        std::fs::create_dir_all(&snap_dir)?;
+        let snapshots = || std::fs::read_dir(&snap_dir).unwrap().count();
+
+        fn start<'e>(
+            engine: &'e PdfEngine,
+            app: &mut PdfViewerApp<'e>,
+            snap_dir: &Path,
+            sink: Box<dyn crate::print::PrintSink>,
+        ) -> Result<std::path::PathBuf> {
+            let job = crate::print::PagedPrintJob::new(
+                engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 1, 1, false, snap_dir, sink,
+            )?;
+            let temp = job.temp_path().to_path_buf();
+            app.start_print_job(job, "doc.pdf".into());
+            assert!(temp.exists());
+            Ok(temp)
+        }
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+
+        // Finished.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        while app.step_print_job() {}
+        assert!(!temp.exists(), "finished job");
+        // Esc.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        app.step_print_job();
+        app.handle_key_input(Key::Named(NamedKey::Escape), None);
+        assert!(!temp.exists(), "cancelled job");
+        // Printer error.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::failing_on_page(&log, 2))?;
+        while app.step_print_job() {}
+        assert!(!temp.exists(), "failed job");
+        // App quits mid-print.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        app.step_print_job();
+        drop(app);
+        assert!(!temp.exists(), "app quit mid-print");
+        assert_eq!(log.borrow().last().map(String::as_str), Some("abort"));
+        assert_eq!(snapshots(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Print temp files older than an hour (left by a run killed mid-print) are removed when
+    /// the app starts; recent ones are left alone.
+    #[test]
+    fn test_stale_print_files_swept_on_start() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir();
+        let tag = format!("{}_sweeptest", std::process::id());
+        let stale = tmp.join(format!("micropdf_print_{tag}_old.pdf"));
+        let fresh = tmp.join(format!("micropdf_print_{tag}_new.pdf"));
+        std::fs::write(&stale, b"%PDF-1.4")?;
+        std::fs::write(&fresh, b"%PDF-1.4")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)?
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))?;
+
+        let app = PdfViewerApp::new(&engine, None)?;
+        assert!(!stale.exists(), "stale print file must be swept on start");
+        assert!(fresh.exists(), "a recent print file may belong to a running print");
+        drop(app);
+        let _ = std::fs::remove_file(&fresh);
+        Ok(())
+    }
+
     /// macOS: Enter in the print bar starts `lp` without waiting; each frame polls it; when it
     /// exits the temp file is gone and the result is in the status bar.
     #[cfg(unix)]

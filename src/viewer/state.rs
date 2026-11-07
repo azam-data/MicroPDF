@@ -676,6 +676,8 @@ pub struct PdfViewerApp<'a> {
 
 impl<'a> PdfViewerApp<'a> {
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
+        // Print temp files left behind by a previous run that was killed mid-print.
+        crate::print::remove_stale_print_temp_files(&std::env::temp_dir());
         let mut app = Self {
             engine,
             tabs: Vec::new(),
