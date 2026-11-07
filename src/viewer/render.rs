@@ -1513,14 +1513,16 @@ pub(super) fn draw_help_overlay(buffer: &mut [u32], buf_w: u32, buf_h: u32, scal
     let line_h = 14 * scale;
 
     let lines = [
-        "=== MICRO_PDF PHASE 5: MENU BAR, VIEW MODES & POWER TOOLS ===",
+        "=== MICROPDF v1.2: LIGHTWEIGHT PDF VIEWER & POWER TOOLS ===",
         "",
         "TOP MENU BAR : Click [File] [View] [Edit] [Page] [Tools] [Help]",
         "TOP TAB BAR  : Click Tab to Switch, [x] or Cmd/Ctrl+W Close, [+] Open",
-        "VIEW MODES   : '1' Fit Page | '2' Fit Width | '3' Fit Text | '4' 2-Page",
+        "VIEW MODES   : '1' Fit | '2' Width | '3' Text | '4' 2-Page | '5' Cont.",
+        "ZOOM & FULL  : Ctrl+Wheel / '+' / '-' / '0' Zoom | F11 Full | F5 Slide",
+        "LINKS & HIST : Click Links to Jump | Alt+Left Back | Alt+Right Forward",
         "GRID & BKMKS : 'Tab' Thumbnail Grid | 'B' Bookmark Sidebar | 'L' Import",
-        "FIND TEXT    : Cmd/Ctrl+F Search Text in PDF | F3 / Cmd+G Next Match",
-        "MOUSE MODES  : Highlight (default) | Redact (Edit menu) | Crop (Edit)",
+        "FIND & COPY  : Cmd/Ctrl+F Incremental Search (Esc Cancel) | Cmd+C Copy",
+        "MOUSE MODES  : Select (default) | Highlight | Redact | Crop (Edit menu)",
         "STAMP IMAGE  : 'P' Pick PNG/JPG Signature -> Click/Drag on Page to Stamp",
         "READ FILTER  : 'V' Cycle Normal / Dark Invert / Warm Sepia (0-RAM Blit)",
         "FLATTEN PDF  : 'U' Flatten Annotations/Forms & Unlock Permissions",

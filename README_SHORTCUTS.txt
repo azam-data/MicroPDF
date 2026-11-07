@@ -33,8 +33,8 @@ MULTI-DOCUMENT TAB BAR (Zero-RAM Inactive Tabs)
 - Press `Ctrl+Tab`            : Cycle to the next open PDF tab.
 
 
-FOUR VIEW MODES (`1`, `2`, `3`, `4` Keys & `View` Menu)
--------------------------------------------------------
+FIVE VIEW MODES (`1`, `2`, `3`, `4`, `5` Keys & `View` Menu) & ZOOM
+-------------------------------------------------------------------
   `1` : Fit Full Page         — Fits the entire page inside the viewport.
   `2` : Fit Page Width        — Scales page width to fill the viewport (minus 24px
                                 padding). Mouse wheel / Up / Down arrows smoothly
@@ -45,13 +45,20 @@ FOUR VIEW MODES (`1`, `2`, `3`, `4` Keys & `View` Menu)
   `4` : Two-Page Side-by-Side — Renders `current_page` (left) and `current_page + 1`
                                 (right) side-by-side with a 12px gap; Next/Prev
                                 advances 2 pages at a time.
-  `Tab` : Toggle All-Pages Thumbnail Grid Overview (`140 x 198` cards).
+  `5` : Continuous Scroll     — Vertical page stack with 12px gaps; caches only
+                                visible pages +-1 in RAM.
+  `Ctrl/Cmd+Wheel`, `+`, `-`  — Zoom in/out (`25%..=800%`) around cursor (`0` resets).
+  `F11` / `F5` / `Esc`        — Toggle Fullscreen (`F11`) or Presentation Mode (`F5`).
+  `Tab` : Toggle All-Pages Thumbnail Grid Overview (`140 x 198` cards, capped at 300).
 
 
-NAVIGATION & SHORTCUTS
-----------------------
-  Right / Down / PageDown / Space : Next Page (or scroll down in FitWidth/FitText)
-  Left / Up / PageUp              : Previous Page (or scroll up in FitWidth/FitText)
+NAVIGATION, LINKS, SELECT/COPY & SHORTCUTS
+------------------------------------------
+  Right / Down / PageDown / Space : Next Page (or scroll down in FitWidth/Cont.)
+  Left / Up / PageUp              : Previous Page (or scroll up in FitWidth/Cont.)
+  Alt+Left / Alt+Right            : Back / Forward in link & jump history (max 50)
+  Click Link on Page              : Jump to internal page or confirm external URL
+  Drag / Double-Click Text        : Select text / word (`Ctrl/Cmd+C` copies to clipboard)
   Home / End                      : First Page / Last Page
   G (or type digits 0-9)          : Smart Jump to Page -> Enter:
                                     - Type Arabic `5` -> Jumps to Logical Page 5
@@ -61,7 +68,7 @@ NAVIGATION & SHORTCUTS
   L                               : Import Hierarchical Bookmarks from `.txt` file
   Cmd+Z (macOS) / Ctrl+Z (Win)    : Undo last structural or page edit (up to 8 steps)
   ? or F1                         : Toggle in-window Keyboard & Mouse Help Overlay
-  Esc                             : Close Menu / Cancel Prompt / Reset Mouse Mode
+  Esc                             : Exit Fullscreen/Presentation, Cancel Search/Prompt
 
 
 6 ZERO-RAM POWER EDITOR FEATURES
