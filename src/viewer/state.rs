@@ -594,6 +594,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Accepted single-instance connections whose request line has not fully arrived yet.
     pub(super) pending_ipc: Vec<PendingIpcConnection>,
+    /// Flattened one-page copy of the form page being tiled (see `ensure_tile_rendered`).
+    pub(super) tile_form_copy: Option<(u16, PdfDocument<'a>)>,
     /// Renames a finished save's temp file over its target. `std::fs::rename` except in tests,
     /// which substitute file-system behaviour (e.g. refusing to replace a file that is open).
     pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
@@ -701,6 +703,7 @@ impl<'a> PdfViewerApp<'a> {
             custom_session_ini_path: None,
             single_instance_listener: None,
             pending_ipc: Vec::new(),
+            tile_form_copy: None,
             rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
@@ -1263,6 +1266,7 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         self.tile_cache.shrink_to_fit();
+        self.tile_form_copy = None;
         // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
         self.cached_char_boxes = None;
         self.selected_text.clear();

@@ -1779,6 +1779,172 @@ mod tests {
         Ok(())
     }
 
+    /// One A4 page with a filled-in text field: the widget's appearance stream is a solid black
+    /// box at (100,600)-(400,650) in PDF points, and the page content has a red box at
+    /// (100,300)-(400,350). The catalog has an /AcroForm, as real forms do, so PDFium sets up
+    /// its form environment for it.
+    fn build_filled_form_pdf() -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let page_id = ldoc.new_object_id();
+        let ap = ldoc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 300.into(), 50.into()],
+            },
+            b"0 g 0 0 300 50 re f".to_vec(),
+        ));
+        let widget = ldoc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => lopdf::Object::string_literal("name"),
+            "V" => lopdf::Object::string_literal("filled"),
+            "F" => 4, "P" => page_id,
+            "Rect" => vec![100.into(), 600.into(), 400.into(), 650.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        let content = ldoc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"1 0 0 rg 100 300 300 50 re f".to_vec(),
+        ));
+        ldoc.objects.insert(
+            page_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Contents" => content, "Annots" => vec![widget.into()],
+            }),
+        );
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let acroform = ldoc.add_object(dictionary! { "Fields" => vec![widget.into()] });
+        let catalog = ldoc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "AcroForm" => acroform,
+        });
+        ldoc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Pixel at PDF point (`x_pt`, `y_pt`) of an A4 page rendered `w` x `h` into `pixels`.
+    fn pixel_at_pt(pixels: &[u32], w: u32, h: u32, x_pt: f32, y_pt: f32) -> (u8, u8, u8) {
+        let x = ((x_pt / 595.0) * w as f32) as usize;
+        let y = (((842.0 - y_pt) / 842.0) * h as f32) as usize;
+        let px = pixels[y * w as usize + x];
+        ((px >> 16) as u8, (px >> 8) as u8, px as u8)
+    }
+
+    fn is_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 40 && c.1 < 40 && c.2 < 40
+    }
+
+    fn is_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 200 && c.1 < 60 && c.2 < 60
+    }
+
+    /// A filled-in form field must show in every view: page view, continuous scroll, thumbnail
+    /// grid, and zoomed in (400%), where pages are drawn as 512x512 tiles. The open document is
+    /// never flattened: its widget stays a live form field.
+    #[test]
+    fn test_filled_form_field_visible_in_all_views_including_400_percent_tiles() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_form_views");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("form.pdf");
+        std::fs::write(&path, build_filled_form_pdf()?)?;
+        let (field, content) = ((250.0, 625.0), (250.0, 325.0));
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let (vw, vh) = (1024, 1080);
+
+        // 1. Page view (fit page).
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let c = app.cached_page.as_ref().unwrap();
+        assert!(!c.pixels.is_empty());
+        assert!(is_red(pixel_at_pt(&c.pixels, c.bitmap_width, c.bitmap_height, content.0, content.1)));
+        assert!(
+            is_black(pixel_at_pt(&c.pixels, c.bitmap_width, c.bitmap_height, field.0, field.1)),
+            "form field missing in page view"
+        );
+
+        // 2. Thumbnail.
+        app.ensure_thumbnail_rendered(0)?;
+        let t = &app.thumbnail_cache[&0];
+        assert!(
+            is_black(pixel_at_pt(&t.pixels, t.width, t.height, field.0, field.1)),
+            "form field missing in thumbnail"
+        );
+
+        // 3. Continuous scroll.
+        app.view_mode = ViewMode::ContinuousScroll;
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let cc = &app.continuous_page_cache[&0];
+        assert!(
+            is_black(pixel_at_pt(&cc.pixels, cc.bitmap_width, cc.bitmap_height, field.0, field.1)),
+            "form field missing in continuous scroll"
+        );
+
+        // 4. 400% in page view: tiles only, with the field scrolled into view.
+        app.view_mode = ViewMode::FitPage;
+        app.invalidate_page_caches();
+        app.set_zoom_around_cursor(4.0, 500.0, 500.0);
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let (bw, bh) = {
+            let c = app.cached_page.as_ref().unwrap();
+            assert!(c.pixels.is_empty(), "400% must render tiles, not a full page");
+            (c.bitmap_width, c.bitmap_height)
+        };
+        let to_virtual = |(x, y): (f32, f32)| {
+            ((x / 595.0 * bw as f32) as u32, ((842.0 - y) / 842.0 * bh as f32) as u32)
+        };
+        let tile_pixel = |app: &PdfViewerApp, (vx, vy): (u32, u32)| {
+            let key = state::TileKey {
+                page_index: 0,
+                virtual_w: bw,
+                virtual_h: bh,
+                rotation_deg: 0,
+                tile_col: (vx / state::TILE_SIZE_PX) as u16,
+                tile_row: (vy / state::TILE_SIZE_PX) as u16,
+            };
+            let tile = app.tile_cache.get(&key).expect("tile under the point must be rendered");
+            let (tx, ty) = (vx % state::TILE_SIZE_PX, vy % state::TILE_SIZE_PX);
+            let px = tile.pixels[(ty * tile.width + tx) as usize];
+            ((px >> 16) as u8, (px >> 8) as u8, px as u8)
+        };
+        for (point, want_black) in [(field, true), (content, false)] {
+            let (vx, vy) = to_virtual(point);
+            app.pan_x = vx.saturating_sub(300) as f32;
+            app.scroll_y = vy.saturating_sub(300) as f32;
+            app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+            let got = tile_pixel(&app, (vx, vy));
+            if want_black {
+                assert!(is_black(got), "form field missing at 400% zoom (tile pixel {got:?})");
+            } else {
+                assert!(is_red(got), "page content wrong at 400% zoom (tile pixel {got:?})");
+            }
+        }
+
+        // 5. The document itself is not flattened: the widget is still a live form field.
+        let doc = app.doc.as_ref().unwrap();
+        let page = doc.pages().get(0)?;
+        assert_eq!(page.annotations().len(), 1);
+        assert_eq!(
+            page.annotations().iter().next().map(|a| a.annotation_type()),
+            Some(PdfPageAnnotationType::Widget)
+        );
+        drop(page);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// `n`-page text PDF built with lopdf.
     fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
         use lopdf::dictionary;

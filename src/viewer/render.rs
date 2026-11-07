@@ -108,14 +108,41 @@ impl<'a> PdfViewerApp<'a> {
             std::mem::take(&mut self.spare_pixel_buf)
         };
 
-        let doc = self
-            .doc
-            .as_ref()
-            .context("No active PDF document to render tile")?;
-        let page = doc
-            .pages()
-            .get(key.page_index)
-            .context("Page index out of bounds for tile")?;
+        let has_form_widgets = {
+            let doc = self
+                .doc
+                .as_ref()
+                .context("No active PDF document to render tile")?;
+            let page = doc
+                .pages()
+                .get(key.page_index)
+                .context("Page index out of bounds for tile")?;
+            PdfEngine::page_has_form_widgets(&page)
+        };
+        // Tiles are matrix renders, which PDFium draws without form fields. A page with form
+        // fields is tiled from a flattened one-page copy (the document itself is untouched),
+        // kept while that page is zoomed and dropped by `invalidate_page_caches`.
+        if has_form_widgets
+            && self
+                .tile_form_copy
+                .as_ref()
+                .is_none_or(|(idx, _)| *idx != key.page_index)
+        {
+            self.tile_form_copy = None;
+            let doc = self.doc.as_ref().context("No active PDF document to render tile")?;
+            let copy = self.engine.flattened_page_copy(doc, key.page_index)?;
+            self.tile_form_copy = Some((key.page_index, copy));
+        }
+        let page = match (&self.tile_form_copy, has_form_widgets) {
+            (Some((_, copy)), true) => copy.pages().get(0).context("Form page copy is empty")?,
+            _ => self
+                .doc
+                .as_ref()
+                .context("No active PDF document to render tile")?
+                .pages()
+                .get(key.page_index)
+                .context("Page index out of bounds for tile")?,
+        };
 
         let page_w_pts = page.width().value.max(1.0);
         let page_h_pts = page.height().value.max(1.0);

@@ -376,6 +376,33 @@ impl PdfEngine {
         }
     }
 
+    /// Whether `page` has form-field widgets. PDFium draws those only through `FPDF_FFLDraw`
+    /// (which the full-page render path uses); matrix renders such as zoom tiles and print
+    /// strips skip them, so those render from `flattened_page_copy` instead.
+    pub fn page_has_form_widgets(page: &PdfPage) -> bool {
+        page.annotations()
+            .iter()
+            .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget)
+    }
+
+    /// A new one-page document holding a copy of page `page_idx` of `doc` with its form fields
+    /// and annotations flattened into the page content, so matrix renders show them as they
+    /// appear on screen. `doc` itself is never modified.
+    pub fn flattened_page_copy<'e>(&'e self, doc: &PdfDocument, page_idx: u16) -> Result<PdfDocument<'e>> {
+        let mut copy = self
+            .pdfium
+            .create_new_pdf()
+            .context("Failed to create a copy of a form page")?;
+        copy.pages_mut()
+            .copy_page_from_document(doc, page_idx, 0)
+            .with_context(|| format!("Failed to copy page {}", page_idx + 1))?;
+        let mut page = copy.pages().get(0).context("Page copy is empty")?;
+        page.flatten()
+            .with_context(|| format!("Failed to flatten form fields of page {}", page_idx + 1))?;
+        drop(page);
+        Ok(copy)
+    }
+
     /// The temporary file a save of `path` is written to before it replaces `path`:
     /// `<stem>.micropdf-save.pdf` in the same folder (same drive, so the rename is atomic).
     /// Visible and ending in `.pdf`, because when the final rename fails it is left in place as

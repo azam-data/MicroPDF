@@ -108,29 +108,15 @@ where
         .pages()
         .get(page_idx)
         .with_context(|| format!("Page {} is out of range for printing", page_idx + 1))?;
-    let has_form_widgets = page
-        .annotations()
-        .iter()
-        .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget);
     let args = (dpi_x, dpi_y, avail_w, avail_h, fit_to_page, strip_rows);
-    if !has_form_widgets {
+    if !PdfEngine::page_has_form_widgets(&page) {
         return render_strips_of_page(engine, page, args, strip_buf, on_strip);
     }
     drop(page);
 
-    let mut copy = engine
-        .pdfium
-        .create_new_pdf()
-        .context("Failed to create print copy of a form page")?;
-    copy.pages_mut()
-        .copy_page_from_document(doc, page_idx, 0)
-        .with_context(|| format!("Failed to copy page {} for printing", page_idx + 1))?;
-    let mut copied = copy.pages().get(0).context("Print copy has no page")?;
-    copied
-        .flatten()
-        .with_context(|| format!("Failed to flatten form fields of page {}", page_idx + 1))?;
-    // Flattening invalidates the page handle; reload the page before rendering.
-    drop(copied);
+    let copy = engine
+        .flattened_page_copy(doc, page_idx)
+        .context("Failed to prepare a form page for printing")?;
     let copied = copy.pages().get(0).context("Print copy has no page")?;
     render_strips_of_page(engine, copied, args, strip_buf, on_strip)
 }
