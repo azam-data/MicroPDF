@@ -5,7 +5,66 @@ use std::num::NonZeroU32;
 use super::state::*;
 
 impl<'a> PdfViewerApp<'a> {
-    /// Rasterizes a single `page_idx` for the specified `mode` and available `(avail_w, avail_h)`.
+    /// Renders `page` directly into a reusable `Vec<u32>` buffer via `PdfBitmap::from_bytes`,
+    /// masking the high byte in place (`0x00RRGGBB` on little-endian) so only 1 copy of the page
+    /// bitmap exists in memory at any point.
+    pub(super) fn render_page_into_u32_vec(
+        &self,
+        page: &PdfPage,
+        target_w: i32,
+        target_h: i32,
+        lcd_text: bool,
+        mut pixels: Vec<u32>,
+    ) -> Result<Vec<u32>> {
+        let pixel_count = (target_w.max(1) as usize) * (target_h.max(1) as usize);
+        pixels.clear();
+        pixels.resize(pixel_count, 0x00FFFFFF);
+
+        let bindings = self.engine.pdfium.bindings();
+        let config = PdfRenderConfig::new()
+            .set_fixed_width(target_w)
+            .set_fixed_height(target_h)
+            .render_form_data(true)
+            .render_annotations(true)
+            .use_lcd_text_rendering(lcd_text)
+            .set_reverse_byte_order(false);
+
+        {
+            let byte_slice: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(pixels.as_mut_ptr() as *mut u8, pixel_count * 4)
+            };
+            let mut bitmap = unsafe {
+                PdfBitmap::from_bytes(
+                    target_w,
+                    target_h,
+                    PdfBitmapFormat::BGRx,
+                    byte_slice,
+                    bindings,
+                )
+            }
+            .context("Failed to wrap reusable buffer in PdfBitmap")?;
+
+            page.render_into_bitmap_with_config(&mut bitmap, &config)
+                .context("Failed to render PDF page into bitmap")?;
+        }
+
+        // On little-endian, BGRx bytes [B, G, R, X] read as u32 are 0xXXRRGGBB; mask high byte in place.
+        for px in &mut pixels {
+            #[cfg(target_endian = "little")]
+            {
+                *px &= 0x00FFFFFF;
+            }
+            #[cfg(target_endian = "big")]
+            {
+                let [b, g, r, _] = px.to_be_bytes();
+                *px = ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+            }
+        }
+        Ok(pixels)
+    }
+
+    /// Rasterizes a single `page_idx` for the specified `mode` and available `(avail_w, avail_h)`,
+    /// reusing `reused_pixels` when provided.
     pub(super) fn rasterize_page_for_mode(
         &self,
         page_idx: u16,
@@ -14,6 +73,7 @@ impl<'a> PdfViewerApp<'a> {
         content_h: u32,
         avail_w: f32,
         avail_h: f32,
+        reused_pixels: Vec<u32>,
     ) -> Result<CachedPageBitmap> {
         let doc = self
             .doc
@@ -56,33 +116,7 @@ impl<'a> PdfViewerApp<'a> {
         let target_w = ((page_w_pts * clamped_scale).round() as i32).max(1);
         let target_h = ((page_h_pts * clamped_scale).round() as i32).max(1);
 
-        let bindings = self.engine.pdfium.bindings();
-        let mut bitmap = PdfBitmap::empty(target_w, target_h, PdfBitmapFormat::BGRx, bindings)
-            .context("Failed to allocate PdfBitmap")?;
-
-        let config = PdfRenderConfig::new()
-            .set_fixed_width(target_w)
-            .set_fixed_height(target_h)
-            .render_form_data(true)
-            .render_annotations(true)
-            .use_lcd_text_rendering(true)
-            .set_reverse_byte_order(false);
-
-        page.render_into_bitmap_with_config(&mut bitmap, &config)
-            .context("Failed to render PDF page into bitmap")?;
-
-        let raw_bytes = bitmap.as_raw_bytes();
-        drop(bitmap);
-
-        let pixel_count = (target_w as usize) * (target_h as usize);
-        let mut pixels = Vec::with_capacity(pixel_count);
-        for chunk in raw_bytes.chunks_exact(4).take(pixel_count) {
-            let b = chunk[0] as u32;
-            let g = chunk[1] as u32;
-            let r = chunk[2] as u32;
-            pixels.push((r << 16) | (g << 8) | b);
-        }
-        drop(raw_bytes);
+        let pixels = self.render_page_into_u32_vec(&page, target_w, target_h, true, reused_pixels)?;
 
         Ok(CachedPageBitmap {
             page_index: page_idx,
@@ -170,7 +204,11 @@ impl<'a> PdfViewerApp<'a> {
                     || c.rotation_deg != left_rot
             });
             if need_left {
-                self.cached_page = None;
+                let reused = self
+                    .cached_page
+                    .take()
+                    .map(|c| c.pixels)
+                    .unwrap_or_else(|| std::mem::take(&mut self.spare_pixel_buf));
                 self.cached_page = Some(self.rasterize_page_for_mode(
                     left_idx,
                     ViewMode::TwoPageSpread,
@@ -178,6 +216,7 @@ impl<'a> PdfViewerApp<'a> {
                     content_h,
                     avail_w,
                     avail_h,
+                    reused,
                 )?);
             }
 
@@ -196,7 +235,11 @@ impl<'a> PdfViewerApp<'a> {
                         || c.rotation_deg != right_rot
                 });
                 if need_right {
-                    self.cached_second_page = None;
+                    let reused = self
+                        .cached_second_page
+                        .take()
+                        .map(|c| c.pixels)
+                        .unwrap_or_default();
                     self.cached_second_page = Some(self.rasterize_page_for_mode(
                         right_idx,
                         ViewMode::TwoPageSpread,
@@ -204,6 +247,7 @@ impl<'a> PdfViewerApp<'a> {
                         content_h,
                         avail_w,
                         avail_h,
+                        reused,
                     )?);
                 }
             } else {
@@ -256,7 +300,11 @@ impl<'a> PdfViewerApp<'a> {
         });
 
         if need_render {
-            self.cached_page = None;
+            let reused = self
+                .cached_page
+                .take()
+                .map(|c| c.pixels)
+                .unwrap_or_else(|| std::mem::take(&mut self.spare_pixel_buf));
             let avail_w = match self.view_mode {
                 ViewMode::FitWidth | ViewMode::FitTextWidth => {
                     content_w.saturating_sub(24).max(1) as f32
@@ -271,6 +319,7 @@ impl<'a> PdfViewerApp<'a> {
                 content_h,
                 avail_w,
                 avail_h,
+                reused,
             )?;
             self.cached_page = Some(rendered);
         }

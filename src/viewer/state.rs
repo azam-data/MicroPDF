@@ -368,6 +368,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
     pub(super) status_notice: Option<String>,
+    /// Reusable pixel buffer so page turns never reallocate when `cached_page` is invalidated.
+    pub(super) spare_pixel_buf: Vec<u32>,
     /// Declared in strict drop order: `surface` drops first, then `context`, then `window`.
     pub(super) surface: Option<Surface<Rc<Window>, Rc<Window>>>,
     pub(super) context: Option<SoftContext<Rc<Window>>>,
@@ -423,6 +425,7 @@ impl<'a> PdfViewerApp<'a> {
             pending_dialog: None,
             show_help_overlay: false,
             status_notice: None,
+            spare_pixel_buf: Vec::new(),
             surface: None,
             context: None,
             window: None,
@@ -432,7 +435,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn invalidate_page_caches(&mut self) {
-        self.cached_page = None;
+        if let Some(old) = self.cached_page.take() {
+            if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
+                self.spare_pixel_buf = old.pixels;
+            }
+        }
         self.cached_second_page = None;
         self.second_page_draw_rect = None;
     }

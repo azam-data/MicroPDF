@@ -1,6 +1,5 @@
 use crate::engine::PdfEngine;
 use anyhow::Result;
-use pdfium_render::prelude::*;
 use super::state::*;
 use super::render::{draw_bitmap_str_8x8, draw_rect_border, fill_rect_clipped};
 
@@ -25,27 +24,12 @@ impl<'a> PdfViewerApp<'a> {
         let tw = ((pw * scale).round() as i32).max(1);
         let th = ((ph * scale).round() as i32).max(1);
 
-        let bindings = self.engine.pdfium.bindings();
-        let mut bitmap = PdfBitmap::empty(tw, th, PdfBitmapFormat::BGRx, bindings)?;
-        let config = PdfRenderConfig::new()
-            .set_fixed_width(tw)
-            .set_fixed_height(th)
-            .render_form_data(true)
-            .render_annotations(true)
-            .set_reverse_byte_order(false);
-
-        page.render_into_bitmap_with_config(&mut bitmap, &config)?;
-        let raw_bytes = bitmap.as_raw_bytes();
-        drop(bitmap);
-
-        let count = (tw as usize) * (th as usize);
-        let mut pixels = Vec::with_capacity(count);
-        for chunk in raw_bytes.chunks_exact(4).take(count) {
-            let b = chunk[0] as u32;
-            let g = chunk[1] as u32;
-            let r = chunk[2] as u32;
-            pixels.push((r << 16) | (g << 8) | b);
-        }
+        let reused = self
+            .thumbnail_cache
+            .remove(&page_idx)
+            .map(|e| e.pixels)
+            .unwrap_or_default();
+        let pixels = self.render_page_into_u32_vec(&page, tw, th, false, reused)?;
 
         self.thumbnail_cache.insert(
             page_idx,
