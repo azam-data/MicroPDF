@@ -793,9 +793,23 @@ mod tests {
             elapsed
         );
 
-        // Primary instance polls listener and opens pdf_b in Tab 2
-        let opened = app.poll_single_instance_listener();
+        // Primary instance polls listener and opens pdf_b in Tab 2. Reads are non-blocking
+        // (Phase 4) and loopback data can arrive just after the client's write returns, so
+        // poll until it opens, within the same 200 ms budget.
+        let t_poll = std::time::Instant::now();
+        let mut opened = 0;
+        while opened == 0 && t_poll.elapsed() < std::time::Duration::from_millis(200) {
+            opened += app.poll_single_instance_listener();
+            if opened == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
         assert_eq!(opened, 1);
+        // Further polls must not open the same file again.
+        for _ in 0..5 {
+            assert_eq!(app.poll_single_instance_listener(), 0, "forwarded file opened twice");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
         assert_eq!(app.tabs.len(), 2);
         assert_eq!(app.active_tab, 1);
         assert_eq!(app.total_pages(), 4);
@@ -841,8 +855,11 @@ mod tests {
         assert_eq!(app.total_pages(), 3, "Must not poll/reload while window is unfocused");
 
         // 2. When focused and no unsaved edits, reloads and preserves page & scroll_y
+        //    v1.2.1: a stale pre-reload snapshot must not survive (Ctrl+Z would revert the change)
+        app.undo_stack.push_back(b"stale snapshot".to_vec());
         app.window_focused = true;
         app.poll_auto_reload_if_due();
+        assert!(app.undo_stack.is_empty(), "undo history must be cleared on auto-reload");
         assert_eq!(app.total_pages(), 6, "Must auto-reload updated 6-page PDF from disk");
         assert_eq!(app.current_page_index, 2, "Must preserve current_page_index");
         assert!((app.scroll_y - 145.5).abs() < 0.01, "Must preserve scroll_y");
@@ -1053,253 +1070,1347 @@ mod tests {
         Ok(())
     }
 
+    /// Cache caps hold while scrolling, zooming and browsing the grid. (v1.2.1: RSS figures were
+    /// removed from this test: inside a shared test process they mostly measure other tests.
+    /// Real RAM is measured by `ram_realistic_measurement` below, in its own process.)
     #[test]
-    fn test_phase4_ram_measurement_matrix() -> Result<()> {
-        use lopdf::dictionary;
-        let tmp_dir = std::env::temp_dir().join("micropdf_phase4_ram_bench");
-        let _ = std::fs::remove_dir_all(&tmp_dir);
-        std::fs::create_dir_all(&tmp_dir)?;
+    fn test_phase4_cache_caps_hold() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let path = std::env::temp_dir().join("micropdf_cache_caps.pdf");
+        PdfEngine::write_atomic(&path, &build_text_pdf(60)?)?;
+        let (vw, vh, sw, th, sb) = (1024u32, 768u32, 0u32, 52u32, 22u32);
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        for step in 0..50u16 {
+            app.current_page_index = step;
+            app.scroll_y = 120.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            assert!(app.continuous_page_cache.len() <= 5);
+        }
+        app.set_view_mode(ViewMode::FitPage);
+        app.set_zoom_around_cursor(4.0, 512.0, 384.0);
+        for k in 0..8 {
+            app.pan_x = k as f32 * 320.0;
+            app.scroll_y = k as f32 * 280.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            assert!(app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES);
+        }
+        app.reset_zoom();
+        app.set_view_mode(ViewMode::ThumbnailGrid);
+        let mut gs = 0.0f32;
+        while gs < 20_000.0 {
+            app.grid_scroll_y = gs;
+            app.update_visible_thumbnails(vw, vh, sw, th, sb);
+            assert!(app.thumbnail_cache.len() <= state::MAX_THUMB_CACHE_ENTRIES);
+            gs += 600.0;
+        }
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
 
-        let small_pdf = tmp_dir.join("small_text.pdf");
-        let scanned_pdf = tmp_dir.join("scanned_300p.pdf");
-        let large_pdf = tmp_dir.join("large_1050p.pdf");
+    #[test]
+    fn test_phase1_optimize_menu_step_and_cancel() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_phase1_opt_menu");
+        let _ = std::fs::create_dir_all(&dir);
+        let src_path = dir.join("scan_doc.pdf");
+        let opt_path = dir.join("scan_doc_optimized.pdf");
+        let _ = std::fs::remove_file(&src_path);
+        let _ = std::fs::remove_file(&opt_path);
+
+        let scan_bytes = build_scan_pdf(3)?;
+        PdfEngine::write_atomic(&src_path, &scan_bytes)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
+        app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
+
+        // 1. Open Tools -> Optimize... (item 7 in Tools menu)
+        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        assert_eq!(
+            app.input_mode,
+            state::InputMode::OptimizePrompt {
+                preset: crate::optimize::OptimizePreset::Balanced,
+                mode: crate::optimize::ColorMode::Color,
+                clean_scans: true,
+                previewing: false,
+            }
+        );
+        let prompt0 = app.format_active_prompt_text().unwrap();
+        assert!(prompt0.contains("Balanced(200dpi)"));
+        assert!(prompt0.contains("Color"));
+        assert!(prompt0.contains("Clean:ON"));
+
+        // 2. Toggle preset ('1' -> Smaller), colour mode ('b' -> B/W), clean scans ('s' -> OFF)
+        app.handle_key_input(winit::keyboard::Key::Character("1".into()), Some("1"));
+        app.handle_key_input(winit::keyboard::Key::Character("b".into()), Some("b"));
+        app.handle_key_input(winit::keyboard::Key::Character("s".into()), Some("s"));
+        let prompt_bw = app.format_active_prompt_text().unwrap();
+        assert!(prompt_bw.contains("Smaller(150dpi)"));
+        assert!(
+            prompt_bw.contains("signatures will look jagged"),
+            "B/W mode must show 'signatures will look jagged' warning, got: {prompt_bw}"
+        );
+        assert!(prompt_bw.contains("Clean:OFF"));
+
+        // 3. Toggle Preview current page ('p' -> ON, then 'p' -> OFF)
+        app.handle_key_input(winit::keyboard::Key::Character("p".into()), Some("p"));
+        assert!(app.format_active_prompt_text().unwrap().contains("[P]Preview:ON"));
+        assert!(app.cached_page.is_some());
+        app.handle_key_input(winit::keyboard::Key::Character("p".into()), Some("p"));
+        assert!(!app.format_active_prompt_text().unwrap().contains("[P]Preview:ON"));
+
+        // 4. Switch back to Balanced + Color + Clean:ON, press Enter -> starts OptimizeJob
+        app.handle_key_input(winit::keyboard::Key::Character("2".into()), Some("2"));
+        app.handle_key_input(winit::keyboard::Key::Character("c".into()), Some("c"));
+        app.handle_key_input(winit::keyboard::Key::Character("s".into()), Some("s"));
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        assert_eq!(app.input_mode, state::InputMode::Normal);
+        assert!(app.optimize_job.is_some(), "Enter must start an active OptimizeJob");
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Optimizing image 0 / 3")
+        );
+
+        // Step once (1 of 3 images) and verify progress string "Optimizing image 1 / 3"
+        assert!(app.step_optimize_job(), "Should still have 2 images remaining");
+        assert!(
+            app.status_notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Optimizing image 1 / 3"),
+            "got status: {:?}",
+            app.status_notice
+        );
+
+        // Press Esc to cancel -> job is dropped and nothing is written
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Escape),
+            None,
+        );
+        assert!(app.optimize_job.is_none(), "Esc must drop the active OptimizeJob");
+        assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
+
+        // 5. Re-open Tools -> Optimize... and run all steps to completion
+        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        app.handle_key_input(
+            winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
+            None,
+        );
+        let mut steps = 0usize;
+        while app.optimize_job.is_some() {
+            app.step_optimize_job();
+            steps += 1;
+        }
+        assert_eq!(steps, 3, "Must execute exactly 1 step per image");
+        assert!(opt_path.exists(), "Finished OptimizeJob must write <name>_optimized.pdf");
+        assert_eq!(
+            std::fs::read(&src_path)?,
+            scan_bytes,
+            "Original PDF on disk must never be modified"
+        );
+        let done_msg = app.status_notice.as_deref().unwrap_or("");
+        assert!(
+            done_msg.contains("Optimized") && done_msg.contains("->") && done_msg.contains("scan_doc_optimized.pdf"),
+            "Completion notice must show before/after sizes and output filename, got: {done_msg}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `n`-page text PDF whose page `i` reads "`label` page `i`". Each content stream carries
+    /// about 16 KB of comment padding, so PDFium's read-ahead cannot already hold the bytes of
+    /// pages far from the one viewed at open.
+    fn build_labeled_padded_pdf(n: u32, label: &str) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let font_id = ldoc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = ldoc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let padding = format!("% {}\n", "x".repeat(16 * 1024));
+        let mut kids = Vec::new();
+        for i in 1..=n {
+            let content = format!("{padding}BT /F1 14 Tf 72 720 Td ({label} page {i}) Tj ET\n{padding}");
+            let content_id = ldoc.add_object(lopdf::Stream::new(dictionary! {}, content.into_bytes()));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => resources_id, "Contents" => content_id,
+                })
+                .into(),
+            );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Extracted text of page `idx` in the active document, trimmed.
+    fn active_page_text(app: &PdfViewerApp, idx: u16) -> Result<String> {
+        let doc = app.doc.as_ref().context("no document")?;
+        let page = doc.pages().get(idx)?;
+        Ok(page.text()?.all().trim().to_string())
+    }
+
+    /// Navigates to `idx` and renders it the way a frame does, recording any error in the
+    /// status bar. Returns whether the page bitmap was produced.
+    fn render_page_like_frame(app: &mut PdfViewerApp, idx: u16) -> bool {
+        app.navigate_to_page(idx);
+        app.render_page_view_or_notice(1024, 768, 0, 52, 22)
+    }
+
+    /// (a) Saving over the open file (atomic temp + rename), then rendering pages never viewed
+    /// before the save: they must show the saved content (the app reloads after a save), and a
+    /// second document opened on the old file must keep showing the old content.
+    #[test]
+    fn test_streaming_save_over_open_file_then_render_unviewed_pages() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_stream_save_over_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+        // A second handle on the same file, like another tab, with no page ever loaded.
+        let other = engine.load_pdf_safe(&path)?;
+
+        // Unsaved edit: blank page after page 1, so the saved file differs from the old one.
+        app.insert_blank_page_after_current();
+        assert_eq!(app.total_pages(), 21);
+        app.save_active_doc_to(path.clone());
+        assert!(!app.has_unsaved_edits, "save failed: {:?}", app.status_notice);
+        assert!(
+            !PdfEngine::save_temp_path(&path).exists(),
+            "atomic save must not leave its temp file behind"
+        );
+
+        // Saved content: page 2 is the blank page, so old page i is now at index i.
+        assert_eq!(app.total_pages(), 21);
+        for idx in 10..21u16 {
+            assert!(
+                render_page_like_frame(&mut app, idx),
+                "page {} failed after save: {:?}",
+                idx + 1,
+                app.status_notice
+            );
+            assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {idx}"));
+        }
+
+        // The other handle still reads the replaced file's old bytes: old content, not garbage.
+        for idx in 10..20u16 {
+            let text = other.pages().get(idx)?.text()?.all();
+            assert_eq!(text.trim(), format!("Alpha page {}", idx + 1));
+        }
+
+        drop(other);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// (b) Another process overwrites the open file in place (truncate + write, as
+    /// `cp other.pdf open.pdf` does). Unviewed pages must render the old content or fail with
+    /// a status-bar error, never show the new file's bytes at the old offsets, and auto-reload
+    /// must then pick up the new file. Covers a shorter, a same-size (identical layout, so old
+    /// offsets land on valid objects of the new file) and a longer replacement.
+    #[test]
+    fn test_streaming_open_file_overwritten_in_place() -> Result<()> {
+        for new_pages in [7u32, 20, 30] {
+            overwrite_in_place_case(new_pages)?;
+        }
+        Ok(())
+    }
+
+    fn overwrite_in_place_case(new_pages: u32) -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join(format!("micropdf_stream_overwrite_{new_pages}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+
+        // In place: same inode, truncated, then rewritten with a different PDF.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().write(true).truncate(true).open(&path)?;
+            f.write_all(&build_labeled_padded_pdf(new_pages, "Bravo")?)?;
+            f.sync_all()?;
+        }
+
+        let mut failed = 0;
+        for idx in 10..20u16 {
+            let rendered = render_page_like_frame(&mut app, idx);
+            if !rendered {
+                failed += 1;
+                let notice = app.status_notice.clone().unwrap_or_default();
+                assert!(
+                    notice.contains(&format!("Cannot render page {}", idx + 1)),
+                    "a failed render must say so in the status bar, got: {notice:?}"
+                );
+            }
+            match active_page_text(&app, idx) {
+                Ok(text) => assert_eq!(
+                    text,
+                    format!("Alpha page {}", idx + 1),
+                    "[{new_pages}-page replacement] page {} shows bytes of the new file",
+                    idx + 1
+                ),
+                Err(_) => assert!(!rendered, "page {} rendered but its text is unreadable", idx + 1),
+            }
+        }
+        assert!(
+            failed > 0,
+            "[{new_pages}-page replacement] reads after the overwrite must be refused"
+        );
+
+        // Auto-reload picks up the new file.
+        app.last_file_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
+        app.window_focused = true;
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), new_pages as u16, "auto-reload must load the new file");
+        for idx in [0u16, new_pages as u16 - 1] {
+            assert!(render_page_like_frame(&mut app, idx), "{:?}", app.status_notice);
+            assert_eq!(active_page_text(&app, idx)?, format!("Bravo page {}", idx + 1));
+        }
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// (c) The open file is deleted. Nothing may crash. An open handle keeps a deleted file's
+    /// data readable (POSIX unlink; Windows FILE_SHARE_DELETE), so unviewed pages render the
+    /// original content; a page that cannot be read reports an error in the status bar.
+    #[test]
+    fn test_streaming_open_file_deleted() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_stream_deleted");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        assert!(render_page_like_frame(&mut app, 0));
+        std::fs::remove_file(&path)?;
+        assert!(!path.exists());
+
+        for idx in 10..20u16 {
+            let rendered = render_page_like_frame(&mut app, idx);
+            if rendered {
+                assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {}", idx + 1));
+            } else {
+                let notice = app.status_notice.clone().unwrap_or_default();
+                assert!(notice.contains(&format!("Cannot render page {}", idx + 1)), "{notice:?}");
+            }
+            #[cfg(unix)]
+            assert!(rendered, "an unlinked file stays readable through the open handle");
+        }
+
+        // Auto-reload must leave the open document alone while the file is missing.
+        app.last_file_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(2));
+        app.window_focused = true;
+        app.last_mtime_poll = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        app.poll_auto_reload_if_due();
+        assert_eq!(app.total_pages(), 20);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Simulates FAT32/exFAT (and Windows without POSIX rename): replacing a file fails while
+    /// this process still has it open.
+    fn rename_refusing_open_target(from: &Path, to: &Path) -> std::io::Result<()> {
+        if crate::engine::open_file_registry::is_open(to) {
+            return Err(std::io::Error::other("simulated: the file is in use"));
+        }
+        std::fs::rename(from, to)
+    }
+
+    fn rename_always_failing(_: &Path, _: &Path) -> std::io::Result<()> {
+        Err(std::io::Error::other("simulated: access denied"))
+    }
+
+    fn pdf_page_count(path: &Path, engine: &PdfEngine) -> Result<u16> {
+        Ok(engine.load_pdf_from_bytes_safe(std::fs::read(path)?)?.pages().len())
+    }
+
+    /// Rename refused while the file is open: the save closes the app's handles on that file
+    /// (the active tab and a clean second tab on the same file), renames, and reopens them.
+    #[test]
+    fn test_save_over_open_file_when_fs_refuses_replacing_open_files() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_refuse_open");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(20, "Alpha")?)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.open_document_in_new_tab(path.clone())?;
+        assert_eq!((app.tabs.len(), app.active_tab), (2, 1));
+        assert!(crate::engine::open_file_registry::is_open(&path));
+        app.rename_for_save = rename_refusing_open_target;
+
+        assert!(render_page_like_frame(&mut app, 0));
+        app.insert_blank_page_after_current();
+        app.save_active_doc_to(path.clone());
+
+        assert!(!app.has_unsaved_edits, "save failed: {:?}", app.status_notice);
+        assert!(app.status_notice.as_deref().unwrap_or("").starts_with("Saved PDF"));
+        assert!(!PdfEngine::save_temp_path(&path).exists(), "temp file must be renamed away");
+        assert_eq!(pdf_page_count(&path, &engine)?, 21, "the file on disk is the saved version");
+
+        // Active tab reopened from the saved file: unviewed pages render the saved content.
+        assert_eq!(app.total_pages(), 21);
+        for idx in [10u16, 20] {
+            assert!(render_page_like_frame(&mut app, idx), "{:?}", app.status_notice);
+            assert_eq!(active_page_text(&app, idx)?, format!("Alpha page {idx}"));
+        }
+        // The other tab on the same file was reopened too.
+        app.switch_to_tab(0);
+        assert_eq!(app.total_pages(), 21);
+        assert!(render_page_like_frame(&mut app, 15), "{:?}", app.status_notice);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Rename keeps failing: the original is untouched, the saved copy stays next to it, the
+    /// status bar names it, and the tab keeps working (from the copy) with its edits unsaved.
+    /// A later save that can rename then succeeds normally.
+    #[test]
+    fn test_save_when_replace_keeps_failing_keeps_original_and_copy() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_rename_fails");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        let original = build_labeled_padded_pdf(20, "Alpha")?;
+        std::fs::write(&path, &original)?;
+        let temp = PdfEngine::save_temp_path(&path);
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.rename_for_save = rename_always_failing;
+        assert!(render_page_like_frame(&mut app, 0));
+        app.insert_blank_page_after_current();
+        app.save_active_doc_to(path.clone());
+
+        assert_eq!(std::fs::read(&path)?, original, "original must be byte-for-byte unchanged");
+        assert!(temp.exists(), "the saved copy must stay next to the original");
+        assert_eq!(pdf_page_count(&temp, &engine)?, 21);
+        let notice = app.status_notice.clone().unwrap_or_default();
+        assert!(notice.contains("original is unchanged"), "{notice}");
+        assert!(notice.contains(&temp.display().to_string()), "must name the copy: {notice}");
+        assert!(notice.contains("simulated: access denied"), "{notice}");
+        assert!(app.has_unsaved_edits, "the edits did not reach the file");
+        assert_eq!(app.file_path, path, "the tab still belongs to the original file");
+
+        // The tab keeps the edits and can render pages it never showed.
+        assert_eq!(app.total_pages(), 21);
+        assert!(render_page_like_frame(&mut app, 18), "{:?}", app.status_notice);
+        assert_eq!(active_page_text(&app, 18)?, "Alpha page 18");
+
+        // Next save on a file system that allows the rename.
+        app.rename_for_save = |from, to| std::fs::rename(from, to);
+        app.save_active_doc_to(path.clone());
+        assert!(!app.has_unsaved_edits, "{:?}", app.status_notice);
+        assert!(!temp.exists());
+        assert_eq!(pdf_page_count(&path, &engine)?, 21);
+        assert!(render_page_like_frame(&mut app, 20), "{:?}", app.status_notice);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// A second tab on the same file with unsaved edits of its own is never closed to make the
+    /// rename work; the save then fails safely and that tab keeps its edits.
+    #[test]
+    fn test_save_never_drops_another_tabs_unsaved_edits() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_save_dirty_tab");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        let original = build_labeled_padded_pdf(20, "Alpha")?;
+        std::fs::write(&path, &original)?;
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        app.insert_blank_page_after_current(); // tab 0: 21 pages, unsaved
+        app.open_document_in_new_tab(path.clone())?;
+        app.delete_current_page(); // tab 1: 19 pages, unsaved
+        assert_eq!(app.total_pages(), 19);
+        app.rename_for_save = rename_refusing_open_target;
+        app.save_active_doc_to(path.clone());
+
+        assert_eq!(std::fs::read(&path)?, original);
+        assert!(PdfEngine::save_temp_path(&path).exists());
+        assert!(app.has_unsaved_edits);
+        assert_eq!(app.total_pages(), 19);
+        app.switch_to_tab(0);
+        assert!(app.has_unsaved_edits, "the other tab's edits must survive");
+        assert_eq!(app.total_pages(), 21);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `write_atomic` never falls back to rewriting the target in place.
+    #[test]
+    fn test_write_atomic_failed_rename_leaves_target_and_no_temp() -> Result<()> {
+        let dir = std::env::temp_dir().join("micropdf_write_atomic_fail");
+        let _ = std::fs::remove_dir_all(&dir);
+        // A non-empty directory cannot be replaced by a file on any platform.
+        let target = dir.join("busy.pdf");
+        std::fs::create_dir_all(&target)?;
+        std::fs::write(target.join("keep.txt"), b"keep")?;
+        assert!(PdfEngine::write_atomic(&target, b"%PDF-1.4 new").is_err());
+        assert_eq!(std::fs::read(target.join("keep.txt"))?, b"keep");
+        assert!(!PdfEngine::save_temp_path(&target).exists(), "temp must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    fn lock_port_and_token(lock: &Path) -> (u16, String) {
+        let s = std::fs::read_to_string(lock).unwrap();
+        let (port, token) = s.trim().split_once('|').unwrap();
+        (port.parse().unwrap(), token.to_string())
+    }
+
+    fn send_ipc_line(port: u16, line: &str) {
+        use std::io::Write;
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        s.write_all(line.as_bytes()).unwrap();
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+
+    #[test]
+    fn test_single_instance_token_is_random() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_token");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let (lock_a, lock_b) = (dir.join("a.lock"), dir.join("b.lock"));
+        let mut a = PdfViewerApp::new(&engine, None)?;
+        let mut b = PdfViewerApp::new(&engine, None)?;
+        a.start_single_instance_listener(Some(lock_a.clone()))?;
+        b.start_single_instance_listener(Some(lock_b.clone()))?;
+        let (_, ta) = lock_port_and_token(&lock_a);
+        let (_, tb) = lock_port_and_token(&lock_b);
+        for t in [&ta, &tb] {
+            assert_eq!(t.len(), 32, "16 random bytes as hex: {t}");
+            assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(ta, tb);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&lock_a)?.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "lock file holds the token: owner-only");
+        }
+        a.stop_single_instance_listener();
+        b.stop_single_instance_listener();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_single_instance_opens_only_existing_pdfs_with_the_token() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_accept");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let pdf = dir.join("ok.PDF");
+        engine.create_sample_pdf(&pdf, 2)?;
+        let txt = dir.join("notes.txt");
+        std::fs::write(&txt, b"hello")?;
+        let fake_pdf_dir = dir.join("folder.pdf");
+        std::fs::create_dir_all(&fake_pdf_dir)?;
+
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, token) = lock_port_and_token(&lock);
+        let send = |line: String| send_ipc_line(port, &line);
+
+        send(format!("wrong{}|{}\n", &token[5..], pdf.display()));
+        send(format!("{token}|{}\n", txt.display()));
+        send(format!("{token}|{}\n", dir.join("missing.pdf").display()));
+        send(format!("{token}|{}\n", fake_pdf_dir.display()));
+        send(format!("{token}|\n"));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        assert!(app.doc.is_none());
+
+        send(format!("{token}|{}\n", pdf.display()));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(app.poll_single_instance_listener(), 1, "{:?}", app.status_notice);
+        assert_eq!(app.total_pages(), 2);
+
+        app.stop_single_instance_listener();
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Phase 4: one local client that connects and sends nothing must not make any single poll
+    /// take more than a few milliseconds (the old blocking read waited 50 ms per connection),
+    /// and it is dropped after one frame.
+    #[test]
+    fn test_single_instance_silent_client_does_not_stall_a_poll() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_silent");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, _) = lock_port_and_token(&lock);
+
+        let silent = std::net::TcpStream::connect(("127.0.0.1", port))?;
+        std::thread::sleep(std::time::Duration::from_millis(10)); // surely in the accept queue
+
+        let t0 = std::time::Instant::now();
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        let first = t0.elapsed();
+        assert_eq!(app.pending_ipc.len(), 1, "accepted and waiting, not read with a block");
+        assert!(first < std::time::Duration::from_millis(5), "poll took {first:?}");
+
+        std::thread::sleep(state::IPC_FRAME + std::time::Duration::from_millis(2));
+        let t1 = std::time::Instant::now();
+        assert_eq!(app.poll_single_instance_listener(), 0);
+        let second = t1.elapsed();
+        assert!(second < std::time::Duration::from_millis(5), "poll took {second:?}");
+        assert!(app.pending_ipc.is_empty(), "silent for a frame: dropped");
+
+        drop(silent);
+        app.stop_single_instance_listener();
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Silent, slow and flooding local connections never block a poll, are dropped after one
+    /// frame (or when too long), and a normal forward still works afterwards.
+    #[test]
+    fn test_single_instance_slow_or_silent_clients_never_block() -> Result<()> {
+        use std::io::Write;
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_si_slow");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let lock = dir.join("i.lock");
+        let pdf = dir.join("doc.pdf");
+        engine.create_sample_pdf(&pdf, 3)?;
+
+        let mut app = PdfViewerApp::new(&engine, None)?;
+        app.start_single_instance_listener(Some(lock.clone()))?;
+        let (port, token) = lock_port_and_token(&lock);
+        let connect = || std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+
+        // Silent connections, more than the pending cap.
+        let silent: Vec<_> = (0..20).map(|_| connect()).collect();
+        // Half a request line, never finished.
+        let mut slow = connect();
+        slow.write_all(token.as_bytes())?;
+        // 1 MB without a newline, written from another thread (it may block on a full socket).
+        let flood = std::thread::spawn(move || {
+            let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let _ = s.write_all(&vec![b'x'; 1 << 20]);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let mut slowest = std::time::Duration::ZERO;
+        for _ in 0..3 {
+            let t0 = std::time::Instant::now();
+            assert_eq!(app.poll_single_instance_listener(), 0);
+            slowest = slowest.max(t0.elapsed());
+            assert!(app.pending_ipc.len() <= state::IPC_MAX_PENDING);
+            assert!(app.pending_ipc.iter().all(|c| c.buf.len() <= state::IPC_MAX_LINE_BYTES + 1024));
+            std::thread::sleep(state::IPC_FRAME + std::time::Duration::from_millis(5));
+        }
+        assert!(slowest < std::time::Duration::from_millis(15), "a poll took {slowest:?}");
+        assert!(app.pending_ipc.is_empty(), "stalled connections must be dropped after one frame");
+        let _ = flood.join();
+        drop(silent);
+        drop(slow);
+
+        // A normal forward still works.
+        assert!(try_forward_to_running_instance(&pdf, Some(&lock)));
+        let mut opened = 0;
+        for _ in 0..3 {
+            opened += app.poll_single_instance_listener();
+            if opened > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(opened, 1);
+        assert_eq!(app.total_pages(), 3);
+
+        app.stop_single_instance_listener();
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// One A4 page with a filled-in text field: the widget's appearance stream is a solid black
+    /// box at (100,600)-(400,650) in PDF points, and the page content has a red box at
+    /// (100,300)-(400,350). The catalog has an /AcroForm, as real forms do, so PDFium sets up
+    /// its form environment for it.
+    fn build_filled_form_pdf() -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let page_id = ldoc.new_object_id();
+        let ap = ldoc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject", "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 300.into(), 50.into()],
+            },
+            b"0 g 0 0 300 50 re f".to_vec(),
+        ));
+        let widget = ldoc.add_object(dictionary! {
+            "Type" => "Annot", "Subtype" => "Widget", "FT" => "Tx",
+            "T" => lopdf::Object::string_literal("name"),
+            "V" => lopdf::Object::string_literal("filled"),
+            "F" => 4, "P" => page_id,
+            "Rect" => vec![100.into(), 600.into(), 400.into(), 650.into()],
+            "AP" => dictionary! { "N" => ap },
+        });
+        let content = ldoc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"1 0 0 rg 100 300 300 50 re f".to_vec(),
+        ));
+        ldoc.objects.insert(
+            page_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Page", "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                "Contents" => content, "Annots" => vec![widget.into()],
+            }),
+        );
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page_id.into()], "Count" => 1,
+            }),
+        );
+        let acroform = ldoc.add_object(dictionary! { "Fields" => vec![widget.into()] });
+        let catalog = ldoc.add_object(dictionary! {
+            "Type" => "Catalog", "Pages" => pages_id, "AcroForm" => acroform,
+        });
+        ldoc.trailer.set("Root", catalog);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Pixel at PDF point (`x_pt`, `y_pt`) of an A4 page rendered `w` x `h` into `pixels`.
+    fn pixel_at_pt(pixels: &[u32], w: u32, h: u32, x_pt: f32, y_pt: f32) -> (u8, u8, u8) {
+        let x = ((x_pt / 595.0) * w as f32) as usize;
+        let y = (((842.0 - y_pt) / 842.0) * h as f32) as usize;
+        let px = pixels[y * w as usize + x];
+        ((px >> 16) as u8, (px >> 8) as u8, px as u8)
+    }
+
+    fn is_black(c: (u8, u8, u8)) -> bool {
+        c.0 < 40 && c.1 < 40 && c.2 < 40
+    }
+
+    fn is_red(c: (u8, u8, u8)) -> bool {
+        c.0 > 200 && c.1 < 60 && c.2 < 60
+    }
+
+    /// A filled-in form field must show in every view: page view, continuous scroll, thumbnail
+    /// grid, and zoomed in (400%), where pages are drawn as 512x512 tiles. The open document is
+    /// never flattened: its widget stays a live form field.
+    #[test]
+    fn test_filled_form_field_visible_in_all_views_including_400_percent_tiles() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_form_views");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("form.pdf");
+        std::fs::write(&path, build_filled_form_pdf()?)?;
+        let (field, content) = ((250.0, 625.0), (250.0, 325.0));
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let (vw, vh) = (1024, 1080);
+
+        // 1. Page view (fit page).
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let c = app.cached_page.as_ref().unwrap();
+        assert!(!c.pixels.is_empty());
+        assert!(is_red(pixel_at_pt(&c.pixels, c.bitmap_width, c.bitmap_height, content.0, content.1)));
+        assert!(
+            is_black(pixel_at_pt(&c.pixels, c.bitmap_width, c.bitmap_height, field.0, field.1)),
+            "form field missing in page view"
+        );
+
+        // 2. Thumbnail.
+        app.ensure_thumbnail_rendered(0)?;
+        let t = &app.thumbnail_cache[&0];
+        assert!(
+            is_black(pixel_at_pt(&t.pixels, t.width, t.height, field.0, field.1)),
+            "form field missing in thumbnail"
+        );
+
+        // 3. Continuous scroll.
+        app.view_mode = ViewMode::ContinuousScroll;
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let cc = &app.continuous_page_cache[&0];
+        assert!(
+            is_black(pixel_at_pt(&cc.pixels, cc.bitmap_width, cc.bitmap_height, field.0, field.1)),
+            "form field missing in continuous scroll"
+        );
+
+        // 4. 400% in page view: tiles only, with the field scrolled into view.
+        app.view_mode = ViewMode::FitPage;
+        app.invalidate_page_caches();
+        app.set_zoom_around_cursor(4.0, 500.0, 500.0);
+        app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+        let (bw, bh) = {
+            let c = app.cached_page.as_ref().unwrap();
+            assert!(c.pixels.is_empty(), "400% must render tiles, not a full page");
+            (c.bitmap_width, c.bitmap_height)
+        };
+        let to_virtual = |(x, y): (f32, f32)| {
+            ((x / 595.0 * bw as f32) as u32, ((842.0 - y) / 842.0 * bh as f32) as u32)
+        };
+        let tile_pixel = |app: &PdfViewerApp, (vx, vy): (u32, u32)| {
+            let key = state::TileKey {
+                page_index: 0,
+                virtual_w: bw,
+                virtual_h: bh,
+                rotation_deg: 0,
+                tile_col: (vx / state::TILE_SIZE_PX) as u16,
+                tile_row: (vy / state::TILE_SIZE_PX) as u16,
+            };
+            let tile = app.tile_cache.get(&key).expect("tile under the point must be rendered");
+            let (tx, ty) = (vx % state::TILE_SIZE_PX, vy % state::TILE_SIZE_PX);
+            let px = tile.pixels[(ty * tile.width + tx) as usize];
+            ((px >> 16) as u8, (px >> 8) as u8, px as u8)
+        };
+        for (point, want_black) in [(field, true), (content, false)] {
+            let (vx, vy) = to_virtual(point);
+            app.pan_x = vx.saturating_sub(300) as f32;
+            app.scroll_y = vy.saturating_sub(300) as f32;
+            app.ensure_current_page_rendered(vw, vh, 0, 52, 22)?;
+            let got = tile_pixel(&app, (vx, vy));
+            if want_black {
+                assert!(is_black(got), "form field missing at 400% zoom (tile pixel {got:?})");
+            } else {
+                assert!(is_red(got), "page content wrong at 400% zoom (tile pixel {got:?})");
+            }
+        }
+
+        // 5. The document itself is not flattened: the widget is still a live form field.
+        let doc = app.doc.as_ref().unwrap();
+        let page = doc.pages().get(0)?;
+        assert_eq!(page.annotations().len(), 1);
+        assert_eq!(
+            page.annotations().iter().next().map(|a| a.annotation_type()),
+            Some(PdfPageAnnotationType::Widget)
+        );
+        drop(page);
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Windows printing state machine through the app, with a fake printer: one page per
+    /// event-loop step, "Printing page N / M" in the status bar, Esc cancels with AbortDoc,
+    /// and a second Ctrl/Cmd+P while printing is refused.
+    #[test]
+    fn test_print_job_steps_one_page_per_frame_and_esc_cancels() -> Result<()> {
+        use crate::print::test_support::{FakeSink, PrintLog};
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_print_job");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let notice = |app: &PdfViewerApp| app.status_notice.clone().unwrap_or_default();
+
+        // Run 1: cancelled with Esc after the first page.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 1, 1, false, &dir, FakeSink::new(&log),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        assert!(notice(&app).starts_with("Printing page 1 / 3"), "{}", notice(&app));
+        assert!(app.step_print_job());
+        assert!(notice(&app).starts_with("Printing page 2 / 3"), "{}", notice(&app));
+        assert_eq!(log.borrow().len(), 2, "one page sent per step");
+
+        app.trigger_print();
+        assert!(notice(&app).contains("still running"), "{}", notice(&app));
+        assert!(app.print_job.is_some(), "the running job is untouched");
+
+        app.handle_key_input(Key::Named(NamedKey::Escape), None);
+        assert!(app.print_job.is_none());
+        assert_eq!(notice(&app), "Printing cancelled after 1 of 3 page(s)");
+        assert_eq!(*log.borrow(), ["start portrait", "end ink", "abort"]);
+
+        // Run 2: to completion, one step per frame.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 2, 2, false, &dir, FakeSink::new(&log),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        let mut frames = 1;
+        while app.step_print_job() {
+            frames += 1;
+            let (sent, total) = app.print_job.as_ref().unwrap().job.progress();
+            assert_eq!(notice(&app), format!("Printing page {} / {total} (Esc to cancel)", sent + 1));
+        }
+        assert_eq!(frames, 6, "3 pages x 2 copies, one per frame");
+        assert!(app.print_job.is_none());
+        assert_eq!(notice(&app), "Printed 3 page(s) x 2 copy/copies of 'doc.pdf'");
+        assert_eq!(log.borrow().last().map(String::as_str), Some("finish"));
+
+        // Run 3: a printer error ends the job with the error in the status bar.
+        let log: PrintLog = Default::default();
+        let job = crate::print::PagedPrintJob::new(
+            &engine, app.doc.as_ref().unwrap(), &[0, 1], 1, 1, false, &dir,
+            FakeSink::failing_on_page(&log, 1),
+        )?;
+        app.start_print_job(job, "doc.pdf".into());
+        assert!(!app.step_print_job());
+        assert!(app.print_job.is_none());
+        assert!(notice(&app).contains("paper jam") && notice(&app).contains("aborted"), "{}", notice(&app));
+        assert_eq!(log.borrow().last().map(String::as_str), Some("abort"));
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// The Windows print snapshot is deleted however the job ends: finished, Esc (AbortDoc),
+    /// printer error, or the app quitting mid-print (the printer document is aborted too).
+    #[test]
+    fn test_print_snapshot_deleted_however_the_job_ends() -> Result<()> {
+        use crate::print::test_support::{FakeSink, PrintLog};
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_print_snapshot");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let snap_dir = dir.join("tmp");
+        std::fs::create_dir_all(&snap_dir)?;
+        let snapshots = || std::fs::read_dir(&snap_dir).unwrap().count();
+
+        fn start<'e>(
+            engine: &'e PdfEngine,
+            app: &mut PdfViewerApp<'e>,
+            snap_dir: &Path,
+            sink: Box<dyn crate::print::PrintSink>,
+        ) -> Result<std::path::PathBuf> {
+            let job = crate::print::PagedPrintJob::new(
+                engine, app.doc.as_ref().unwrap(), &[0, 1, 2], 1, 1, false, snap_dir, sink,
+            )?;
+            let temp = job.temp_path().to_path_buf();
+            app.start_print_job(job, "doc.pdf".into());
+            assert!(temp.exists());
+            Ok(temp)
+        }
+
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+
+        // Finished.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        while app.step_print_job() {}
+        assert!(!temp.exists(), "finished job");
+        // Esc.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        app.step_print_job();
+        app.handle_key_input(Key::Named(NamedKey::Escape), None);
+        assert!(!temp.exists(), "cancelled job");
+        // Printer error.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::failing_on_page(&log, 2))?;
+        while app.step_print_job() {}
+        assert!(!temp.exists(), "failed job");
+        // App quits mid-print.
+        let log: PrintLog = Default::default();
+        let temp = start(&engine, &mut app, &snap_dir, FakeSink::new(&log))?;
+        app.step_print_job();
+        drop(app);
+        assert!(!temp.exists(), "app quit mid-print");
+        assert_eq!(log.borrow().last().map(String::as_str), Some("abort"));
+        assert_eq!(snapshots(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Print temp files older than an hour (left by a run killed mid-print) are removed when
+    /// the app starts; recent ones are left alone.
+    #[test]
+    fn test_stale_print_files_swept_on_start() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let tmp = std::env::temp_dir();
+        let tag = format!("{}_sweeptest", std::process::id());
+        let stale = tmp.join(format!("micropdf_print_{tag}_old.pdf"));
+        let fresh = tmp.join(format!("micropdf_print_{tag}_new.pdf"));
+        std::fs::write(&stale, b"%PDF-1.4")?;
+        std::fs::write(&fresh, b"%PDF-1.4")?;
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)?
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(7200))?;
+
+        let app = PdfViewerApp::new(&engine, None)?;
+        assert!(!stale.exists(), "stale print file must be swept on start");
+        assert!(fresh.exists(), "a recent print file may belong to a running print");
+        drop(app);
+        let _ = std::fs::remove_file(&fresh);
+        Ok(())
+    }
+
+    /// macOS: Enter in the print bar starts `lp` without waiting; each frame polls it; when it
+    /// exits the temp file is gone and the result is in the status bar.
+    #[cfg(unix)]
+    #[test]
+    fn test_lp_print_from_prompt_runs_in_background() -> Result<()> {
+        use winit::keyboard::{Key, NamedKey};
+        let engine = PdfEngine::new()?;
+        let dir = std::env::temp_dir().join("micropdf_app_lp");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("doc.pdf");
+        std::fs::write(&path, build_labeled_padded_pdf(3, "Alpha")?)?;
+        let mut app = PdfViewerApp::new(&engine, Some(path.clone()))?;
+        let notice = |app: &PdfViewerApp| app.status_notice.clone().unwrap_or_default();
+
+        for (exit_code, expect) in [
+            (0, "Sent 2 page(s) x 2 copy/copies to printer 'Fake' (request id is Fake-42 (1 file(s)))"),
+            (1, "Print error: lp failed: lp: The printer or class does not exist."),
+        ] {
+            app.lp_program = crate::print::test_support::fake_lp(&dir, &dir, exit_code, 0.3).into();
+            app.input_mode = state::InputMode::PrintPrompt {
+                printers: vec!["Fake".into()],
+                selected_printer: 0,
+                copies: 2,
+                range_input: "1-2".into(),
+                fit_to_page: true,
+            };
+            let t0 = std::time::Instant::now();
+            app.handle_key_input(Key::Named(NamedKey::Enter), None);
+            assert!(t0.elapsed() < std::time::Duration::from_millis(250), "Enter must not wait for lp");
+            assert_eq!(notice(&app), "Sending to printer 'Fake'...");
+            let temp = app.lp_job.as_ref().unwrap().job.temp_path().unwrap().to_path_buf();
+            assert!(temp.exists());
+
+            app.trigger_print();
+            assert!(notice(&app).contains("still running"));
+
+            let mut frames = 0;
+            while app.poll_lp_job() {
+                frames += 1;
+                assert!(frames < 1000, "lp never finished");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(frames > 0, "lp was polled across frames, not waited for");
+            assert!(app.lp_job.is_none());
+            assert!(!temp.exists(), "temp PDF deleted when lp exited");
+            assert_eq!(notice(&app), expect);
+        }
+
+        drop(app);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// `n`-page text PDF built with lopdf.
+    fn build_text_pdf(n: u32) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let font_id = ldoc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Helvetica",
+        });
+        let resources_id = ldoc.add_object(dictionary! { "Font" => dictionary! { "F1" => font_id } });
+        let mut kids = Vec::new();
+        for i in 1..=n {
+            let content = format!("BT /F1 14 Tf 72 720 Td (Text page {i}) Tj ET");
+            let content_id = ldoc.add_object(lopdf::Stream::new(dictionary! {}, content.into_bytes()));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => resources_id, "Contents" => content_id,
+                })
+                .into(),
+            );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// `n`-page scan PDF: each page a distinct 300-dpi A4 JPEG (about 1.1 MB), like a real
+    /// office scanner produces. Built with lopdf so PDFium allocations don't pollute the
+    /// measurement that follows.
+    fn build_scan_pdf(n: u32) -> Result<Vec<u8>> {
+        use lopdf::dictionary;
+        let (w, h) = (2480u32, 3508u32);
+        let mut ldoc = lopdf::Document::with_version("1.5");
+        let pages_id = ldoc.new_object_id();
+        let mut kids = Vec::new();
+        for p in 0..n {
+            let mut img = image::RgbImage::from_pixel(w, h, image::Rgb([245, 243, 238]));
+            let mut seed: u32 = 12345 + p;
+            for row in (300..h - 300).step_by(60) {
+                let mut x = 250;
+                while x < w - 250 {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    let word = 40 + (seed % 160);
+                    for yy in row..row + 34 {
+                        for xx in x..(x + word).min(w - 250) {
+                            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                            if seed % 2 == 0 {
+                                img.put_pixel(xx, yy, image::Rgb([25 + (seed % 40) as u8, 25, 30]));
+                            }
+                        }
+                    }
+                    x += word + 30;
+                }
+            }
+            let mut jpg = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 60).encode_image(&img)?;
+            let img_id = ldoc.add_object(
+                lopdf::Stream::new(
+                    dictionary! {
+                        "Type" => "XObject", "Subtype" => "Image",
+                        "Width" => w as i64, "Height" => h as i64,
+                        "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+                    },
+                    jpg,
+                )
+                .with_compression(false),
+            );
+            let content_id = ldoc.add_object(lopdf::Stream::new(
+                dictionary! {},
+                b"q 595 0 0 842 0 0 cm /Im0 Do Q".to_vec(),
+            ));
+            kids.push(
+                ldoc.add_object(dictionary! {
+                    "Type" => "Page", "Parent" => pages_id,
+                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+                    "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+                    "Contents" => content_id,
+                })
+                .into(),
+            );
+        }
+        ldoc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => n as i64 }),
+        );
+        let catalog_id = ldoc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        ldoc.trailer.set("Root", catalog_id);
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Raw process RSS while printing a 20-page, 300-dpi scan at 600 dpi:
+    /// - Windows path: every page rendered in 256-row strips (the GDI calls are replaced by a
+    ///   no-op sink, so this measures MicroPDF + PDFium, not the printer driver);
+    /// - macOS path: the in-memory document written to the temporary PDF handed to `lp`.
+    /// Run: cargo test --release ram_print -- --ignored --nocapture --test-threads=1
+    #[test]
+    #[ignore]
+    fn ram_print_600dpi_scan_measurement() -> Result<()> {
+        let rss = || get_current_rss_mb().unwrap_or(0.0);
+        let dir = std::env::temp_dir().join("micropdf_ram_print");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("scan20.pdf");
+        std::fs::write(&path, build_scan_pdf(20)?)?;
+        let file_mb = std::fs::metadata(&path)?.len() as f64 / 1_048_576.0;
 
         let engine = PdfEngine::new()?;
-        let baseline_rss = get_current_rss_mb().unwrap_or(0.0);
+        let doc = engine.load_pdf_safe(&path)?;
+        let opened = rss();
 
-        // 1. Small text PDF (< 1 MB): 15-page text PDF built with lopdf
-        {
-            let mut ldoc = lopdf::Document::with_version("1.5");
-            let pages_id = ldoc.new_object_id();
-            let font_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => "Helvetica",
-            });
-            let resources_id = ldoc.add_object(lopdf::dictionary! {
-                "Font" => lopdf::dictionary! {
-                    "F1" => font_id,
+        let mut strip_buf = Vec::new();
+        let mut peak_strips = opened;
+        let start = std::time::Instant::now();
+        for page_idx in 0..doc.pages().len() {
+            // A4 at 600 dpi with ~4 mm margins.
+            crate::print::render_page_in_horizontal_strips(
+                &engine,
+                &doc,
+                page_idx,
+                600,
+                600,
+                4800,
+                6814,
+                true,
+                crate::print::PRINT_STRIP_ROWS,
+                &mut strip_buf,
+                |_, _, _, _, px| {
+                    std::hint::black_box(px);
+                    peak_strips = peak_strips.max(rss());
+                    Ok(())
                 },
-            });
-            let mut kids = Vec::with_capacity(15);
-            for i in 1..=15u32 {
-                let content_str = format!(
-                    "BT /F1 18 Tf 72 720 Td (Small Text PDF - Page {i} of 15) Tj 0 -30 Td /F1 12 Tf (MicroPDF lightweight PDF viewer benchmark.) Tj ET"
-                );
-                let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content_str.into_bytes());
-                let _ = stream.compress();
-                let content_id = ldoc.add_object(stream);
-                let page_id = ldoc.add_object(lopdf::dictionary! {
-                    "Type" => "Page",
-                    "Parent" => pages_id,
-                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-                    "Resources" => resources_id,
-                    "Contents" => content_id,
-                });
-                kids.push(page_id.into());
-            }
-            ldoc.objects.insert(
-                pages_id,
-                lopdf::Object::Dictionary(lopdf::dictionary! {
-                    "Type" => "Pages",
-                    "Kids" => kids,
-                    "Count" => 15,
-                }),
-            );
-            let catalog_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Catalog",
-                "Pages" => pages_id,
-            });
-            ldoc.trailer.set("Root", catalog_id);
-            let mut out = Vec::new();
-            ldoc.save_to(&mut out)?;
-            PdfEngine::write_atomic(&small_pdf, &out)?;
+            )?;
         }
-        let small_file_mb =
-            (std::fs::metadata(&small_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        assert!(small_file_mb < 1.0, "Small text PDF must be < 1 MB");
+        let strips_secs = start.elapsed().as_secs_f64();
+        let after_strips = rss();
 
-        // Measure 1. Small Text PDF immediately before generating the 300p and 1,050p files
-        // so its idle RSS reflects a clean launch (target: <= 25 MB).
-        let measure_scenarios = |label: &str, path: &std::path::Path, file_mb: f64| -> Result<(f64, f64, f64, f64)> {
-            let mut app = PdfViewerApp::new(&engine, Some(path.to_path_buf()))?;
-            let vw = 1024u32;
-            let vh = 768u32;
-            let sw = 0u32;
-            let th = 52u32;
-            let sb = 22u32;
+        let all: Vec<u16> = (0..doc.pages().len()).collect();
+        let before_temp = rss();
+        let temp = crate::print::write_pages_to_temp_pdf(&engine, &doc, &all, false, &dir)?;
+        let after_temp = rss();
+        let temp_mb = std::fs::metadata(temp.path())?.len() as f64 / 1_048_576.0;
+        drop(temp);
 
-            // Scenario 1: Idle after open (page 1 rendered in FitPage)
+        eprintln!();
+        eprintln!("| Raw RSS, printing a 20-page 300-dpi scan ({file_mb:.1} MB) | Value |");
+        eprintln!("|---|---|");
+        eprintln!("| After open | {opened:.1} MB |");
+        eprintln!("| Windows path: peak while rendering 20 pages at 600 dpi in strips | {peak_strips:.1} MB |");
+        eprintln!("| Windows path: after the last page | {after_strips:.1} MB |");
+        eprintln!("| Windows path: render time (no printer) | {strips_secs:.1} s |");
+        eprintln!("| macOS path: before writing the temp PDF | {before_temp:.1} MB |");
+        eprintln!("| macOS path: after writing the temp PDF ({temp_mb:.1} MB) | {after_temp:.1} MB |");
+
+        drop(doc);
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Helper for `ram_realistic_measurement` (runs in a child process).
+    #[test]
+    #[ignore]
+    fn ram_build_scan_fixture() -> Result<()> {
+        let scan = std::env::temp_dir().join("micropdf_ram_scan.pdf");
+        PdfEngine::write_atomic(&scan, &build_scan_pdf(100)?)
+    }
+
+    /// Real RAM measurement: raw, unadjusted process RSS at 1920x1080 (headless, so the window
+    /// frame buffer, about 8 MB at 1080p, is not included). Run it on its own:
+    ///   cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
+    /// Targets: small text PDF idle <= 25 MB; 100-page 300-dpi scan <= file size + 120 MB in
+    /// every scenario. Known in v1.2.1: zoom and grid on the scan exceed the target.
+    #[test]
+    #[ignore]
+    fn ram_realistic_measurement() -> Result<()> {
+        let engine = PdfEngine::new()?;
+        let (vw, vh, sw, th, sb) = (1920u32, 1080u32, 0u32, 52u32, 22u32);
+        let rss = || get_current_rss_mb().unwrap_or(0.0);
+        let dir = std::env::temp_dir();
+
+        let small = dir.join("micropdf_ram_small.pdf");
+        PdfEngine::write_atomic(&small, &build_text_pdf(15)?)?;
+        let before_small = rss();
+        let small_idle = {
+            let mut app = PdfViewerApp::new(&engine, Some(small.clone()))?;
             app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
-            let rss_idle = get_current_rss_mb().unwrap_or(0.0);
-
-            // Scenario 2: After scrolling 50 pages in Continuous Scroll mode
-            app.set_view_mode(ViewMode::ContinuousScroll);
-            for step in 0..50 {
-                let target_p = (step as u16).min(app.total_pages().saturating_sub(1));
-                app.current_page_index = target_p;
-                app.scroll_y = 120.0;
-                app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
-            }
-            let rss_cont_50 = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.continuous_page_cache.len() <= 5,
-                "{label}: Continuous scroll cache must hold only visible +-1 pages (got {})",
-                app.continuous_page_cache.len()
-            );
-
-            // Scenario 3: At 400% zoom while panning across the page
-            app.set_view_mode(ViewMode::FitPage);
-            app.set_zoom_around_cursor(4.0, 512.0, 384.0);
-            for pan_step in 0..8 {
-                app.pan_x = (pan_step as f32) * 320.0;
-                app.scroll_y = (pan_step as f32) * 280.0;
-                app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
-            }
-            let rss_zoom_400 = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.tile_cache.len() <= state::MAX_TILE_CACHE_ENTRIES,
-                "{label}: Tile cache must never exceed 48 entries"
-            );
-
-            // Scenario 4: Thumbnail grid scrolled to the end
-            app.reset_zoom();
-            app.set_view_mode(ViewMode::ThumbnailGrid);
-            let total_rows = ((app.total_pages() as u32) + 3) / 4;
-            let row_stride = state::THUMB_H + 36;
-            let max_grid_scroll = (total_rows * row_stride) as f32;
-            let mut cur_scroll = 0.0_f32;
-            while cur_scroll <= max_grid_scroll {
-                app.grid_scroll_y = cur_scroll;
-                app.update_visible_thumbnails(vw, vh, sw, th, sb);
-                cur_scroll += 600.0;
-            }
-            let rss_thumb_end = get_current_rss_mb().unwrap_or(0.0);
-            assert!(
-                app.thumbnail_cache.len() <= state::MAX_THUMB_CACHE_ENTRIES,
-                "{label}: Thumbnail cache must never exceed 300 entries (got {})",
-                app.thumbnail_cache.len()
-            );
-
-            let max_allowed = file_mb + 120.0;
-            // If running in parallel with other heavy tests (e.g. test_phase0_manual_checks_suite's 64MB undo test),
-            // account for any pre-existing process RSS above a clean 22 MB baseline so parallel test order never flakes.
-            let parallel_overhead = (baseline_rss - 22.0).max(0.0);
-            let adj_idle = (rss_idle - parallel_overhead).max(0.0);
-            let adj_cont_50 = (rss_cont_50 - parallel_overhead).max(0.0);
-            let adj_zoom_400 = (rss_zoom_400 - parallel_overhead).max(0.0);
-            let adj_thumb_end = (rss_thumb_end - parallel_overhead).max(0.0);
-            eprintln!(
-                "| {:<24} | {:>6.2} MB | {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | <= {:>6.2} MB |",
-                label, file_mb, adj_idle, adj_cont_50, adj_zoom_400, adj_thumb_end, max_allowed
-            );
-
-            assert!(adj_idle <= max_allowed, "{label} idle RSS {adj_idle:.2} > {max_allowed:.2}");
-            assert!(adj_cont_50 <= max_allowed, "{label} cont50 RSS {adj_cont_50:.2} > {max_allowed:.2}");
-            assert!(adj_zoom_400 <= max_allowed, "{label} zoom400 RSS {adj_zoom_400:.2} > {max_allowed:.2}");
-            assert!(adj_thumb_end <= max_allowed, "{label} thumb_end RSS {adj_thumb_end:.2} > {max_allowed:.2}");
-
-            Ok((rss_idle, rss_cont_50, rss_zoom_400, rss_thumb_end))
+            rss()
         };
 
-        eprintln!("\n=== PHASE 4: WORKING-SET RAM MEASUREMENT TABLE ===");
-        eprintln!("| Document                 | File Size | Idle Open   | Scroll 50p  | 400% Zoom   | Grid to End | Target Cap   |");
-        eprintln!("|--------------------------|-----------|-------------|-------------|-------------|-------------|--------------|");
-        let (small_idle, _, _, _) = measure_scenarios("1. Small Text (15p)", &small_pdf, small_file_mb)?;
-
-        // 2. 300-page scanned PDF: create a 10-page scanned chunk and combine 30 copies
-        {
-            let scanned_chunk = tmp_dir.join("scanned_chunk_10p.pdf");
-            let mut doc = engine.pdfium.create_new_pdf()?;
-            let mut img = image::RgbaImage::new(320, 450);
-            for (x, y, px) in img.enumerate_pixels_mut() {
-                let v = if (x % 37 == 0) || (y % 23 < 3 && x > 30 && x < 290) {
-                    30u8
-                } else {
-                    245u8
-                };
-                *px = image::Rgba([v, v, v, 255]);
-            }
-            let stamp = crate::engine::StampImageBuffer {
-                width: 320,
-                height: 450,
-                image: image::DynamicImage::ImageRgba8(img),
-            };
-            let full_rect =
-                pdfium_render::prelude::PdfRect::new_from_values(36.0, 36.0, 805.0, 559.0);
-            for p_idx in 0..10u16 {
-                let _ = doc
-                    .pages_mut()
-                    .create_page_at_end(pdfium_render::prelude::PdfPagePaperSize::a4())?;
-                engine.stamp_image_on_page(&mut doc, p_idx, &stamp, full_rect)?;
-            }
-            PdfEngine::save_doc(&doc, &scanned_chunk)?;
-            let chunks: Vec<std::path::PathBuf> = (0..30).map(|_| scanned_chunk.clone()).collect();
-            let (raw_combined, total_p) = engine.combine_multiple_pdfs(&chunks)?;
-            assert_eq!(total_p, 300);
-            let compact = PdfEngine::compress_pdf(&raw_combined).unwrap_or(raw_combined);
-            PdfEngine::write_atomic(&scanned_pdf, &compact)?;
+        // Build the 116 MB fixture in a child process; building it here would leave about
+        // 100 MB of freed-but-resident heap in this process and distort every scan figure.
+        let scan = dir.join("micropdf_ram_scan.pdf");
+        let status = std::process::Command::new(std::env::current_exe()?)
+            .args(["--ignored", "--exact", "viewer::tests::ram_build_scan_fixture", "--test-threads=1"])
+            .status()?;
+        assert!(status.success() && scan.exists(), "fixture build failed");
+        let file_mb = std::fs::metadata(&scan)?.len() as f64 / 1048576.0;
+        let before_scan = rss();
+        let mut app = PdfViewerApp::new(&engine, Some(scan.clone()))?;
+        app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+        let idle = rss();
+        app.set_view_mode(ViewMode::ContinuousScroll);
+        let mut scroll = 0.0f64;
+        for p in 0..50u16 {
+            app.current_page_index = p;
+            app.scroll_y = 120.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            scroll = scroll.max(rss());
         }
-        let scanned_file_mb =
-            (std::fs::metadata(&scanned_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        let _ = measure_scenarios("2. Scanned PDF (300p)", &scanned_pdf, scanned_file_mb)?;
-
-        // 3. 1,000+ page PDF: build a 1,050-page document via lopdf sharing a single Type1 Helvetica font resource
-        {
-            let mut ldoc = lopdf::Document::with_version("1.5");
-            let pages_id = ldoc.new_object_id();
-            let font_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Font",
-                "Subtype" => "Type1",
-                "BaseFont" => "Helvetica",
-            });
-            let resources_id = ldoc.add_object(lopdf::dictionary! {
-                "Font" => lopdf::dictionary! {
-                    "F1" => font_id,
-                },
-            });
-            let mut kids = Vec::with_capacity(1050);
-            for i in 1..=1050u32 {
-                let content_str = format!(
-                    "BT /F1 18 Tf 72 720 Td (Large Benchmark Document - Page {i} of 1050) Tj 0 -30 Td /F1 12 Tf (MicroPDF lightweight 1000+ page RAM benchmark test.) Tj ET"
-                );
-                let mut stream = lopdf::Stream::new(lopdf::dictionary! {}, content_str.into_bytes());
-                let _ = stream.compress();
-                let content_id = ldoc.add_object(stream);
-                let page_id = ldoc.add_object(lopdf::dictionary! {
-                    "Type" => "Page",
-                    "Parent" => pages_id,
-                    "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-                    "Resources" => resources_id,
-                    "Contents" => content_id,
-                });
-                kids.push(page_id.into());
-            }
-            ldoc.objects.insert(
-                pages_id,
-                lopdf::Object::Dictionary(lopdf::dictionary! {
-                    "Type" => "Pages",
-                    "Kids" => kids,
-                    "Count" => 1050,
-                }),
-            );
-            let catalog_id = ldoc.add_object(lopdf::dictionary! {
-                "Type" => "Catalog",
-                "Pages" => pages_id,
-            });
-            ldoc.trailer.set("Root", catalog_id);
-            let mut out = Vec::new();
-            ldoc.save_to(&mut out)?;
-            PdfEngine::write_atomic(&large_pdf, &out)?;
+        app.set_view_mode(ViewMode::FitPage);
+        app.set_zoom_around_cursor(4.0, 960.0, 540.0);
+        let mut zoom = 0.0f64;
+        for k in 0..12 {
+            app.pan_x = k as f32 * 400.0;
+            app.scroll_y = k as f32 * 350.0;
+            app.ensure_current_page_rendered(vw, vh, sw, th, sb)?;
+            zoom = zoom.max(rss());
         }
-        let large_file_mb =
-            (std::fs::metadata(&large_pdf)?.len() as f64) / (1024.0 * 1024.0);
-        let _ = measure_scenarios("3. Large PDF (1,050p)", &large_pdf, large_file_mb)?;
-        eprintln!("==================================================\n");
+        app.reset_zoom();
+        app.set_view_mode(ViewMode::ThumbnailGrid);
+        let mut grid = 0.0f64;
+        let mut gs = 0.0f32;
+        while gs < 30_000.0 {
+            app.grid_scroll_y = gs;
+            app.update_visible_thumbnails(vw, vh, sw, th, sb);
+            grid = grid.max(rss());
+            gs += 600.0;
+        }
+        drop(app);
+        let _ = std::fs::remove_file(&small);
+        let _ = std::fs::remove_file(&scan);
 
-        let _ = small_idle;
+        eprintln!("\n| Raw RSS, 1920x1080, headless | Value |");
+        eprintln!("|---|---|");
+        eprintln!("| Small text PDF: process before open | {before_small:.1} MB |");
+        eprintln!("| Small text PDF: idle after open | {small_idle:.1} MB |");
+        eprintln!("| Scan ({file_mb:.1} MB, 100 pages): process before open | {before_scan:.1} MB |");
+        eprintln!("| Scan: idle after open | {idle:.1} MB |");
+        eprintln!("| Scan: peak while scrolling 50 pages | {scroll:.1} MB |");
+        eprintln!("| Scan: peak at 400% zoom, panning | {zoom:.1} MB |");
+        eprintln!("| Scan: peak in thumbnail grid | {grid:.1} MB |");
 
-        let _ = std::fs::remove_dir_all(&tmp_dir);
+        let cap = file_mb + 120.0;
+        assert!(small_idle <= 25.0, "small text idle {small_idle:.1} MB > 25 MB");
+        assert!(idle <= cap, "scan idle {idle:.1} > {cap:.1}");
+        assert!(scroll <= cap, "scan scroll {scroll:.1} > {cap:.1}");
+        assert!(zoom <= cap, "scan zoom {zoom:.1} > {cap:.1}");
+        assert!(grid <= cap, "scan grid {grid:.1} > {cap:.1}");
         Ok(())
     }
 }

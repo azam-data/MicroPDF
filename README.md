@@ -2,10 +2,20 @@
 
 **MicroPDF** is a lightweight, portable PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), and [`image`](https://crates.io/crates/image). No GPU, no GUI toolkit, no installer: the menu bar, tab bar and status bar are drawn by the CPU straight into the window frame buffer.
 
-**Footprint (v1.2, measured by the built-in RAM readout):**
+**Footprint (v1.3.0, raw process memory measured by `ram_realistic_measurement`, release build on macOS, 1920×1080, without the window frame buffer of about 8 MB):**
 
-- `micro_pdf.exe` is about 1 MB. It needs `pdfium.dll` (roughly 5–10 MB, from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)) in the **same folder**, so a portable install is about 6–11 MB in total.
-- RAM is roughly 16–22 MB with a small text PDF open, ~40 MB on a 300-page scanned PDF, and ~45 MB on a 1,050-page PDF. Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 48 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries.
+- `micro_pdf.exe` is about 1.6 MB (`micro_pdf` on macOS about 1.4 MB). It needs `pdfium.dll` (about 7.8 MB, from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)) in the **same folder**, so a portable install is about 9.5 MB.
+- PDFium reads the file on demand, so a large file is not held in memory.
+
+| Raw RSS | v1.2.1 | v1.3.0 |
+|---|---|---|
+| Small text PDF: idle after open | | 16.9 MB |
+| 116 MB, 100-page 300-dpi scan: idle after open | 129 MB | 50.6 MB |
+| Scan: peak while scrolling 50 pages | 228 MB | 118.2 MB |
+| Scan: peak at 400% zoom, panning | 274 MB | 134.4 MB |
+| Scan: peak in thumbnail grid | 301 MB | 187.8 MB |
+
+All scan figures are within the target of file size + 120 MB (236 MB). Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 48 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries. Printing a 20-page scan at 600 dpi adds about 25 MB at peak (one decoded scan image plus one 5 MB strip).
 
 ---
 
@@ -33,6 +43,10 @@
   4. **Signature / Image Stamp (`P` Key or `Tools -> Stamp Signature / Image...`)**: Pick any `.png` (preserving alpha transparency) or `.jpg`/`.jpeg` file (auto-capped at 2,000 px) and click or drag on the page to stamp it via `PdfPageImageObject`.
   5. **Dark Mode / Sepia Reading Filter (`V` Key or `View` Menu)**: Cycles `Normal`, `DarkInvert`, and `WarmSepia` directly in the final `softbuffer` blit loop with zero extra RAM and zero modifications to the PDF file.
   6. **Flatten & Unlock PDF (`U` Key or `Tools -> Flatten & Unlock PDF`)**: Flattens annotations and form fields on all pages into page content streams and strips `/Encrypt`, `/AcroForm`, and `/Perms` restrictions.
+- **Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Prints the document as it is in the app, including unsaved edits, redactions and filled-in form fields.
+  - **Windows**: native print dialog (page range, copies); pages are sent one per frame with `Printing page N / M` in the status bar and `Esc` to cancel. Each page is rendered at the printer's resolution in 256-row strips, fitted to the printable area, paper orientation following the page.
+  - **macOS**: bottom-bar prompt (printer from `lpstat`, copies, page range like `1-3,5,8-`, `F` fit-to-page) that sends a temporary PDF to `lp` in the background and deletes it once `lp` has it.
+- **Optimize (`Z` or `Tools -> Optimize...`)**: Smaller / Balanced / Print presets, colour, gray or black-and-white, scan cleaning on or off, a preview of the current page, progress in the status bar and `Esc` to cancel. Writes `<name>_optimized.pdf`.
 - **Batch Combine Multiple PDFs (`Shift+M` or `File -> Combine Multiple PDFs...`)**:
   - Select 2 or more PDF files in the native multi-file dialog to append all their pages in order and open the combined document in a new `"Combined.pdf"` tab.
 - **Multi-Document Tab Bar, Thumbnail Grid (`Tab`), Grayscale (`[BW]` / `K`), Bookmarks (`B` / `L`), & Multi-Step Undo (`Cmd/Ctrl+Z`)**:
@@ -61,7 +75,9 @@
 | `N` / `H` / `C` / `W` | Normal | Roman/Arabic Page Numbers (`N`), Aligned Header/Footer (`H`), Clear Margins (`C`), Watermark (`W`) |
 | `K` / `I` / `R` / `D` | Normal / Grid | Convert page to Grayscale `[BW]` (`K`), Insert A4 (`I`), Rotate 90° (`R`), Delete page (`D`) |
 | `Cmd+Z` / `Ctrl+Z` | Normal | Undo last structural or page edit (up to 8 steps per tab) |
-| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Compress PDF (`Z`), Split/Extract range (`X`) |
+| `Ctrl/Cmd+P` / `File -> Print...` | Any | Print the current document (Windows: print dialog, `Esc` cancels while printing; macOS: print bar, `Tab` printer, `+`/`-` copies, `F` fit-to-page) |
+| `Tools -> Optimize...` | Any | Optimize menu in the bottom bar: `1`/`2`/`3` preset, `C`/`G`/`B` colour mode, `S` clean scans, `P` preview, `Enter` run, `Esc` cancel |
+| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Optimize PDF to `<name>_optimized.pdf` (`Z`), Split/Extract range (`X`) |
 | `?` / `F1` / `Esc` | Any | Toggle Help Overlay / Close menu / Cancel prompt / Reset mouse mode |
 
 ---
@@ -80,11 +96,24 @@ cargo build --release
 cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+## Optimize (`Z` and `Tools -> Optimize...`)
+
+Writes `<name>_optimized.pdf` next to the original; the original and the open document are never changed, and nothing is written if the result would not be smaller. `Z` runs the Balanced preset: images are downsampled to 200 dpi and re-encoded as JPEG (quality 70). On scanned pages (an image covering most of the page) off-white paper is pushed to pure white and text is sharpened, while ink colour is kept, so blue signatures stay blue. `Tools -> Optimize...` also offers Smaller (150 dpi) and Print (300 dpi), gray and black-and-white (1-bit) output, scan cleaning on or off, and a preview of the current page. Everything runs locally; no Ghostscript or OCR.
+
+On a 10-page, 24 MB scan: 6.0 MB in about 1 s per page; 0.54 MB in black-and-white mode.
+
 ## Testing
 
 ```
 # PDFium must be reachable: copy it next to the test binary or set MICROPDF_PDFIUM_DIR
 cargo test
+```
+
+Real memory figures (run on its own, takes a minute):
+
+```
+cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
+cargo test --release ram_print -- --ignored --nocapture --test-threads=1
 ```
 
 `test_redaction_leaves_no_trace` builds a PDF with secret text over an image, redacts it, saves it, and fails if the secret survives in extracted text, in any decompressed stream, or in the image pixels under the box.

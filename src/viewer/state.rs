@@ -23,7 +23,7 @@ pub(super) const THUMB_W: u32 = 140;
 pub(super) const THUMB_H: u32 = 198;
 pub(super) const MAX_THUMB_CACHE_ENTRIES: usize = 300;
 pub(super) const TILE_SIZE_PX: u32 = 512;
-pub(super) const MAX_TILE_CACHE_BYTES: usize = 48 * 1024 * 1024;
+pub(super) const MAX_TILE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
     MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
@@ -76,7 +76,8 @@ impl MenuCategory {
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
-                "Compress & Save PDF (Z)",
+                "Optimize -> _optimized.pdf (Z)",
+                "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
             ],
             MenuCategory::View => &[
@@ -119,6 +120,7 @@ impl MenuCategory {
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
                 "Flatten & Unlock PDF (U)",
+                "Optimize...",
             ],
             MenuCategory::Help => &["Toggle Shortcuts Overlay (? / F1)"],
         }
@@ -259,7 +261,6 @@ pub(super) struct CachedPageBitmap {
 pub(super) struct ThumbnailEntry {
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) rotation_deg: i32,
     pub(super) pixels: Vec<u32>,
 }
 
@@ -398,6 +399,115 @@ pub(super) enum InputMode {
     RestoreSessionPrompt {
         tab_count: usize,
     },
+    OptimizePrompt {
+        preset: crate::optimize::OptimizePreset,
+        mode: crate::optimize::ColorMode,
+        clean_scans: bool,
+        previewing: bool,
+    },
+    /// Bottom-bar print prompt (macOS/Linux; Windows uses the native dialog).
+    #[cfg_attr(windows, allow(dead_code))]
+    PrintPrompt {
+        printers: Vec<String>,
+        selected_printer: usize,
+        copies: u16,
+        range_input: String,
+        /// Scale each page to the paper (`lp -o fit-to-page`).
+        fit_to_page: bool,
+    },
+}
+
+/// A single-instance connection being read without blocking (see `poll_single_instance_listener`).
+pub(super) struct PendingIpcConnection {
+    pub(super) stream: std::net::TcpStream,
+    pub(super) buf: Vec<u8>,
+    pub(super) accepted_at: Instant,
+    pub(super) polls: u32,
+}
+
+/// Longest accepted request line (`token|absolute path`); longer connections are dropped.
+pub(super) const IPC_MAX_LINE_BYTES: usize = 8 * 1024;
+/// At most this many connections are kept waiting for their request line at once.
+pub(super) const IPC_MAX_PENDING: usize = 8;
+/// One frame at 60 Hz: a connection that has not sent its whole request line by the poll after
+/// the one that accepted it, and at least this long after being accepted, is dropped.
+pub(super) const IPC_FRAME: Duration = Duration::from_millis(16);
+
+/// 16 random bytes from the OS as 32 hex characters: `/dev/urandom` on macOS/Linux,
+/// `BCryptGenRandom` (system-preferred RNG) on Windows.
+pub(super) fn random_token_hex() -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut std::ffi::c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status != 0 {
+            return Err(std::io::Error::other(format!(
+                "BCryptGenRandom failed (NTSTATUS {status:#x})"
+            )));
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return Err(std::io::Error::other("no OS random source on this platform"));
+    }
+    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Compares two tokens in time independent of where they first differ.
+pub(super) fn tokens_match(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A forwarded path is opened only if it is an existing file ending in `.pdf` (any case).
+pub(super) fn is_acceptable_forwarded_pdf(path: &std::path::Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+        && path.is_file()
+}
+
+/// A print job in progress, with the name shown in status messages.
+pub(super) struct ActivePrintJob<'a> {
+    pub(super) job: crate::print::PagedPrintJob<'a>,
+    pub(super) title: String,
+}
+
+/// An `lp` submission in progress.
+pub(super) struct ActiveLpJob {
+    pub(super) job: crate::print::PendingLpJob,
+    pub(super) printer: String,
+}
+
+pub(super) struct ActiveOptimizeJob {
+    pub(super) job: crate::optimize::OptimizeJob,
+    pub(super) out_path: PathBuf,
+    pub(super) out_name: String,
+    pub(super) disk_size: usize,
+    pub(super) roman_end: usize,
+    pub(super) bookmarks: Vec<Bookmark>,
+    pub(super) redacted: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +604,19 @@ pub struct PdfViewerApp<'a> {
     pub(super) custom_session_ini_path: Option<PathBuf>,
     /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
+    /// Accepted single-instance connections whose request line has not fully arrived yet.
+    pub(super) pending_ipc: Vec<PendingIpcConnection>,
+    /// Flattened one-page copy of the form page being tiled (see `ensure_tile_rendered`).
+    pub(super) tile_form_copy: Option<(u16, PdfDocument<'a>)>,
+    /// Paged print job sent one page per frame (Windows GDI; a fake printer in tests).
+    pub(super) print_job: Option<ActivePrintJob<'a>>,
+    /// `lp` submission running in the background (macOS/Linux).
+    pub(super) lp_job: Option<ActiveLpJob>,
+    /// The `lp` program to run; replaced by a fake in tests.
+    pub(super) lp_program: std::ffi::OsString,
+    /// Renames a finished save's temp file over its target. `std::fs::rename` except in tests,
+    /// which substitute file-system behaviour (e.g. refusing to replace a file that is open).
+    pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
     /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
@@ -508,6 +631,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) current_search_match: usize,
     /// Time-sliced (~8 ms/frame) incremental search state on the main thread (`Esc` cancels).
     pub(super) incremental_search: Option<IncrementalSearchState>,
+    /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
+    pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
     pub(super) thumbnail_cache: HashMap<u16, ThumbnailEntry>,
     /// Vertical scroll offset in physical pixels for Thumbnail Grid View.
@@ -551,6 +676,8 @@ pub struct PdfViewerApp<'a> {
 
 impl<'a> PdfViewerApp<'a> {
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
+        // Print temp files left behind by a previous run that was killed mid-print.
+        crate::print::remove_stale_print_temp_files(&std::env::temp_dir());
         let mut app = Self {
             engine,
             tabs: Vec::new(),
@@ -595,6 +722,12 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
             single_instance_listener: None,
+            pending_ipc: Vec::new(),
+            tile_form_copy: None,
+            print_job: None,
+            lp_job: None,
+            lp_program: "lp".into(),
+            rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
@@ -603,6 +736,7 @@ impl<'a> PdfViewerApp<'a> {
             search_matches: Vec::new(),
             current_search_match: 0,
             incremental_search: None,
+            optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
             hovered_thumb: None,
@@ -896,19 +1030,22 @@ impl<'a> PdfViewerApp<'a> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         listener.set_nonblocking(true)?;
         let port = listener.local_addr()?.port();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let token = format!("{:x}_{}", nanos, std::process::id());
+        // Random, so another local program cannot guess it and push files into the viewer.
+        let token = random_token_hex()?;
         let lock_path =
             custom_lock_path.unwrap_or_else(Self::default_single_instance_lock_path);
         std::fs::write(&lock_path, format!("{port}|{token}\n").as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         self.single_instance_listener = Some((listener, token, lock_path));
         Ok(())
     }
 
     pub(super) fn stop_single_instance_listener(&mut self) {
+        self.pending_ipc.clear();
         if let Some((listener, token, lock_path)) = self.single_instance_listener.take() {
             if let Ok(addr) = listener.local_addr() {
                 let expected = format!("{}|{}", addr.port(), token);
@@ -921,32 +1058,76 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Polls the non-blocking single-instance listener and opens any forwarded PDF paths as new tabs.
+    /// Polls the single-instance listener and opens forwarded PDF paths as new tabs. Never
+    /// blocks: connections are accepted and read without blocking, a request line is at most
+    /// `IPC_MAX_LINE_BYTES`, at most `IPC_MAX_PENDING` connections wait at once, and one that has
+    /// not sent its whole line within one frame (`IPC_FRAME`, and at least one later poll) is
+    /// dropped. Only lines with the right token naming an existing `.pdf` file are opened.
     pub(super) fn poll_single_instance_listener(&mut self) -> usize {
-        use std::io::{BufRead, BufReader};
+        use std::io::Read;
 
         let mut received_paths: Vec<PathBuf> = Vec::new();
         if let Some((ref listener, ref expected_token, _)) = self.single_instance_listener {
-            while let Ok((mut stream, _peer)) = listener.accept() {
-                let _ = stream.set_nonblocking(false);
-                let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-                let mut line = String::new();
-                {
-                    let mut reader = BufReader::new(&mut stream);
-                    let _ = reader.read_line(&mut line);
+            while let Ok((stream, _peer)) = listener.accept() {
+                if self.pending_ipc.len() >= IPC_MAX_PENDING || stream.set_nonblocking(true).is_err() {
+                    continue; // dropped: closes the connection
                 }
-                let trimmed = line.trim_end_matches(|c| c == '\r' || c == '\n');
-                if let Some((tok, path_str)) = trimmed.split_once('|') {
-                    if tok == expected_token && !path_str.is_empty() {
-                        received_paths.push(PathBuf::from(path_str));
+                self.pending_ipc.push(PendingIpcConnection {
+                    stream,
+                    buf: Vec::new(),
+                    accepted_at: Instant::now(),
+                    polls: 0,
+                });
+            }
+
+            let mut chunk = [0u8; 1024];
+            self.pending_ipc.retain_mut(|conn| {
+                conn.polls += 1;
+                let mut eof = false;
+                loop {
+                    match conn.stream.read(&mut chunk) {
+                        Ok(0) => {
+                            eof = true;
+                            break;
+                        }
+                        Ok(n) => {
+                            conn.buf.extend_from_slice(&chunk[..n]);
+                            if conn.buf.len() > IPC_MAX_LINE_BYTES || conn.buf.contains(&b'\n') {
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            eof = true; // reset or other error: drop it
+                            break;
+                        }
                     }
                 }
-            }
+                if let Some(end) = conn.buf.iter().position(|&b| b == b'\n') {
+                    if end <= IPC_MAX_LINE_BYTES {
+                        let line = String::from_utf8_lossy(&conn.buf[..end]);
+                        let line = line.trim_end_matches('\r');
+                        if let Some((tok, path_str)) = line.split_once('|') {
+                            if tokens_match(tok.as_bytes(), expected_token.as_bytes())
+                                && !path_str.is_empty()
+                            {
+                                received_paths.push(PathBuf::from(path_str));
+                            }
+                        }
+                    }
+                    return false;
+                }
+                let expired = conn.polls >= 2 && conn.accepted_at.elapsed() >= IPC_FRAME;
+                !(eof || conn.buf.len() > IPC_MAX_LINE_BYTES || expired)
+            });
+        } else {
+            self.pending_ipc.clear();
         }
 
         let mut opened = 0usize;
         for path in received_paths {
-            if !path.exists() {
+            if !is_acceptable_forwarded_pdf(&path) {
                 continue;
             }
             let fname = path
@@ -1022,7 +1203,7 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         };
         let new_total = new_doc.pages().len();
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&self.file_path);
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&new_doc);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&new_doc, &self.file_path, roman_end);
 
         self.invalidate_page_caches();
@@ -1030,6 +1211,11 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
 
         self.doc = Some(new_doc);
+        // v1.2.1: snapshots from before the reload must not be restorable, otherwise Ctrl+Z
+        // would silently bring back the old file content over the external change.
+        self.undo_stack.clear();
+        self.undo_stack.shrink_to_fit();
+        self.redacted = false;
         self.last_file_mtime = Some(disk_mtime);
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
@@ -1057,6 +1243,8 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].view_mode = self.view_mode;
             self.tabs[self.active_tab].roman_end = self.roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+            self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redacted = false;
         }
 
         let fname = self.filename_display();
@@ -1101,6 +1289,7 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         self.tile_cache.shrink_to_fit();
+        self.tile_form_copy = None;
         // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
         self.cached_char_boxes = None;
         self.selected_text.clear();
@@ -1170,6 +1359,15 @@ impl<'a> PdfViewerApp<'a> {
         self.doc.as_ref().map(|d| d.pages().len()).unwrap_or(0)
     }
 
+    pub(super) fn rotation_degrees_of_page(page: &PdfPage<'_>) -> i32 {
+        match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
+            PdfPageRenderRotation::None => 0,
+            PdfPageRenderRotation::Degrees90 => 90,
+            PdfPageRenderRotation::Degrees180 => 180,
+            PdfPageRenderRotation::Degrees270 => 270,
+        }
+    }
+
     pub(super) fn page_rotation_degrees(&self, page_idx: u16) -> i32 {
         let Some(doc) = self.doc.as_ref() else {
             return 0;
@@ -1177,12 +1375,7 @@ impl<'a> PdfViewerApp<'a> {
         let Ok(page) = doc.pages().get(page_idx) else {
             return 0;
         };
-        match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
-            PdfPageRenderRotation::None => 0,
-            PdfPageRenderRotation::Degrees90 => 90,
-            PdfPageRenderRotation::Degrees180 => 180,
-            PdfPageRenderRotation::Degrees270 => 270,
-        }
+        Self::rotation_degrees_of_page(&page)
     }
 
     pub(super) fn current_page_rotation_degrees(&self) -> i32 {

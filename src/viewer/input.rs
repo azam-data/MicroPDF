@@ -1,7 +1,7 @@
 use crate::engine::{Bookmark, MarginPosition, MarginZone, PdfEngine};
 use pdfium_render::prelude::*;
 use softbuffer::{Context as SoftContext, Surface};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -22,6 +22,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.last_page_view_mode = self.view_mode;
             }
             self.invalidate_page_caches();
+            self.spare_pixel_buf = Vec::new();
             self.view_mode = ViewMode::ThumbnailGrid;
             self.status_notice = Some(
                 "Thumbnail Grid View (Click page, Drag reorder, [BW]/[R] badges, Tab/Enter to view)"
@@ -1503,9 +1504,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_file_dialog(&mut self) {
-        let Some(doc) = self.doc.as_ref() else {
+        if self.doc.is_none() {
             return;
-        };
+        }
         let stem = self
             .file_path
             .file_stem()
@@ -1519,43 +1520,173 @@ impl<'a> PdfViewerApp<'a> {
             .save_file();
 
         if let Some(save_path) = target_path {
-            match PdfEngine::save_doc_with_metadata(
-                doc,
-                &save_path,
-                self.roman_end,
-                &self.bookmarks,
-                self.redacted,
-            ) {
-                Ok(warning) => {
-                    let saved_mtime = Self::read_file_mtime(&save_path);
-                    self.record_recent_file(&save_path);
-                    self.file_path = save_path.clone();
-                    self.has_unsaved_edits = false;
-                    self.last_file_mtime = saved_mtime;
-                    if self.active_tab < self.tabs.len() {
-                        self.tabs[self.active_tab].file_path = save_path;
-                        self.tabs[self.active_tab].has_unsaved_edits = false;
-                        self.tabs[self.active_tab].last_file_mtime = saved_mtime;
-                    }
-                    self.persist_bookmarks();
-                    self.status_notice = Some(match warning {
-                        None if self.redacted => {
-                            "Saved PDF (redaction finalized: orphaned objects, /Info & thumbnails removed)".to_string()
-                        }
-                        None => "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)".to_string(),
-                        Some(w) => format!("Saved PDF, but WARNING: {w}"),
-                    });
-                }
-                Err(e) => {
-                    self.status_notice = Some(format!("Save error: {e}"));
-                }
-            }
-            self.update_title_bar();
-            self.request_redraw();
+            self.save_active_doc_to(save_path);
         }
     }
 
+    /// Saves the active document to `save_path` (which may be the open file itself), then
+    /// reopens it from there. Shows the outcome in the status bar.
+    /// Saves the active document to `save_path` (which may be the open file itself), then
+    /// reopens it from there. Shows the outcome in the status bar.
+    ///
+    /// The bytes go to a temp file next to `save_path` first, which then replaces `save_path` by
+    /// rename, so the original is never rewritten in place. If the rename fails (FAT32/exFAT and
+    /// some network shares refuse to replace a file that is open), the documents this app has
+    /// open on `save_path` are closed and the rename is retried. If it still fails, the original
+    /// is left untouched, the temp file stays next to it as the saved copy, and the active tab
+    /// keeps working from that copy with its edits still marked unsaved.
+    pub(super) fn save_active_doc_to(&mut self, save_path: std::path::PathBuf) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let serialized = PdfEngine::serialize_doc_with_metadata(
+            doc,
+            self.roman_end,
+            &self.bookmarks,
+            self.redacted,
+        );
+        let temp = serialized.and_then(|(bytes, warning)| {
+            PdfEngine::write_temp_next_to(&save_path, &bytes).map(|t| (t, warning))
+        });
+        match temp {
+            Err(e) => {
+                self.status_notice = Some(format!("Save error: {e:#}"));
+            }
+            Ok((temp, warning)) => match self.replace_with_saved_temp(&temp, &save_path) {
+                Ok(()) => self.finish_successful_save(save_path, warning),
+                Err(e) => {
+                    let fname = save_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.status_notice = Some(format!(
+                        "Could not replace '{fname}' ({e}). The original is unchanged; your saved copy is {}",
+                        temp.display()
+                    ));
+                }
+            },
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Renames the saved `temp` file over `target`, closing and reopening this app's documents
+    /// on `target` if the first attempt fails. On success the active document is reopened by
+    /// `finish_successful_save`; on failure it is reopened from `temp` (it holds the edits).
+    fn replace_with_saved_temp(&mut self, temp: &Path, target: &Path) -> std::io::Result<()> {
+        let first_err = match (self.rename_for_save)(temp, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        };
+
+        let active_holds = self.doc.is_some() && same_file(&self.file_path, target);
+        // Other tabs on the same file are closed too, unless they have unsaved edits of their
+        // own: those are never dropped (the retry may then fail and is reported).
+        let other_tabs: Vec<usize> = (0..self.tabs.len())
+            .filter(|&i| {
+                i != self.active_tab
+                    && self.tabs[i].doc.is_some()
+                    && !self.tabs[i].has_unsaved_edits
+                    && same_file(&self.tabs[i].file_path, target)
+            })
+            .collect();
+        if !active_holds && other_tabs.is_empty() {
+            return Err(first_err);
+        }
+
+        if active_holds {
+            self.invalidate_page_caches();
+            self.thumbnail_cache.clear();
+            self.doc = None;
+        }
+        for &i in &other_tabs {
+            self.tabs[i].doc = None;
+        }
+
+        let result = (self.rename_for_save)(temp, target);
+
+        for &i in &other_tabs {
+            self.tabs[i].doc = self.engine.load_pdf_safe(target).ok();
+            if result.is_ok() {
+                self.tabs[i].last_file_mtime = Self::read_file_mtime(target);
+            }
+        }
+        if active_holds && result.is_err() {
+            self.doc = self
+                .engine
+                .load_pdf_safe(temp)
+                .or_else(|_| self.engine.load_pdf_safe(target))
+                .ok();
+        }
+        result
+    }
+
+    fn finish_successful_save(&mut self, save_path: std::path::PathBuf, warning: Option<String>) {
+        let mut reopen_error = None;
+        match self.engine.load_pdf_safe(&save_path) {
+            Ok(reloaded) => {
+                self.doc = Some(reloaded);
+                self.invalidate_page_caches();
+            }
+            // Keep the document already open, unless it was closed for the rename.
+            Err(e) if self.doc.is_none() => reopen_error = Some(e),
+            Err(_) => {}
+        }
+        let saved_mtime = Self::read_file_mtime(&save_path);
+        self.record_recent_file(&save_path);
+        self.file_path = save_path.clone();
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = saved_mtime;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].file_path = save_path;
+            self.tabs[self.active_tab].has_unsaved_edits = false;
+            self.tabs[self.active_tab].last_file_mtime = saved_mtime;
+        }
+        self.persist_bookmarks();
+        self.status_notice = Some(match (reopen_error, warning) {
+            (Some(e), _) => format!("Saved PDF, but could not reopen it: {e:#}"),
+            (None, None) if self.redacted => {
+                "Saved PDF (redaction finalized: orphaned objects, /Info & thumbnails removed)".to_string()
+            }
+            (None, None) => "Saved PDF (sanitized metadata + embedded /PageLabels & /Outlines)".to_string(),
+            (None, Some(w)) => format!("Saved PDF, but WARNING: {w}"),
+        });
+    }
+
+    /// Opens the interactive Optimize menu in the bottom command bar (`Tools -> Optimize...`).
+    pub(super) fn open_optimize_prompt(&mut self) {
+        if self.doc.is_none() {
+            return;
+        }
+        self.input_mode = InputMode::OptimizePrompt {
+            preset: crate::optimize::OptimizePreset::Balanced,
+            mode: crate::optimize::ColorMode::Color,
+            clean_scans: true,
+            previewing: false,
+        };
+        self.status_notice = None;
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// `Z`: optimize images (Balanced preset: 200 dpi, JPEG 70, scan cleanup) and write
+    /// `<name>_optimized.pdf` next to the original. The open document and the original file
+    /// are never modified. Nothing is written when optimizing would not make the file smaller.
     pub(super) fn compress_current_pdf(&mut self) {
+        self.optimize_current_pdf(crate::optimize::OptimizeOptions::default());
+    }
+
+    pub(super) fn optimize_current_pdf(&mut self, opts: crate::optimize::OptimizeOptions) {
+        self.start_optimize_job(opts);
+        if self.window.is_none() {
+            while self.optimize_job.is_some() {
+                self.step_optimize_job();
+            }
+        }
+    }
+
+    /// Starts an incremental `OptimizeJob` to be stepped one image per event-loop iteration.
+    pub(super) fn start_optimize_job(&mut self, opts: crate::optimize::OptimizeOptions) {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
@@ -1563,65 +1694,435 @@ impl<'a> PdfViewerApp<'a> {
             .file_path
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("document");
-        let out_name = format!("{stem}_compressed.pdf");
-        let out_path = match self.file_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(&out_name),
-            _ => PathBuf::from(&out_name),
-        };
+            .unwrap_or("document")
+            .to_string();
+        let dir = self
+            .file_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.to_path_buf())
+            .unwrap_or_default();
+        let mut out_name = format!("{stem}_optimized.pdf");
+        let mut out_path = dir.join(&out_name);
+        let mut n = 2;
+        while out_path == self.file_path {
+            out_name = format!("{stem}_optimized-{n}.pdf");
+            out_path = dir.join(&out_name);
+            n += 1;
+        }
 
         let disk_size = std::fs::metadata(&self.file_path)
             .map(|m| m.len() as usize)
             .unwrap_or(0);
 
-        match self.engine.compress_doc(doc) {
-            Ok((compressed_bytes, serialized_len, _)) => {
-                let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
-                    &compressed_bytes,
-                    self.roman_end,
-                    &self.bookmarks,
-                    self.redacted,
-                ) {
-                    Ok(b) => (b, None),
-                    Err(e) if self.redacted => {
-                        self.status_notice = Some(format!(
-                            "Compression refused: post-redaction cleanup failed ({e}). Nothing was written."
-                        ));
-                        self.update_title_bar();
-                        self.request_redraw();
-                        return;
-                    }
-                    Err(e) => (compressed_bytes, Some(format!(" (WARNING: metadata not sanitized: {e})"))),
+        let raw_bytes = match doc.save_to_bytes() {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let job = match crate::optimize::OptimizeJob::new(raw_bytes, opts) {
+            Ok(j) => j,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+
+        let total = job.total();
+        let is_done = job.is_done();
+        self.optimize_job = Some(ActiveOptimizeJob {
+            job,
+            out_path,
+            out_name,
+            disk_size,
+            roman_end: self.roman_end,
+            bookmarks: self.bookmarks.clone(),
+            redacted: self.redacted,
+        });
+
+        if is_done {
+            self.finish_active_optimize_job();
+        } else {
+            self.status_notice = Some(format!(
+                "Optimizing image 0 / {} (Esc to cancel)",
+                total
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Runs a single `OptimizeJob::step()` per event-loop iteration. Returns `true` if more steps remain.
+    pub(super) fn step_optimize_job(&mut self) -> bool {
+        let Some(active) = self.optimize_job.as_mut() else {
+            return false;
+        };
+        if !active.job.is_done() {
+            active.job.step();
+        }
+        let processed = active.job.processed();
+        let total = active.job.total();
+        let done = active.job.is_done();
+        if !done {
+            self.status_notice = Some(format!(
+                "Optimizing image {} / {} (Esc to cancel)",
+                processed, total
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            true
+        } else {
+            self.finish_active_optimize_job();
+            false
+        }
+    }
+
+    /// Cancels an active `OptimizeJob` (`Esc` key), dropping the job and writing nothing.
+    pub(super) fn cancel_optimize_job(&mut self) {
+        if let Some(active) = self.optimize_job.take() {
+            self.status_notice = Some(format!(
+                "Optimize cancelled at image {} / {} (nothing written)",
+                active.job.processed(),
+                active.job.total()
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    pub(super) fn finish_active_optimize_job(&mut self) {
+        let Some(active) = self.optimize_job.take() else {
+            return;
+        };
+        let report = match active.job.finish() {
+            Ok(r) => r,
+            Err(e) => {
+                self.status_notice = Some(format!("Optimize error: {e:#}"));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+        };
+        let orig_len = active.disk_size.max(report.original_len);
+        if report.kept_original {
+            self.status_notice = Some(format!(
+                "Optimize: no size gain ({} image(s) checked); nothing written",
+                report.images_seen
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        let (final_bytes, warning) = match PdfEngine::embed_metadata_in_pdf_bytes(
+            &report.bytes,
+            active.roman_end,
+            &active.bookmarks,
+            active.redacted,
+        ) {
+            Ok(b) => (b, None),
+            Err(e) if active.redacted => {
+                self.status_notice = Some(format!(
+                    "Optimize refused: post-redaction cleanup failed ({e}). Nothing was written."
+                ));
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+            Err(e) => (
+                report.bytes,
+                Some(format!(" (WARNING: metadata not sanitized: {e})")),
+            ),
+        };
+        let new_len = final_bytes.len();
+        match PdfEngine::write_atomic(&active.out_path, &final_bytes) {
+            Ok(()) => {
+                let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
+                let new_mb = (new_len as f64) / (1024.0 * 1024.0);
+                let saved_pct = if orig_len > 0 && new_len < orig_len {
+                    (((orig_len - new_len) as f64 / (orig_len as f64)) * 100.0).round() as u32
+                } else {
+                    0
                 };
-                let new_len = final_bytes.len();
-                let orig_len = disk_size.max(serialized_len);
-                match PdfEngine::write_atomic(&out_path, &final_bytes) {
-                    Ok(()) => {
-                        let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
-                        let new_mb = (new_len as f64) / (1024.0 * 1024.0);
-                        let saved_pct = if orig_len > 0 && new_len < orig_len {
-                            (((orig_len - new_len) as f64 / (orig_len as f64)) * 100.0).round()
-                                as u32
-                        } else {
-                            0
-                        };
-                        self.status_notice = Some(format!(
-                            "Compressed! {:.2} MB -> {:.2} MB (Saved {}%) -> '{}'{}",
-                            orig_mb, new_mb, saved_pct, out_name, warning.unwrap_or_default()
-                        ));
-                    }
-                    Err(e) => {
-                        self.status_notice =
-                            Some(format!("Failed to write compressed PDF '{}': {e}", out_name));
-                    }
-                }
+                self.status_notice = Some(format!(
+                    "Optimized {:.2} MB -> {:.2} MB ({}% smaller; {} image(s) rewritten, {} left as is) -> '{}'{}",
+                    orig_mb,
+                    new_mb,
+                    saved_pct,
+                    report.images_rewritten,
+                    report.images_skipped,
+                    active.out_name,
+                    warning.unwrap_or_default()
+                ));
             }
             Err(e) => {
-                self.status_notice = Some(format!("Compression error: {e}"));
+                self.status_notice = Some(format!("Failed to write '{}': {e}", active.out_name));
             }
         }
         self.update_title_bar();
         self.request_redraw();
+    }
+
+    /// Renders a transient 1-page preview of the current page with the selected `OptimizeOptions`
+    /// directly into `self.cached_page` and drops all temporary buffers immediately (zero permanent RAM).
+    pub(super) fn render_optimize_preview_current_page(
+        &mut self,
+        preset: crate::optimize::OptimizePreset,
+        mode: crate::optimize::ColorMode,
+        clean_scans: bool,
+    ) {
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let total = doc.pages().len();
+        if total == 0 {
+            return;
+        }
+        let page_idx = self.current_page_index.min(total - 1);
+
+        let mut opts = crate::optimize::OptimizeOptions::preset(preset);
+        opts.mode = mode;
+        opts.clean_scans = clean_scans;
+
+        let preview_bytes_res: anyhow::Result<Vec<u8>> = (|| {
+            let mut temp_doc = self.engine.pdfium.create_new_pdf()?;
+            temp_doc
+                .pages_mut()
+                .copy_page_from_document(doc, page_idx, 0)?;
+            let raw_bytes = temp_doc.save_to_bytes()?;
+            drop(temp_doc);
+
+            let mut job = crate::optimize::OptimizeJob::new(raw_bytes.clone(), opts)?;
+            while !job.is_done() {
+                job.step();
+            }
+            let report = job.finish()?;
+            if report.kept_original || report.bytes.is_empty() {
+                Ok(raw_bytes)
+            } else {
+                Ok(report.bytes)
+            }
+        })();
+
+        let preview_bytes = match preview_bytes_res {
+            Ok(b) => b,
+            Err(e) => {
+                self.status_notice = Some(format!("Preview error: {e}"));
+                return;
+            }
+        };
+
+        let Ok(opt_doc) = self.engine.load_pdf_from_bytes_safe(preview_bytes) else {
+            return;
+        };
+
+        let (win_w, win_h, sidebar_w, top_bars_h, status_bar_h) =
+            if let Some(w) = self.window.as_ref() {
+                let sz = w.inner_size();
+                let sf = w.scale_factor();
+                (
+                    sz.width.max(1),
+                    sz.height.max(1),
+                    self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
+                    self.top_bars_height_px(sf).min(sz.height.saturating_sub(32)),
+                    self.status_bar_height_px(sf),
+                )
+            } else {
+                (
+                    1024,
+                    1080,
+                    0,
+                    MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL,
+                    STATUS_BAR_HEIGHT_LOGICAL,
+                )
+            };
+
+        if !matches!(
+            self.view_mode,
+            ViewMode::FitPage | ViewMode::FitWidth | ViewMode::FitTextWidth
+        ) {
+            self.view_mode = ViewMode::FitPage;
+        }
+        let orig_doc = self.doc.replace(opt_doc);
+        let orig_page = self.current_page_index;
+        self.current_page_index = 0;
+        self.invalidate_page_caches();
+        let _ = self.ensure_current_page_rendered(
+            win_w,
+            win_h,
+            sidebar_w,
+            top_bars_h,
+            status_bar_h,
+        );
+        if let Some(c) = self.cached_page.as_mut() {
+            c.page_index = orig_page;
+        }
+        self.current_page_index = orig_page;
+        self.doc = orig_doc;
+    }
+
+    /// Triggers printing (`Ctrl/Cmd+P` or `File -> Print...`) of the current in-memory document.
+    pub(super) fn trigger_print(&mut self) {
+        if self.doc.is_none() || self.total_pages() == 0 {
+            self.status_notice = Some("No open PDF document to print".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+        if self.print_job.is_some() || self.lp_job.is_some() {
+            self.status_notice = Some(
+                "A print job is still running (Esc cancels printing)".to_string(),
+            );
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            let title = self.filename_display();
+            let owner_hwnd = self.window.as_ref().and_then(|w| {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                match w.window_handle().ok()?.as_raw() {
+                    RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
+                    _ => None,
+                }
+            });
+            let total = self.total_pages();
+            match crate::print::show_windows_print_dialog(&title, total, owner_hwnd) {
+                Ok(None) => {
+                    self.status_notice = Some("Print cancelled".to_string());
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("Print error: {e:#}"));
+                }
+                Ok(Some(setup)) => {
+                    let Some(doc) = self.doc.as_ref() else {
+                        return;
+                    };
+                    match crate::print::PagedPrintJob::new(
+                        self.engine,
+                        doc,
+                        &setup.page_indices,
+                        setup.loop_copies,
+                        setup.reported_copies,
+                        self.redacted,
+                        &std::env::temp_dir(),
+                        Box::new(setup.sink),
+                    ) {
+                        Ok(job) => self.start_print_job(job, title),
+                        Err(e) => {
+                            self.status_notice = Some(format!("Print error: {e:#}"));
+                        }
+                    }
+                }
+            }
+            self.update_title_bar();
+            self.request_redraw();
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let (printers, selected_printer) = crate::print::discover_cups_printers();
+            self.input_mode = InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies: 1,
+                range_input: String::new(),
+                fit_to_page: true,
+            };
+            self.status_notice = None;
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    fn print_progress_notice(job: &crate::print::PagedPrintJob) -> String {
+        let (sent, total) = job.progress();
+        format!("Printing page {} / {total} (Esc to cancel)", (sent + 1).min(total))
+    }
+
+    /// Starts sending `job` to the printer, one page per event-loop iteration.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
+    pub(super) fn start_print_job(&mut self, job: crate::print::PagedPrintJob<'a>, title: String) {
+        self.status_notice = Some(Self::print_progress_notice(&job));
+        self.print_job = Some(ActivePrintJob { job, title });
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Renders and sends one page of the active print job. Returns `true` while pages remain.
+    pub(super) fn step_print_job(&mut self) -> bool {
+        let Some(active) = self.print_job.as_mut() else {
+            return false;
+        };
+        let result = active.job.step(self.engine);
+        let running = matches!(result, Ok(true));
+        self.status_notice = Some(match result {
+            Ok(true) => Self::print_progress_notice(&active.job),
+            Ok(false) => format!(
+                "Printed {} page(s) x {} copy/copies of '{}'",
+                active.job.pages_per_copy(),
+                active.job.copies(),
+                active.title
+            ),
+            Err(e) => format!("Print error: {e:#} (printing aborted)"),
+        });
+        if !running {
+            self.print_job = None;
+        }
+        self.update_title_bar();
+        self.request_redraw();
+        running
+    }
+
+    /// Cancels the active print job (`Esc`): the printer document is aborted (`AbortDoc`).
+    pub(super) fn cancel_print_job(&mut self) {
+        if let Some(mut active) = self.print_job.take() {
+            let (sent, total) = active.job.progress();
+            active.job.cancel();
+            self.status_notice = Some(format!(
+                "Printing cancelled after {sent} of {total} page(s)"
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+        }
+    }
+
+    /// Checks the background `lp` submission without waiting. Returns `true` while it runs.
+    pub(super) fn poll_lp_job(&mut self) -> bool {
+        let Some(active) = self.lp_job.as_mut() else {
+            return false;
+        };
+        let Some(result) = active.job.poll() else {
+            return true;
+        };
+        let printer = active.printer.clone();
+        self.lp_job = None;
+        self.status_notice = Some(match result {
+            Ok(out) => {
+                let suffix = if out.job_info.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", out.job_info)
+                };
+                format!(
+                    "Sent {} page(s) x {} copy/copies to printer '{printer}'{suffix}",
+                    out.pages, out.copies
+                )
+            }
+            Err(e) => format!("Print error: {e:#}"),
+        });
+        self.update_title_bar();
+        self.request_redraw();
+        false
     }
 
     pub(super) fn parse_page_range_input(&self, input: &str) -> Option<(u16, u16)> {
@@ -1974,6 +2475,65 @@ impl<'a> PdfViewerApp<'a> {
                 self.restore_pending_session();
                 return;
             }
+            InputMode::OptimizePrompt {
+                preset,
+                mode,
+                clean_scans,
+                previewing,
+            } => {
+                if previewing {
+                    self.invalidate_page_caches();
+                }
+                let mut opts = crate::optimize::OptimizeOptions::preset(preset);
+                opts.mode = mode;
+                opts.clean_scans = clean_scans;
+                self.start_optimize_job(opts);
+                return;
+            }
+            InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies,
+                range_input,
+                fit_to_page,
+            } => {
+                let Some(printer) = printers.get(selected_printer).cloned() else {
+                    self.status_notice = Some(
+                        "Print failed: no CUPS printers found via 'lpstat -p -d'".to_string(),
+                    );
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                };
+                let title = self.filename_display();
+                let Some(doc) = self.doc.as_ref() else {
+                    return;
+                };
+                let req = crate::print::CupsPrintRequest {
+                    printer: &printer,
+                    copies,
+                    range_input: &range_input,
+                    fit_to_page,
+                    title: &title,
+                };
+                match crate::print::start_cups_print_with(
+                    self.engine,
+                    doc,
+                    &req,
+                    self.redacted,
+                    &self.lp_program,
+                    &std::env::temp_dir(),
+                ) {
+                    Ok(job) => {
+                        self.status_notice =
+                            Some(format!("Sending to printer '{printer}'..."));
+                        self.lp_job = Some(ActiveLpJob { job, printer });
+                    }
+                    Err(e) => {
+                        self.status_notice = Some(format!("Print error: {e:#}"));
+                    }
+                }
+            }
         }
         self.update_title_bar();
         self.request_redraw();
@@ -1984,12 +2544,19 @@ impl<'a> PdfViewerApp<'a> {
         if self.input_mode != InputMode::Normal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    if let InputMode::PasswordPrompt {
-                        mut password_input, ..
-                    } = std::mem::replace(&mut self.input_mode, InputMode::Normal)
-                    {
-                        password_input.clear();
-                        password_input.shrink_to_fit();
+                    match std::mem::replace(&mut self.input_mode, InputMode::Normal) {
+                        InputMode::PasswordPrompt {
+                            mut password_input, ..
+                        } => {
+                            password_input.clear();
+                            password_input.shrink_to_fit();
+                        }
+                        InputMode::OptimizePrompt {
+                            previewing: true, ..
+                        } => {
+                            self.invalidate_page_caches();
+                        }
+                        _ => {}
                     }
                     self.pending_restore_tabs.clear();
                     self.status_notice = Some("Cancelled".to_string());
@@ -2024,12 +2591,44 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::PasswordPrompt { password_input, .. } => {
                             password_input.pop();
                         }
+                        InputMode::PrintPrompt { range_input, .. } => {
+                            range_input.pop();
+                        }
                         InputMode::ConfirmExternalUrl { .. }
                         | InputMode::RestoreSessionPrompt { .. }
+                        | InputMode::OptimizePrompt { .. }
                         | InputMode::Normal => {}
                     }
                     self.update_title_bar();
                     self.request_redraw();
+                }
+                Key::Named(NamedKey::Tab) => {
+                    if let InputMode::PrintPrompt {
+                        printers,
+                        selected_printer,
+                        ..
+                    } = &mut self.input_mode
+                    {
+                        if !printers.is_empty() {
+                            *selected_printer = (*selected_printer + 1) % printers.len();
+                        }
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    if let InputMode::PrintPrompt { copies, .. } = &mut self.input_mode {
+                        *copies = (*copies + 1).min(99);
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if let InputMode::PrintPrompt { copies, .. } = &mut self.input_mode {
+                        *copies = copies.saturating_sub(1).max(1);
+                        self.update_title_bar();
+                        self.request_redraw();
+                    }
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.handle_prompt_submission();
@@ -2054,6 +2653,11 @@ impl<'a> PdfViewerApp<'a> {
 
                     if !typed.is_empty() {
                         let mut auto_submit_clear = false;
+                        let mut opt_preview_action: Option<Option<(
+                            crate::optimize::OptimizePreset,
+                            crate::optimize::ColorMode,
+                            bool,
+                        )>> = None;
                         match &mut self.input_mode {
                             InputMode::SearchText { query_input } => {
                                 query_input.push_str(&typed);
@@ -2128,7 +2732,107 @@ impl<'a> PdfViewerApp<'a> {
                                     self.pending_restore_tabs.clear();
                                 }
                             }
+                            InputMode::OptimizePrompt {
+                                preset,
+                                mode,
+                                clean_scans,
+                                previewing,
+                            } => {
+                                let mut changed_opts = false;
+                                let mut toggled_preview = false;
+                                for ch in typed.chars() {
+                                    match ch {
+                                        '1' => {
+                                            *preset = crate::optimize::OptimizePreset::Smaller;
+                                            changed_opts = true;
+                                        }
+                                        '2' => {
+                                            *preset = crate::optimize::OptimizePreset::Balanced;
+                                            changed_opts = true;
+                                        }
+                                        '3' => {
+                                            *preset = crate::optimize::OptimizePreset::Print;
+                                            changed_opts = true;
+                                        }
+                                        'c' | 'C' => {
+                                            *mode = crate::optimize::ColorMode::Color;
+                                            changed_opts = true;
+                                        }
+                                        'g' | 'G' => {
+                                            *mode = crate::optimize::ColorMode::Gray;
+                                            changed_opts = true;
+                                        }
+                                        'b' | 'B' => {
+                                            *mode = crate::optimize::ColorMode::BlackWhite;
+                                            changed_opts = true;
+                                        }
+                                        's' | 'S' | ' ' => {
+                                            *clean_scans = !*clean_scans;
+                                            changed_opts = true;
+                                        }
+                                        'p' | 'P' => {
+                                            *previewing = !*previewing;
+                                            toggled_preview = true;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if toggled_preview || (changed_opts && *previewing) {
+                                    if *previewing {
+                                        opt_preview_action =
+                                            Some(Some((*preset, *mode, *clean_scans)));
+                                    } else {
+                                        opt_preview_action = Some(None);
+                                    }
+                                }
+                            }
+                            InputMode::PrintPrompt {
+                                copies,
+                                range_input,
+                                fit_to_page,
+                                ..
+                            } => {
+                                for c in typed.chars() {
+                                    match c {
+                                        'f' | 'F' => {
+                                            *fit_to_page = !*fit_to_page;
+                                        }
+                                        '+' | '=' | ']' => {
+                                            *copies = (*copies + 1).min(99);
+                                        }
+                                        '[' => {
+                                            *copies = copies.saturating_sub(1).max(1);
+                                        }
+                                        '-' => {
+                                            if range_input.is_empty() {
+                                                *copies = copies.saturating_sub(1).max(1);
+                                            } else {
+                                                range_input.push('-');
+                                            }
+                                        }
+                                        _ if c.is_ascii_digit()
+                                            || c == ','
+                                            || c == ' '
+                                            || c.eq_ignore_ascii_case(&'a')
+                                            || c.eq_ignore_ascii_case(&'l') =>
+                                        {
+                                            range_input.push(c);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             InputMode::ConfirmExternalUrl { .. } | InputMode::Normal => {}
+                        }
+                        if let Some(action) = opt_preview_action {
+                            match action {
+                                Some((p, m, cs)) => {
+                                    self.render_optimize_preview_current_page(p, m, cs);
+                                }
+                                None => {
+                                    self.invalidate_page_caches();
+                                }
+                            }
                         }
                         if auto_submit_clear {
                             self.handle_prompt_submission();
@@ -2162,6 +2866,9 @@ impl<'a> PdfViewerApp<'a> {
                     return;
                 } else if s.eq_ignore_ascii_case("g") {
                     self.jump_to_next_search_match();
+                    return;
+                } else if s.eq_ignore_ascii_case("p") {
+                    self.trigger_print();
                     return;
                 } else if s.eq_ignore_ascii_case("w") {
                     if self.tabs.len() > 1 {
@@ -2236,6 +2943,10 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.incremental_search.is_some() {
                     self.cancel_incremental_search();
+                } else if self.optimize_job.is_some() {
+                    self.cancel_optimize_job();
+                } else if self.print_job.is_some() {
+                    self.cancel_print_job();
                 } else if self.is_presentation || self.is_fullscreen {
                     self.exit_presentation_or_fullscreen();
                 } else if !self.selected_text_rects.is_empty() {
@@ -2492,13 +3203,32 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_single_instance_listener();
         self.poll_auto_reload_if_due();
+        if self.optimize_job.is_some() {
+            let still_running = self.step_optimize_job();
+            if still_running {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+            }
+        }
+        // One printed page per iteration while a print job runs.
+        let printing = self.print_job.is_some() && self.step_print_job();
+        if printing {
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
+        }
+        let sending_to_lp = self.lp_job.is_some() && self.poll_lp_job();
         if self.incremental_search.is_some() {
             let still_searching = self.step_incremental_search(Duration::from_millis(8));
             if still_searching {
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
-        } else if self.single_instance_listener.is_some()
-            || (self.window_focused && self.doc.is_some())
+        } else if sending_to_lp && self.optimize_job.is_none() && !printing {
+            // `lp` is still running: check it again soon.
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(50),
+            ));
+        } else if self.optimize_job.is_none()
+            && !printing
+            && (self.single_instance_listener.is_some()
+                || (self.window_focused && self.doc.is_some()))
         {
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
                 Instant::now() + Duration::from_millis(120),
@@ -3344,5 +4074,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             }
             _ => {}
         }
+    }
+}
+
+/// Whether `a` and `b` name the same file (compared after resolving links and `..`).
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
     }
 }

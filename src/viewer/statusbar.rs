@@ -86,6 +86,57 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::RestoreSessionPrompt { tab_count } => Some(format!(
                 "RESTORE PREVIOUS SESSION ({tab_count} saved tab(s))? Press Enter or Y to restore, Esc or N to dismiss"
             )),
+            InputMode::OptimizePrompt {
+                preset,
+                mode,
+                clean_scans,
+                previewing,
+            } => {
+                let preset_lbl = match preset {
+                    crate::optimize::OptimizePreset::Smaller => "Smaller(150dpi)",
+                    crate::optimize::OptimizePreset::Balanced => "Balanced(200dpi)",
+                    crate::optimize::OptimizePreset::Print => "Print(300dpi)",
+                };
+                let mode_lbl = match mode {
+                    crate::optimize::ColorMode::Color => "Color",
+                    crate::optimize::ColorMode::Gray => "Gray",
+                    crate::optimize::ColorMode::BlackWhite => {
+                        "B/W (signatures will look jagged)"
+                    }
+                };
+                let clean_lbl = if *clean_scans { "ON" } else { "OFF" };
+                let prev_lbl = if *previewing {
+                    "[P]Preview:ON"
+                } else {
+                    "[P]Preview"
+                };
+                Some(format!(
+                    "OPTIMIZE: [1/2/3]{preset_lbl} [C/G/B]{mode_lbl} [S]Clean:{clean_lbl} {prev_lbl} | Enter=Run Esc=Cancel"
+                ))
+            }
+            InputMode::PrintPrompt {
+                printers,
+                selected_printer,
+                copies,
+                range_input,
+                fit_to_page,
+            } => {
+                let fit_lbl = if *fit_to_page { "ON" } else { "OFF" };
+                let printer_lbl = printers
+                    .get(*selected_printer)
+                    .map(|s| s.as_str())
+                    .unwrap_or("(no printer)");
+                let range_lbl = if range_input.is_empty() {
+                    "all"
+                } else {
+                    range_input.as_str()
+                };
+                Some(format!(
+                    "PRINT: Printer [Tab]: {printer_lbl} ({}/{}) | Copies [+/-]: {copies} | [F]Fit:{fit_lbl} | Pages (e.g. 1-3,5): {range_lbl}_ | Enter=Print Esc=Cancel",
+                    if printers.is_empty() { 0 } else { selected_printer + 1 },
+                    printers.len()
+                ))
+            }
         }
     }
 

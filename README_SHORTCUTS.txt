@@ -67,6 +67,10 @@ NAVIGATION, LINKS, SELECT/COPY & SHORTCUTS
   B                               : Toggle Left Bookmark Sidebar (240px panel)
   L                               : Import Hierarchical Bookmarks from `.txt` file
   Cmd+Z (macOS) / Ctrl+Z (Win)    : Undo last structural or page edit (up to 8 steps)
+  Cmd+P (macOS) / Ctrl+P (Win)    : Print (also File -> Print...). Windows: print dialog,
+                                    then Esc cancels while pages are being sent. macOS:
+                                    print bar - Tab printer, +/- copies, F fit-to-page,
+                                    type pages (e.g. 1-3,5), Enter prints.
   ? or F1                         : Toggle in-window Keyboard & Mouse Help Overlay
   Esc                             : Exit Fullscreen/Presentation, Cancel Search/Prompt
 
@@ -124,7 +128,9 @@ BATCH COMBINE & DOCUMENT STRUCTURAL TOOLS
   R       : Rotate current (or hovered thumbnail) page 90° clockwise.
   D       : Delete current page.
   X       : Split / Extract Page Range (e.g. `1-3` or `2,4,6`) into a new PDF file.
-  Z       : Compress & Optimize PDF (`<filename>_compressed.pdf`).
+  Z       : Optimize PDF: downsample/recompress images, clean scans (`<filename>_optimized.pdf`).
+            Tools -> Optimize... : choose preset (1/2/3), colour mode (C/G/B),
+            clean scans (S) and preview (P) in the bottom bar; Esc cancels.
   O       : Open PDF File in a new tab.
   S       : Save Modified PDF (sanitizes metadata and embeds `/PageLabels` &
             hierarchical `/Outlines` bookmarks).

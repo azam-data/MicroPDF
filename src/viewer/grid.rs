@@ -6,11 +6,8 @@ use super::render::{draw_bitmap_str_8x8, draw_rect_border, fill_rect_clipped};
 impl<'a> PdfViewerApp<'a> {
     /// Renders a single 140x198 thumbnail for `page_idx` into `self.thumbnail_cache` if not already cached.
     pub(super) fn ensure_thumbnail_rendered(&mut self, page_idx: u16) -> Result<()> {
-        let rot = self.page_rotation_degrees(page_idx);
-        if let Some(existing) = self.thumbnail_cache.get(&page_idx) {
-            if existing.rotation_deg == rot {
-                return Ok(());
-            }
+        if self.thumbnail_cache.contains_key(&page_idx) {
+            return Ok(());
         }
 
         let Some(doc) = self.doc.as_ref() else {
@@ -24,19 +21,19 @@ impl<'a> PdfViewerApp<'a> {
         let tw = ((pw * scale).round() as i32).max(1);
         let th = ((ph * scale).round() as i32).max(1);
 
-        let reused = self
-            .thumbnail_cache
-            .remove(&page_idx)
-            .map(|e| e.pixels)
-            .unwrap_or_default();
-        let pixels = self.render_page_into_u32_vec(&page, tw, th, false, reused)?;
+        let reused = std::mem::take(&mut self.spare_pixel_buf);
+        let mut pixels = self.render_page_into_u32_vec(&page, tw, th, false, reused)?;
+        drop(page);
+        let max_thumb_pixels = (THUMB_W as usize) * (THUMB_H as usize);
+        if pixels.capacity() > max_thumb_pixels {
+            pixels.shrink_to_fit();
+        }
 
         self.thumbnail_cache.insert(
             page_idx,
             ThumbnailEntry {
                 width: tw as u32,
                 height: th as u32,
-                rotation_deg: rot,
                 pixels,
             },
         );
@@ -80,6 +77,7 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
+        let mut evicted_bufs: Vec<Vec<u32>> = Vec::new();
         if keep_min <= keep_max {
             let count = (keep_max - keep_min + 1) as usize;
             if count > MAX_THUMB_CACHE_ENTRIES {
@@ -92,15 +90,31 @@ impl<'a> PdfViewerApp<'a> {
                 keep_min = mid.saturating_sub(half);
                 keep_max = (keep_min + (MAX_THUMB_CACHE_ENTRIES as u16) - 1).min(total - 1);
             }
-            self.thumbnail_cache
-                .retain(|&idx, _| idx >= keep_min && idx <= keep_max);
+            let out_of_range: Vec<u16> = self
+                .thumbnail_cache
+                .keys()
+                .copied()
+                .filter(|&idx| idx < keep_min || idx > keep_max)
+                .collect();
+            for k in out_of_range {
+                if let Some(entry) = self.thumbnail_cache.remove(&k) {
+                    evicted_bufs.push(entry.pixels);
+                }
+            }
         } else {
             self.thumbnail_cache.clear();
         }
 
         for idx in visible_indices {
             if idx >= keep_min && idx <= keep_max {
-                let _ = self.ensure_thumbnail_rendered(idx);
+                if !self.thumbnail_cache.contains_key(&idx) {
+                    if self.spare_pixel_buf.is_empty() {
+                        if let Some(buf) = evicted_bufs.pop() {
+                            self.spare_pixel_buf = buf;
+                        }
+                    }
+                    let _ = self.ensure_thumbnail_rendered(idx);
+                }
             }
         }
 

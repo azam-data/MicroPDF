@@ -103,6 +103,112 @@ pub struct PdfEngine {
     pub pdfium: Pdfium,
 }
 
+/// The open PDF file that PDFium reads blocks from on demand (see `load_pdf_with_password`).
+///
+/// PDFium keeps the byte offsets it parsed at open time and asks for blocks at those offsets for
+/// the lifetime of the document. If another program rewrites the file in place (truncate and
+/// write, as `cp` does), those offsets point into a different file: a same-size replacement
+/// would make old pages silently show the new file's content. So every block read is checked
+/// against the length and modification time recorded at open, and refused once either changes.
+/// pdfium-render turns the error into a failed read, PDFium fails that page load, the viewer
+/// reports it in the status bar, and auto-reload then opens the new file.
+///
+/// Each block is read completely or not at all: pdfium-render calls `read` once and would treat
+/// a short read (a truncated file) as success with a partly filled buffer.
+///
+/// A file replaced by rename (an atomic save) or deleted is unaffected: the handle still refers
+/// to the original file, whose bytes stay readable and unchanged until the handle is closed.
+pub(crate) struct ChangeGuardedFile {
+    file: std::fs::File,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+impl ChangeGuardedFile {
+    pub(crate) fn new(file: std::fs::File, _path: &Path) -> std::io::Result<Self> {
+        let meta = file.metadata()?;
+        #[cfg(test)]
+        let path = open_file_registry::opened(_path);
+        Ok(Self {
+            len: meta.len(),
+            modified: meta.modified().ok(),
+            file,
+            #[cfg(test)]
+            path,
+        })
+    }
+
+    fn check_unchanged(&self) -> std::io::Result<()> {
+        let meta = self.file.metadata()?;
+        if meta.len() != self.len || meta.modified().ok() != self.modified {
+            return Err(std::io::Error::other(
+                "the PDF file was changed on disk after it was opened",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for ChangeGuardedFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read_exact(buf)?;
+        // Checked after the read: if nothing changed by now, the bytes just read are the
+        // original ones. A change during the read moves the length or mtime and is caught here.
+        self.check_unchanged()?;
+        Ok(buf.len())
+    }
+}
+
+#[cfg(test)]
+impl Drop for ChangeGuardedFile {
+    fn drop(&mut self) {
+        open_file_registry::closed(&self.path);
+    }
+}
+
+/// Test-only record of which files this process holds open through `ChangeGuardedFile`, so
+/// tests can simulate file systems that refuse to replace a file while it is open (FAT32,
+/// exFAT, some network shares, Windows without POSIX rename semantics).
+#[cfg(test)]
+pub(crate) mod open_file_registry {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static OPEN: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+    fn key(path: &Path) -> PathBuf {
+        std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    }
+
+    /// Records `path` as open; returns the key to pass to `closed`.
+    pub(crate) fn opened(path: &Path) -> PathBuf {
+        let k = key(path);
+        OPEN.lock().unwrap_or_else(|e| e.into_inner()).push(k.clone());
+        k
+    }
+
+    /// `opened_key` as returned by `opened` (the file may have been renamed or deleted since).
+    pub(crate) fn closed(opened_key: &Path) {
+        let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = open.iter().position(|p| p == opened_key) {
+            open.swap_remove(i);
+        }
+    }
+
+    pub(crate) fn is_open(path: &Path) -> bool {
+        let k = key(path);
+        OPEN.lock().unwrap_or_else(|e| e.into_inner()).contains(&k)
+    }
+}
+
+impl std::io::Seek for ChangeGuardedFile {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
 #[allow(dead_code)]
 impl PdfEngine {
     /// Initializes PDFium from the executable's own directory only.
@@ -159,9 +265,11 @@ impl PdfEngine {
 
     /// Unified, safe PDF loader that never passes file paths to PDFium's C loader.
     /// 1. Cleans/canonicalizes `path` (stripping any trailing newlines or surrounding quotes).
-    /// 2. Reads the entire file into memory via `std::fs::read`.
-    /// 3. Strips leading junk/BOM bytes before `%PDF-` (within the first 1 KB) in place.
-    /// 4. Hands the single buffer to PDFium (v1.1: no `bytes.clone()`, so peak RAM is 1x file size).
+    /// 2. Normal case: keeps the file open and lets PDFium read blocks on demand
+    ///    (`FPDF_LoadCustomDocument` via `load_pdf_from_reader`) through a `ChangeGuardedFile`,
+    ///    so the file is never held in RAM.
+    /// 3. Leading junk/BOM before `%PDF-`, or a password: reads the whole file, strips the junk
+    ///    in place and hands that single buffer to PDFium.
     pub fn load_pdf_safe<'a>(&'a self, path: &Path) -> Result<PdfDocument<'a>> {
         self.load_pdf_with_password(path, None)
     }
@@ -173,6 +281,8 @@ impl PdfEngine {
         path: &Path,
         password: Option<&str>,
     ) -> Result<PdfDocument<'a>> {
+        use std::io::{Read, Seek, SeekFrom};
+
         let cleaned_path = if let Some(raw_str) = path.to_str() {
             let trimmed = raw_str
                 .trim_matches(|c: char| c == '\n' || c == '\r' || c == '"' || c == '\'');
@@ -183,13 +293,47 @@ impl PdfEngine {
 
         let resolved_path = std::fs::canonicalize(&cleaned_path).unwrap_or(cleaned_path);
 
-        let mut bytes = std::fs::read(&resolved_path)
+        let mut file = std::fs::File::open(&resolved_path)
             .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
-
-        if bytes.is_empty() {
+        let file_len = file
+            .metadata()
+            .with_context(|| format!("FS Error reading metadata {:?}", resolved_path))?
+            .len();
+        if file_len == 0 {
             anyhow::bail!("FS Error: file {:?} is empty (0 bytes)", resolved_path);
         }
 
+        let mut head = [0u8; 1024];
+        let n = file
+            .read(&mut head)
+            .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
+        let junk_offset = head[..n]
+            .windows(5)
+            .position(|w| w == b"%PDF-")
+            .unwrap_or(0);
+
+        if junk_offset == 0 && password.is_none() {
+            file.seek(SeekFrom::Start(0))
+                .with_context(|| format!("FS Error seeking {:?}", resolved_path))?;
+            let reader = ChangeGuardedFile::new(file, &resolved_path)
+                .with_context(|| format!("FS Error reading metadata {:?}", resolved_path))?;
+            match self.pdfium.load_pdf_from_reader(reader, None) {
+                Ok(doc) => return Ok(doc),
+                Err(PdfiumError::PdfiumLibraryInternalError(
+                    PdfiumInternalError::PasswordError,
+                )) => {
+                    return Err(anyhow::Error::new(PasswordRequiredError))
+                        .with_context(|| format!("Could not open {:?}", resolved_path));
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!("PDFium could not parse the document: {e:?}"))
+                        .with_context(|| format!("Could not open {:?}", resolved_path));
+                }
+            }
+        }
+
+        let mut bytes = std::fs::read(&resolved_path)
+            .with_context(|| format!("FS Error reading {:?}", resolved_path))?;
         Self::strip_leading_junk(&mut bytes);
         self.load_pdf_from_bytes_with_password(bytes, password)
             .with_context(|| format!("Could not open {:?}", resolved_path))
@@ -232,22 +376,67 @@ impl PdfEngine {
         }
     }
 
-    /// Writes `bytes` to `path` atomically: write a sibling temp file, flush it to disk, then
-    /// rename over the target. A crash or full disk mid-save can no longer leave a truncated PDF.
-    pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-        use std::io::Write;
-        let file_name = path
-            .file_name()
+    /// Whether `page` has form-field widgets. PDFium draws those only through `FPDF_FFLDraw`
+    /// (which the full-page render path uses); matrix renders such as zoom tiles and print
+    /// strips skip them, so those render from `flattened_page_copy` instead.
+    pub fn page_has_form_widgets(page: &PdfPage) -> bool {
+        page.annotations()
+            .iter()
+            .any(|a| a.annotation_type() == PdfPageAnnotationType::Widget)
+    }
+
+    /// A new one-page document holding a copy of page `page_idx` of `doc` with its form fields
+    /// and annotations flattened into the page content, so matrix renders show them as they
+    /// appear on screen. `doc` itself is never modified.
+    pub fn flattened_page_copy<'e>(&'e self, doc: &PdfDocument, page_idx: u16) -> Result<PdfDocument<'e>> {
+        let mut copy = self
+            .pdfium
+            .create_new_pdf()
+            .context("Failed to create a copy of a form page")?;
+        copy.pages_mut()
+            .copy_page_from_document(doc, page_idx, 0)
+            .with_context(|| format!("Failed to copy page {}", page_idx + 1))?;
+        let mut page = copy.pages().get(0).context("Page copy is empty")?;
+        page.flatten()
+            .with_context(|| format!("Failed to flatten form fields of page {}", page_idx + 1))?;
+        drop(page);
+        Ok(copy)
+    }
+
+    /// The temporary file a save of `path` is written to before it replaces `path`:
+    /// `<stem>.micropdf-save.pdf` in the same folder (same drive, so the rename is atomic).
+    /// Visible and ending in `.pdf`, because when the final rename fails it is left in place as
+    /// the user's saved copy.
+    pub fn save_temp_path(path: &Path) -> PathBuf {
+        let stem = path
+            .file_stem()
             .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "output.pdf".to_string());
-        let tmp = path.with_file_name(format!(".{file_name}.micropdf-tmp"));
-        {
-            let mut f = std::fs::File::create(&tmp)
-                .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
-            f.write_all(bytes)
-                .and_then(|_| f.sync_all())
-                .with_context(|| format!("Failed to write temp file {:?}", tmp))?;
+            .unwrap_or_else(|| "output".to_string());
+        path.with_file_name(format!("{stem}.micropdf-save.pdf"))
+    }
+
+    /// Writes `bytes` to `save_temp_path(path)` and flushes it to disk. On failure the partial
+    /// temp file is removed. Returns the temp path.
+    pub fn write_temp_next_to(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
+        use std::io::Write;
+        let tmp = Self::save_temp_path(path);
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create temp file {:?}", tmp))?;
+        if let Err(e) = f.write_all(bytes).and_then(|_| f.sync_all()) {
+            drop(f);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("Failed to write temp file {:?}", tmp));
         }
+        Ok(tmp)
+    }
+
+    /// Writes `bytes` to `path` atomically: write a sibling temp file, flush it to disk, then
+    /// rename over the target. A crash or full disk mid-save can never leave a truncated file:
+    /// if the rename fails, the temp file is removed and `path` is left exactly as it was.
+    /// (Saving over a document the viewer has open goes through `save_active_doc_to`, which
+    /// closes the open handle and retries before giving up.)
+    pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+        let tmp = Self::write_temp_next_to(path, bytes)?;
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e).with_context(|| format!("Failed to replace {:?}", path));
@@ -401,10 +590,23 @@ impl PdfEngine {
         0
     }
 
-    pub fn read_page_labels_roman_end_from_path(path: &Path) -> usize {
-        std::fs::read(path)
-            .map(|b| Self::read_page_labels_roman_end(&b))
-            .unwrap_or(0)
+    /// Number of leading pages labelled i, ii, iii, ... read through PDFium from the already
+    /// open document. v1.2.1: replaces `read_page_labels_roman_end_from_path`, which read and
+    /// fully parsed the whole file a second time with lopdf on every open and auto-reload.
+    /// Like the lopdf version, returns 0 when there is no roman front matter or when the whole
+    /// document is roman-numbered.
+    pub fn read_page_labels_roman_end_from_doc(doc: &PdfDocument) -> usize {
+        let total = doc.pages().len();
+        let mut count: u16 = 0;
+        while count < total {
+            let Ok(page) = doc.pages().get(count) else { break };
+            let expected = Self::to_roman(count + 1);
+            if page.label() != Some(expected.as_str()) {
+                break;
+            }
+            count += 1;
+        }
+        if count == total { 0 } else { count as usize }
     }
 
     /// Parses hierarchical bookmarks from a `--` delimited `.txt` string (`Serial -- Title -- LogicalPage`),
@@ -738,11 +940,31 @@ impl PdfEngine {
         Self::write_atomic(output_path.as_ref(), &bytes)
     }
 
-    /// Saves `doc` with `/PageLabels`, `/Outlines` and sanitized metadata.
+    /// Serializes `doc` with `/PageLabels`, `/Outlines` and sanitized metadata.
     ///
-    /// Returns `Ok(None)` on a clean save, or `Ok(Some(warning))` when the file was written but
-    /// metadata could not be sanitized. When `redacted` is true the save is refused instead of
-    /// writing a file that might still contain redacted content.
+    /// Returns the bytes plus `Some(warning)` when metadata could not be sanitized (the raw
+    /// bytes are returned then). When `redacted` is true that case is an error instead, so a file
+    /// that might still contain redacted content is never produced.
+    pub fn serialize_doc_with_metadata(
+        doc: &PdfDocument,
+        roman_end: usize,
+        bookmarks: &[Bookmark],
+        redacted: bool,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let raw_bytes = doc
+            .save_to_bytes()
+            .context("Failed to serialize PDF document to bytes")?;
+        match Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks, redacted) {
+            Ok(final_bytes) => Ok((final_bytes, None)),
+            Err(e) if redacted => Err(e.context(
+                "Save refused: post-redaction cleanup failed, nothing was written",
+            )),
+            Err(e) => Ok((raw_bytes, Some(format!("metadata was NOT sanitized ({e})")))),
+        }
+    }
+
+    /// Saves `doc` with `/PageLabels`, `/Outlines` and sanitized metadata (see
+    /// `serialize_doc_with_metadata`), written with `write_atomic`.
     pub fn save_doc_with_metadata<P: AsRef<Path>>(
         doc: &PdfDocument,
         output_path: P,
@@ -750,22 +972,10 @@ impl PdfEngine {
         bookmarks: &[Bookmark],
         redacted: bool,
     ) -> Result<Option<String>> {
-        let raw_bytes = doc
-            .save_to_bytes()
-            .context("Failed to serialize PDF document to bytes")?;
-        match Self::embed_metadata_in_pdf_bytes(&raw_bytes, roman_end, bookmarks, redacted) {
-            Ok(final_bytes) => {
-                Self::write_atomic(output_path.as_ref(), &final_bytes)?;
-                Ok(None)
-            }
-            Err(e) if redacted => Err(e.context(
-                "Save refused: post-redaction cleanup failed, nothing was written",
-            )),
-            Err(e) => {
-                Self::write_atomic(output_path.as_ref(), &raw_bytes)?;
-                Ok(Some(format!("metadata was NOT sanitized ({e})")))
-            }
-        }
+        let (bytes, warning) =
+            Self::serialize_doc_with_metadata(doc, roman_end, bookmarks, redacted)?;
+        Self::write_atomic(output_path.as_ref(), &bytes)?;
+        Ok(warning)
     }
 
     /// Sidecar file path (`<pdf_filename>.bookmarks.txt`) used to persist user bookmark edits.
@@ -1658,160 +1868,6 @@ impl PdfEngine {
         Ok((best_bytes, orig_len, new_len))
     }
 
-    /// Converts a specific page (`page_index`, 0-based) to 8-bit grayscale (`[BW]`):
-    /// 1. Converts all text, path fill, stroke, and annotation RGB colors on `page_index` to
-    ///    8-bit grayscale luminance (`Y = (0.299*R + 0.587*G + 0.114*B) as u8`, `(Y, Y, Y)`).
-    /// 2. Converts embedded raster images on that page to 8-bit grayscale (`/DeviceGray` / 1-channel luma)
-    ///    and compresses their streams so color pages shrink in byte size while keeping vector text razor-sharp.
-    pub fn convert_page_to_bw(&self, doc_bytes: &[u8], page_index: u16) -> Result<Vec<u8>> {
-        let mut doc = self.load_pdf_from_bytes_safe(doc_bytes.to_vec())?;
-        let to_gray = |c: PdfColor| -> PdfColor {
-            let y = (0.299 * (c.red() as f32)
-                + 0.587 * (c.green() as f32)
-                + 0.114 * (c.blue() as f32))
-                .round()
-                .clamp(0.0, 255.0) as u8;
-            PdfColor::new(y, y, y, c.alpha())
-        };
-
-        {
-            let mut page = doc
-                .pages_mut()
-                .get(page_index)
-                .context("Page index out of bounds for BW conversion")?;
-            let prev_strategy = page.content_regeneration_strategy();
-            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
-
-            let obj_count = page.objects().len();
-            for i in 0..obj_count {
-                if let Ok(mut obj) = page.objects_mut().get(i) {
-                    if let Ok(fc) = obj.fill_color() {
-                        let _ = obj.set_fill_color(to_gray(fc));
-                    }
-                    if let Ok(sc) = obj.stroke_color() {
-                        let _ = obj.set_stroke_color(to_gray(sc));
-                    }
-                }
-            }
-
-            let annot_count = page.annotations().len();
-            for a_idx in 0..annot_count {
-                if let Ok(mut annot) = page.annotations_mut().get(a_idx) {
-                    if let Ok(fc) = annot.fill_color() {
-                        let _ = annot.set_fill_color(to_gray(fc));
-                    }
-                    if let Ok(sc) = annot.stroke_color() {
-                        let _ = annot.set_stroke_color(to_gray(sc));
-                    }
-                }
-            }
-
-            let _ = page.regenerate_content();
-            page.set_content_regeneration_strategy(prev_strategy);
-        }
-
-        let step1_bytes = doc
-            .save_to_bytes()
-            .context("Failed to serialize PDF after PDFium BW conversion")?;
-
-        // Pass through lopdf to convert any remaining /DeviceRGB image streams on that page to /DeviceGray and compress
-        if let Ok(mut ldoc) = lopdf::Document::load_mem(&step1_bytes) {
-            let page_num_1based = (page_index as u32) + 1;
-            if let Some(&page_obj_id) = ldoc.get_pages().get(&page_num_1based) {
-                // Collect XObject image ObjectIds referenced by this page
-                let mut image_ids = Vec::new();
-                if let Ok(page_dict) = ldoc.get_object(page_obj_id).and_then(|o| o.as_dict()) {
-                    let res_dict = page_dict
-                        .get(b"Resources")
-                        .ok()
-                        .and_then(|r| match r {
-                            lopdf::Object::Reference(id) => {
-                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
-                            }
-                            lopdf::Object::Dictionary(d) => Some(d),
-                            _ => None,
-                        });
-                    if let Some(res) = res_dict {
-                        let xobj_dict = res.get(b"XObject").ok().and_then(|x| match x {
-                            lopdf::Object::Reference(id) => {
-                                ldoc.get_object(*id).and_then(|o| o.as_dict()).ok()
-                            }
-                            lopdf::Object::Dictionary(d) => Some(d),
-                            _ => None,
-                        });
-                        if let Some(xobjs) = xobj_dict {
-                            for (_k, val) in xobjs.iter() {
-                                if let Ok(id) = val.as_reference() {
-                                    image_ids.push(id);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                for img_id in image_ids {
-                    if let Ok(lopdf::Object::Stream(stream)) =
-                        ldoc.get_object_mut(img_id)
-                    {
-                        let is_image = stream
-                            .dict
-                            .get(b"Subtype")
-                            .ok()
-                            .and_then(|s| s.as_name_str().ok())
-                            .map(|n| n == "Image")
-                            .unwrap_or(false);
-                        let is_rgb = stream
-                            .dict
-                            .get(b"ColorSpace")
-                            .ok()
-                            .and_then(|s| s.as_name_str().ok())
-                            .map(|n| n == "DeviceRGB")
-                            .unwrap_or(false);
-                        let bpc = stream
-                            .dict
-                            .get(b"BitsPerComponent")
-                            .ok()
-                            .and_then(|b| b.as_i64().ok())
-                            .unwrap_or(8);
-                        if is_image && is_rgb && bpc == 8 {
-                            if let Ok(raw_pixels) = stream.decompressed_content() {
-                                if raw_pixels.len() >= 3 && raw_pixels.len() % 3 == 0 {
-                                    let mut gray_pixels = Vec::with_capacity(raw_pixels.len() / 3);
-                                    for rgb in raw_pixels.chunks_exact(3) {
-                                        let y = ((77 * (rgb[0] as u32)
-                                            + 150 * (rgb[1] as u32)
-                                            + 29 * (rgb[2] as u32))
-                                            >> 8)
-                                            as u8;
-                                        gray_pixels.push(y);
-                                    }
-                                    stream.set_plain_content(gray_pixels);
-                                    stream.dict.set(
-                                        "ColorSpace",
-                                        lopdf::Object::Name(b"DeviceGray".to_vec()),
-                                    );
-                                    let _ = stream.compress();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            ldoc.prune_objects();
-            ldoc.compress();
-            let mut out = Vec::with_capacity(step1_bytes.len());
-            if ldoc.save_to(&mut out).is_ok()
-                && !out.is_empty()
-                && self.load_pdf_from_bytes_safe(out.clone()).is_ok()
-            {
-                return Ok(out);
-            }
-        }
-
-        Ok(step1_bytes)
-    }
-
     /// Computes the union bounding box `(min_x, min_y, max_x, max_y)` in PDF points of all
     /// content objects (`page.objects().iter()`) on `page` for `FitTextWidth` mode (`3` key).
     /// Falls back to a 12% left/right margin trim if the page has no detectable content bounds.
@@ -2505,6 +2561,9 @@ mod tests {
         let raw_bytes = doc.save_to_bytes()?;
         let embedded_bytes = PdfEngine::embed_metadata_in_pdf_bytes(&raw_bytes, 4, &bms, false)?;
         assert_eq!(PdfEngine::read_page_labels_roman_end(&embedded_bytes), 4);
+        // v1.2.1: the PDFium-based reader used on open must agree with the lopdf reader.
+        let labelled = engine.load_pdf_from_bytes_safe(embedded_bytes.clone())?;
+        assert_eq!(PdfEngine::read_page_labels_roman_end_from_doc(&labelled), 4);
         let bw_bytes = engine.convert_page_to_bw(&embedded_bytes, 0)?;
         let bw_doc = engine.load_pdf_from_bytes_safe(bw_bytes)?;
         assert_eq!(bw_doc.pages().len(), 10);

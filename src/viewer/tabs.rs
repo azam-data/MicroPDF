@@ -101,7 +101,7 @@ impl<'a> PdfViewerApp<'a> {
         password: Option<&str>,
     ) -> Result<()> {
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
 
         // Strictly drop previous cached page bitmaps, thumbnail cache, and previous document
@@ -234,7 +234,7 @@ impl<'a> PdfViewerApp<'a> {
             return self.load_document_with_password(path, password);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_path(&path);
+        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
         let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
         let selected_bookmark = if loaded_bookmarks.is_empty() {
             None
