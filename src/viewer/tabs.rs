@@ -14,9 +14,11 @@ impl<'a> PdfViewerApp<'a> {
             slot.current_page_index = self.current_page_index;
             slot.view_mode = self.view_mode;
             slot.last_page_view_mode = self.last_page_view_mode;
+            slot.scroll_mode = self.scroll_mode;
             slot.zoom_level = self.zoom_level;
             slot.pan_x = self.pan_x;
             slot.scroll_y = self.scroll_y;
+            slot.scroll_x = self.scroll_x;
             slot.nav_back_stack = std::mem::take(&mut self.nav_back_stack);
             slot.nav_forward_stack = std::mem::take(&mut self.nav_forward_stack);
             slot.roman_end = self.roman_end;
@@ -42,9 +44,11 @@ impl<'a> PdfViewerApp<'a> {
             self.current_page_index = slot.current_page_index;
             self.view_mode = slot.view_mode;
             self.last_page_view_mode = slot.last_page_view_mode;
+            self.scroll_mode = slot.scroll_mode;
             self.zoom_level = slot.zoom_level;
             self.pan_x = slot.pan_x;
             self.scroll_y = slot.scroll_y;
+            self.scroll_x = slot.scroll_x;
             self.nav_back_stack = std::mem::take(&mut slot.nav_back_stack);
             self.nav_forward_stack = std::mem::take(&mut slot.nav_forward_stack);
             self.hovered_link = None;
@@ -152,9 +156,11 @@ impl<'a> PdfViewerApp<'a> {
                 current_page_index: 0,
                 view_mode: self.view_mode,
                 last_page_view_mode: self.last_page_view_mode,
+                scroll_mode: self.scroll_mode,
                 zoom_level: 1.0,
                 pan_x: 0.0,
                 scroll_y: 0.0,
+                scroll_x: 0.0,
                 nav_back_stack: VecDeque::new(),
                 nav_forward_stack: Vec::new(),
                 roman_end,
@@ -175,6 +181,7 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].zoom_level = 1.0;
             self.tabs[self.active_tab].pan_x = 0.0;
             self.tabs[self.active_tab].scroll_y = 0.0;
+            self.tabs[self.active_tab].scroll_x = 0.0;
             self.tabs[self.active_tab].nav_back_stack.clear();
             self.tabs[self.active_tab].nav_forward_stack.clear();
             self.tabs[self.active_tab].roman_end = roman_end;
@@ -258,9 +265,11 @@ impl<'a> PdfViewerApp<'a> {
             current_page_index: 0,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: self.scroll_mode,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             roman_end,
@@ -284,6 +293,7 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
@@ -326,9 +336,11 @@ impl<'a> PdfViewerApp<'a> {
             current_page_index: 0,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: self.scroll_mode,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             roman_end: 0,
@@ -352,6 +364,7 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;

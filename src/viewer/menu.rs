@@ -119,18 +119,20 @@ impl<'a> PdfViewerApp<'a> {
 
     fn menu_item_checked(&self, cat: MenuCategory, idx: usize) -> bool {
         match (cat, idx) {
-            (MenuCategory::View, 0) => self.view_mode == ViewMode::FitPage,
-            (MenuCategory::View, 1) => self.view_mode == ViewMode::FitWidth,
-            (MenuCategory::View, 2) => self.view_mode == ViewMode::FitTextWidth,
-            (MenuCategory::View, 3) => self.view_mode == ViewMode::TwoPageSpread,
-            (MenuCategory::View, 4) => self.view_mode == ViewMode::ContinuousScroll,
-            (MenuCategory::View, 5) => self.view_mode == ViewMode::TextView,
-            (MenuCategory::View, 9) => self.view_mode == ViewMode::ThumbnailGrid,
-            (MenuCategory::View, 10) => self.show_bookmarks,
-            (MenuCategory::View, 12) => self.is_fullscreen && !self.is_presentation,
-            (MenuCategory::View, 13) => self.is_presentation,
-            (MenuCategory::View, 14) => self.show_toolbar,
-            (MenuCategory::View, 19) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
+            (MenuCategory::View, 0) => self.effective_layout_mode() == ViewMode::FitPage && self.view_mode.is_page_view(),
+            (MenuCategory::View, 1) => self.effective_layout_mode() == ViewMode::FitWidth && self.view_mode.is_page_view(),
+            (MenuCategory::View, 2) => self.effective_layout_mode() == ViewMode::FitTextWidth && self.view_mode.is_page_view(),
+            (MenuCategory::View, 3) => self.effective_layout_mode() == ViewMode::TwoPageSpread && self.view_mode.is_page_view(),
+            (MenuCategory::View, 4) => self.effective_scroll_mode() == ScrollMode::SinglePage,
+            (MenuCategory::View, 5) => self.effective_scroll_mode() == ScrollMode::ContinuousVertical,
+            (MenuCategory::View, 6) => self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal,
+            (MenuCategory::View, 7) => self.view_mode == ViewMode::TextView,
+            (MenuCategory::View, 11) => self.view_mode == ViewMode::ThumbnailGrid,
+            (MenuCategory::View, 12) => self.show_bookmarks,
+            (MenuCategory::View, 14) => self.is_fullscreen && !self.is_presentation,
+            (MenuCategory::View, 15) => self.is_presentation,
+            (MenuCategory::View, 16) => self.show_toolbar,
+            (MenuCategory::View, 21) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
             (MenuCategory::Edit, 3) => self.mouse_mode == MouseMode::Select,
             (MenuCategory::Edit, 4) => self.mouse_mode == MouseMode::Highlight,
             (MenuCategory::Edit, 5) => self.mouse_mode == MouseMode::Underline,
@@ -421,19 +423,30 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 1) => self.set_view_mode(ViewMode::FitWidth),
             (MenuCategory::View, 2) => self.set_view_mode(ViewMode::FitTextWidth),
             (MenuCategory::View, 3) => self.set_view_mode(ViewMode::TwoPageSpread),
-            (MenuCategory::View, 4) => self.set_view_mode(ViewMode::ContinuousScroll),
+            (MenuCategory::View, 4) => {
+                self.set_scroll_mode(ScrollMode::SinglePage);
+                return;
+            }
             (MenuCategory::View, 5) => {
+                self.set_scroll_mode(ScrollMode::ContinuousVertical);
+                return;
+            }
+            (MenuCategory::View, 6) => {
+                self.set_scroll_mode(ScrollMode::ContinuousHorizontal);
+                return;
+            }
+            (MenuCategory::View, 7) => {
                 if self.view_mode == ViewMode::TextView {
                     self.set_view_mode(self.last_page_view_mode);
                 } else {
                     self.set_view_mode(ViewMode::TextView);
                 }
             }
-            (MenuCategory::View, 6) => self.zoom_by_step(1.25),
-            (MenuCategory::View, 7) => self.zoom_by_step(0.8),
-            (MenuCategory::View, 8) => self.reset_zoom(),
-            (MenuCategory::View, 9) => self.toggle_view_mode(),
-            (MenuCategory::View, 10) => {
+            (MenuCategory::View, 8) => self.zoom_by_step(1.25),
+            (MenuCategory::View, 9) => self.zoom_by_step(0.8),
+            (MenuCategory::View, 10) => self.reset_zoom(),
+            (MenuCategory::View, 11) => self.toggle_view_mode(),
+            (MenuCategory::View, 12) => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
                 self.status_notice = Some(if self.show_bookmarks {
@@ -442,22 +455,19 @@ impl<'a> PdfViewerApp<'a> {
                     "Bookmarks Sidebar OFF".to_string()
                 });
             }
-            (MenuCategory::View, 11) => {
-                self.reading_filter = self.reading_filter.next();
-                self.status_notice = Some(format!(
-                    "Reading Filter: {} (Zero-RAM CPU Blit Filter)",
-                    self.reading_filter.label()
-                ));
-            }
-            (MenuCategory::View, 12) => self.toggle_fullscreen(),
             (MenuCategory::View, 13) => {
+                self.set_reading_filter(self.reading_filter.next());
+                return;
+            }
+            (MenuCategory::View, 14) => self.toggle_fullscreen(),
+            (MenuCategory::View, 15) => {
                 if self.is_presentation {
                     self.exit_presentation_or_fullscreen();
                 } else {
                     self.enter_presentation_mode();
                 }
             }
-            (MenuCategory::View, 14) => {
+            (MenuCategory::View, 16) => {
                 self.show_toolbar = !self.show_toolbar;
                 self.save_session_to_ini();
                 self.status_notice = Some(if self.show_toolbar {
@@ -466,22 +476,22 @@ impl<'a> PdfViewerApp<'a> {
                     "Toolbar hidden (re-enable via View -> Show Toolbar)".to_string()
                 });
             }
-            (MenuCategory::View, 15) => {
+            (MenuCategory::View, 17) => {
                 self.show_customize_toolbar = true;
             }
-            (MenuCategory::View, 16) => {
+            (MenuCategory::View, 18) => {
                 self.adjust_ui_scale(0.10);
                 return;
             }
-            (MenuCategory::View, 17) => {
+            (MenuCategory::View, 19) => {
                 self.adjust_ui_scale(-0.10);
                 return;
             }
-            (MenuCategory::View, 18) => {
+            (MenuCategory::View, 20) => {
                 self.reset_ui_scale();
                 return;
             }
-            (MenuCategory::View, 19) => {
+            (MenuCategory::View, 21) => {
                 self.ui_theme_mode = self.ui_theme_mode.toggle();
                 self.save_session_to_ini();
                 self.status_notice = Some(format!("UI Theme: {}", self.ui_theme_mode.label()));
@@ -607,35 +617,28 @@ impl<'a> PdfViewerApp<'a> {
 
             // Tools menu
             (MenuCategory::Tools, 0) => {
-                self.input_mode = InputMode::PageNumbers {
-                    input: String::new(),
-                };
+                self.open_page_number_modal();
+                return;
             }
             (MenuCategory::Tools, 1) => {
-                self.input_mode = InputMode::HeaderFooterRange {
-                    range_input: String::new(),
-                };
+                self.open_header_footer_modal();
+                return;
             }
             (MenuCategory::Tools, 2) => {
-                self.input_mode = InputMode::ClearMargins {
-                    input: String::new(),
-                };
-            }
-            (MenuCategory::Tools, 3) => {
                 self.input_mode = InputMode::Watermark {
                     input: String::new(),
                 };
             }
-            (MenuCategory::Tools, 4) => {
+            (MenuCategory::Tools, 3) => {
                 self.pending_dialog = Some(PendingDialog::PickStampImage);
             }
-            (MenuCategory::Tools, 5) => {
+            (MenuCategory::Tools, 4) => {
                 self.input_mode = InputMode::SplitRange {
                     input: String::new(),
                 };
             }
-            (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
-            (MenuCategory::Tools, 7) => self.open_optimize_prompt(),
+            (MenuCategory::Tools, 5) => self.flatten_and_unlock_current_pdf(),
+            (MenuCategory::Tools, 6) => self.open_optimize_prompt(),
 
             // Help menu
             (MenuCategory::Help, 0) => {

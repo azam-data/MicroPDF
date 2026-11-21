@@ -13,8 +13,8 @@ pub enum MarginZone {
     PageNumber,
 }
 
-/// Horizontal alignment for headers and footers.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Horizontal alignment for headers and footers (and 6-position page numbers).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MarginPosition {
     HeaderLeft,
     HeaderCenter,
@@ -25,6 +25,7 @@ pub enum MarginPosition {
 }
 
 impl MarginPosition {
+    #[allow(dead_code)]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_uppercase().as_str() {
             "HL" => Some(Self::HeaderLeft),
@@ -49,6 +50,233 @@ impl MarginPosition {
             MarginZone::Header
         } else {
             MarginZone::Footer
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HeaderLeft => "Top Left",
+            Self::HeaderCenter => "Top Center",
+            Self::HeaderRight => "Top Right",
+            Self::FooterLeft => "Bot Left",
+            Self::FooterCenter => "Bot Center",
+            Self::FooterRight => "Bot Right",
+        }
+    }
+}
+
+/// Text color preset for Header/Footer & Page Numbering stamps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeaderFooterColor {
+    Gray,
+    Black,
+    Navy,
+}
+
+impl HeaderFooterColor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gray => "Slate Gray",
+            Self::Black => "Black",
+            Self::Navy => "Navy",
+        }
+    }
+
+    pub fn pdf_color(self) -> PdfColor {
+        match self {
+            Self::Gray => PdfColor::new(90, 90, 90, 255),
+            Self::Black => PdfColor::new(20, 20, 20, 255),
+            Self::Navy => PdfColor::new(30, 58, 138, 255),
+        }
+    }
+
+    pub fn ui_rgb(self) -> u32 {
+        match self {
+            Self::Gray => 0x005A_5A5A,
+            Self::Black => 0x0014_1414,
+            Self::Navy => 0x001E_3A8A,
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::Gray => "gray",
+            Self::Black => "black",
+            Self::Navy => "navy",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "black" => Self::Black,
+            "navy" => Self::Navy,
+            _ => Self::Gray,
+        }
+    }
+}
+
+/// Reusable Header & Footer style profile persisted in portable `micropdf.ini`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeaderFooterProfile {
+    pub name: String,
+    pub header_left: String,
+    pub header_center: String,
+    pub header_right: String,
+    pub footer_left: String,
+    pub footer_center: String,
+    pub footer_right: String,
+    pub font_size: f32,
+    pub margin_pt: f32,
+    pub color: HeaderFooterColor,
+}
+
+impl Default for HeaderFooterProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            header_left: String::new(),
+            header_center: String::new(),
+            header_right: String::new(),
+            footer_left: String::new(),
+            footer_center: String::new(),
+            footer_right: String::new(),
+            font_size: 10.0,
+            margin_pt: 28.0,
+            color: HeaderFooterColor::Gray,
+        }
+    }
+}
+
+impl HeaderFooterProfile {
+    pub fn has_header(&self) -> bool {
+        !self.header_left.trim().is_empty()
+            || !self.header_center.trim().is_empty()
+            || !self.header_right.trim().is_empty()
+    }
+
+    pub fn has_footer(&self) -> bool {
+        !self.footer_left.trim().is_empty()
+            || !self.footer_center.trim().is_empty()
+            || !self.footer_right.trim().is_empty()
+    }
+
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('|', "\\p")
+            .replace('\n', " ")
+            .replace('\r', "")
+    }
+
+    fn unesc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('p') => out.push('|'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => out.push(other),
+                    None => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    pub fn to_ini_str(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}",
+            Self::esc(&self.name),
+            Self::esc(&self.header_left),
+            Self::esc(&self.header_center),
+            Self::esc(&self.header_right),
+            Self::esc(&self.footer_left),
+            Self::esc(&self.footer_center),
+            Self::esc(&self.footer_right),
+            self.font_size.clamp(6.0, 24.0),
+            self.margin_pt.clamp(12.0, 72.0),
+            self.color.to_ini_str(),
+        )
+    }
+
+    pub fn from_ini_str(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() < 10 {
+            return None;
+        }
+        let name = Self::unesc(parts[0]).trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            name,
+            header_left: Self::unesc(parts[1]),
+            header_center: Self::unesc(parts[2]),
+            header_right: Self::unesc(parts[3]),
+            footer_left: Self::unesc(parts[4]),
+            footer_center: Self::unesc(parts[5]),
+            footer_right: Self::unesc(parts[6]),
+            font_size: parts[7].trim().parse::<f32>().unwrap_or(10.0).clamp(6.0, 24.0),
+            margin_pt: parts[8].trim().parse::<f32>().unwrap_or(28.0).clamp(12.0, 72.0),
+            color: HeaderFooterColor::from_ini_str(parts[9]),
+        })
+    }
+}
+
+/// Formatting template for Page Numbering stamps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageNumberFormat {
+    Plain,
+    PageN,
+    PageNOfTotal,
+    NSlashTotal,
+    Dashed,
+}
+
+impl PageNumberFormat {
+    pub const ALL: [Self; 5] = [
+        Self::Plain,
+        Self::PageN,
+        Self::PageNOfTotal,
+        Self::NSlashTotal,
+        Self::Dashed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "1",
+            Self::PageN => "Page 1",
+            Self::PageNOfTotal => "Page 1 of N",
+            Self::NSlashTotal => "1 / N",
+            Self::Dashed => "- 1 -",
+        }
+    }
+}
+
+/// Configuration for the visual Page Numbering modal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageNumberConfig {
+    pub position: MarginPosition,
+    pub format: PageNumberFormat,
+    pub roman_end: u16,
+    pub skip_first_page: bool,
+    pub font_size: f32,
+    pub margin_pt: f32,
+    pub color: HeaderFooterColor,
+}
+
+impl Default for PageNumberConfig {
+    fn default() -> Self {
+        Self {
+            position: MarginPosition::FooterCenter,
+            format: PageNumberFormat::Plain,
+            roman_end: 0,
+            skip_first_page: false,
+            font_size: 10.0,
+            margin_pt: 28.0,
+            color: HeaderFooterColor::Gray,
         }
     }
 }
@@ -1504,6 +1732,7 @@ impl PdfEngine {
             .context("Page index out of bounds for mutable highlight")?;
 
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Highlight");
         for path_obj in path_objects {
@@ -1555,6 +1784,7 @@ impl PdfEngine {
         let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Underline");
         for obj in path_objects {
@@ -1605,6 +1835,7 @@ impl PdfEngine {
         let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Strikeout");
         for obj in path_objects {
@@ -1665,6 +1896,7 @@ impl PdfEngine {
 
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(rect);
         let _ = annot.set_creator("MicroPDF:StickyNote");
         let _ = annot.set_contents(trimmed);
@@ -1803,6 +2035,7 @@ impl PdfEngine {
         );
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Ink");
         annot.objects_mut().add_path_object(path)?;
@@ -1855,6 +2088,7 @@ impl PdfEngine {
 
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:FreeText");
         let _ = annot.set_contents(trimmed);
@@ -1892,6 +2126,7 @@ impl PdfEngine {
         );
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Rect");
         annot.objects_mut().add_path_object(rect_obj)?;
@@ -1961,10 +2196,217 @@ impl PdfEngine {
 
         let mut page = doc.pages_mut().get(page_index)?;
         let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
         let _ = annot.set_bounds(bounds);
         let _ = annot.set_creator("MicroPDF:Arrow");
         annot.objects_mut().add_path_object(shaft)?;
         annot.objects_mut().add_path_object(head)?;
+        Ok(())
+    }
+
+    /// Marks visible annotations on all pages with the PDF PRINT flag (`/F` bit `0x04`) so
+    /// older PDFs whose annotations lacked `/F` still render when `With Annots` printing is selected.
+    pub fn ensure_annotations_printable(doc: &mut PdfDocument) {
+        let total = doc.pages().len();
+        for idx in 0..total {
+            if let Ok(mut page) = doc.pages_mut().get(idx) {
+                let count = page.annotations().len();
+                for a_idx in 0..count {
+                    if let Ok(mut annot) = page.annotations_mut().get(a_idx) {
+                        if !annot.is_hidden() && !annot.is_printed() {
+                            let _ = annot.set_is_printed(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expands `{page}` and `{total}` placeholders inside header/footer strings for 1-based `page_num`.
+    pub fn expand_hf_tokens(template: &str, page_num: u16, total_pages: u16) -> String {
+        template
+            .replace("{page}", &page_num.to_string())
+            .replace("{total}", &total_pages.to_string())
+    }
+
+    /// Formats a page number label for 1-based `page_num` out of `total_pages` using `cfg`.
+    pub fn format_page_number_label(
+        cfg: &PageNumberConfig,
+        page_num: u16,
+        total_pages: u16,
+    ) -> Option<String> {
+        if cfg.skip_first_page && page_num == 1 {
+            return None;
+        }
+        let core = if page_num <= cfg.roman_end {
+            Self::to_roman(page_num)
+        } else {
+            format!("{}", page_num.saturating_sub(cfg.roman_end))
+        };
+        let arabic_total = total_pages.saturating_sub(cfg.roman_end).max(1);
+        let formatted = match cfg.format {
+            PageNumberFormat::Plain => core,
+            PageNumberFormat::PageN => format!("Page {core}"),
+            PageNumberFormat::PageNOfTotal => {
+                if page_num <= cfg.roman_end {
+                    format!("Page {core}")
+                } else {
+                    format!("Page {core} of {arabic_total}")
+                }
+            }
+            PageNumberFormat::NSlashTotal => {
+                if page_num <= cfg.roman_end {
+                    core
+                } else {
+                    format!("{core} / {arabic_total}")
+                }
+            }
+            PageNumberFormat::Dashed => format!("- {core} -"),
+        };
+        Some(formatted)
+    }
+
+    /// Stamps up to 6 aligned Header/Footer slots (HL/HC/HR/FL/FC/FR) across 0-based `page_indices`
+    /// with optional `{page}`/`{total}` tokens, font size, margin, color, and optional replace-existing clear.
+    pub fn apply_header_footer_full(
+        doc: &mut PdfDocument,
+        profile: &HeaderFooterProfile,
+        page_indices: &[u16],
+        replace_existing: bool,
+    ) -> Result<()> {
+        let total_pages = doc.pages().len();
+        if total_pages == 0 || page_indices.is_empty() {
+            return Ok(());
+        }
+        let font = doc.fonts_mut().helvetica();
+        let font_sz = profile.font_size.clamp(6.0, 24.0);
+        let edge_y = profile.margin_pt.clamp(12.0, 72.0);
+        let side_x = 36.0_f32;
+        let color = profile.color.pdf_color();
+        let has_hdr = profile.has_header();
+        let has_ftr = profile.has_footer();
+
+        for &idx in page_indices {
+            if idx >= total_pages {
+                continue;
+            }
+            if replace_existing {
+                let mut page = doc.pages_mut().get(idx)?;
+                if has_hdr {
+                    Self::clear_margin_zone(&mut page, MarginZone::Header)?;
+                }
+                if has_ftr {
+                    Self::clear_margin_zone(&mut page, MarginZone::Footer)?;
+                }
+            }
+
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value, page.height().value)
+            };
+            let pnum = idx + 1;
+
+            let slots: [(MarginPosition, &str); 6] = [
+                (MarginPosition::HeaderLeft, &profile.header_left),
+                (MarginPosition::HeaderCenter, &profile.header_center),
+                (MarginPosition::HeaderRight, &profile.header_right),
+                (MarginPosition::FooterLeft, &profile.footer_left),
+                (MarginPosition::FooterCenter, &profile.footer_center),
+                (MarginPosition::FooterRight, &profile.footer_right),
+            ];
+
+            let mut objs = Vec::new();
+            for (pos, raw_txt) in slots {
+                let expanded = Self::expand_hf_tokens(raw_txt.trim(), pnum, total_pages);
+                if expanded.is_empty() {
+                    continue;
+                }
+                let mut obj = PdfPageTextObject::new(doc, &expanded, font, PdfPoints::new(font_sz))?;
+                obj.set_fill_color(color)?;
+                let tw = obj.width().unwrap_or(PdfPoints::new(40.0)).value;
+                let x = match pos {
+                    MarginPosition::HeaderLeft | MarginPosition::FooterLeft => side_x,
+                    MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
+                        ((pw - tw) * 0.5).max(side_x)
+                    }
+                    MarginPosition::HeaderRight | MarginPosition::FooterRight => {
+                        (pw - tw - side_x).max(side_x)
+                    }
+                };
+                let y = if pos.is_header() {
+                    (ph - edge_y - font_sz * 0.75).max(0.0)
+                } else {
+                    edge_y
+                };
+                obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
+                objs.push(obj);
+            }
+
+            if !objs.is_empty() {
+                let mut page = doc.pages_mut().get(idx)?;
+                for obj in objs {
+                    page.objects_mut().add_text_object(obj)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stamps formatted Page Numbers across the document using `PageNumberConfig`, clearing
+    /// any existing page numbers in the target zone first.
+    pub fn apply_page_numbers_full(
+        doc: &mut PdfDocument,
+        cfg: &PageNumberConfig,
+    ) -> Result<()> {
+        let total_pages = doc.pages().len();
+        if total_pages == 0 {
+            return Ok(());
+        }
+        let font = doc.fonts_mut().helvetica();
+        let font_sz = cfg.font_size.clamp(6.0, 24.0);
+        let edge_y = cfg.margin_pt.clamp(12.0, 72.0);
+        let side_x = 36.0_f32;
+        let color = cfg.color.pdf_color();
+        let clear_zone = if cfg.position == MarginPosition::FooterCenter {
+            MarginZone::PageNumber
+        } else {
+            cfg.position.zone()
+        };
+
+        for idx in 0..total_pages {
+            {
+                let mut page = doc.pages_mut().get(idx)?;
+                Self::clear_margin_zone(&mut page, clear_zone)?;
+            }
+            let pnum = idx + 1;
+            let Some(label) = Self::format_page_number_label(cfg, pnum, total_pages) else {
+                continue;
+            };
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value, page.height().value)
+            };
+            let mut obj = PdfPageTextObject::new(doc, &label, font, PdfPoints::new(font_sz))?;
+            obj.set_fill_color(color)?;
+            let tw = obj.width().unwrap_or(PdfPoints::new(18.0)).value;
+            let x = match cfg.position {
+                MarginPosition::HeaderLeft | MarginPosition::FooterLeft => side_x,
+                MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
+                    ((pw - tw) * 0.5).max(side_x)
+                }
+                MarginPosition::HeaderRight | MarginPosition::FooterRight => {
+                    (pw - tw - side_x).max(side_x)
+                }
+            };
+            let y = if cfg.position.is_header() {
+                (ph - edge_y - font_sz * 0.75).max(0.0)
+            } else {
+                edge_y
+            };
+            obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
+            let mut page = doc.pages_mut().get(idx)?;
+            page.objects_mut().add_text_object(obj)?;
+        }
         Ok(())
     }
 

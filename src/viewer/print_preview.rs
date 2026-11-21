@@ -157,9 +157,8 @@ pub(super) enum PrintPreviewHit {
     ToggleCollate,
     AnnotationsInclude,
     AnnotationsHide,
-    PaperA4,
-    PaperLetter,
-    PaperLegal,
+    PaperPrev,
+    PaperNext,
     OrientAuto,
     OrientPortrait,
     OrientLandscape,
@@ -311,11 +310,10 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(RectHit { x: ix + half_row as i32 + gap, y: cy, w: iw.saturating_sub(half_row + gap as u32), h: row_h, hit: PrintPreviewHit::ToggleManualDuplex });
         cy += row_h as i32 + sec_gap;
 
-        // 4. Paper Size (A4 / Letter / Legal)
+        // 4. Paper Size (< A4 / Letter / Legal / A5 / A3 / B5 / Executive / Tabloid / Statement / Auto >)
         cy += lbl_h;
-        hits.push(RectHit { x: ix, y: cy, w: w3, h: row_h, hit: PrintPreviewHit::PaperA4 });
-        hits.push(RectHit { x: ix + w3 as i32 + gap, y: cy, w: w3, h: row_h, hit: PrintPreviewHit::PaperLetter });
-        hits.push(RectHit { x: ix + (w3 as i32 + gap) * 2, y: cy, w: iw.saturating_sub(w3 * 2 + (gap * 2) as u32), h: row_h, hit: PrintPreviewHit::PaperLegal });
+        hits.push(RectHit { x: ix, y: cy, w: p_arrow, h: row_h, hit: PrintPreviewHit::PaperPrev });
+        hits.push(RectHit { x: ix + iw as i32 - p_arrow as i32, y: cy, w: p_arrow, h: row_h, hit: PrintPreviewHit::PaperNext });
         cy += row_h as i32 + sec_gap;
 
         // 5. Orientation (Auto / Portrait / Landscape)
@@ -449,7 +447,7 @@ impl<'a> PdfViewerApp<'a> {
             .set_fixed_height(rh as i32)
             .render_form_data(false)
             .render_annotations(opts.include_annotations)
-            .use_print_quality(true)
+            .use_print_quality(!opts.include_annotations)
             .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
             .reset_matrix(PdfMatrix::new(sx, 0.0, 0.0, sy, shift_x, shift_y))
@@ -502,16 +500,16 @@ impl<'a> PdfViewerApp<'a> {
         let avail_h = layout.mh.saturating_sub((110.0 * s).round() as u32).max(80);
 
         let Some(doc) = self.doc.as_ref() else { return };
-        let (p_w, p_h) = paper.portrait_pts();
+        let (doc_pw, doc_ph) = key_left
+            .or(key_right)
+            .and_then(|pidx| doc.pages().get(pidx).ok())
+            .map(|p| (p.width().value, p.height().value))
+            .unwrap_or((595.28, 841.89));
+        let (p_w, p_h) = paper.portrait_pts_for_page(doc_pw, doc_ph);
         let landscape = if opts.booklet {
             true
-        } else if let Some(pidx) = key_left {
-            doc.pages()
-                .get(pidx)
-                .map(|p| opts.orientation.is_landscape(p.width().value, p.height().value))
-                .unwrap_or(opts.orientation == PrintOrientation::Landscape)
         } else {
-            opts.orientation == PrintOrientation::Landscape
+            opts.orientation.is_landscape(doc_pw, doc_ph)
         };
         let (sheet_w_pts, sheet_h_pts) = if landscape { (p_h, p_w) } else { (p_w, p_h) };
         let sheet_scale = (avail_w as f32 / sheet_w_pts).min(avail_h as f32 / sheet_h_pts);
@@ -654,7 +652,7 @@ impl<'a> PdfViewerApp<'a> {
             .map(|r| (r.width().value.max(1.0), r.height().value.max(1.0)))
             .unwrap_or((595.28, 841.89));
         let landscape = pp.render_opts.booklet || pp.render_opts.orientation.is_landscape(page_w_pts, page_h_pts);
-        let (pw, ph) = pp.paper.portrait_pts();
+        let (pw, ph) = pp.paper.portrait_pts_for_page(page_w_pts, page_h_pts);
         let (sheet_w_pts, sheet_h_pts) = if landscape { (ph, pw) } else { (pw, ph) };
         let sheet_scale = (avail_w as f32 / sheet_w_pts).min(avail_h as f32 / sheet_h_pts);
         let sheet_w = (sheet_w_pts * sheet_scale).round().max(40.0) as u32;
@@ -868,16 +866,22 @@ impl<'a> PdfViewerApp<'a> {
             draw_pill(buffer, r, if pp.manual_duplex { "✓ Simplex 2-Sided" } else { "Simplex 2-Sided" }, pp.manual_duplex);
         }
 
-        // 4. Paper Size
-        if let Some(r) = Self::find_hit(&layout, PrintPreviewHit::PaperA4) {
-            draw_text(buffer, buf_w, buf_h, ix, r.y - lbl_h, "Paper Size", lbl_sz, theme.text_muted, true);
-            draw_pill(buffer, r, PrintPaperSize::A4.label(), pp.paper == PrintPaperSize::A4);
-        }
-        if let Some(r) = Self::find_hit(&layout, PrintPreviewHit::PaperLetter) {
-            draw_pill(buffer, r, PrintPaperSize::Letter.label(), pp.paper == PrintPaperSize::Letter);
-        }
-        if let Some(r) = Self::find_hit(&layout, PrintPreviewHit::PaperLegal) {
-            draw_pill(buffer, r, PrintPaperSize::Legal.label(), pp.paper == PrintPaperSize::Legal);
+        // 4. Paper Size (< 10 standard sizes + Auto >)
+        if let (Some(lp), Some(rp)) = (
+            Self::find_hit(&layout, PrintPreviewHit::PaperPrev),
+            Self::find_hit(&layout, PrintPreviewHit::PaperNext),
+        ) {
+            draw_text(buffer, buf_w, buf_h, ix, lp.y - lbl_h, "Paper Size", lbl_sz, theme.text_muted, true);
+            let full_w = (rp.x + rp.w as i32 - lp.x) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, lp.x, lp.y, full_w, lp.h, pill_rad, theme.surface_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, lp.x, lp.y, full_w, lp.h, pill_rad, theme.input_border);
+            draw_icon(buffer, buf_w, buf_h, UiIcon::ChevronLeft, lp.x + ((lp.w.saturating_sub(ic_sz)) / 2) as i32, lp.y + ((lp.h.saturating_sub(ic_sz)) / 2) as i32, ic_sz, theme.text_secondary);
+            draw_icon(buffer, buf_w, buf_h, UiIcon::ChevronRight, rp.x + ((rp.w.saturating_sub(ic_sz)) / 2) as i32, rp.y + ((rp.h.saturating_sub(ic_sz)) / 2) as i32, ic_sz, theme.text_secondary);
+            let max_pw = (rp.x - (lp.x + lp.w as i32) - 8).max(20) as f32;
+            let p_trunc = truncate_ellipsis(pp.paper.label(), max_pw, body_sz, false);
+            let tw = measure_text(&p_trunc, body_sz, false);
+            let cx = lp.x + lp.w as i32 + (((rp.x - (lp.x + lp.w as i32)) as f32 - tw) * 0.5).round().max(4.0) as i32;
+            draw_text_vcenter(buffer, buf_w, buf_h, cx, lp.y, lp.h, rp.x - 4, &p_trunc, body_sz, theme.text_primary, false);
         }
 
         // 5. Orientation
@@ -1079,9 +1083,14 @@ impl<'a> PdfViewerApp<'a> {
                 PrintPreviewHit::ToggleCollate => {
                     pp.render_opts.collate = !pp.render_opts.collate;
                 }
-                PrintPreviewHit::PaperA4 => pp.paper = PrintPaperSize::A4,
-                PrintPreviewHit::PaperLetter => pp.paper = PrintPaperSize::Letter,
-                PrintPreviewHit::PaperLegal => pp.paper = PrintPaperSize::Legal,
+                PrintPreviewHit::PaperPrev => {
+                    pp.paper = pp.paper.prev();
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::PaperNext => {
+                    pp.paper = pp.paper.next();
+                    pp.cached_sheet = None;
+                }
                 PrintPreviewHit::OrientAuto => pp.render_opts.orientation = PrintOrientation::Auto,
                 PrintPreviewHit::OrientPortrait => pp.render_opts.orientation = PrintOrientation::Portrait,
                 PrintPreviewHit::OrientLandscape => pp.render_opts.orientation = PrintOrientation::Landscape,

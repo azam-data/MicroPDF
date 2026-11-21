@@ -262,7 +262,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // Evict off-screen tiles for this page first so their 512x512 buffers can be reused.
         let mut evicted_bufs: Vec<Vec<u32>> = Vec::new();
-        if self.view_mode != ViewMode::ContinuousScroll && self.view_mode != ViewMode::TwoPageSpread {
+        if !self.is_continuous_scroll() && self.view_mode != ViewMode::TwoPageSpread {
             let max_tile_pixels = (TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize);
             let stale_keys: Vec<TileKey> = self
                 .tile_cache
@@ -516,7 +516,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let zoom_bits = self.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL).to_bits();
 
-        if self.view_mode == ViewMode::ContinuousScroll {
+        if self.is_continuous_scroll() {
             if let Some(old) = self.cached_page.take() {
                 if old.pixels.capacity() > self.spare_pixel_buf.capacity() {
                     self.spare_pixel_buf = old.pixels;
@@ -525,16 +525,27 @@ impl<'a> PdfViewerApp<'a> {
             self.cached_second_page = None;
             self.second_page_draw_rect = None;
 
-            let avail_w = content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
+            let scroll_mode = self.effective_scroll_mode();
+            let layout_mode = self.effective_layout_mode();
+            let is_spread = layout_mode == ViewMode::TwoPageSpread;
+
+            let avail_w = if is_spread {
+                (content_w.saturating_sub(PAGE_MARGIN_PX * 2 + SPREAD_GAP_PX) / 2).max(1) as f32
+            } else {
+                content_w.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32
+            };
             let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
             let gap = SPREAD_GAP_PX as f32;
             let min_screen_y = top_bars_h as f32;
             let max_screen_y = (viewport_h.saturating_sub(status_bar_h)) as f32;
             let center_y = min_screen_y + (content_h as f32) * 0.5;
+            let min_screen_x = sidebar_w as f32;
+            let max_screen_x = viewport_w as f32;
+            let center_x = min_screen_x + (content_w as f32) * 0.5;
 
             let ensure_page_cached = |app: &mut Self, p: u16| -> Result<(u32, u32)> {
                 let need = app.continuous_page_cache.get(&p).map_or(true, |c| {
-                    c.view_mode != ViewMode::ContinuousScroll
+                    c.view_mode != layout_mode
                         || c.zoom_bits != zoom_bits
                         || c.viewport_width != content_w
                         || c.viewport_height != content_h
@@ -547,7 +558,7 @@ impl<'a> PdfViewerApp<'a> {
                         .unwrap_or_else(|| std::mem::take(&mut app.spare_pixel_buf));
                     let bmp = app.rasterize_page_for_mode(
                         p,
-                        ViewMode::ContinuousScroll,
+                        layout_mode,
                         content_w,
                         content_h,
                         avail_w,
@@ -563,45 +574,26 @@ impl<'a> PdfViewerApp<'a> {
                 }
             };
 
-            // Normalize `(current_page_index, scroll_y)` so `current_page_index` follows the page at the viewport centre.
-            for _ in 0..total {
-                let (_, cur_h_u32) = ensure_page_cached(self, self.current_page_index)?;
-                let cur_h = cur_h_u32 as f32;
-                let cur_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
-                let cur_bottom = cur_top + cur_h;
-
-                if center_y > cur_bottom + gap * 0.5 && self.current_page_index + 1 < total {
-                    self.current_page_index += 1;
-                    self.scroll_y -= cur_h + gap;
-                    self.cached_char_boxes = None;
-                } else if center_y < cur_top - gap * 0.5 && self.current_page_index > 0 {
-                    let prev_idx = self.current_page_index - 1;
-                    let (_, prev_h_u32) = ensure_page_cached(self, prev_idx)?;
-                    self.current_page_index = prev_idx;
-                    self.scroll_y += (prev_h_u32 as f32) + gap;
-                    self.cached_char_boxes = None;
-                } else {
-                    break;
+            let compute_single_px = |app: &mut Self, p: u16, bw: u32| -> i32 {
+                if layout_mode == ViewMode::FitTextWidth {
+                    if let Some(c) = app.continuous_page_cache.get(&p) {
+                        if let Some(doc) = app.doc.as_ref() {
+                            if let Ok(page) = doc.pages().get(p) {
+                                let pw_pts = page.width().value.max(1.0);
+                                let text_mid_px = ((c.content_min_x + c.content_max_x) * 0.5 / pw_pts) * (bw as f32);
+                                let ideal_x = (sidebar_w as f32) + (content_w as f32) * 0.5 - text_mid_px;
+                                let min_x = (sidebar_w as f32) + (content_w as f32) - (bw as f32);
+                                let max_x = sidebar_w as f32;
+                                let base = if min_x < max_x {
+                                    ideal_x.clamp(min_x, max_x)
+                                } else {
+                                    (sidebar_w as f32) + ((content_w as f32 - bw as f32) * 0.5)
+                                };
+                                return (base - app.pan_x).round() as i32;
+                            }
+                        }
+                    }
                 }
-            }
-
-            // Clamp scroll at document top/bottom boundaries.
-            if self.current_page_index == 0 && self.scroll_y < 0.0 {
-                self.scroll_y = 0.0;
-            }
-            if self.current_page_index + 1 == total {
-                let (_, last_h_u32) = ensure_page_cached(self, self.current_page_index)?;
-                let max_s = (last_h_u32 as f32 - avail_h).max(0.0);
-                if self.scroll_y > max_s {
-                    self.scroll_y = max_s;
-                }
-            }
-
-            // Collect visible pages above and below `current_page_index`.
-            self.continuous_draw_rects.clear();
-            let anchor_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
-
-            let compute_px = |app: &mut Self, bw: u32| -> i32 {
                 if bw > content_w {
                     let max_pan = (bw - content_w) as f32;
                     app.pan_x = app.pan_x.clamp(0.0, max_pan);
@@ -611,54 +603,269 @@ impl<'a> PdfViewerApp<'a> {
                 }
             };
 
-            // Walk upward from `current_page_index - 1` while visible.
-            let mut up_bottom = anchor_top - gap;
-            let mut p_up = self.current_page_index;
-            let mut upper_pages = Vec::new();
-            while p_up > 0 && up_bottom > min_screen_y {
-                p_up -= 1;
-                let (bw, bh) = ensure_page_cached(self, p_up)?;
-                let py = (up_bottom - bh as f32).round() as i32;
-                let px = compute_px(self, bw);
-                upper_pages.push((p_up, (px, py, bw, bh)));
-                up_bottom -= (bh as f32) + gap;
-            }
-            for item in upper_pages.into_iter().rev() {
-                self.continuous_draw_rects.push(item);
-            }
+            self.continuous_draw_rects.clear();
 
-            // Walk downward from `current_page_index` while visible.
-            let mut down_top = anchor_top;
-            let mut p_down = self.current_page_index;
-            while p_down < total && down_top < max_screen_y {
-                let (bw, bh) = ensure_page_cached(self, p_down)?;
-                let py = down_top.round() as i32;
-                let px = compute_px(self, bw);
-                let rect = (px, py, bw, bh);
-                if p_down == self.current_page_index {
-                    self.page_draw_rect = rect;
+            if scroll_mode == ScrollMode::ContinuousHorizontal {
+                // Continuous Horizontal "Book Ribbon" Scroll: pages flow smoothly left-to-right!
+                for _ in 0..total {
+                    let (cur_w_u32, _) = ensure_page_cached(self, self.current_page_index)?;
+                    let cur_w = cur_w_u32 as f32;
+                    let cur_left = min_screen_x + (PAGE_MARGIN_PX as f32) - self.scroll_x;
+                    let cur_right = cur_left + cur_w;
+                    if center_x > cur_right + gap * 0.5 && self.current_page_index + 1 < total {
+                        self.current_page_index += 1;
+                        self.scroll_x -= cur_w + gap;
+                        self.cached_char_boxes = None;
+                    } else if center_x < cur_left - gap * 0.5 && self.current_page_index > 0 {
+                        let prev_idx = self.current_page_index - 1;
+                        let (prev_w_u32, _) = ensure_page_cached(self, prev_idx)?;
+                        self.current_page_index = prev_idx;
+                        self.scroll_x += (prev_w_u32 as f32) + gap;
+                        self.cached_char_boxes = None;
+                    } else {
+                        break;
+                    }
                 }
-                self.continuous_draw_rects.push((p_down, rect));
-                down_top += (bh as f32) + gap;
-                p_down += 1;
+
+                if self.current_page_index == 0 && self.scroll_x < 0.0 {
+                    self.scroll_x = 0.0;
+                }
+                if self.current_page_index + 1 == total {
+                    let (last_w_u32, _) = ensure_page_cached(self, self.current_page_index)?;
+                    let max_sx = (last_w_u32 as f32 - avail_w).max(0.0);
+                    if self.scroll_x > max_sx {
+                        self.scroll_x = max_sx;
+                    }
+                }
+
+                let anchor_left = min_screen_x + (PAGE_MARGIN_PX as f32) - self.scroll_x;
+                let compute_hy = |app: &mut Self, bh: u32| -> i32 {
+                    if bh > content_h {
+                        let max_sy = (bh - content_h) as f32;
+                        app.scroll_y = app.scroll_y.clamp(0.0, max_sy);
+                        (top_bars_h as i32) - (app.scroll_y.round() as i32)
+                    } else {
+                        (top_bars_h as i32) + ((content_h as i32 - bh as i32) / 2)
+                    }
+                };
+
+                // Walk left from current_page_index - 1
+                let mut left_edge = anchor_left - gap;
+                let mut p_l = self.current_page_index;
+                let mut left_pages = Vec::new();
+                while p_l > 0 && left_edge > min_screen_x {
+                    p_l -= 1;
+                    let (bw, bh) = ensure_page_cached(self, p_l)?;
+                    let px = (left_edge - bw as f32).round() as i32;
+                    let py = compute_hy(self, bh);
+                    left_pages.push((p_l, (px, py, bw, bh)));
+                    left_edge -= (bw as f32) + gap;
+                }
+                for item in left_pages.into_iter().rev() {
+                    self.continuous_draw_rects.push(item);
+                }
+
+                // Walk right from current_page_index
+                let mut right_edge = anchor_left;
+                let mut p_r = self.current_page_index;
+                while p_r < total && right_edge < max_screen_x {
+                    let (bw, bh) = ensure_page_cached(self, p_r)?;
+                    let px = right_edge.round() as i32;
+                    let py = compute_hy(self, bh);
+                    let rect = (px, py, bw, bh);
+                    if p_r == self.current_page_index {
+                        self.page_draw_rect = rect;
+                    }
+                    self.continuous_draw_rects.push((p_r, rect));
+                    right_edge += (bw as f32) + gap;
+                    p_r += 1;
+                }
+            } else if is_spread {
+                // Continuous Vertical + Two-Page Spread rows: (0,1), (2,3), (4,5)...
+                let step = 2u16;
+                let row_start = (self.current_page_index / step) * step;
+                self.current_page_index = row_start;
+
+                let row_height = |app: &mut Self, rs: u16| -> Result<u32> {
+                    let (_, h0) = ensure_page_cached(app, rs)?;
+                    let h1 = if rs + 1 < total {
+                        ensure_page_cached(app, rs + 1)?.1
+                    } else {
+                        0
+                    };
+                    Ok(h0.max(h1))
+                };
+
+                for _ in 0..((total + 1) / 2) {
+                    let cur_h = row_height(self, self.current_page_index)? as f32;
+                    let cur_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+                    let cur_bottom = cur_top + cur_h;
+                    if center_y > cur_bottom + gap * 0.5 && self.current_page_index + step < total {
+                        self.current_page_index += step;
+                        self.scroll_y -= cur_h + gap;
+                        self.cached_char_boxes = None;
+                    } else if center_y < cur_top - gap * 0.5 && self.current_page_index >= step {
+                        let prev_rs = self.current_page_index - step;
+                        let prev_h = row_height(self, prev_rs)? as f32;
+                        self.current_page_index = prev_rs;
+                        self.scroll_y += prev_h + gap;
+                        self.cached_char_boxes = None;
+                    } else {
+                        break;
+                    }
+                }
+
+                if self.current_page_index == 0 && self.scroll_y < 0.0 {
+                    self.scroll_y = 0.0;
+                }
+                if self.current_page_index + step >= total {
+                    let last_h = row_height(self, self.current_page_index)? as f32;
+                    let max_s = (last_h - avail_h).max(0.0);
+                    if self.scroll_y > max_s {
+                        self.scroll_y = max_s;
+                    }
+                }
+
+                let anchor_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+                let push_spread_row = |app: &mut Self, rs: u16, row_top: i32, dst: &mut Vec<(u16, (i32, i32, u32, u32))>| -> Result<u32> {
+                    let (w0, h0) = ensure_page_cached(app, rs)?;
+                    if rs + 1 < total {
+                        let (w1, h1) = ensure_page_cached(app, rs + 1)?;
+                        let rh = h0.max(h1);
+                        let combined_w = w0 + SPREAD_GAP_PX + w1;
+                        let left_x = (sidebar_w as i32) + ((content_w as i32 - combined_w as i32) / 2);
+                        let r0 = (left_x, row_top + ((rh - h0) / 2) as i32, w0, h0);
+                        let r1 = (left_x + w0 as i32 + SPREAD_GAP_PX as i32, row_top + ((rh - h1) / 2) as i32, w1, h1);
+                        dst.push((rs, r0));
+                        dst.push((rs + 1, r1));
+                        Ok(rh)
+                    } else {
+                        let left_x = (sidebar_w as i32) + ((content_w as i32 - w0 as i32) / 2);
+                        dst.push((rs, (left_x, row_top, w0, h0)));
+                        Ok(h0)
+                    }
+                };
+
+                // Walk upward
+                let mut up_bottom = anchor_top - gap;
+                let mut rs_up = self.current_page_index;
+                let mut upper_rows = Vec::new();
+                while rs_up >= step && up_bottom > min_screen_y {
+                    rs_up -= step;
+                    let rh = row_height(self, rs_up)?;
+                    let py = (up_bottom - rh as f32).round() as i32;
+                    let mut row_items = Vec::with_capacity(2);
+                    let _ = push_spread_row(self, rs_up, py, &mut row_items)?;
+                    upper_rows.push(row_items);
+                    up_bottom -= (rh as f32) + gap;
+                }
+                for row_items in upper_rows.into_iter().rev() {
+                    self.continuous_draw_rects.extend(row_items);
+                }
+
+                // Walk downward
+                let mut down_top = anchor_top;
+                let mut rs_down = self.current_page_index;
+                while rs_down < total && down_top < max_screen_y {
+                    let py = down_top.round() as i32;
+                    let start_len = self.continuous_draw_rects.len();
+                    let mut tmp = Vec::with_capacity(2);
+                    let rh = push_spread_row(self, rs_down, py, &mut tmp)?;
+                    if rs_down == self.current_page_index && !tmp.is_empty() {
+                        self.page_draw_rect = tmp[0].1;
+                        self.second_page_draw_rect = tmp.get(1).map(|x| x.1);
+                    }
+                    let _ = start_len;
+                    self.continuous_draw_rects.extend(tmp);
+                    down_top += (rh as f32) + gap;
+                    rs_down += step;
+                }
+            } else {
+                // Continuous Vertical Single-Column (FitPage, FitWidth, FitTextWidth)
+                for _ in 0..total {
+                    let (_, cur_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                    let cur_h = cur_h_u32 as f32;
+                    let cur_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+                    let cur_bottom = cur_top + cur_h;
+
+                    if center_y > cur_bottom + gap * 0.5 && self.current_page_index + 1 < total {
+                        self.current_page_index += 1;
+                        self.scroll_y -= cur_h + gap;
+                        self.cached_char_boxes = None;
+                    } else if center_y < cur_top - gap * 0.5 && self.current_page_index > 0 {
+                        let prev_idx = self.current_page_index - 1;
+                        let (_, prev_h_u32) = ensure_page_cached(self, prev_idx)?;
+                        self.current_page_index = prev_idx;
+                        self.scroll_y += (prev_h_u32 as f32) + gap;
+                        self.cached_char_boxes = None;
+                    } else {
+                        break;
+                    }
+                }
+
+                if self.current_page_index == 0 && self.scroll_y < 0.0 {
+                    self.scroll_y = 0.0;
+                }
+                if self.current_page_index + 1 == total {
+                    let (_, last_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                    let max_s = (last_h_u32 as f32 - avail_h).max(0.0);
+                    if self.scroll_y > max_s {
+                        self.scroll_y = max_s;
+                    }
+                }
+
+                let anchor_top = min_screen_y + (PAGE_MARGIN_PX as f32) - self.scroll_y;
+
+                // Walk upward
+                let mut up_bottom = anchor_top - gap;
+                let mut p_up = self.current_page_index;
+                let mut upper_pages = Vec::new();
+                while p_up > 0 && up_bottom > min_screen_y {
+                    p_up -= 1;
+                    let (bw, bh) = ensure_page_cached(self, p_up)?;
+                    let py = (up_bottom - bh as f32).round() as i32;
+                    let px = compute_single_px(self, p_up, bw);
+                    upper_pages.push((p_up, (px, py, bw, bh)));
+                    up_bottom -= (bh as f32) + gap;
+                }
+                for item in upper_pages.into_iter().rev() {
+                    self.continuous_draw_rects.push(item);
+                }
+
+                // Walk downward
+                let mut down_top = anchor_top;
+                let mut p_down = self.current_page_index;
+                while p_down < total && down_top < max_screen_y {
+                    let (bw, bh) = ensure_page_cached(self, p_down)?;
+                    let py = down_top.round() as i32;
+                    let px = compute_single_px(self, p_down, bw);
+                    let rect = (px, py, bw, bh);
+                    if p_down == self.current_page_index {
+                        self.page_draw_rect = rect;
+                    }
+                    self.continuous_draw_rects.push((p_down, rect));
+                    down_top += (bh as f32) + gap;
+                    p_down += 1;
+                }
             }
 
             let first_vis = self
                 .continuous_draw_rects
-                .first()
+                .iter()
                 .map(|&(idx, _)| idx)
+                .min()
                 .unwrap_or(self.current_page_index);
             let last_vis = self
                 .continuous_draw_rects
-                .last()
+                .iter()
                 .map(|&(idx, _)| idx)
+                .max()
                 .unwrap_or(self.current_page_index);
 
-            // RAM rule: Cache only the visible pages plus 1 above and below. Evict everything else immediately.
+            // RAM rule: Cache only visible pages plus 1 neighbor on each side. Evict everything else immediately.
             let keep_start = first_vis.saturating_sub(1);
             let keep_end = (last_vis + 1).min(total - 1);
 
-            // Evict pages outside `[keep_start..=keep_end]` first so their buffer can be reused by neighbor prefetch.
             let evicted_keys: Vec<u16> = self
                 .continuous_page_cache
                 .keys()
@@ -680,7 +887,6 @@ impl<'a> PdfViewerApp<'a> {
                 let _ = ensure_page_cached(self, keep_end);
             }
 
-            // If any visible page is above 2x viewport size, render its visible 512x512 tiles into `tile_cache`.
             let vis_rects = self.continuous_draw_rects.clone();
             for (p_idx, rect) in vis_rects {
                 let is_tiled = self
@@ -1052,19 +1258,74 @@ impl<'a> PdfViewerApp<'a> {
                     buffer[dst_idx..dst_idx + copy_len]
                         .copy_from_slice(&pixels[src_idx..src_idx + copy_len]);
                 }
-                ReadingFilter::DarkInvert => {
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        buffer[dst_idx + i] = px ^ 0x00FFFFFF;
-                    }
-                }
-                ReadingFilter::WarmSepia => {
+                ReadingFilter::PaperEInk => {
+                    // Best for day: Matte low-glare neutral gray e-ink paper (#EAEBE6 bg, #1E1F1D ink), gently desaturated
                     for i in 0..copy_len {
                         let px = pixels[src_idx + i];
                         let r = (px >> 16) & 0xFF;
-                        let g = (((px >> 8) & 0xFF) * 95) / 100;
-                        let b = ((px & 0xFF) * 83) / 100;
-                        buffer[dst_idx + i] = (r << 16) | (g << 8) | b;
+                        let g = (px >> 8) & 0xFF;
+                        let b = px & 0xFF;
+                        let lum = (77 * r + 150 * g + 29 * b) >> 8;
+                        // 80% grayscale + 20% original color so highlights/charts stay subtly legible
+                        let dr = (lum * 4 + r) / 5;
+                        let dg = (lum * 4 + g) / 5;
+                        let db = (lum * 4 + b) / 5;
+                        let nr = 30 + ((dr * 204) >> 8); // 30..234
+                        let ng = 31 + ((dg * 204) >> 8); // 31..235
+                        let nb = 29 + ((db * 201) >> 8); // 29..230
+                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
+                    }
+                }
+                ReadingFilter::WarmSepia => {
+                    // Warm book parchment (#F7F0DF bg, #2B2318 ink)
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        let r = (px >> 16) & 0xFF;
+                        let g = (px >> 8) & 0xFF;
+                        let b = px & 0xFF;
+                        let nr = 43 + ((r * 204) >> 8); // 43..247
+                        let ng = 35 + ((g * 205) >> 8); // 35..240
+                        let nb = 24 + ((b * 199) >> 8); // 24..223
+                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
+                    }
+                }
+                ReadingFilter::SageEyeCare => {
+                    // Ultra-pale desaturated mint paper (#E9F2EA bg, #1D271F ink) for long study sessions
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        let r = (px >> 16) & 0xFF;
+                        let g = (px >> 8) & 0xFF;
+                        let b = px & 0xFF;
+                        let nr = 29 + ((r * 204) >> 8); // 29..233
+                        let ng = 39 + ((g * 203) >> 8); // 39..242
+                        let nb = 31 + ((b * 203) >> 8); // 31..234
+                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
+                    }
+                }
+                ReadingFilter::DarkInvert => {
+                    // Anti-halation Soft Charcoal (#1E2024 bg, #D8DCE2 text) — no harsh pure-black/white bleed
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        let ir = 255 - ((px >> 16) & 0xFF);
+                        let ig = 255 - ((px >> 8) & 0xFF);
+                        let ib = 255 - (px & 0xFF);
+                        let nr = 30 + ((ir * 186) >> 8); // 30..216
+                        let ng = 32 + ((ig * 188) >> 8); // 32..220
+                        let nb = 36 + ((ib * 190) >> 8); // 36..226
+                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
+                    }
+                }
+                ReadingFilter::NightAmber => {
+                    // Best for night: Deep espresso dark (#1A1713 bg) + warm amber text (#E5CFA8), lowest blue light
+                    for i in 0..copy_len {
+                        let px = pixels[src_idx + i];
+                        let ir = 255 - ((px >> 16) & 0xFF);
+                        let ig = 255 - ((px >> 8) & 0xFF);
+                        let ib = 255 - (px & 0xFF);
+                        let nr = 26 + ((ir * 203) >> 8); // 26..229
+                        let ng = 23 + ((ig * 184) >> 8); // 23..207
+                        let nb = 19 + ((ib * 149) >> 8); // 19..168
+                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
                     }
                 }
             }
@@ -1459,7 +1720,7 @@ impl<'a> PdfViewerApp<'a> {
                 buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
             );
         } else if self.view_mode.is_page_view() {
-            if self.view_mode == ViewMode::ContinuousScroll {
+            if self.is_continuous_scroll() {
                 for &(page_idx, draw_rect) in &self.continuous_draw_rects {
                     if let Some(cache) = self.continuous_page_cache.get(&page_idx) {
                         self.draw_page_frame_chrome(
@@ -1670,6 +1931,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_notification_board_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
+        // Reading Color Mode Picker Popover (6 eye-care palettes)
+        if self.show_reading_mode_popover {
+            self.draw_reading_mode_popover(buffer, width, height, status_bar_h, scale_factor);
+        }
+
         // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu is open)
         if self.open_menu.is_none()
             && !self.show_customize_toolbar
@@ -1678,6 +1944,8 @@ impl<'a> PdfViewerApp<'a> {
             && self.combine_modal.is_none()
             && self.print_preview.is_none()
             && self.manual_duplex_wait.is_none()
+            && self.header_footer_modal.is_none()
+            && self.page_number_modal.is_none()
         {
             self.draw_floating_hover_tooltip(buffer, width, height, menu_bar_h, status_bar_h, scale_factor);
         }
@@ -1712,6 +1980,16 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_combine_modal(buffer, width, height, scale_factor);
         }
 
+        // Header & Footer Modal (`H`)
+        if self.header_footer_modal.is_some() {
+            self.draw_header_footer_modal(buffer, width, height, scale_factor);
+        }
+
+        // Page Numbering Modal (`N`)
+        if self.page_number_modal.is_some() {
+            self.draw_page_number_modal(buffer, width, height, scale_factor);
+        }
+
         // Print Preview Modal (`Ctrl/Cmd+P`)
         if self.print_preview.is_some() {
             self.draw_print_preview_modal(buffer, width, height, scale_factor);
@@ -1726,7 +2004,7 @@ impl<'a> PdfViewerApp<'a> {
     /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`
     /// for rendering live move/selection ghosts over the currently visible page(s).
     pub(super) fn pdf_rect_to_screen_rect(&self, page_idx: u16, rect: PdfRect) -> Option<(i32, i32, u32, u32)> {
-        let draw_rect = if self.view_mode == ViewMode::ContinuousScroll {
+        let draw_rect = if self.is_continuous_scroll() {
             let &(_, dr) = self.continuous_draw_rects.iter().find(|&&(p, _)| p == page_idx)?;
             dr
         } else if self.cached_page.as_ref().is_some_and(|c| c.page_index == page_idx)
@@ -1778,6 +2056,9 @@ impl<'a> PdfViewerApp<'a> {
             }
             Some(UiHit::BottomBar(act)) => {
                 if self.show_notifications && act == super::bottom_bar::BottomBarAction::NotificationBoard {
+                    return;
+                }
+                if self.show_reading_mode_popover && act == super::bottom_bar::BottomBarAction::ReadingFilter {
                     return;
                 }
                 let Some(rect) = self.bottom_bar_widget_rect(act, buf_w, buf_h, status_bar_h, sf) else {

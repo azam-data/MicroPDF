@@ -51,17 +51,26 @@ impl<'a> PdfViewerApp<'a> {
             self.hovered_thumb = None;
             self.view_mode = mode;
             self.last_page_view_mode = mode;
+            if mode == ViewMode::ContinuousScroll {
+                self.scroll_mode = ScrollMode::ContinuousVertical;
+            }
             self.scroll_y = 0.0;
+            self.scroll_x = 0.0;
             self.pan_x = 0.0;
             self.invalidate_page_caches();
+            let flow_suffix = match self.effective_scroll_mode() {
+                ScrollMode::SinglePage => "",
+                ScrollMode::ContinuousVertical => " + Continuous Vertical",
+                ScrollMode::ContinuousHorizontal => " + Book Horizontal Scroll",
+            };
             self.status_notice = Some(match mode {
-                ViewMode::FitPage => "View Mode: Fit Full Page (1)".to_string(),
-                ViewMode::FitWidth => "View Mode: Fit Page Width (2) — Scroll vertically".to_string(),
+                ViewMode::FitPage => format!("View Mode: Fit Full Page (1){flow_suffix}"),
+                ViewMode::FitWidth => format!("View Mode: Fit Page Width (2){flow_suffix}"),
                 ViewMode::FitTextWidth => {
-                    "View Mode: Fit Text Width (3) — Auto-trimmed margins".to_string()
+                    format!("View Mode: Fit Text Width (3) — Auto-trimmed margins{flow_suffix}")
                 }
                 ViewMode::TwoPageSpread => {
-                    "View Mode: Two-Page Side-by-Side Spread (4)".to_string()
+                    format!("View Mode: Two-Page Side-by-Side Spread (4){flow_suffix}")
                 }
                 ViewMode::ContinuousScroll => {
                     "View Mode: Continuous Vertical Scroll (5)".to_string()
@@ -88,19 +97,21 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Resolves which page (`current_page_index` vs `current_page_index + 1` in `TwoPageSpread`,
-    /// or the vertically hit page in `ContinuousScroll`) and its corresponding screen `draw_rect` contains `(sx, sy)`.
+    /// or the hit page in `ContinuousVertical` / `ContinuousHorizontal`) and its corresponding screen `draw_rect` contains `(sx, sy)`.
     pub(super) fn resolve_target_page_and_draw_rect(&self, sx: f64, sy: f64) -> (u16, (i32, i32, u32, u32)) {
-        if self.view_mode == ViewMode::ContinuousScroll {
+        if self.is_continuous_scroll() {
+            let ix = sx.round() as i32;
             let iy = sy.round() as i32;
             for &(p_idx, rect) in &self.continuous_draw_rects {
-                let (_rx, ry, _rw, rh) = rect;
-                if iy >= ry && iy <= ry + (rh as i32) {
+                let (rx, ry, rw, rh) = rect;
+                if ix >= rx && ix <= rx + (rw as i32) && iy >= ry && iy <= ry + (rh as i32) {
                     return (p_idx, rect);
                 }
             }
-            if let Some(&(p_idx, rect)) = self.continuous_draw_rects.iter().min_by_key(|&&(_, (_, ry, _, rh))| {
-                let center = ry + (rh as i32) / 2;
-                (iy - center).abs()
+            if let Some(&(p_idx, rect)) = self.continuous_draw_rects.iter().min_by_key(|&&(_, (rx, ry, rw, rh))| {
+                let cx = rx + (rw as i32) / 2;
+                let cy = ry + (rh as i32) / 2;
+                (ix - cx).abs() + (iy - cy).abs()
             }) {
                 return (p_idx, rect);
             }
@@ -719,6 +730,7 @@ impl<'a> PdfViewerApp<'a> {
         if clamped != self.current_page_index {
             self.current_page_index = clamped;
             self.scroll_y = 0.0;
+            self.scroll_x = 0.0;
             self.invalidate_page_caches();
             self.status_notice = None;
             self.update_title_bar();
@@ -817,20 +829,40 @@ impl<'a> PdfViewerApp<'a> {
             let new_draw_x = ax - u * new_w;
             let new_draw_y = ay - v * new_h;
 
-            if new_w > content_w as f32 {
-                self.pan_x =
-                    ((sidebar_w as f32) - new_draw_x).clamp(0.0, (new_w - content_w as f32).max(0.0));
-            } else {
-                self.pan_x = 0.0;
-            }
-
-            if self.view_mode == ViewMode::ContinuousScroll {
-                self.scroll_y = ((top_bars_h + PAGE_MARGIN_PX) as f32) - new_draw_y;
-            } else if new_h > content_h as f32 {
-                self.scroll_y = ((top_bars_h as f32) - new_draw_y)
-                    .clamp(0.0, (new_h - content_h as f32).max(0.0));
-            } else {
-                self.scroll_y = 0.0;
+            match self.effective_scroll_mode() {
+                ScrollMode::ContinuousHorizontal => {
+                    self.pan_x = 0.0;
+                    self.scroll_x = ((sidebar_w + PAGE_MARGIN_PX) as f32) - new_draw_x;
+                    if new_h > content_h as f32 {
+                        self.scroll_y = ((top_bars_h as f32) - new_draw_y)
+                            .clamp(0.0, (new_h - content_h as f32).max(0.0));
+                    } else {
+                        self.scroll_y = 0.0;
+                    }
+                }
+                ScrollMode::ContinuousVertical => {
+                    if new_w > content_w as f32 {
+                        self.pan_x = ((sidebar_w as f32) - new_draw_x)
+                            .clamp(0.0, (new_w - content_w as f32).max(0.0));
+                    } else {
+                        self.pan_x = 0.0;
+                    }
+                    self.scroll_y = ((top_bars_h + PAGE_MARGIN_PX) as f32) - new_draw_y;
+                }
+                ScrollMode::SinglePage => {
+                    if new_w > content_w as f32 {
+                        self.pan_x = ((sidebar_w as f32) - new_draw_x)
+                            .clamp(0.0, (new_w - content_w as f32).max(0.0));
+                    } else {
+                        self.pan_x = 0.0;
+                    }
+                    if new_h > content_h as f32 {
+                        self.scroll_y = ((top_bars_h as f32) - new_draw_y)
+                            .clamp(0.0, (new_h - content_h as f32).max(0.0));
+                    } else {
+                        self.scroll_y = 0.0;
+                    }
+                }
             }
         }
 
@@ -858,6 +890,7 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         for (_, old_tile) in self.tile_cache.drain() {
             if old_tile.pixels.capacity() > self.spare_pixel_buf.capacity() {
                 self.spare_pixel_buf = old_tile.pixels;
@@ -871,6 +904,11 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn pan_horizontal(&mut self, delta_x: f32) -> bool {
         if !self.view_mode.is_page_view() {
             return false;
+        }
+        if self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal {
+            self.scroll_x += delta_x;
+            self.request_redraw();
+            return true;
         }
         let (_, _, bmp_w, _) = self.page_draw_rect;
         let content_w = self
@@ -895,13 +933,24 @@ impl<'a> PdfViewerApp<'a> {
         false
     }
 
-    /// Scrolls vertically in `ContinuousScroll`, or in any page view when the page bitmap exceeds the viewport height,
+    /// Scrolls vertically in `ContinuousVertical`, horizontally in `ContinuousHorizontal` (Book mode),
+    /// or in any page view when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
-        if self.view_mode == ViewMode::ContinuousScroll {
-            self.scroll_y += scroll_delta_px;
-            self.request_redraw();
-            return true;
+        if self.view_mode.is_page_view() {
+            match self.effective_scroll_mode() {
+                ScrollMode::ContinuousVertical => {
+                    self.scroll_y += scroll_delta_px;
+                    self.request_redraw();
+                    return true;
+                }
+                ScrollMode::ContinuousHorizontal => {
+                    self.scroll_x += scroll_delta_px;
+                    self.request_redraw();
+                    return true;
+                }
+                ScrollMode::SinglePage => {}
+            }
         }
         if self.view_mode == ViewMode::TextView {
             self.scroll_y = (self.scroll_y + scroll_delta_px).max(0.0);
@@ -1982,10 +2031,14 @@ impl<'a> PdfViewerApp<'a> {
         };
         let orig_len = active.disk_size.max(report.original_len);
         if report.kept_original {
-            self.status_notice = Some(format!(
-                "Optimize: no size gain ({} image(s) checked); nothing written",
-                report.images_seen
-            ));
+            self.status_notice = Some(if report.images_seen == 0 && report.deduped_streams == 0 {
+                "Optimize: PDF is already compact (text/vector only — no images to compress); nothing written".to_string()
+            } else {
+                format!(
+                    "Optimize: already compact ({} image(s) checked, {} stream(s) deduped — no smaller output); nothing written",
+                    report.images_seen, report.deduped_streams
+                )
+            });
             self.update_title_bar();
             self.request_redraw();
             return;
@@ -2012,22 +2065,38 @@ impl<'a> PdfViewerApp<'a> {
             ),
         };
         let new_len = final_bytes.len();
+        let fmt_size = |bytes: usize| -> String {
+            if bytes >= 1024 * 1024 {
+                format!("{:.2} MB", (bytes as f64) / (1024.0 * 1024.0))
+            } else {
+                format!("{:.0} KB", ((bytes as f64) / 1024.0).max(1.0))
+            }
+        };
         match PdfEngine::write_atomic(&active.out_path, &final_bytes) {
             Ok(()) => {
-                let orig_mb = (orig_len as f64) / (1024.0 * 1024.0);
-                let new_mb = (new_len as f64) / (1024.0 * 1024.0);
                 let saved_pct = if orig_len > 0 && new_len < orig_len {
                     (((orig_len - new_len) as f64 / (orig_len as f64)) * 100.0).round() as u32
                 } else {
                     0
                 };
+                let dedup_part = if report.deduped_streams > 0 {
+                    format!(", {} deduped", report.deduped_streams)
+                } else {
+                    String::new()
+                };
+                let skip_part = if report.images_skipped > 0 {
+                    format!(", {} kept", report.images_skipped)
+                } else {
+                    String::new()
+                };
                 self.status_notice = Some(format!(
-                    "Optimized {:.2} MB -> {:.2} MB ({}% smaller; {} image(s) rewritten, {} left as is) -> '{}'{}",
-                    orig_mb,
-                    new_mb,
+                    "Optimized {} -> {} ({}% smaller; {} image(s) recompressed{}{}) -> '{}'{}",
+                    fmt_size(orig_len),
+                    fmt_size(new_len),
                     saved_pct,
                     report.images_rewritten,
-                    report.images_skipped,
+                    skip_part,
+                    dedup_part,
                     active.out_name,
                     warning.unwrap_or_default()
                 ));
@@ -2727,6 +2796,115 @@ impl<'a> PdfViewerApp<'a> {
             self.handle_combine_key(logical_key, text);
             return;
         }
+        // 0d. Header & Footer visual modal
+        if self.header_footer_modal.is_some() {
+            use super::doc_tools_modal::{HeaderFooterHit, HfField};
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.handle_header_footer_click(HeaderFooterHit::Cancel);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.handle_header_footer_click(HeaderFooterHit::Apply);
+                }
+                Key::Named(NamedKey::Tab) => {
+                    const ORDER: [HfField; 8] = [
+                        HfField::ProfileName,
+                        HfField::CustomRange,
+                        HfField::HeaderLeft,
+                        HfField::HeaderCenter,
+                        HfField::HeaderRight,
+                        HfField::FooterLeft,
+                        HfField::FooterCenter,
+                        HfField::FooterRight,
+                    ];
+                    if let Some(m) = self.header_footer_modal.as_mut() {
+                        let idx = ORDER.iter().position(|&f| f == m.focused_field).unwrap_or(0);
+                        let next_idx = if self.shift_pressed {
+                            (idx + ORDER.len() - 1) % ORDER.len()
+                        } else {
+                            (idx + 1) % ORDER.len()
+                        };
+                        m.focused_field = ORDER[next_idx];
+                        if m.focused_field == HfField::CustomRange {
+                            m.all_pages = false;
+                        }
+                    }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(m) = self.header_footer_modal.as_mut() {
+                        m.focused_text_mut().pop();
+                        m.error_msg = None;
+                    }
+                    self.request_redraw();
+                }
+                _ => {
+                    let mut typed = String::new();
+                    if let Some(t) = text {
+                        for c in t.chars() {
+                            if !c.is_control() {
+                                typed.push(c);
+                            }
+                        }
+                    } else if let Key::Character(ch) = &logical_key {
+                        for c in ch.chars() {
+                            if !c.is_control() {
+                                typed.push(c);
+                            }
+                        }
+                    } else if logical_key == Key::Named(NamedKey::Space) {
+                        typed.push(' ');
+                    }
+                    if !typed.is_empty() {
+                        if let Some(m) = self.header_footer_modal.as_mut() {
+                            match m.focused_field {
+                                HfField::CustomRange => {
+                                    m.all_pages = false;
+                                    for c in typed.chars() {
+                                        if c.is_ascii_digit() || c == '-' || c == ',' || c == ' ' {
+                                            m.custom_range.push(c);
+                                        }
+                                    }
+                                }
+                                HfField::ProfileName => {
+                                    for c in typed.chars() {
+                                        if c != '|' && c != '\n' && c != '\r' {
+                                            m.profile.name.push(c);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    m.focused_text_mut().push_str(&typed);
+                                }
+                            }
+                            m.error_msg = None;
+                        }
+                        self.request_redraw();
+                    }
+                }
+            }
+            return;
+        }
+        // 0e. Page Numbering visual modal
+        if self.page_number_modal.is_some() {
+            use super::doc_tools_modal::PageNumberHit;
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.handle_page_number_click(PageNumberHit::Cancel);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.handle_page_number_click(PageNumberHit::Apply);
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.handle_page_number_click(PageNumberHit::PrevPage);
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.handle_page_number_click(PageNumberHit::NextPage);
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.show_customize_toolbar || self.show_about_overlay {
             if matches!(logical_key, Key::Named(NamedKey::Escape)) {
                 self.show_customize_toolbar = false;
@@ -3145,6 +3323,9 @@ impl<'a> PdfViewerApp<'a> {
                 if self.open_menu.is_some() {
                     self.open_menu = None;
                     self.request_redraw();
+                } else if self.show_reading_mode_popover {
+                    self.show_reading_mode_popover = false;
+                    self.request_redraw();
                 } else if self.show_notifications {
                     self.show_notifications = false;
                     self.request_redraw();
@@ -3262,7 +3443,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if s == "4" {
                     self.set_view_mode(ViewMode::TwoPageSpread);
                 } else if s == "5" {
-                    self.set_view_mode(ViewMode::ContinuousScroll);
+                    self.set_scroll_mode(self.effective_scroll_mode().next());
                 } else if s.eq_ignore_ascii_case("t") {
                     if self.view_mode == ViewMode::TextView {
                         let restore = if self.last_page_view_mode.is_page_view() {
@@ -3275,13 +3456,7 @@ impl<'a> PdfViewerApp<'a> {
                         self.set_view_mode(ViewMode::TextView);
                     }
                 } else if s.eq_ignore_ascii_case("v") {
-                    self.reading_filter = self.reading_filter.next();
-                    self.status_notice = Some(format!(
-                        "Reading Filter: {} (Zero-RAM CPU Blit Filter)",
-                        self.reading_filter.label()
-                    ));
-                    self.update_title_bar();
-                    self.request_redraw();
+                    self.set_reading_filter(self.reading_filter.next());
                 } else if s.eq_ignore_ascii_case("p") {
                     self.pending_dialog = Some(PendingDialog::PickStampImage);
                 } else if s.eq_ignore_ascii_case("u") {
@@ -3339,26 +3514,9 @@ impl<'a> PdfViewerApp<'a> {
                     self.update_title_bar();
                     self.request_redraw();
                 } else if s.eq_ignore_ascii_case("n") {
-                    self.input_mode = InputMode::PageNumbers {
-                        input: String::new(),
-                    };
-                    self.status_notice = None;
-                    self.update_title_bar();
-                    self.request_redraw();
-                } else if s.eq_ignore_ascii_case("h") {
-                    self.input_mode = InputMode::HeaderFooterRange {
-                        range_input: String::new(),
-                    };
-                    self.status_notice = None;
-                    self.update_title_bar();
-                    self.request_redraw();
-                } else if s.eq_ignore_ascii_case("c") {
-                    self.input_mode = InputMode::ClearMargins {
-                        input: String::new(),
-                    };
-                    self.status_notice = None;
-                    self.update_title_bar();
-                    self.request_redraw();
+                    self.open_page_number_modal();
+                } else if s.eq_ignore_ascii_case("h") || s.eq_ignore_ascii_case("c") {
+                    self.open_header_footer_modal();
                 } else if s.eq_ignore_ascii_case("w") {
                     self.input_mode = InputMode::Watermark {
                         input: String::new(),
@@ -3650,6 +3808,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 if self.print_preview.is_some()
                     || self.manual_duplex_wait.is_some()
                     || self.combine_modal.is_some()
+                    || self.header_footer_modal.is_some()
+                    || self.page_number_modal.is_some()
                 {
                     return;
                 }
@@ -3691,12 +3851,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                let mut panned_h = false;
                 if dx.abs() > 0.5 {
-                    let _ = self.pan_horizontal((-dx) as f32);
+                    panned_h = self.pan_horizontal((-dx) as f32);
+                }
+                if panned_h && dy.abs() < 0.5 {
+                    return;
                 }
 
-                // Smoothly scroll `scroll_y` vertically when zoomed or in ContinuousScroll / FitWidth / FitTextWidth
-                if self.scroll_or_turn_page_vertical((-dy) as f32) {
+                // Smoothly scroll vertically (or horizontally in Book mode) when zoomed or in continuous / FitWidth / FitTextWidth
+                if dy.abs() > 0.1 && self.scroll_or_turn_page_vertical((-dy) as f32) {
                     return;
                 }
 
@@ -3768,6 +3932,30 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::Combine(h));
                         }
                     }
+                } else if self.header_footer_modal.is_some() {
+                    if let Some(h) = self.hit_test_header_footer_modal(
+                        position.x.round() as i32,
+                        position.y.round() as i32,
+                        win_w,
+                        win_h,
+                        sf,
+                    ) {
+                        if h != super::doc_tools_modal::HeaderFooterHit::InsideModal {
+                            new_hover = Some(UiHit::HeaderFooter(h));
+                        }
+                    }
+                } else if self.page_number_modal.is_some() {
+                    if let Some(h) = self.hit_test_page_number_modal(
+                        position.x.round() as i32,
+                        position.y.round() as i32,
+                        win_w,
+                        win_h,
+                        sf,
+                    ) {
+                        if h != super::doc_tools_modal::PageNumberHit::InsideModal {
+                            new_hover = Some(UiHit::PageNumber(h));
+                        }
+                    }
                 } else if self.show_customize_toolbar {
                     if let Some(h) = self.hit_test_customize_toolbar_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::toolbar::CustomizeHit::InsideModal {
@@ -3785,7 +3973,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         new_hover = Some(UiHit::MenuItem(idx));
                     }
                 } else {
-                    if self.show_notifications {
+                    if self.show_reading_mode_popover {
+                        if let Some(Some(mode)) = self.hit_test_reading_mode_popover(
+                            position.x,
+                            position.y,
+                            win_w,
+                            win_h,
+                            status_bar_h,
+                            sf,
+                        ) {
+                            new_hover = Some(UiHit::ReadingModeOption(mode));
+                        }
+                    }
+                    if new_hover.is_none() && self.show_notifications {
                         if let Some(on_clear) = self.hit_test_notification_board(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                             if on_clear {
                                 new_hover = Some(UiHit::NotificationClear);
@@ -3866,6 +4066,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 if self.manual_duplex_wait.is_some()
                     || self.print_preview.is_some()
                     || self.combine_modal.is_some()
+                    || self.header_footer_modal.is_some()
+                    || self.page_number_modal.is_some()
                     || self.show_customize_toolbar
                     || self.open_menu.is_some()
                 {
@@ -4008,6 +4210,38 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                // Header & Footer visual modal
+                if self.header_footer_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_header_footer_modal(
+                            self.cursor_pos.0.round() as i32,
+                            self.cursor_pos.1.round() as i32,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            self.handle_header_footer_click(hit);
+                        }
+                    }
+                    return;
+                }
+
+                // Page Numbering visual modal
+                if self.page_number_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_page_number_modal(
+                            self.cursor_pos.0.round() as i32,
+                            self.cursor_pos.1.round() as i32,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            self.handle_page_number_click(hit);
+                        }
+                    }
+                    return;
+                }
+
                 // Help & About modals
                 if self.show_help_overlay || self.show_about_overlay {
                     if state == ElementState::Pressed {
@@ -4063,6 +4297,32 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         self.request_redraw();
                     }
                     return;
+                }
+
+                // 0a0. Reading Mode picker popover clicks
+                if self.show_reading_mode_popover && state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(opt_mode) = self.hit_test_reading_mode_popover(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        if let Some(mode) = opt_mode {
+                            self.show_reading_mode_popover = false;
+                            self.set_reading_filter(mode);
+                        }
+                        return;
+                    }
+                    let clicking_toggle = status_bar_h > 0
+                        && (self.cursor_pos.1 as i32) >= win_h.saturating_sub(status_bar_h) as i32
+                        && self.hit_test_bottom_bar(self.cursor_pos.0, self.cursor_pos.1, win_w, win_h, status_bar_h, scale_factor)
+                            == Some(super::bottom_bar::BottomBarAction::ReadingFilter);
+                    if !clicking_toggle {
+                        self.show_reading_mode_popover = false;
+                        self.request_redraw();
+                    }
                 }
 
                 // 0a1. Session Notification Board popover clicks

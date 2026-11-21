@@ -146,37 +146,96 @@ impl PrintOrientation {
     }
 }
 
-/// Standard sheet paper sizes for Print Preview & CUPS media selection.
+/// Standard sheet paper sizes for Print Preview, Windows GDI & CUPS media selection.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PrintPaperSize {
+    Auto,
     A4,
+    A5,
+    A3,
+    B5,
     Letter,
     Legal,
+    Executive,
+    Tabloid,
+    Statement,
 }
 
 impl PrintPaperSize {
+    pub const ALL: [Self; 10] = [
+        Self::A4,
+        Self::Letter,
+        Self::Legal,
+        Self::A5,
+        Self::A3,
+        Self::B5,
+        Self::Executive,
+        Self::Tabloid,
+        Self::Statement,
+        Self::Auto,
+    ];
+
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            Self::A4 => "A4",
-            Self::Letter => "Letter",
-            Self::Legal => "Legal",
+            Self::Auto => "Auto (PDF Size)",
+            Self::A4 => "A4 (210×297 mm)",
+            Self::A5 => "A5 (148×210 mm)",
+            Self::A3 => "A3 (297×420 mm)",
+            Self::B5 => "B5 (176×250 mm)",
+            Self::Letter => "Letter (8.5×11 in)",
+            Self::Legal => "Legal (8.5×14 in)",
+            Self::Executive => "Executive (7.25×10.5 in)",
+            Self::Tabloid => "Tabloid (11×17 in)",
+            Self::Statement => "Statement (5.5×8.5 in)",
         }
     }
 
     /// Portrait `(width_pts, height_pts)` in PDF points (1/72 inch).
     pub fn portrait_pts(self) -> (f32, f32) {
         match self {
-            Self::A4 => (595.28, 841.89),
+            Self::Auto | Self::A4 => (595.28, 841.89),
+            Self::A5 => (419.53, 595.28),
+            Self::A3 => (841.89, 1190.55),
+            Self::B5 => (498.90, 708.66),
             Self::Letter => (612.0, 792.0),
             Self::Legal => (612.0, 1008.0),
+            Self::Executive => (522.0, 756.0),
+            Self::Tabloid => (792.0, 1224.0),
+            Self::Statement => (396.0, 612.0),
         }
     }
 
-    pub fn cups_media(self) -> &'static str {
+    /// Returns portrait `(short_pts, long_pts)` matching the page's own dimensions when `Auto`.
+    pub fn portrait_pts_for_page(self, page_w: f32, page_h: f32) -> (f32, f32) {
+        if self == Self::Auto && page_w > 10.0 && page_h > 10.0 {
+            (page_w.min(page_h), page_w.max(page_h))
+        } else {
+            self.portrait_pts()
+        }
+    }
+
+    pub fn cups_media(self) -> Option<&'static str> {
         match self {
-            Self::A4 => "A4",
-            Self::Letter => "Letter",
-            Self::Legal => "Legal",
+            Self::Auto => None,
+            Self::A4 => Some("A4"),
+            Self::A5 => Some("A5"),
+            Self::A3 => Some("A3"),
+            Self::B5 => Some("ISOB5"),
+            Self::Letter => Some("Letter"),
+            Self::Legal => Some("Legal"),
+            Self::Executive => Some("Executive"),
+            Self::Tabloid => Some("Tabloid"),
+            Self::Statement => Some("Statement"),
         }
     }
 }
@@ -532,7 +591,7 @@ where
             .set_fixed_height(strip_h as i32)
             .render_form_data(false)
             .render_annotations(opts.include_annotations)
-            .use_print_quality(true)
+            .use_print_quality(!opts.include_annotations)
             .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
             .reset_matrix(PdfMatrix::new(
@@ -1102,6 +1161,48 @@ fn strip_annotations_from_temp_pdf(pdf_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ensures every visible annotation in the temporary print PDF has the PDF PRINT flag (`/F` bit `0x04`)
+/// set so CUPS/macOS PDF filters always render annotations when `With Annots` is chosen.
+#[cfg_attr(windows, allow(dead_code))]
+fn ensure_annotations_printable_in_temp_pdf(pdf_path: &Path) -> Result<()> {
+    let raw = std::fs::read(pdf_path)?;
+    let mut ldoc = lopdf::Document::load_mem(&raw)?;
+    let mut changed = false;
+    let mut annot_ids = Vec::new();
+    for (_pnum, page_id) in ldoc.get_pages() {
+        let Ok(page_dict) = ldoc.get_dictionary(page_id) else { continue };
+        let Ok(annots_obj) = page_dict.get(b"Annots") else { continue };
+        let arr = match annots_obj {
+            lopdf::Object::Reference(r) => ldoc.get_object(*r).and_then(|o| o.as_array()).ok(),
+            lopdf::Object::Array(a) => Some(a),
+            _ => None,
+        };
+        if let Some(arr) = arr {
+            for item in arr {
+                if let Ok(r) = item.as_reference() {
+                    annot_ids.push(r);
+                }
+            }
+        }
+    }
+    for aid in annot_ids {
+        if let Ok(lopdf::Object::Dictionary(ad)) = ldoc.get_object_mut(aid) {
+            let f = ad.get(b"F").and_then(|v| v.as_i64()).unwrap_or(0);
+            // Skip Hidden (0x02) or Invisible (0x01) annotations; set Print (0x04) on all others
+            if (f & 0x03) == 0 && (f & 0x04) == 0 {
+                ad.set("F", f | 0x04);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let mut out = Vec::with_capacity(raw.len());
+        ldoc.save_to(&mut out)?;
+        std::fs::write(pdf_path, &out)?;
+    }
+    Ok(())
+}
+
 /// Starts printing with full Print Preview options through CUPS (`lp`).
 #[cfg_attr(windows, allow(dead_code))]
 pub fn start_cups_print_extended(
@@ -1133,6 +1234,8 @@ pub fn start_cups_print_extended(
 
     if !req.render_opts.include_annotations {
         let _ = strip_annotations_from_temp_pdf(temp.path());
+    } else {
+        let _ = ensure_annotations_printable_in_temp_pdf(temp.path());
     }
 
     if req.render_opts.auto_trim_margins || req.render_opts.zoom_percent > 100 {
@@ -1168,9 +1271,10 @@ pub fn start_cups_print_extended(
         .arg("-t")
         .arg(if req.title.is_empty() { "MicroPDF" } else { req.title })
         .arg("-o")
-        .arg(format!("media={}", req.paper.cups_media()))
-        .arg("-o")
         .arg(req.duplex.cups_sides_arg());
+    if let Some(media) = req.paper.cups_media() {
+        cmd.arg("-o").arg(format!("media={media}"));
+    }
     if copies > 1 {
         cmd.arg("-o")
             .arg(if req.render_opts.collate { "Collate=True" } else { "Collate=False" });
@@ -1589,8 +1693,14 @@ pub mod gdi {
     const DMORIENT_PORTRAIT: i16 = 1;
     const DMORIENT_LANDSCAPE: i16 = 2;
     const DMPAPER_LETTER: i16 = 1;
+    const DMPAPER_TABLOID: i16 = 3;
     const DMPAPER_LEGAL: i16 = 5;
+    const DMPAPER_STATEMENT: i16 = 6;
+    const DMPAPER_EXECUTIVE: i16 = 7;
+    const DMPAPER_A3: i16 = 8;
     const DMPAPER_A4: i16 = 9;
+    const DMPAPER_A5: i16 = 11;
+    const DMPAPER_B5: i16 = 13;
     const DMDUP_SIMPLEX: i16 = 1;
     const DMDUP_VERTICAL: i16 = 2;
     const DMDUP_HORIZONTAL: i16 = 3;
@@ -1875,17 +1985,28 @@ pub mod gdi {
                         );
                         if res > 0 {
                             let dm = dm_ptr as *mut DevModeWPrefix;
-                            (*dm).dm_fields |= DM_DUPLEX | DM_PAPERSIZE;
+                            (*dm).dm_fields |= DM_DUPLEX;
                             (*dm).dm_duplex = match duplex {
                                 DuplexMode::Off => DMDUP_SIMPLEX,
                                 DuplexMode::LongEdge => DMDUP_VERTICAL,
                                 DuplexMode::ShortEdge => DMDUP_HORIZONTAL,
                             };
-                            (*dm).dm_paper_size = match paper {
-                                PrintPaperSize::A4 => DMPAPER_A4,
-                                PrintPaperSize::Letter => DMPAPER_LETTER,
-                                PrintPaperSize::Legal => DMPAPER_LEGAL,
+                            let dm_paper = match paper {
+                                PrintPaperSize::Auto => None,
+                                PrintPaperSize::A4 => Some(DMPAPER_A4),
+                                PrintPaperSize::A5 => Some(DMPAPER_A5),
+                                PrintPaperSize::A3 => Some(DMPAPER_A3),
+                                PrintPaperSize::B5 => Some(DMPAPER_B5),
+                                PrintPaperSize::Letter => Some(DMPAPER_LETTER),
+                                PrintPaperSize::Legal => Some(DMPAPER_LEGAL),
+                                PrintPaperSize::Executive => Some(DMPAPER_EXECUTIVE),
+                                PrintPaperSize::Tabloid => Some(DMPAPER_TABLOID),
+                                PrintPaperSize::Statement => Some(DMPAPER_STATEMENT),
                             };
+                            if let Some(pcode) = dm_paper {
+                                (*dm).dm_fields |= DM_PAPERSIZE;
+                                (*dm).dm_paper_size = pcode;
+                            }
                             let _ = DocumentPropertiesW(
                                 std::ptr::null_mut(),
                                 h_printer,
@@ -3036,11 +3157,17 @@ mod tests {
         assert!(!PrintOrientation::Portrait.is_landscape(800.0, 600.0));
         assert!(PrintOrientation::Landscape.is_landscape(600.0, 800.0));
 
-        assert_eq!(PrintPaperSize::A4.cups_media(), "A4");
-        assert_eq!(PrintPaperSize::Letter.cups_media(), "Letter");
-        assert_eq!(PrintPaperSize::Legal.cups_media(), "Legal");
+        assert_eq!(PrintPaperSize::A4.cups_media(), Some("A4"));
+        assert_eq!(PrintPaperSize::Letter.cups_media(), Some("Letter"));
+        assert_eq!(PrintPaperSize::Legal.cups_media(), Some("Legal"));
+        assert_eq!(PrintPaperSize::A3.cups_media(), Some("A3"));
+        assert_eq!(PrintPaperSize::A5.cups_media(), Some("A5"));
+        assert_eq!(PrintPaperSize::Tabloid.cups_media(), Some("Tabloid"));
+        assert_eq!(PrintPaperSize::Auto.cups_media(), None);
+        assert_eq!(PrintPaperSize::A4.next().prev(), PrintPaperSize::A4);
         let (a4w, a4h) = PrintPaperSize::A4.portrait_pts();
         assert!(a4h > a4w && (a4w - 595.28).abs() < 0.1);
+        assert_eq!(PrintPaperSize::Auto.portrait_pts_for_page(500.0, 300.0), (300.0, 500.0));
     }
 
     #[test]

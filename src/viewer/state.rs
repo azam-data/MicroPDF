@@ -1,5 +1,6 @@
 use crate::engine::{
-    AnnotationColor, Bookmark, MarginPosition, PdfEngine, SearchMatch, StampImageBuffer,
+    AnnotationColor, Bookmark, HeaderFooterProfile, MarginPosition, PdfEngine, SearchMatch,
+    StampImageBuffer,
 };
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -12,6 +13,9 @@ use winit::window::Window;
 
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
+use super::doc_tools_modal::{
+    HeaderFooterHit, HeaderFooterModalState, PageNumberHit, PageNumberModalState,
+};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
@@ -100,14 +104,16 @@ impl MenuCategory {
                 "Fit Page Width (2)",
                 "Fit Text Width — Crop Margins (3)",
                 "Two-Page Side-by-Side (4)",
-                "Continuous Vertical Scroll (5)",
+                "Scroll: Single Page",
+                "Scroll: Continuous Vertical (5)",
+                "Scroll: Continuous Horizontal Book",
                 "Text View — Reflowable Reader (T)",
                 "Zoom In (+ / Ctrl+Wheel Up)",
                 "Zoom Out (- / Ctrl+Wheel Down)",
                 "Reset Zoom 100% (0)",
                 "Toggle Thumbnail Grid (Tab)",
                 "Toggle Bookmark Sidebar (B)",
-                "Cycle Dark / Sepia / Normal Reading Mode (V)",
+                "Cycle Reading Mode (E-Ink / Sepia / Sage / Dark / Night) (V)",
                 "Toggle Fullscreen (F11)",
                 "Presentation Mode (F5)",
                 "Show Toolbar",
@@ -143,9 +149,8 @@ impl MenuCategory {
                 "Reset Page Crop",
             ],
             MenuCategory::Tools => &[
-                "Page Numbering Roman/Arabic... (N)",
-                "Add Header / Footer... (H)",
-                "Clear Existing Margins... (C)",
+                "Page Numbering... (N)",
+                "Header & Footer / Clear Existing... (H)",
                 "Add Watermark... (W)",
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
@@ -210,28 +215,136 @@ impl MouseMode {
     }
 }
 
-/// Zero-RAM CPU-rendered Reading Filter (`V` key or `View` menu).
+/// Zero-RAM CPU-rendered Reading Filter (`V` key, Bottom Bar picker, or `View` menu).
+/// Research-backed palettes tuned to reduce luminance glare in daytime and halation/blue-light at night.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReadingFilter {
     Normal,
-    DarkInvert,
+    /// Matte neutral low-glare paper (recommended for daytime reading).
+    PaperEInk,
+    /// Warm book parchment / cream.
     WarmSepia,
+    /// Ultra-pale desaturated mint paper for long study sessions.
+    SageEyeCare,
+    /// Anti-halation soft charcoal dark mode for dim rooms.
+    DarkInvert,
+    /// Deep espresso dark with warm amber text (recommended for night reading).
+    NightAmber,
 }
 
 impl ReadingFilter {
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
+        Self::PaperEInk,
+        Self::WarmSepia,
+        Self::SageEyeCare,
+        Self::DarkInvert,
+        Self::NightAmber,
+    ];
+
     pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Short compact label for the Bottom Bar pill.
+    pub fn label(self) -> &'static str {
         match self {
-            ReadingFilter::Normal => ReadingFilter::DarkInvert,
-            ReadingFilter::DarkInvert => ReadingFilter::WarmSepia,
-            ReadingFilter::WarmSepia => ReadingFilter::Normal,
+            Self::Normal => "Normal",
+            Self::PaperEInk => "E-Ink",
+            Self::WarmSepia => "Sepia",
+            Self::SageEyeCare => "Sage",
+            Self::DarkInvert => "Dark",
+            Self::NightAmber => "Night",
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// Descriptive title shown in the Reading Mode picker popover (including Best for day / night labels).
+    pub fn picker_title(self) -> &'static str {
         match self {
-            ReadingFilter::Normal => "Normal",
-            ReadingFilter::DarkInvert => "Dark",
-            ReadingFilter::WarmSepia => "Sepia",
+            Self::Normal => "Normal",
+            Self::PaperEInk => "Paper (E-Ink) — Best for day",
+            Self::WarmSepia => "Sepia (Cream)",
+            Self::SageEyeCare => "Sage (Eye Care)",
+            Self::DarkInvert => "Soft Dark",
+            Self::NightAmber => "Night Amber — Best for night",
+        }
+    }
+
+    /// Secondary guidance subtitle shown in the Reading Mode picker popover.
+    pub fn picker_hint(self) -> &'static str {
+        match self {
+            Self::Normal => "Original PDF colors",
+            Self::PaperEInk => "Matte low-glare neutral gray paper",
+            Self::WarmSepia => "Warm book parchment · day & dusk",
+            Self::SageEyeCare => "Soft pale mint · long study sessions",
+            Self::DarkInvert => "Anti-halation charcoal · dim rooms",
+            Self::NightAmber => "Warm amber on dark · lowest blue light",
+        }
+    }
+
+    /// `(background_rgb, text_rgb)` preview swatch colors for the picker popover.
+    pub fn swatch_colors(self) -> (u32, u32) {
+        match self {
+            Self::Normal => (0x00FF_FFFF, 0x001E_293B),
+            Self::PaperEInk => (0x00EA_EBE6, 0x001E_1F1D),
+            Self::WarmSepia => (0x00F7_F0DF, 0x002B_2318),
+            Self::SageEyeCare => (0x00E9_F2EA, 0x001D_271F),
+            Self::DarkInvert => (0x001E_2024, 0x00D8_DCE2),
+            Self::NightAmber => (0x001A_1713, 0x00E5_CFA8),
+        }
+    }
+}
+
+/// Independent page scrolling flow combined orthogonally with Fit/Layout (`ViewMode`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollMode {
+    /// Classic discrete page turns (zero neighbor prefetch).
+    SinglePage,
+    /// Smooth continuous vertical scroll across all pages (works with FitPage, FitWidth, FitTextWidth, TwoPageSpread).
+    ContinuousVertical,
+    /// Smooth continuous horizontal "book ribbon" scroll across all pages left-to-right.
+    ContinuousHorizontal,
+}
+
+impl ScrollMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::SinglePage => Self::ContinuousVertical,
+            Self::ContinuousVertical => Self::ContinuousHorizontal,
+            Self::ContinuousHorizontal => Self::SinglePage,
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single",
+            Self::ContinuousVertical => "Vert",
+            Self::ContinuousHorizontal => "Book",
+        }
+    }
+
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single Page",
+            Self::ContinuousVertical => "Continuous Vertical Scroll",
+            Self::ContinuousHorizontal => "Continuous Horizontal Book Scroll",
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::SinglePage => "SinglePage",
+            Self::ContinuousVertical => "ContinuousVertical",
+            Self::ContinuousHorizontal => "ContinuousHorizontal",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "ContinuousVertical" => Self::ContinuousVertical,
+            "ContinuousHorizontal" => Self::ContinuousHorizontal,
+            _ => Self::SinglePage,
         }
     }
 }
@@ -299,7 +412,7 @@ pub(super) struct SavedSessionTab {
     pub(super) view_mode: ViewMode,
 }
 
-/// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, and UI preferences).
+/// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, UI preferences & saved profiles).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SessionConfig {
     pub(super) active_tab: usize,
@@ -307,8 +420,10 @@ pub(super) struct SessionConfig {
     pub(super) recent_files: Vec<PathBuf>,
     pub(super) ui_theme: UiThemeMode,
     pub(super) ui_scale: f32,
+    pub(super) scroll_mode: ScrollMode,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
+    pub(super) hf_profiles: Vec<HeaderFooterProfile>,
 }
 
 impl Default for SessionConfig {
@@ -319,8 +434,10 @@ impl Default for SessionConfig {
             recent_files: Vec::new(),
             ui_theme: UiThemeMode::Light,
             ui_scale: 1.0,
+            scroll_mode: ScrollMode::SinglePage,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
+            hf_profiles: Vec::new(),
         }
     }
 }
@@ -390,9 +507,11 @@ pub(super) struct DocumentTab<'a> {
     pub(super) current_page_index: u16,
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
+    pub(super) scroll_mode: ScrollMode,
     pub(super) zoom_level: f32,
     pub(super) pan_x: f32,
     pub(super) scroll_y: f32,
+    pub(super) scroll_x: f32,
     pub(super) nav_back_stack: VecDeque<(u16, f32)>,
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     pub(super) roman_end: usize,
@@ -450,6 +569,9 @@ pub(super) enum UiHit {
     PrintPreview(PrintPreviewHit),
     ManualDuplex(ManualDuplexHit),
     Combine(CombineHit),
+    HeaderFooter(HeaderFooterHit),
+    PageNumber(PageNumberHit),
+    ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
     Overlay(OverlayHit),
     NotificationClear,
@@ -487,23 +609,28 @@ pub(super) enum InputMode {
     JumpToPage {
         input: String,
     },
+    #[allow(dead_code)]
     PageNumbers {
         input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterRange {
         range_input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterPosition {
         start_page: u16,
         end_page: u16,
         pos_input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterText {
         start_page: u16,
         end_page: u16,
         position: MarginPosition,
         text_input: String,
     },
+    #[allow(dead_code)]
     ClearMargins {
         input: String,
     },
@@ -720,12 +847,16 @@ pub struct PdfViewerApp<'a> {
     /// Active View Mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`, `ContinuousScroll`, `ThumbnailGrid`).
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
+    /// Independent scroll flow (`SinglePage`, `ContinuousVertical`, `ContinuousHorizontal`).
+    pub(super) scroll_mode: ScrollMode,
     /// Zoom factor (`0.25..=8.0`, i.e. 25%–800%, default `1.0`).
     pub(super) zoom_level: f32,
     /// Horizontal pan offset in physical pixels when the zoomed page width exceeds the viewport width.
     pub(super) pan_x: f32,
-    /// Vertical scroll offset in physical pixels when zoomed or in `FitWidth` / `FitTextWidth` / `ContinuousScroll`.
+    /// Vertical scroll offset in physical pixels when zoomed or in vertical continuous scroll.
     pub(super) scroll_y: f32,
+    /// Horizontal scroll offset in physical pixels when in `ScrollMode::ContinuousHorizontal` (book ribbon).
+    pub(super) scroll_x: f32,
     /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 16 MB).
     pub(super) tile_cache: HashMap<TileKey, TileEntry>,
     pub(super) tile_lru_tick: u64,
@@ -770,8 +901,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) mouse_mode: MouseMode,
     /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
     pub(super) pending_stamp_image: Option<StampImageBuffer>,
-    /// Zero-RAM CPU-rendered Reading Filter (`Normal`, `DarkInvert`, `WarmSepia`).
+    /// Zero-RAM CPU-rendered Reading Filter (6 eye-care palettes).
     pub(super) reading_filter: ReadingFilter,
+    /// True when the bottom-bar Reading Mode picker popover is open.
+    pub(super) show_reading_mode_popover: bool,
     /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`).
     pub(super) search_query: String,
     pub(super) search_matches: Vec<SearchMatch>,
@@ -815,6 +948,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) show_toolbar: bool,
     /// Per-button customization persisted in `micropdf.ini`.
     pub(super) toolbar_config: ToolbarConfig,
+    /// Saved reusable Header/Footer style profiles persisted in `micropdf.ini`.
+    pub(super) hf_profiles: Vec<HeaderFooterProfile>,
+    /// Most recently edited Header/Footer settings so reopening the dialog lets you tweak & update cleanly.
+    pub(super) last_hf_profile: HeaderFooterProfile,
     /// Active annotation color swatch (Highlight, Underline, Strikethrough, Note, Pen, TextBox, Shapes).
     pub(super) annotation_color: AnnotationColor,
     /// Live freehand pen stroke points in window physical pixels while dragging `MouseMode::InkPen`.
@@ -829,6 +966,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) manual_duplex_wait: Option<ManualDuplexWaitState>,
     /// Active Interactive Combine PDFs modal state (0 bytes when closed).
     pub(super) combine_modal: Option<CombineModalState>,
+    /// Active visual Header & Footer modal state (0 bytes when closed).
+    pub(super) header_footer_modal: Option<HeaderFooterModalState>,
+    /// Active visual Page Numbering modal state (0 bytes when closed).
+    pub(super) page_number_modal: Option<PageNumberModalState>,
     /// Cached extracted blocks for `ViewMode::TextView` (0 bytes when not in Text View).
     pub(super) cached_text_view: Option<CachedTextViewPage>,
     /// Reading font size in logical pixels for `ViewMode::TextView`.
@@ -841,8 +982,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) is_fullscreen: bool,
     /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
     pub(super) is_presentation: bool,
-    /// Saved `(view_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
-    pub(super) pre_presentation_state: Option<(ViewMode, f32, f32, f32)>,
+    /// Saved `(view_mode, scroll_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
+    pub(super) pre_presentation_state: Option<(ViewMode, ScrollMode, f32, f32, f32)>,
     pub(super) status_notice: Option<String>,
     /// Bounded session log of timestamped status notifications (max 50 entries).
     pub(super) notifications: VecDeque<NotificationEntry>,
@@ -886,6 +1027,56 @@ impl<'a> PdfViewerApp<'a> {
         self.request_redraw();
     }
 
+    /// Effective scroll mode (supports legacy `ViewMode::ContinuousScroll` seamlessly).
+    pub(super) fn effective_scroll_mode(&self) -> ScrollMode {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            ScrollMode::ContinuousVertical
+        } else {
+            self.scroll_mode
+        }
+    }
+
+    /// Effective page layout/fit mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`).
+    pub(super) fn effective_layout_mode(&self) -> ViewMode {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            ViewMode::FitWidth
+        } else {
+            self.view_mode
+        }
+    }
+
+    /// True when rendering continuous vertical or continuous horizontal scrolling page flow.
+    pub(super) fn is_continuous_scroll(&self) -> bool {
+        self.view_mode.is_page_view() && self.effective_scroll_mode() != ScrollMode::SinglePage
+    }
+
+    pub(super) fn set_scroll_mode(&mut self, mode: ScrollMode) {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            self.view_mode = ViewMode::FitWidth;
+            self.last_page_view_mode = ViewMode::FitWidth;
+        }
+        if !self.view_mode.is_page_view() {
+            self.view_mode = self.last_page_view_mode;
+            self.thumbnail_cache.clear();
+            self.cached_text_view = None;
+        }
+        self.scroll_mode = mode;
+        self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
+        self.pan_x = 0.0;
+        self.invalidate_page_caches();
+        self.status_notice = Some(format!("Scroll Mode: {}", mode.status_label()));
+        self.save_session_to_ini();
+        self.request_redraw();
+    }
+
+    pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
+        self.reading_filter = filter;
+        self.show_reading_mode_popover = false;
+        self.status_notice = Some(format!("Reading Mode: {}", filter.picker_title()));
+        self.request_redraw();
+    }
+
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
         // Print temp files left behind by a previous run that was killed mid-print.
         crate::print::remove_stale_print_temp_files(&std::env::temp_dir());
@@ -915,9 +1106,11 @@ impl<'a> PdfViewerApp<'a> {
             drag_start: None,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: ScrollMode::SinglePage,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             tile_cache: HashMap::new(),
             tile_lru_tick: 0,
             nav_back_stack: VecDeque::new(),
@@ -943,6 +1136,7 @@ impl<'a> PdfViewerApp<'a> {
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
+            show_reading_mode_popover: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             current_search_match: 0,
@@ -972,6 +1166,8 @@ impl<'a> PdfViewerApp<'a> {
             ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
+            hf_profiles: Vec::new(),
+            last_hf_profile: HeaderFooterProfile::default(),
             annotation_color: AnnotationColor::Yellow,
             ink_stroke_screen_pts: Vec::new(),
             active_note_popover: None,
@@ -979,6 +1175,8 @@ impl<'a> PdfViewerApp<'a> {
             print_preview: None,
             manual_duplex_wait: None,
             combine_modal: None,
+            header_footer_modal: None,
+            page_number_modal: None,
             cached_text_view: None,
             text_view_font_size: 14.5,
             hovered_widget: None,
@@ -1120,8 +1318,12 @@ impl<'a> PdfViewerApp<'a> {
         let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
         out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
+        out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
+        for prof in &cfg.hf_profiles {
+            out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
+        }
         out.push_str(&format!("active_tab={}\n", cfg.active_tab));
         for tab in &cfg.tabs {
             let p_str = tab.path.to_string_lossy().replace('\n', "").replace('\r', "");
@@ -1158,11 +1360,19 @@ impl<'a> PdfViewerApp<'a> {
                         cfg.ui_scale = sc.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
                     }
                 }
+            } else if let Some(val) = line.strip_prefix("scroll_mode=") {
+                cfg.scroll_mode = ScrollMode::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("hf_profile=") {
+                if let Some(prof) = HeaderFooterProfile::from_ini_str(val) {
+                    if cfg.hf_profiles.len() < 24 {
+                        cfg.hf_profiles.push(prof);
+                    }
+                }
             } else if let Some(val) = line.strip_prefix("active_tab=") {
                 if let Ok(idx) = val.trim().parse::<usize>() {
                     cfg.active_tab = idx;
@@ -1257,8 +1467,10 @@ impl<'a> PdfViewerApp<'a> {
             recent_files: self.recent_files.clone(),
             ui_theme: self.ui_theme_mode,
             ui_scale: self.ui_scale,
+            scroll_mode: self.scroll_mode,
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
+            hf_profiles: self.hf_profiles.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
         let primary_path = self.portable_session_ini_path();
@@ -1297,8 +1509,13 @@ impl<'a> PdfViewerApp<'a> {
         let cfg = Self::parse_session_ini(&content);
         self.ui_theme_mode = cfg.ui_theme;
         self.ui_scale = cfg.ui_scale;
+        self.scroll_mode = cfg.scroll_mode;
         self.show_toolbar = cfg.show_toolbar;
         self.toolbar_config = cfg.toolbar_config;
+        self.hf_profiles = cfg.hf_profiles;
+        if let Some(first_prof) = self.hf_profiles.first() {
+            self.last_hf_profile = first_prof.clone();
+        }
         self.recent_files = cfg
             .recent_files
             .into_iter()
@@ -1809,6 +2026,7 @@ impl<'a> PdfViewerApp<'a> {
         if !self.is_presentation {
             self.pre_presentation_state = Some((
                 self.view_mode,
+                self.scroll_mode,
                 self.zoom_level,
                 self.pan_x,
                 self.scroll_y,
@@ -1818,9 +2036,11 @@ impl<'a> PdfViewerApp<'a> {
         self.is_fullscreen = true;
         self.open_menu = None;
         self.view_mode = ViewMode::FitPage;
+        self.scroll_mode = ScrollMode::SinglePage;
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         if let Some(w) = self.window.as_ref() {
             w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -1841,8 +2061,9 @@ impl<'a> PdfViewerApp<'a> {
         self.is_presentation = false;
         self.is_fullscreen = false;
         if was_presentation {
-            if let Some((vm, zoom, px, sy)) = self.pre_presentation_state.take() {
+            if let Some((vm, sm, zoom, px, sy)) = self.pre_presentation_state.take() {
                 self.view_mode = vm;
+                self.scroll_mode = sm;
                 self.zoom_level = zoom;
                 self.pan_x = px;
                 self.scroll_y = sy;

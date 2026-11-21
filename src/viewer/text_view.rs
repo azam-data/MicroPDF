@@ -143,10 +143,13 @@ impl<'a> PdfViewerApp<'a> {
         let s = sf as f32;
         let content_bottom = buf_h.saturating_sub(status_bar_h) as i32;
 
-        // Reading surface colors adapt to ReadingFilter (Normal / Dark / Sepia) or UI theme
+        // Reading surface colors adapt to all 6 eye-care ReadingFilter palettes
         let (paper_bg, text_fg, muted_fg, heading_fg) = match self.reading_filter {
-            ReadingFilter::WarmSepia => (0x00FBF5E6, 0x003B2F1E, 0x007A684D, 0x00241A0E),
-            ReadingFilter::DarkInvert => (0x00161B22, 0x00E6EDF3, 0x008B949E, 0x00FFFFFF),
+            ReadingFilter::PaperEInk => (0x00EA_EBE6, 0x001E_1F1D, 0x005C_5E59, 0x0012_1311),
+            ReadingFilter::WarmSepia => (0x00F7_F0DF, 0x002B_2318, 0x007A_684D, 0x001E_160C),
+            ReadingFilter::SageEyeCare => (0x00E9_F2EA, 0x001D_271F, 0x0056_6B5A, 0x0012_1B14),
+            ReadingFilter::DarkInvert => (0x001E_2024, 0x00D8_DCE2, 0x008E_96A4, 0x00EC_EFF4),
+            ReadingFilter::NightAmber => (0x001A_1713, 0x00E5_CFA8, 0x009E_8B6B, 0x00F2_DFB9),
             ReadingFilter::Normal => (theme.surface_bg, theme.text_primary, theme.text_muted, theme.text_primary),
         };
 
@@ -267,20 +270,13 @@ impl<'a> PdfViewerApp<'a> {
 
                     let tbl_top = y_cursor;
                     let tbl_h = (rows.len() as i32) * row_h;
-                    let hdr_bg = match self.reading_filter {
-                        ReadingFilter::DarkInvert => 0x00262626,
-                        ReadingFilter::WarmSepia => 0x00EAE0C8,
-                        ReadingFilter::Normal => theme.surface_elevated,
-                    };
-                    let zebra_bg = match self.reading_filter {
-                        ReadingFilter::DarkInvert => 0x001D1D1D,
-                        ReadingFilter::WarmSepia => 0x00F2EBD9,
-                        ReadingFilter::Normal => 0x00F8FAFC,
-                    };
-                    let grid_col = match self.reading_filter {
-                        ReadingFilter::DarkInvert => 0x00333333,
-                        ReadingFilter::WarmSepia => 0x00DFD3B8,
-                        ReadingFilter::Normal => theme.border_subtle,
+                    let (hdr_bg, zebra_bg, grid_col) = match self.reading_filter {
+                        ReadingFilter::PaperEInk => (0x00DC_DDD7, 0x00E3_E4DF, 0x00C8_C9C3),
+                        ReadingFilter::WarmSepia => (0x00EA_E0C8, 0x00F2_EBD9, 0x00DF_D3B8),
+                        ReadingFilter::SageEyeCare => (0x00DA_E8DC, 0x00E2_EDE4, 0x00C4_D8C7),
+                        ReadingFilter::DarkInvert => (0x0028_2C34, 0x0022_252B, 0x0037_3C47),
+                        ReadingFilter::NightAmber => (0x0026_211B, 0x0020_1C17, 0x0038_3026),
+                        ReadingFilter::Normal => (theme.surface_elevated, 0x00F8_FAFC, theme.border_subtle),
                     };
 
                     for (ri, r) in rows.iter().enumerate() {

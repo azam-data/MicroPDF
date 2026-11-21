@@ -605,28 +605,28 @@ impl<'a> PdfViewerApp<'a> {
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 5 / T", "Fit Page/Width/Text/2-Pg/Scroll & Text View"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll Flow (Vert/Book)"),
+            ("T", "Toggle Reflowable Text View (Tables + Export .md/.tex)"),
             ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 resets)"),
             ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab tabs)"),
             ("B / L", "Bookmark Sidebar / Import .txt"),
             ("G / 0-9", "Smart Jump (5, ii, or #5)"),
             ("Alt+Arrows", "Navigation History Back / Forward"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V", "Cycle Reading Filter (Normal/Dark/Sepia)"),
+            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night Amber)"),
             ("Ctrl+F / F3", "Incremental Search / Next Match"),
-            ("Ctrl+C", "Copy Selected Text"),
         ];
         let right_items: &[(&str, &str)] = &[
             ("O / S", "Open PDF / Save (Ctrl+Shift+S Save As)"),
-            ("Ctrl+P", "Print Preview (Booklet / Simplex Duplex)"),
-            ("Z", "Quick Optimize (_optimized.pdf)"),
+            ("Ctrl+P", "Print Preview (10 Paper Sizes / Booklet / Duplex)"),
+            ("Z", "Optimize PDF (Images + Form XObjects + Dedup)"),
             ("Shift+M", "Combine Multiple PDFs (Interactive)"),
             ("X / U", "Split Pages / Flatten & Unlock"),
             ("P", "Stamp Signature / Image"),
-            ("N / H / C", "Page Numbers / Header-Footer / Clear"),
+            ("N / H", "Page Numbering & Header/Footer Dialogs + Profiles"),
             ("W / K", "Watermark / Convert Page to B&W"),
             ("I / R / D", "Insert Blank / Rotate 90° / Delete"),
-            ("Ctrl+Z", "Undo Edit (up to 8 steps)"),
+            ("Ctrl+Z / C", "Undo Edit (up to 8 steps) / Copy Text"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;

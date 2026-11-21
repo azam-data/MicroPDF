@@ -45,9 +45,9 @@ impl BottomBarAction {
             Self::FitWidth => "Fit Page Width (2)",
             Self::FitTextWidth => "Fit Text Width — Crop Margins (3)",
             Self::TwoPage => "Two-Page Spread (4)",
-            Self::Continuous => "Continuous Scroll (5)",
+            Self::Continuous => "Scroll Flow: Single / Continuous Vertical / Book Horizontal (5)",
             Self::TextView => "Reflowable Text View (T)",
-            Self::ReadingFilter => "Cycle Reading Mode: Normal / Dark / Sepia (V)",
+            Self::ReadingFilter => "Reading Mode Picker — E-Ink (Day) / Sepia / Sage / Dark / Night Amber (V)",
             Self::Fullscreen => "Fullscreen Mode (F11)",
             Self::Presentation => "Presentation Mode (F5)",
             Self::NotificationBoard => "Click to view Session Notification History",
@@ -106,10 +106,16 @@ impl<'a> PdfViewerApp<'a> {
         let zoom_pill_w = (measure_text(&zoom_txt, font_sz, false).ceil() as u32 + (10.0 * s).round() as u32)
             .max((42.0 * s).round() as u32);
 
+        let scroll_mode = self.effective_scroll_mode();
+        let scroll_txt = scroll_mode.short_label().to_string();
+        let scroll_pill_w = (measure_text(&scroll_txt, font_sz, false).ceil() as u32
+            + (24.0 * s).round() as u32)
+            .max((52.0 * s).round() as u32);
+
         let filter_txt = self.reading_filter.label().to_string();
         let filter_pill_w = (measure_text(&filter_txt, font_sz, false).ceil() as u32
             + (26.0 * s).round() as u32)
-            .max((62.0 * s).round() as u32);
+            .max((58.0 * s).round() as u32);
 
         let mk_icon = |w: u32, action: BottomBarAction, icon: UiIcon, active: bool| BottomWidgetRect {
             x: 0,
@@ -132,6 +138,9 @@ impl<'a> PdfViewerApp<'a> {
             active,
         };
 
+        let layout_mode = self.effective_layout_mode();
+        let on_page_view = self.view_mode.is_page_view();
+
         // Group 0: Bookmarks Sidebar & Thumbnail Grid (left of Page Selector)
         let g_panels = vec![
             mk_icon(sq_w, BottomBarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks),
@@ -149,22 +158,22 @@ impl<'a> PdfViewerApp<'a> {
             mk_lbl(zoom_pill_w, BottomBarAction::ZoomReset, zoom_txt, None, false),
             mk_icon(sq_w, BottomBarAction::ZoomIn, UiIcon::ZoomIn, false),
         ];
-        // Group 3: View Modes (FitPage, FitWidth, FitTextWidth, 2-Page, Scroll, TextView)
+        // Group 3: Layout/Fit Modes + Independent Scroll Flow + Text View
         let g_views = vec![
-            mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, self.view_mode == ViewMode::FitPage),
-            mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, self.view_mode == ViewMode::FitWidth),
-            mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, self.view_mode == ViewMode::FitTextWidth),
-            mk_icon(sq_w, BottomBarAction::TwoPage, UiIcon::TwoPage, self.view_mode == ViewMode::TwoPageSpread),
-            mk_icon(sq_w, BottomBarAction::Continuous, UiIcon::Continuous, self.view_mode == ViewMode::ContinuousScroll),
+            mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, on_page_view && layout_mode == ViewMode::FitPage),
+            mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, on_page_view && layout_mode == ViewMode::FitWidth),
+            mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, on_page_view && layout_mode == ViewMode::FitTextWidth),
+            mk_icon(sq_w, BottomBarAction::TwoPage, UiIcon::TwoPage, on_page_view && layout_mode == ViewMode::TwoPageSpread),
+            mk_lbl(scroll_pill_w, BottomBarAction::Continuous, scroll_txt, Some(UiIcon::Continuous), scroll_mode != ScrollMode::SinglePage),
             mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
         ];
-        // Group 4: Reading Filter pill
+        // Group 4: Reading Filter picker pill
         let g_filter = vec![mk_lbl(
             filter_pill_w,
             BottomBarAction::ReadingFilter,
             filter_txt,
             Some(UiIcon::Filter),
-            self.reading_filter != ReadingFilter::Normal,
+            self.reading_filter != ReadingFilter::Normal || self.show_reading_mode_popover,
         )];
         // Group 5: Fullscreen & Presentation
         let g_focus = vec![
@@ -499,7 +508,10 @@ impl<'a> PdfViewerApp<'a> {
             BottomBarAction::FitWidth => self.set_view_mode(ViewMode::FitWidth),
             BottomBarAction::FitTextWidth => self.set_view_mode(ViewMode::FitTextWidth),
             BottomBarAction::TwoPage => self.set_view_mode(ViewMode::TwoPageSpread),
-            BottomBarAction::Continuous => self.set_view_mode(ViewMode::ContinuousScroll),
+            BottomBarAction::Continuous => {
+                self.set_scroll_mode(self.effective_scroll_mode().next());
+                return;
+            }
             BottomBarAction::TextView => {
                 if self.view_mode == ViewMode::TextView {
                     self.set_view_mode(self.last_page_view_mode);
@@ -508,8 +520,8 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             BottomBarAction::ReadingFilter => {
-                self.reading_filter = self.reading_filter.next();
-                self.status_notice = Some(format!("Reading mode: {}", self.reading_filter.label()));
+                self.show_reading_mode_popover = !self.show_reading_mode_popover;
+                self.show_notifications = false;
             }
             BottomBarAction::Fullscreen => {
                 self.toggle_fullscreen();
@@ -523,6 +535,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             BottomBarAction::NotificationBoard => {
                 self.show_notifications = !self.show_notifications;
+                self.show_reading_mode_popover = false;
             }
         }
         self.update_title_bar();
@@ -645,5 +658,132 @@ impl<'a> PdfViewerApp<'a> {
         }
         let on_clear = ix >= cx && ix < cx + cw as i32 && iy >= cy && iy < cy + ch as i32;
         Some(on_clear)
+    }
+
+    // -------------------------------------------------------------------------
+    // Reading Mode Picker Popover (6 evidence-based eye-care modes)
+    // -------------------------------------------------------------------------
+
+    pub(super) fn reading_mode_popover_geometry(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> (i32, i32, u32, u32, u32, u32) {
+        let s = sf as f32;
+        let pw = (292.0 * s).round().min(buf_w.saturating_sub(20) as f32).max(220.0) as u32;
+        let hdr_h = (28.0 * s).round() as u32;
+        let row_h = (38.0 * s).round() as u32;
+        let ph = hdr_h + (ReadingFilter::ALL.len() as u32) * row_h + (10.0 * s).round() as u32;
+        let anchor_cx = self
+            .bottom_bar_widget_rect(BottomBarAction::ReadingFilter, buf_w, buf_h, status_bar_h, sf)
+            .map(|r| r.0 + (r.2 as i32) / 2)
+            .unwrap_or((buf_w / 2) as i32);
+        let max_px = (buf_w as i32 - pw as i32 - 8).max(8);
+        let px = (anchor_cx - (pw as i32) / 2).clamp(8, max_px);
+        let py = (buf_h.saturating_sub(status_bar_h + ph) as i32 - (8.0 * s).round() as i32).max(40);
+        (px, py, pw, ph, hdr_h, row_h)
+    }
+
+    pub(super) fn draw_reading_mode_popover(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) {
+        if !self.show_reading_mode_popover || self.is_fullscreen || self.is_presentation {
+            return;
+        }
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let (px, py, pw, ph, hdr_h, row_h) =
+            self.reading_mode_popover_geometry(buf_w, buf_h, status_bar_h, sf);
+        let rad = (8.0 * s).clamp(5.0, 12.0);
+        let hdr_sz = (11.5 * s).clamp(9.5, 19.0);
+        let title_sz = (11.5 * s).clamp(9.5, 19.0);
+        let hint_sz = (9.8 * s).clamp(8.5, 16.0);
+
+        draw_soft_shadow(
+            buffer, buf_w, buf_h, px, py, pw, ph, rad,
+            (12.0 * s).round() as i32, (4.0 * s).round() as i32,
+            theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.border_subtle);
+
+        draw_text_vcenter(
+            buffer, buf_w, buf_h,
+            px + (12.0 * s).round() as i32, py, hdr_h, px + pw as i32 - 8,
+            "Reading Color Mode (V to cycle)", hdr_sz, theme.text_muted, true,
+        );
+        fill_rect_clipped(buffer, buf_w, buf_h, px + 1, py + hdr_h as i32, pw.saturating_sub(2), 1, theme.divider);
+
+        let sw_w = (28.0 * s).round() as u32;
+        let sw_h = (22.0 * s).round() as u32;
+        let sw_rad = (4.0 * s).clamp(3.0, 7.0);
+        let sw_sz = (10.5 * s).clamp(8.5, 17.0);
+        let row_pad = (6.0 * s).round() as i32;
+
+        for (i, &mode) in ReadingFilter::ALL.iter().enumerate() {
+            let ry = py + hdr_h as i32 + (4.0 * s).round() as i32 + (i as i32) * (row_h as i32);
+            let active = self.reading_filter == mode;
+            let hovered = self.hovered_widget == Some(UiHit::ReadingModeOption(mode));
+            if active || hovered {
+                let bg = if active { theme.accent_soft_bg } else { theme.hover_bg };
+                fill_rounded_rect(buffer, buf_w, buf_h, px + row_pad, ry + 1, pw.saturating_sub((row_pad * 2) as u32), row_h.saturating_sub(2), sw_rad, bg);
+                if active {
+                    stroke_rounded_rect(buffer, buf_w, buf_h, px + row_pad, ry + 1, pw.saturating_sub((row_pad * 2) as u32), row_h.saturating_sub(2), sw_rad, theme.accent);
+                }
+            }
+            let (sw_bg, sw_fg) = mode.swatch_colors();
+            let sw_x = px + (12.0 * s).round() as i32;
+            let sw_y = ry + ((row_h.saturating_sub(sw_h)) / 2) as i32;
+            fill_rounded_rect(buffer, buf_w, buf_h, sw_x, sw_y, sw_w, sw_h, sw_rad, sw_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, sw_x, sw_y, sw_w, sw_h, sw_rad, theme.border_subtle);
+            let aa_w = measure_text("Aa", sw_sz, true);
+            draw_text_vcenter(buffer, buf_w, buf_h, sw_x + ((sw_w as f32 - aa_w) * 0.5).round() as i32, sw_y, sw_h, sw_x + sw_w as i32, "Aa", sw_sz, sw_fg, true);
+
+            let tx = sw_x + sw_w as i32 + (10.0 * s).round() as i32;
+            let max_tx = px + pw as i32 - (10.0 * s).round() as i32;
+            let title_fg = if active { theme.accent_soft_fg } else { theme.text_primary };
+            let title_txt = truncate_ellipsis(mode.picker_title(), (max_tx - tx).max(40) as f32, title_sz, active);
+            draw_text(buffer, buf_w, buf_h, tx, ry + (5.0 * s).round() as i32, &title_txt, title_sz, title_fg, active);
+            let hint_txt = truncate_ellipsis(mode.picker_hint(), (max_tx - tx).max(40) as f32, hint_sz, false);
+            draw_text(buffer, buf_w, buf_h, tx, ry + (20.0 * s).round() as i32, &hint_txt, hint_sz, theme.text_muted, false);
+        }
+    }
+
+    /// Returns `Some(Some(filter))` if clicking a mode row, `Some(None)` if inside header/border, `None` if outside.
+    pub(super) fn hit_test_reading_mode_popover(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<Option<ReadingFilter>> {
+        if !self.show_reading_mode_popover {
+            return None;
+        }
+        let s = sf as f32;
+        let (px, py, pw, ph, hdr_h, row_h) =
+            self.reading_mode_popover_geometry(buf_w, buf_h, status_bar_h, sf);
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < px || ix >= px + pw as i32 || iy < py || iy >= py + ph as i32 {
+            return None;
+        }
+        let list_top = py + hdr_h as i32 + (4.0 * s).round() as i32;
+        if iy >= list_top {
+            let idx = ((iy - list_top) / (row_h as i32)) as usize;
+            if let Some(&mode) = ReadingFilter::ALL.get(idx) {
+                return Some(Some(mode));
+            }
+        }
+        Some(None)
     }
 }

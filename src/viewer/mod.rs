@@ -1,6 +1,7 @@
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
+mod doc_tools_modal;
 mod grid;
 mod input;
 mod menu;
@@ -21,7 +22,7 @@ use std::path::Path;
 use winit::event_loop::EventLoop;
 
 #[allow(unused_imports)]
-pub use state::{MenuCategory, MouseMode, PdfViewerApp, ReadingFilter, ViewMode};
+pub use state::{MenuCategory, MouseMode, PdfViewerApp, ReadingFilter, ScrollMode, ViewMode};
 
 /// Returns the current resident memory (RSS) of the process in megabytes (MB).
 pub fn get_current_rss_mb() -> Option<f64> {
@@ -2613,5 +2614,129 @@ mod tests {
             MenuCategory::Tools.items().iter().any(|s| s.contains("Optimize")),
             "Tools menu should keep Optimize item"
         );
+        assert!(
+            !MenuCategory::Tools.items().iter().any(|s| s.contains("Clear Existing Margins")),
+            "Clear Existing Header/Footer should live inside the Header & Footer dialog, not as a separate Tools menu item"
+        );
+    }
+
+    #[test]
+    fn test_header_footer_profile_and_scroll_mode_session_ini_roundtrip() {
+        use super::state::{PdfViewerApp, ScrollMode, SessionConfig};
+        use crate::engine::{HeaderFooterColor, HeaderFooterProfile};
+
+        let mut p = HeaderFooterProfile::default();
+        p.name = "Board Report | Q4".to_string();
+        p.header_left = "Confidential".to_string();
+        p.header_center = "Annual Review".to_string();
+        p.header_right = "2026".to_string();
+        p.footer_left = "MicroPDF".to_string();
+        p.footer_center = "Page {page} of {total}".to_string();
+        p.footer_right = "Draft".to_string();
+        p.font_size = 11.0;
+        p.margin_pt = 28.0;
+        p.color = HeaderFooterColor::Navy;
+
+        let encoded = p.to_ini_str();
+        let decoded = HeaderFooterProfile::from_ini_str(&encoded).expect("decode profile");
+        assert_eq!(decoded.header_left, p.header_left);
+        assert_eq!(decoded.header_center, p.header_center);
+        assert_eq!(decoded.footer_center, p.footer_center);
+        assert_eq!(decoded.font_size, 11.0);
+        assert_eq!(decoded.margin_pt, 28.0);
+        assert_eq!(decoded.color, HeaderFooterColor::Navy);
+
+        let mut cfg = SessionConfig::default();
+        cfg.scroll_mode = ScrollMode::ContinuousHorizontal;
+        cfg.hf_profiles.push(decoded.clone());
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(parsed.scroll_mode, ScrollMode::ContinuousHorizontal);
+        assert_eq!(parsed.hf_profiles.len(), 1);
+        assert_eq!(parsed.hf_profiles[0].footer_center, "Page {page} of {total}");
+    }
+
+    #[test]
+    fn test_page_number_config_formatting_and_roman_cover_skip() {
+        use crate::engine::{PageNumberConfig, PageNumberFormat, PdfEngine};
+
+        let mut cfg = PageNumberConfig::default();
+        cfg.roman_end = 2;
+        cfg.skip_first_page = true;
+        cfg.format = PageNumberFormat::PageNOfTotal;
+
+        assert_eq!(PdfEngine::format_page_number_label(&cfg, 1, 10), None);
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 2, 10),
+            Some("Page ii".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 3, 10),
+            Some("Page 1 of 8".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 10, 10),
+            Some("Page 8 of 8".to_string())
+        );
+
+        cfg.skip_first_page = false;
+        cfg.roman_end = 0;
+        cfg.format = PageNumberFormat::Dashed;
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 1, 5),
+            Some("- 1 -".to_string())
+        );
+        cfg.format = PageNumberFormat::NSlashTotal;
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 4, 5),
+            Some("4 / 5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_reading_filters_have_six_eye_care_modes_with_day_and_night_recommendations() {
+        use super::state::ReadingFilter;
+
+        assert_eq!(ReadingFilter::ALL.len(), 6);
+        assert!(
+            ReadingFilter::PaperEInk.picker_title().contains("Best for day"),
+            "PaperEInk must advertise Best for day: {}",
+            ReadingFilter::PaperEInk.picker_title()
+        );
+        assert!(
+            ReadingFilter::NightAmber.picker_title().contains("Best for night"),
+            "NightAmber must advertise Best for night: {}",
+            ReadingFilter::NightAmber.picker_title()
+        );
+
+        let mut f = ReadingFilter::Normal;
+        for _ in 0..ReadingFilter::ALL.len() {
+            assert!(!f.label().is_empty());
+            assert!(!f.picker_title().is_empty());
+            assert!(!f.picker_hint().is_empty());
+            f = f.next();
+        }
+        assert_eq!(f, ReadingFilter::Normal);
+    }
+
+    #[test]
+    fn test_scroll_mode_cycling_and_ini_strings() {
+        use super::state::ScrollMode;
+
+        let mut sm = ScrollMode::SinglePage;
+        let seen = [
+            ScrollMode::SinglePage,
+            ScrollMode::ContinuousVertical,
+            ScrollMode::ContinuousHorizontal,
+        ];
+        for expected in seen {
+            assert_eq!(sm, expected);
+            assert_eq!(ScrollMode::from_ini_str(sm.to_ini_str()), sm);
+            sm = sm.next();
+        }
+        assert_eq!(sm, ScrollMode::SinglePage);
     }
 }
+
+
+
