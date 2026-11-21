@@ -1,11 +1,20 @@
 mod bookmarks;
+mod bottom_bar;
+mod combine_modal;
+mod doc_tools_modal;
 mod grid;
 mod input;
 mod menu;
+mod overlays;
+mod print_preview;
 mod render;
 mod state;
 mod statusbar;
 mod tabs;
+mod text_view;
+mod theme;
+mod toolbar;
+mod ui_draw;
 
 use crate::engine::PdfEngine;
 use anyhow::{Context, Result};
@@ -13,7 +22,7 @@ use std::path::Path;
 use winit::event_loop::EventLoop;
 
 #[allow(unused_imports)]
-pub use state::{MenuCategory, MouseMode, PdfViewerApp, ReadingFilter, ViewMode};
+pub use state::{MenuCategory, MouseMode, PdfViewerApp, ReadingFilter, ScrollMode, ViewMode};
 
 /// Returns the current resident memory (RSS) of the process in megabytes (MB).
 pub fn get_current_rss_mb() -> Option<f64> {
@@ -1125,8 +1134,8 @@ mod tests {
         let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
         app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
 
-        // 1. Open Tools -> Optimize... (item 7 in Tools menu)
-        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        // 1. Open Tools -> Optimize... (item 6 in Tools menu)
+        app.execute_menu_item(state::MenuCategory::Tools, 6);
         assert_eq!(
             app.input_mode,
             state::InputMode::OptimizePrompt {
@@ -1197,7 +1206,7 @@ mod tests {
         assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
 
         // 5. Re-open Tools -> Optimize... and run all steps to completion
-        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        app.execute_menu_item(state::MenuCategory::Tools, 6);
         app.handle_key_input(
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
             None,
@@ -2413,4 +2422,386 @@ mod tests {
         assert!(grid <= cap, "scan grid {grid:.1} > {cap:.1}");
         Ok(())
     }
+
+    #[test]
+    fn test_ui_theme_default_is_light_and_ini_roundtrip() {
+        use super::theme::UiThemeMode;
+        assert_eq!(UiThemeMode::default(), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::Light.toggle(), UiThemeMode::Dark);
+        assert_eq!(UiThemeMode::Dark.toggle(), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::from_ini_str("light"), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::from_ini_str("dark"), UiThemeMode::Dark);
+        assert_eq!(UiThemeMode::from_ini_str("unknown"), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::Light.to_ini_str(), "light");
+        assert_eq!(UiThemeMode::Dark.to_ini_str(), "dark");
+        let light = UiThemeMode::Light.theme();
+        let dark = UiThemeMode::Dark.theme();
+        assert_ne!(light.canvas_bg, dark.canvas_bg);
+        assert_ne!(light.topbar_bg, dark.topbar_bg);
+    }
+
+    #[test]
+    fn test_toolbar_config_defaults_toggle_and_ini_roundtrip() {
+        use super::toolbar::{ToolbarConfig, ToolbarItem};
+        let mut cfg = ToolbarConfig::default();
+        // Sidebar & Grid moved to Bottom Bar by default (still toggleable on top toolbar if desired)
+        assert!(!cfg.is_enabled(ToolbarItem::Sidebar));
+        assert!(!cfg.is_enabled(ToolbarItem::Grid));
+        assert!(cfg.is_enabled(ToolbarItem::Open));
+        assert!(cfg.is_enabled(ToolbarItem::SaveAs));
+        assert!(cfg.is_enabled(ToolbarItem::Print));
+        assert!(cfg.is_enabled(ToolbarItem::Annotations));
+        assert!(cfg.is_enabled(ToolbarItem::UiScale));
+        assert!(cfg.is_enabled(ToolbarItem::ThemeToggle));
+
+        cfg.toggle(ToolbarItem::Annotations);
+        cfg.toggle(ToolbarItem::Print);
+        assert!(!cfg.is_enabled(ToolbarItem::Annotations));
+        assert!(!cfg.is_enabled(ToolbarItem::Print));
+
+        let serialized = cfg.to_ini_str();
+        let parsed = ToolbarConfig::from_ini_str(&serialized);
+        assert_eq!(cfg, parsed);
+
+        let none_cfg = ToolbarConfig::from_ini_str("none");
+        for item in ToolbarItem::ALL {
+            assert!(!none_cfg.is_enabled(item));
+        }
+        assert_eq!(none_cfg.to_ini_str(), "none");
+    }
+
+    #[test]
+    fn test_session_config_persists_ui_preferences_and_loads_legacy_ini() {
+        use super::state::{PdfViewerApp, SessionConfig};
+        use super::theme::UiThemeMode;
+        use super::toolbar::{ToolbarConfig, ToolbarItem};
+
+        // Legacy v1.2 ini without ui_theme / show_toolbar / toolbar_items / ui_scale should default cleanly
+        let legacy = "recent=foo.pdf\ntab=bar.pdf|2\nactive_tab=0\n";
+        let loaded_legacy = PdfViewerApp::parse_session_ini(legacy);
+        assert_eq!(loaded_legacy.ui_theme, UiThemeMode::Light);
+        assert!(loaded_legacy.show_toolbar);
+        assert!((loaded_legacy.ui_scale - 1.0).abs() < 0.001);
+        assert_eq!(loaded_legacy.toolbar_config, ToolbarConfig::default());
+
+        // Roundtrip with custom UI preferences including UI scale
+        let mut cfg = SessionConfig::default();
+        cfg.ui_theme = UiThemeMode::Dark;
+        cfg.show_toolbar = false;
+        cfg.ui_scale = 1.25;
+        cfg.toolbar_config.toggle(ToolbarItem::Open);
+        cfg.toolbar_config.toggle(ToolbarItem::EditTools);
+        let serialized = PdfViewerApp::serialize_session_ini(&cfg);
+        let roundtripped = PdfViewerApp::parse_session_ini(&serialized);
+        assert_eq!(roundtripped.ui_theme, UiThemeMode::Dark);
+        assert!(!roundtripped.show_toolbar);
+        assert!((roundtripped.ui_scale - 1.25).abs() < 0.001);
+        assert_eq!(roundtripped.toolbar_config, cfg.toolbar_config);
+    }
+
+    #[test]
+    fn test_ui_draw_fonts_metrics_truncation_and_cache_cap() {
+        use super::ui_draw::*;
+        let w = measure_text("MicroPDF Print Preview", 13.0, false);
+        assert!(w > 40.0, "expected positive measured text width, got {w}");
+        let wb = measure_text("MicroPDF Print Preview", 13.0, true);
+        assert!(wb > 40.0, "expected positive bold text width, got {wb}");
+
+        let trunc = truncate_ellipsis("VeryLongDocumentFileNameThatShouldTruncate.pdf", 80.0, 12.0, false);
+        assert!(trunc.ends_with('…') || trunc.ends_with("..."), "expected ellipsis truncation, got '{trunc}'");
+        assert!(measure_text(&trunc, 12.0, false) <= 82.0);
+
+        // Render text and icons into a scratch buffer and verify glyph cache stays bounded
+        let mut buf = vec![0x00FF_FFFFu32; 320 * 120];
+        draw_text(&mut buf, 320, 120, 10, 10, "Bright Professional UI 1234567890", 14.0, 0x001E_293B, false);
+        draw_text(&mut buf, 320, 120, 10, 34, "Bold Heading — Print & Zoom", 15.0, 0x0025_63EB, true);
+        draw_icon(&mut buf, 320, 120, UiIcon::Print, 10, 64, 18, 0x001E_293B);
+        draw_icon(&mut buf, 320, 120, UiIcon::Sun, 36, 64, 18, 0x001E_293B);
+        draw_icon(&mut buf, 320, 120, UiIcon::Moon, 62, 64, 18, 0x001E_293B);
+        assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
+
+        // Stress-test many sizes to verify the 256 KB glyph cache cap holds
+        for sz in [10.0f32, 12.0, 14.0, 16.0, 18.0, 22.0, 28.0] {
+            let _ = measure_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", sz, false);
+        }
+        assert!(
+            glyph_cache_bytes() <= 256 * 1024,
+            "glyph cache exceeded 256 KB cap: {} bytes",
+            glyph_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn test_print_preview_state_page_options_and_stepping() {
+        use super::print_preview::{PrintPageScope, PrintPreviewState};
+        use crate::print::PageParity;
+
+        let mut pp = PrintPreviewState::new(
+            vec!["HP_LaserJet".to_string(), "Save_as_PDF".to_string()],
+            0,
+            10,
+            3, // 0-based page 4
+        );
+        assert_eq!(pp.resolved_pages, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(pp.active_page_index(), Some(0));
+
+        // Current page scope
+        pp.page_scope = PrintPageScope::Current;
+        pp.recompute_pages(10, 3);
+        assert_eq!(pp.resolved_pages, vec![3]);
+        assert_eq!(pp.active_page_index(), Some(3));
+
+        // Custom range + Even + Reverse
+        pp.page_scope = PrintPageScope::Custom;
+        pp.custom_range = "1-6, 9-10".to_string();
+        pp.parity = PageParity::Even;
+        pp.reverse = true;
+        pp.recompute_pages(10, 3);
+        assert_eq!(pp.resolved_pages, vec![9, 5, 3, 1]);
+        assert_eq!(pp.sheet_pos, 0);
+        assert_eq!(pp.active_page_index(), Some(9));
+        pp.sheet_pos = 2;
+        assert_eq!(pp.active_page_index(), Some(3));
+
+        // Invalid range sets error and clears resolved_pages
+        pp.custom_range = "99".to_string();
+        pp.recompute_pages(10, 3);
+        assert!(pp.resolved_pages.is_empty());
+        assert!(pp.range_error.is_some());
+    }
+
+    #[test]
+    fn test_print_preview_collate_booklet_and_annotation_colors() {
+        use super::print_preview::PrintPreviewState;
+        use crate::engine::AnnotationColor;
+
+        let mut pp = PrintPreviewState::new(vec!["Simplex_Printer".to_string()], 0, 5, 0);
+        assert!(pp.render_opts.collate, "Collate should be checked by default");
+        assert!(pp.render_opts.include_annotations, "Print with annotations should be default");
+        assert!(!pp.render_opts.booklet);
+        assert!(!pp.manual_duplex);
+
+        pp.render_opts.booklet = true;
+        pp.recompute_pages(5, 0);
+        // 5 pages pad to 8 -> 2 physical sheets -> 4 printed sides (front/back pairs)
+        assert_eq!(pp.sheet_count(), 4);
+        let sheets = pp.booklet_sheets();
+        assert_eq!(sheets.len(), 4);
+        assert!(sheets[0].is_front);
+        assert_eq!(sheets[0].left, None);
+        assert_eq!(sheets[0].right, Some(0));
+        assert!(!sheets[1].is_front);
+        assert_eq!(sheets[1].left, Some(1));
+        assert_eq!(sheets[1].right, None);
+
+        // AnnotationColor cycles through all 7 colors cleanly
+        let mut c = AnnotationColor::Yellow;
+        for _ in 0..7 {
+            assert!(!c.label().is_empty());
+            c = c.next();
+        }
+        assert_eq!(c, AnnotationColor::Yellow);
+    }
+
+    #[test]
+    fn test_file_menu_no_duplicate_optimize_and_tools_keeps_optimize() {
+        use super::state::MenuCategory;
+        assert!(
+            !MenuCategory::File.items().iter().any(|s| s.contains("Optimize")),
+            "File menu should not contain duplicate Optimize item"
+        );
+        assert!(
+            MenuCategory::Tools.items().iter().any(|s| s.contains("Optimize")),
+            "Tools menu should keep Optimize item"
+        );
+        assert!(
+            !MenuCategory::Tools.items().iter().any(|s| s.contains("Clear Existing Margins")),
+            "Clear Existing Header/Footer should live inside the Header & Footer dialog, not as a separate Tools menu item"
+        );
+    }
+
+    #[test]
+    fn test_header_footer_profile_and_scroll_mode_session_ini_roundtrip() {
+        use super::state::{PdfViewerApp, ScrollMode, SessionConfig};
+        use crate::engine::{HeaderFooterColor, HeaderFooterProfile};
+
+        let mut p = HeaderFooterProfile::default();
+        p.name = "Board Report | Q4".to_string();
+        p.header_left = "Confidential".to_string();
+        p.header_center = "Annual Review".to_string();
+        p.header_right = "2026".to_string();
+        p.footer_left = "MicroPDF".to_string();
+        p.footer_center = "Page {page} of {total}".to_string();
+        p.footer_right = "Draft".to_string();
+        p.font_size = 11.0;
+        p.margin_pt = 28.0;
+        p.color = HeaderFooterColor::Navy;
+
+        let encoded = p.to_ini_str();
+        let decoded = HeaderFooterProfile::from_ini_str(&encoded).expect("decode profile");
+        assert_eq!(decoded.header_left, p.header_left);
+        assert_eq!(decoded.header_center, p.header_center);
+        assert_eq!(decoded.footer_center, p.footer_center);
+        assert_eq!(decoded.font_size, 11.0);
+        assert_eq!(decoded.margin_pt, 28.0);
+        assert_eq!(decoded.color, HeaderFooterColor::Navy);
+
+        let mut cfg = SessionConfig::default();
+        cfg.scroll_mode = ScrollMode::ContinuousHorizontal;
+        cfg.hf_profiles.push(decoded.clone());
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(parsed.scroll_mode, ScrollMode::ContinuousHorizontal);
+        assert_eq!(parsed.hf_profiles.len(), 1);
+        assert_eq!(parsed.hf_profiles[0].footer_center, "Page {page} of {total}");
+    }
+
+    #[test]
+    fn test_page_number_config_formatting_and_roman_cover_skip() {
+        use crate::engine::{MarginPosition, PageNumberConfig, PageNumberFormat, PdfEngine};
+
+        // Full non-abbreviated "Bottom Left / Center / Right" labels (#2c)
+        assert_eq!(MarginPosition::FooterLeft.label(), "Bottom Left");
+        assert_eq!(MarginPosition::FooterCenter.label(), "Bottom Center");
+        assert_eq!(MarginPosition::FooterRight.label(), "Bottom Right");
+
+        // Multi-page front skip (2 unnumbered cover/picture pages) + 3 Roman pages + Arabic body (#2d)
+        let mut cfg = PageNumberConfig::default();
+        cfg.skip_pages = 2;
+        cfg.roman_end = 3;
+        cfg.format = PageNumberFormat::PageNOfTotal;
+
+        assert_eq!(PdfEngine::format_page_number_label(&cfg, 1, 10), None);
+        assert_eq!(PdfEngine::format_page_number_label(&cfg, 2, 10), None);
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 3, 10),
+            Some("Page i".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 5, 10),
+            Some("Page iii".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 6, 10),
+            Some("Page 1 of 5".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 10, 10),
+            Some("Page 5 of 5".to_string())
+        );
+
+        // Logical page resolution & display labels match skip_pages + roman_end (#2b)
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("i", 2, 3, 10), Some(2));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("iii", 2, 3, 10), Some(4));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("1", 2, 3, 10), Some(5));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("#2", 2, 3, 10), Some(1));
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(0, 2, 3), "—");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(2, 2, 3), "i");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(4, 2, 3), "iii");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(5, 2, 3), "1");
+
+        cfg.skip_pages = 0;
+        cfg.roman_end = 0;
+        cfg.format = PageNumberFormat::Dashed;
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 1, 5),
+            Some("- 1 -".to_string())
+        );
+        cfg.format = PageNumberFormat::NSlashTotal;
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 4, 5),
+            Some("4 / 5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_header_footer_modal_opens_blank_and_export_help_menus_complete() {
+        use super::doc_tools_modal::HeaderFooterModalState;
+        use super::overlays::BOOKMARK_SAMPLE_TXT;
+        use super::state::MenuCategory;
+        use crate::engine::PdfEngine;
+
+        // #1c: Header & Footer modal must always start completely blank (never stale footer text)
+        let hf = HeaderFooterModalState::new(0);
+        assert!(hf.profile.name.is_empty());
+        assert!(hf.profile.header_left.is_empty());
+        assert!(hf.profile.header_center.is_empty());
+        assert!(hf.profile.header_right.is_empty());
+        assert!(hf.profile.footer_left.is_empty());
+        assert!(hf.profile.footer_center.is_empty());
+        assert!(hf.profile.footer_right.is_empty());
+        assert!(!hf.select_all);
+
+        // #9: Dedicated Export menu with .docx, .xlsx, .md, .tex (and removed from File)
+        assert!(MenuCategory::ALL.contains(&MenuCategory::Export));
+        let exp = MenuCategory::Export.items();
+        assert!(exp.iter().any(|s| s.contains(".docx")));
+        assert!(exp.iter().any(|s| s.contains(".xlsx")));
+        assert!(exp.iter().any(|s| s.contains(".md")));
+        assert!(exp.iter().any(|s| s.contains(".tex")));
+        assert!(!MenuCategory::File.items().iter().any(|s| s.contains("Markdown")));
+        assert!(MenuCategory::File.items().iter().any(|s| s.contains("Close Other Tabs")));
+        assert!(MenuCategory::File.items().iter().any(|s| s.contains("Close All Tabs")));
+
+        // #3: Page menu has Insert Blank Page Before and Insert PDF(s) Before / After Page...
+        assert!(MenuCategory::Page.items().iter().any(|s| s.contains("Insert Blank Page Before")));
+        assert!(MenuCategory::Page.items().iter().any(|s| s.contains("Insert PDF(s)")));
+
+        // #8: Help menu has Bookmark Import Format (.txt) & bundled sample parses cleanly
+        assert!(MenuCategory::Help.items().iter().any(|s| s.contains("Bookmark Import Format")));
+        let parsed = PdfEngine::parse_bookmarks_txt(BOOKMARK_SAMPLE_TXT, 4, 30);
+        assert!(parsed.len() >= 7, "sample bookmark template must parse cleanly");
+        assert_eq!(parsed[0].title, "Preface");
+        assert_eq!(parsed[0].page_index, 0);
+        assert_eq!(parsed[0].level, 0);
+        assert!(parsed.iter().any(|b| b.level == 1 && b.title.contains("Overview")));
+        assert!(parsed.iter().any(|b| b.page_index == 24 && b.title.contains("Appendix")));
+    }
+
+    #[test]
+    fn test_reading_filters_have_six_eye_care_modes_with_day_and_night_recommendations() {
+        use super::state::ReadingFilter;
+
+        assert_eq!(ReadingFilter::ALL.len(), 6);
+        assert!(
+            ReadingFilter::PaperEInk.picker_title().contains("Best for day"),
+            "PaperEInk must advertise Best for day: {}",
+            ReadingFilter::PaperEInk.picker_title()
+        );
+        assert!(
+            ReadingFilter::NightAmber.picker_title().contains("Best for night"),
+            "NightAmber must advertise Best for night: {}",
+            ReadingFilter::NightAmber.picker_title()
+        );
+
+        let mut f = ReadingFilter::Normal;
+        for _ in 0..ReadingFilter::ALL.len() {
+            assert!(!f.label().is_empty());
+            assert!(!f.picker_title().is_empty());
+            assert!(!f.picker_hint().is_empty());
+            f = f.next();
+        }
+        assert_eq!(f, ReadingFilter::Normal);
+    }
+
+    #[test]
+    fn test_scroll_mode_cycling_and_ini_strings() {
+        use super::state::ScrollMode;
+
+        let mut sm = ScrollMode::SinglePage;
+        let seen = [
+            ScrollMode::SinglePage,
+            ScrollMode::ContinuousVertical,
+            ScrollMode::ContinuousHorizontal,
+        ];
+        for expected in seen {
+            assert_eq!(sm, expected);
+            assert_eq!(ScrollMode::from_ini_str(sm.to_ini_str()), sm);
+            sm = sm.next();
+        }
+        assert_eq!(sm, ScrollMode::SinglePage);
+    }
 }
+
+
+

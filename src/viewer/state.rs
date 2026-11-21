@@ -1,5 +1,6 @@
 use crate::engine::{
-    Bookmark, MarginPosition, PdfEngine, SearchMatch, StampImageBuffer,
+    AnnotationColor, Bookmark, HeaderFooterProfile, MarginPosition, PdfEngine, SearchMatch,
+    StampImageBuffer,
 };
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -9,14 +10,28 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::window::Window;
-use super::get_current_rss_mb;
 
-pub(super) const BG_COLOR_U32: u32 = 0x002B2B2B; // #2B2B2B subtle dark gray margin background
-pub(super) const SIDEBAR_BG_U32: u32 = 0x001E2229;
-pub(super) const SIDEBAR_WIDTH_LOGICAL: u32 = 240;
-pub(super) const MENU_BAR_HEIGHT_LOGICAL: u32 = 24;
+use super::bottom_bar::BottomBarAction;
+use super::combine_modal::{CombineHit, CombineModalState};
+use super::doc_tools_modal::{
+    HeaderFooterHit, HeaderFooterModalState, PageNumberHit, PageNumberModalState,
+};
+use super::overlays::OverlayHit;
+use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
+use super::text_view::{CachedTextViewPage, TextViewHit};
+use super::theme::{UiTheme, UiThemeMode};
+use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
+
+#[allow(dead_code)]
+pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
+#[allow(dead_code)]
+pub(super) const SIDEBAR_BG_U32: u32 = 0x00F8FAFC;
+pub(super) const SIDEBAR_WIDTH_LOGICAL: u32 = 248;
+/// Unified top bar hosting both menus (`File..Help`) and the inline customizable icon toolbar.
+pub(super) const MENU_BAR_HEIGHT_LOGICAL: u32 = 32;
 pub(super) const TAB_BAR_HEIGHT_LOGICAL: u32 = 28;
-pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 22;
+/// Centered bottom page-view & status bar.
+pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 30;
 pub(super) const PAGE_MARGIN_PX: u32 = 24;
 pub(super) const SPREAD_GAP_PX: u32 = 12;
 pub(super) const THUMB_W: u32 = 140;
@@ -28,6 +43,8 @@ pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
     MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
 pub(super) const MAX_ZOOM_LEVEL: f32 = 8.0;
+pub(super) const MIN_UI_SCALE: f32 = 0.80;
+pub(super) const MAX_UI_SCALE: f32 = 1.60;
 pub(super) const MAX_NAV_HISTORY: usize = 50;
 pub(super) const MAX_RECENT_FILES: usize = 10;
 pub(super) const MAX_UNDO_STATES: usize = 8;
@@ -37,7 +54,7 @@ pub(super) const UNDO_BYTES_BUDGET: usize = 64 * 1024 * 1024;
 /// Window in which a second `U` press confirms Flatten & Unlock on a signed document.
 pub(super) const FLATTEN_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
-/// Top Menu Bar categories (`#1E1E1E` bar at the very top of the window).
+/// Top Menu Bar categories on the unified top bar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MenuCategory {
     File,
@@ -45,27 +62,30 @@ pub enum MenuCategory {
     Edit,
     Page,
     Tools,
+    Export,
     Help,
 }
 
 impl MenuCategory {
-    pub const ALL: [MenuCategory; 6] = [
+    pub const ALL: [MenuCategory; 7] = [
         MenuCategory::File,
         MenuCategory::View,
         MenuCategory::Edit,
         MenuCategory::Page,
         MenuCategory::Tools,
+        MenuCategory::Export,
         MenuCategory::Help,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            MenuCategory::File => "[ File ]",
-            MenuCategory::View => "[ View ]",
-            MenuCategory::Edit => "[ Edit ]",
-            MenuCategory::Page => "[ Page ]",
-            MenuCategory::Tools => "[ Tools ]",
-            MenuCategory::Help => "[ Help ]",
+            MenuCategory::File => "File",
+            MenuCategory::View => "View",
+            MenuCategory::Edit => "Edit",
+            MenuCategory::Page => "Page",
+            MenuCategory::Tools => "Tools",
+            MenuCategory::Export => "Export",
+            MenuCategory::Help => "Help",
         }
     }
 
@@ -76,62 +96,99 @@ impl MenuCategory {
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
-                "Optimize -> _optimized.pdf (Z)",
+                "Save As... (Ctrl+Shift+S)",
                 "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
+                "Close Other Tabs",
+                "Close All Tabs",
             ],
             MenuCategory::View => &[
                 "Fit Full Page (1)",
                 "Fit Page Width (2)",
-                "Fit Text Width (3)",
+                "Fit Text Width — Crop Margins (3)",
                 "Two-Page Side-by-Side (4)",
-                "Continuous Vertical Scroll (5)",
+                "Scroll: Single Page",
+                "Scroll: Continuous Vertical (5)",
+                "Scroll: Continuous Horizontal Book",
+                "Text View — Reflowable Reader (T)",
                 "Zoom In (+ / Ctrl+Wheel Up)",
                 "Zoom Out (- / Ctrl+Wheel Down)",
                 "Reset Zoom 100% (0)",
                 "Toggle Thumbnail Grid (Tab)",
                 "Toggle Bookmark Sidebar (B)",
-                "Cycle Dark / Sepia / Normal Reading Mode (V)",
+                "Cycle Reading Mode (E-Ink / Sepia / Sage / Dark / Night) (V)",
                 "Toggle Fullscreen (F11)",
                 "Presentation Mode (F5)",
+                "Show Toolbar",
+                "Customize Toolbar...",
+                "UI Scale: Larger (+10%)",
+                "UI Scale: Smaller (-10%)",
+                "UI Scale: Reset 100%",
+                "Switch Light / Dark UI",
             ],
             MenuCategory::Edit => &[
                 "Undo (Ctrl+Z / Cmd+Z)",
                 "Copy Selected Text (Ctrl+C / Cmd+C)",
                 "Find Text in PDF... (Ctrl+F / Cmd+F)",
                 "Mouse Mode: Select Text (default)",
-                "Mouse Mode: Highlight Text",
+                "Annotate: Highlight Text",
+                "Annotate: Underline Text",
+                "Annotate: Strikethrough Text",
+                "Annotate: Sticky Note / Comment",
+                "Annotate: Freehand Pen (Ink)",
+                "Annotate: Text Box (FreeText)",
+                "Annotate: Rectangle Shape",
+                "Annotate: Arrow Shape",
+                "Cycle Annotation Color",
                 "Mouse Mode: Black-Box Redact",
                 "Mouse Mode: Crop Page Area",
             ],
             MenuCategory::Page => &[
                 "Jump to Page... (G)",
                 "Rotate Current Page 90° (R)",
-                "Insert Blank Page (I)",
+                "Insert Blank Page After (I)",
+                "Insert Blank Page Before",
+                "Insert PDF(s) Before / After Page...",
                 "Delete Current Page (D)",
                 "Convert Page to Black & White (K)",
                 "Reset Page Crop",
             ],
             MenuCategory::Tools => &[
-                "Page Numbering Roman/Arabic... (N)",
-                "Add Header / Footer... (H)",
-                "Clear Existing Margins... (C)",
+                "Page Numbering... (N)",
+                "Header & Footer / Clear Existing... (H)",
                 "Add Watermark... (W)",
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
             ],
-            MenuCategory::Help => &["Toggle Shortcuts Overlay (? / F1)"],
+            MenuCategory::Export => &[
+                "Export as Word (.docx)...",
+                "Export as Excel (.xlsx)...",
+                "Export as Markdown (.md)...",
+                "Export as LaTeX (.tex)...",
+            ],
+            MenuCategory::Help => &[
+                "Keyboard & Mouse Shortcuts (? / F1)",
+                "Bookmark Import Format (.txt)",
+                "About MicroPDF",
+            ],
         }
     }
 }
 
-/// Interactive Mouse Drag Mode in Single-Page / Spread Views.
+/// Interactive Mouse Drag / Click Mode in Single-Page / Spread Views.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseMode {
     Select,
     Highlight,
+    Underline,
+    Strikethrough,
+    StickyNote,
+    InkPen,
+    FreeText,
+    RectShape,
+    ArrowShape,
     Redact,
     Crop,
     StampImage,
@@ -142,40 +199,169 @@ impl MouseMode {
         match self {
             MouseMode::Select => "Select",
             MouseMode::Highlight => "Highlight",
+            MouseMode::Underline => "Underline",
+            MouseMode::Strikethrough => "Strike",
+            MouseMode::StickyNote => "Note",
+            MouseMode::InkPen => "Pen",
+            MouseMode::FreeText => "TextBox",
+            MouseMode::RectShape => "Rect",
+            MouseMode::ArrowShape => "Arrow",
             MouseMode::Redact => "REDACT",
             MouseMode::Crop => "CROP",
             MouseMode::StampImage => "STAMP",
         }
     }
+
+    pub fn uses_annotation_color(self) -> bool {
+        matches!(
+            self,
+            MouseMode::Highlight
+                | MouseMode::Underline
+                | MouseMode::Strikethrough
+                | MouseMode::StickyNote
+                | MouseMode::InkPen
+                | MouseMode::FreeText
+                | MouseMode::RectShape
+                | MouseMode::ArrowShape
+        )
+    }
 }
 
-/// Zero-RAM CPU-rendered Reading Filter (`V` key or `View` menu).
+/// Zero-RAM CPU-rendered Reading Filter (`V` key, Bottom Bar picker, or `View` menu).
+/// Research-backed palettes tuned to reduce luminance glare in daytime and halation/blue-light at night.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReadingFilter {
     Normal,
-    DarkInvert,
+    /// Matte neutral low-glare paper (recommended for daytime reading).
+    PaperEInk,
+    /// Warm book parchment / cream.
     WarmSepia,
+    /// Ultra-pale desaturated mint paper for long study sessions.
+    SageEyeCare,
+    /// Anti-halation soft charcoal dark mode for dim rooms.
+    DarkInvert,
+    /// Deep espresso dark with warm amber text (recommended for night reading).
+    NightAmber,
 }
 
 impl ReadingFilter {
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
+        Self::PaperEInk,
+        Self::WarmSepia,
+        Self::SageEyeCare,
+        Self::DarkInvert,
+        Self::NightAmber,
+    ];
+
     pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    /// Short compact label for the Bottom Bar pill.
+    pub fn label(self) -> &'static str {
         match self {
-            ReadingFilter::Normal => ReadingFilter::DarkInvert,
-            ReadingFilter::DarkInvert => ReadingFilter::WarmSepia,
-            ReadingFilter::WarmSepia => ReadingFilter::Normal,
+            Self::Normal => "Normal",
+            Self::PaperEInk => "E-Ink",
+            Self::WarmSepia => "Sepia",
+            Self::SageEyeCare => "Sage",
+            Self::DarkInvert => "Dark",
+            Self::NightAmber => "Night",
         }
     }
 
-    pub fn label(self) -> &'static str {
+    /// Descriptive title shown in the Reading Mode picker popover (including Best for day / night labels).
+    pub fn picker_title(self) -> &'static str {
         match self {
-            ReadingFilter::Normal => "Normal",
-            ReadingFilter::DarkInvert => "Dark",
-            ReadingFilter::WarmSepia => "Sepia",
+            Self::Normal => "Normal",
+            Self::PaperEInk => "Paper (E-Ink) — Best for day",
+            Self::WarmSepia => "Sepia (Cream)",
+            Self::SageEyeCare => "Sage (Eye Care)",
+            Self::DarkInvert => "Soft Dark",
+            Self::NightAmber => "Night Amber — Best for night",
+        }
+    }
+
+    /// Secondary guidance subtitle shown in the Reading Mode picker popover.
+    pub fn picker_hint(self) -> &'static str {
+        match self {
+            Self::Normal => "Original PDF colors",
+            Self::PaperEInk => "Matte low-glare neutral gray paper",
+            Self::WarmSepia => "Warm book parchment · day & dusk",
+            Self::SageEyeCare => "Soft pale mint · long study sessions",
+            Self::DarkInvert => "Anti-halation charcoal · dim rooms",
+            Self::NightAmber => "Warm amber on dark · lowest blue light",
+        }
+    }
+
+    /// `(background_rgb, text_rgb)` preview swatch colors for the picker popover.
+    pub fn swatch_colors(self) -> (u32, u32) {
+        match self {
+            Self::Normal => (0x00FF_FFFF, 0x001E_293B),
+            Self::PaperEInk => (0x00EA_EBE6, 0x001E_1F1D),
+            Self::WarmSepia => (0x00F7_F0DF, 0x002B_2318),
+            Self::SageEyeCare => (0x00E9_F2EA, 0x001D_271F),
+            Self::DarkInvert => (0x001E_2024, 0x00D8_DCE2),
+            Self::NightAmber => (0x001A_1713, 0x00E5_CFA8),
         }
     }
 }
 
-/// Page & Grid View Modes (`1`, `2`, `3`, `4`, `5`, and `Tab`).
+/// Independent page scrolling flow combined orthogonally with Fit/Layout (`ViewMode`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollMode {
+    /// Classic discrete page turns (zero neighbor prefetch).
+    SinglePage,
+    /// Smooth continuous vertical scroll across all pages (works with FitPage, FitWidth, FitTextWidth, TwoPageSpread).
+    ContinuousVertical,
+    /// Smooth continuous horizontal "book ribbon" scroll across all pages left-to-right.
+    ContinuousHorizontal,
+}
+
+impl ScrollMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::SinglePage => Self::ContinuousVertical,
+            Self::ContinuousVertical => Self::ContinuousHorizontal,
+            Self::ContinuousHorizontal => Self::SinglePage,
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single",
+            Self::ContinuousVertical => "Vert",
+            Self::ContinuousHorizontal => "Book",
+        }
+    }
+
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single Page",
+            Self::ContinuousVertical => "Continuous Vertical Scroll",
+            Self::ContinuousHorizontal => "Continuous Horizontal Book Scroll",
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::SinglePage => "SinglePage",
+            Self::ContinuousVertical => "ContinuousVertical",
+            Self::ContinuousHorizontal => "ContinuousHorizontal",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "ContinuousVertical" => Self::ContinuousVertical,
+            "ContinuousHorizontal" => Self::ContinuousHorizontal,
+            _ => Self::SinglePage,
+        }
+    }
+}
+
+/// Page, Text & Grid View Modes (`1`, `2`, `3`, `4`, `5`, `T`, and `Tab`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     FitPage,
@@ -183,10 +369,12 @@ pub enum ViewMode {
     FitTextWidth,
     TwoPageSpread,
     ContinuousScroll,
+    TextView,
     ThumbnailGrid,
 }
 
 impl ViewMode {
+    #[allow(dead_code)]
     pub fn short_label(self) -> &'static str {
         match self {
             ViewMode::FitPage => "FitPage",
@@ -194,12 +382,13 @@ impl ViewMode {
             ViewMode::FitTextWidth => "FitText",
             ViewMode::TwoPageSpread => "2-Page",
             ViewMode::ContinuousScroll => "Cont",
+            ViewMode::TextView => "Text",
             ViewMode::ThumbnailGrid => "Grid",
         }
     }
 
     pub fn is_page_view(self) -> bool {
-        !matches!(self, ViewMode::ThumbnailGrid)
+        !matches!(self, ViewMode::ThumbnailGrid | ViewMode::TextView)
     }
 
     pub fn to_ini_str(self) -> &'static str {
@@ -209,6 +398,7 @@ impl ViewMode {
             ViewMode::FitTextWidth => "FitTextWidth",
             ViewMode::TwoPageSpread => "TwoPageSpread",
             ViewMode::ContinuousScroll => "ContinuousScroll",
+            ViewMode::TextView => "TextView",
             ViewMode::ThumbnailGrid => "ThumbnailGrid",
         }
     }
@@ -219,6 +409,7 @@ impl ViewMode {
             "FitTextWidth" => ViewMode::FitTextWidth,
             "TwoPageSpread" => ViewMode::TwoPageSpread,
             "ContinuousScroll" => ViewMode::ContinuousScroll,
+            "TextView" => ViewMode::TextView,
             "ThumbnailGrid" => ViewMode::ThumbnailGrid,
             _ => ViewMode::FitPage,
         }
@@ -233,12 +424,34 @@ pub(super) struct SavedSessionTab {
     pub(super) view_mode: ViewMode,
 }
 
-/// Parsed contents of `micropdf.ini` (open tabs, active tab, and last 10 recent files).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, UI preferences & saved profiles).
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct SessionConfig {
     pub(super) active_tab: usize,
     pub(super) tabs: Vec<SavedSessionTab>,
     pub(super) recent_files: Vec<PathBuf>,
+    pub(super) ui_theme: UiThemeMode,
+    pub(super) ui_scale: f32,
+    pub(super) scroll_mode: ScrollMode,
+    pub(super) show_toolbar: bool,
+    pub(super) toolbar_config: ToolbarConfig,
+    pub(super) hf_profiles: Vec<HeaderFooterProfile>,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            active_tab: 0,
+            tabs: Vec::new(),
+            recent_files: Vec::new(),
+            ui_theme: UiThemeMode::Light,
+            ui_scale: 1.0,
+            scroll_mode: ScrollMode::SinglePage,
+            show_toolbar: true,
+            toolbar_config: ToolbarConfig::default(),
+            hf_profiles: Vec::new(),
+        }
+    }
 }
 
 /// Holds a single visible page's rasterized 0x00RRGGBB pixels.
@@ -252,6 +465,8 @@ pub(super) struct CachedPageBitmap {
     pub(super) bitmap_height: u32,
     pub(super) content_min_x: f32,
     pub(super) content_max_x: f32,
+    pub(super) content_min_y: f32,
+    pub(super) content_max_y: f32,
     pub(super) rotation_deg: i32,
     pub(super) pixels: Vec<u32>,
 }
@@ -275,7 +490,7 @@ pub(super) struct TileKey {
     pub(super) tile_row: u16,
 }
 
-/// Cached 512x512 tile bitmap with LRU access tick (`tile_cache` max 48 MB).
+/// Cached 512x512 tile bitmap with LRU access tick (`tile_cache` max 16 MB).
 pub(super) struct TileEntry {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -304,12 +519,15 @@ pub(super) struct DocumentTab<'a> {
     pub(super) current_page_index: u16,
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
+    pub(super) scroll_mode: ScrollMode,
     pub(super) zoom_level: f32,
     pub(super) pan_x: f32,
     pub(super) scroll_y: f32,
+    pub(super) scroll_x: f32,
     pub(super) nav_back_stack: VecDeque<(u16, f32)>,
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     pub(super) roman_end: usize,
+    pub(super) skip_pages: usize,
     pub(super) bookmarks: Vec<Bookmark>,
     pub(super) selected_bookmark: Option<usize>,
     pub(super) bookmark_scroll_y: usize,
@@ -324,11 +542,53 @@ pub(super) struct DocumentTab<'a> {
     pub(super) last_file_mtime: Option<std::time::SystemTime>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum TabBarHit {
+    ScrollLeft,
+    ScrollRight,
     SwitchTab(usize),
     CloseTab(usize),
     NewTab,
+    TabListToggle,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum TabListHit {
+    SwitchTab(usize),
+    CloseTab(usize),
+    CloseOthers,
+    CloseAll,
+    InsidePopover,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum TabContextHit {
+    CloseThis,
+    CloseOthers,
+    CloseRight,
+    CloseAll,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ThumbContextHit {
+    BlankCountMinus,
+    BlankCountPlus,
+    InsertBlankBefore,
+    InsertBlankAfter,
+    InsertPdfBefore,
+    InsertPdfAfter,
+    RotateCw,
+    ConvertBw,
+    DeletePage,
+    InsideMenu,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct ThumbContextMenuState {
+    pub(super) page_idx: u16,
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) blank_count: u16,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -340,8 +600,66 @@ pub(super) enum ThumbBadgeHit {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) enum SidebarHit {
+    AddBookmarkButton,
     ImportTxtButton,
     BookmarkRow { index: usize, on_delete: bool },
+}
+
+/// Unified hovered UI widget identifier so `CursorMoved` only redraws when hover actually changes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum UiHit {
+    MenuHeader(MenuCategory),
+    MenuItem(usize),
+    Toolbar(ToolbarAction),
+    BottomBar(BottomBarAction),
+    Tab(usize),
+    TabClose(usize),
+    TabScrollLeft,
+    TabScrollRight,
+    TabNew,
+    TabListToggle,
+    TabList(TabListHit),
+    TabContext(TabContextHit),
+    ThumbContext(ThumbContextHit),
+    SidebarAdd,
+    SidebarImport,
+    SidebarRow(usize),
+    SidebarDelete(usize),
+    Scrollbar,
+    Customize(CustomizeHit),
+    PrintPreview(PrintPreviewHit),
+    ManualDuplex(ManualDuplexHit),
+    Combine(CombineHit),
+    HeaderFooter(HeaderFooterHit),
+    PageNumber(PageNumberHit),
+    ReadingModeOption(ReadingFilter),
+    TextView(TextViewHit),
+    Overlay(OverlayHit),
+    BookmarkFormatSaveSample,
+    BookmarkFormatClose,
+    NotificationClear,
+}
+
+/// One timestamped session notification stored in the bottom-left Notification Board (capped at 50).
+#[derive(Clone, Debug)]
+pub(super) struct NotificationEntry {
+    pub(super) timestamp: String,
+    pub(super) message: String,
+    pub(super) is_error: bool,
+}
+
+/// Active drag-to-move state for repositioning a Sticky Note or Text Box annotation on a page.
+#[derive(Clone, Debug)]
+pub(super) struct DraggingAnnotation {
+    pub(super) page_index: u16,
+    pub(super) annot_index: usize,
+    pub(super) is_sticky_note: bool,
+    pub(super) orig_rect: PdfRect,
+    pub(super) start_pdf_x: f32,
+    pub(super) start_pdf_y: f32,
+    pub(super) start_screen_x: f64,
+    pub(super) start_screen_y: f64,
+    pub(super) note_text: Option<String>,
 }
 
 /// Interactive Command Prompt HUD state machine in the Bottom Command Bar & Window Title Bar.
@@ -354,23 +672,28 @@ pub(super) enum InputMode {
     JumpToPage {
         input: String,
     },
+    #[allow(dead_code)]
     PageNumbers {
         input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterRange {
         range_input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterPosition {
         start_page: u16,
         end_page: u16,
         pos_input: String,
     },
+    #[allow(dead_code)]
     HeaderFooterText {
         start_page: u16,
         end_page: u16,
         position: MarginPosition,
         text_input: String,
     },
+    #[allow(dead_code)]
     ClearMargins {
         input: String,
     },
@@ -386,6 +709,16 @@ pub(super) enum InputMode {
     EditBookmark {
         bookmark_idx: usize,
         title_input: String,
+    },
+    StickyNotePrompt {
+        pdf_x: f32,
+        pdf_y: f32,
+        text_input: String,
+    },
+    FreeTextPrompt {
+        pdf_x: f32,
+        pdf_y: f32,
+        text_input: String,
     },
     ConfirmExternalUrl {
         url: String,
@@ -405,8 +738,8 @@ pub(super) enum InputMode {
         clean_scans: bool,
         previewing: bool,
     },
-    /// Bottom-bar print prompt (macOS/Linux; Windows uses the native dialog).
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Legacy print prompt retained for existing tests; interactive printing uses `print_preview`.
+    #[allow(dead_code)]
     PrintPrompt {
         printers: Vec<String>,
         selected_printer: usize,
@@ -524,11 +857,18 @@ pub(super) struct IncrementalSearchState {
 pub(super) enum PendingDialog {
     Open,
     Save,
+    SaveAs,
     Merge,
     CombineMultiple,
+    CombineAddFiles,
+    ExportMarkdown,
+    ExportLatex,
+    ExportDocx,
+    ExportXlsx,
     PickStampImage,
     Split(String),
     ImportBookmarksTxt,
+    SaveBookmarkSampleTxt,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -536,11 +876,21 @@ pub struct PdfViewerApp<'a> {
     /// Open document tabs; inactive tabs hold zero rendered bitmaps.
     pub(super) tabs: Vec<DocumentTab<'a>>,
     pub(super) active_tab: usize,
+    /// First visible tab index when tabs overflow the horizontal tab strip.
+    pub(super) tab_scroll_offset: usize,
+    /// True when the `▾` All-Tabs overflow dropdown is open.
+    pub(super) show_tab_list_popover: bool,
+    /// Scroll offset (first visible row) inside the `▾` All-Tabs dropdown.
+    pub(super) tab_list_scroll: usize,
+    /// Right-click Tab Context Menu: `Some((target_tab_idx, screen_x, screen_y))`.
+    pub(super) tab_context_menu: Option<(usize, i32, i32)>,
     /// Active tab state mirrored directly for fast, conflict-free access.
     pub(super) doc: Option<PdfDocument<'a>>,
     pub(super) file_path: PathBuf,
     pub(super) current_page_index: u16,
     pub(super) roman_end: usize,
+    /// Number of leading unnumbered cover/picture pages set via Page Numbering.
+    pub(super) skip_pages: usize,
     pub(super) bw_pages: HashSet<u16>,
     pub(super) undo_stack: VecDeque<Vec<u8>>,
     /// True once any redaction has been applied to the active document.
@@ -573,13 +923,17 @@ pub struct PdfViewerApp<'a> {
     /// Active View Mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`, `ContinuousScroll`, `ThumbnailGrid`).
     pub(super) view_mode: ViewMode,
     pub(super) last_page_view_mode: ViewMode,
+    /// Independent scroll flow (`SinglePage`, `ContinuousVertical`, `ContinuousHorizontal`).
+    pub(super) scroll_mode: ScrollMode,
     /// Zoom factor (`0.25..=8.0`, i.e. 25%–800%, default `1.0`).
     pub(super) zoom_level: f32,
     /// Horizontal pan offset in physical pixels when the zoomed page width exceeds the viewport width.
     pub(super) pan_x: f32,
-    /// Vertical scroll offset in physical pixels when zoomed or in `FitWidth` / `FitTextWidth` / `ContinuousScroll`.
+    /// Vertical scroll offset in physical pixels when zoomed or in vertical continuous scroll.
     pub(super) scroll_y: f32,
-    /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 48 MB).
+    /// Horizontal scroll offset in physical pixels when in `ScrollMode::ContinuousHorizontal` (book ribbon).
+    pub(super) scroll_x: f32,
+    /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 16 MB).
     pub(super) tile_cache: HashMap<TileKey, TileEntry>,
     pub(super) tile_lru_tick: u64,
     /// Navigation history of `(page_index, scroll_y)` entries (capped at `MAX_NAV_HISTORY = 50`).
@@ -623,8 +977,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) mouse_mode: MouseMode,
     /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
     pub(super) pending_stamp_image: Option<StampImageBuffer>,
-    /// Zero-RAM CPU-rendered Reading Filter (`Normal`, `DarkInvert`, `WarmSepia`).
+    /// Zero-RAM CPU-rendered Reading Filter (6 eye-care palettes).
     pub(super) reading_filter: ReadingFilter,
+    /// True when the bottom-bar Reading Mode picker popover is open.
+    pub(super) show_reading_mode_popover: bool,
     /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`).
     pub(super) search_query: String,
     pub(super) search_matches: Vec<SearchMatch>,
@@ -643,6 +999,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) grid_drag_page: Option<(u16, f64, f64)>,
     /// Last double-click tracking in Grid View: `(page_idx, timestamp)`.
     pub(super) last_thumb_click: Option<(u16, Instant)>,
+    /// Right-click context menu on a thumbnail card in Grid View.
+    pub(super) thumb_context_menu: Option<ThumbContextMenuState>,
     /// Left Bookmark Sidebar (`B` to toggle).
     pub(super) show_bookmarks: bool,
     pub(super) bookmarks: Vec<Bookmark>,
@@ -658,13 +1016,60 @@ pub struct PdfViewerApp<'a> {
     pub(super) input_mode: InputMode,
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
+    pub(super) show_bookmark_format_overlay: bool,
+    pub(super) show_about_overlay: bool,
+    pub(super) show_customize_toolbar: bool,
+    /// Bright Light default UI theme with Dark Mode toggle.
+    pub(super) ui_theme_mode: UiThemeMode,
+    /// User-adjustable UI interface scale multiplier (`0.80..=1.60`, persisted in `micropdf.ini`).
+    pub(super) ui_scale: f32,
+    /// Inline icon toolbar beside the menus on the unified top bar (`View -> Show Toolbar`).
+    pub(super) show_toolbar: bool,
+    /// Per-button customization persisted in `micropdf.ini`.
+    pub(super) toolbar_config: ToolbarConfig,
+    /// Saved reusable Header/Footer style profiles persisted in `micropdf.ini`.
+    pub(super) hf_profiles: Vec<HeaderFooterProfile>,
+    /// Most recently edited Header/Footer settings so reopening the dialog lets you tweak & update cleanly.
+    pub(super) last_hf_profile: HeaderFooterProfile,
+    /// Active annotation color swatch (Highlight, Underline, Strikethrough, Note, Pen, TextBox, Shapes).
+    pub(super) annotation_color: AnnotationColor,
+    /// Live freehand pen stroke points in window physical pixels while dragging `MouseMode::InkPen`.
+    pub(super) ink_stroke_screen_pts: Vec<(f32, f32)>,
+    /// Floating sticky-note popover `(note_text, screen_x, screen_y)` when user clicks a sticky note.
+    pub(super) active_note_popover: Option<(String, i32, i32)>,
+    /// Active drag-to-move state when repositioning an existing Sticky Note or Text Box.
+    pub(super) dragging_annotation: Option<DraggingAnnotation>,
+    /// Active Print Preview modal state (0 bytes when closed).
+    pub(super) print_preview: Option<PrintPreviewState>,
+    /// Active Manual Duplex Pass 2 wait modal state (0 bytes when closed).
+    pub(super) manual_duplex_wait: Option<ManualDuplexWaitState>,
+    /// Active Interactive Combine PDFs modal state (0 bytes when closed).
+    pub(super) combine_modal: Option<CombineModalState>,
+    /// Active visual Header & Footer modal state (0 bytes when closed).
+    pub(super) header_footer_modal: Option<HeaderFooterModalState>,
+    /// Active visual Page Numbering modal state (0 bytes when closed).
+    pub(super) page_number_modal: Option<PageNumberModalState>,
+    /// Cached extracted blocks for `ViewMode::TextView` (0 bytes when not in Text View).
+    pub(super) cached_text_view: Option<CachedTextViewPage>,
+    /// Reading font size in logical pixels for `ViewMode::TextView`.
+    pub(super) text_view_font_size: f32,
+    /// Unified hovered UI widget to coalesce redraws and show crisp hover feedback.
+    pub(super) hovered_widget: Option<UiHit>,
+    /// True while dragging the right-edge overlay vertical scrollbar.
+    pub(super) scrollbar_drag: bool,
     /// True when `F11` fullscreen (or `F5` presentation) is active with menu/tab/status bars hidden.
     pub(super) is_fullscreen: bool,
     /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
     pub(super) is_presentation: bool,
-    /// Saved `(view_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
-    pub(super) pre_presentation_state: Option<(ViewMode, f32, f32, f32)>,
+    /// Saved `(view_mode, scroll_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
+    pub(super) pre_presentation_state: Option<(ViewMode, ScrollMode, f32, f32, f32)>,
     pub(super) status_notice: Option<String>,
+    /// Bounded session log of timestamped status notifications (max 50 entries).
+    pub(super) notifications: VecDeque<NotificationEntry>,
+    /// Last notice message recorded into `notifications` so duplicates are not double-logged.
+    pub(super) last_recorded_notice: Option<String>,
+    /// True when the bottom-left Session Notification Board popover is open.
+    pub(super) show_notifications: bool,
     /// Reusable pixel buffer so page turns never reallocate when `cached_page` is invalidated.
     pub(super) spare_pixel_buf: Vec<u32>,
     /// Declared in strict drop order: `surface` drops first, then `context`, then `window`.
@@ -675,6 +1080,82 @@ pub struct PdfViewerApp<'a> {
 
 
 impl<'a> PdfViewerApp<'a> {
+    pub(super) fn ui_theme(&self) -> UiTheme {
+        self.ui_theme_mode.theme()
+    }
+
+    /// Effective UI scale combining OS display HiDPI `window_sf` with user's `ui_scale` preference.
+    pub(super) fn effective_scale_factor(&self, window_sf: f64) -> f64 {
+        (window_sf * (self.ui_scale as f64)).clamp(0.75, 4.0)
+    }
+
+    pub(super) fn adjust_ui_scale(&mut self, delta: f32) {
+        let next = ((self.ui_scale + delta) * 20.0).round() / 20.0;
+        self.ui_scale = next.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        self.status_notice = Some(format!("UI Scale: {}%", (self.ui_scale * 100.0).round() as i32));
+        self.save_session_to_ini();
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn reset_ui_scale(&mut self) {
+        self.ui_scale = 1.0;
+        self.status_notice = Some("UI Scale reset to 100%".to_string());
+        self.save_session_to_ini();
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Effective scroll mode (supports legacy `ViewMode::ContinuousScroll` seamlessly).
+    pub(super) fn effective_scroll_mode(&self) -> ScrollMode {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            ScrollMode::ContinuousVertical
+        } else {
+            self.scroll_mode
+        }
+    }
+
+    /// Effective page layout/fit mode (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPageSpread`).
+    pub(super) fn effective_layout_mode(&self) -> ViewMode {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            ViewMode::FitWidth
+        } else {
+            self.view_mode
+        }
+    }
+
+    /// True when rendering continuous vertical or continuous horizontal scrolling page flow.
+    pub(super) fn is_continuous_scroll(&self) -> bool {
+        self.view_mode.is_page_view() && self.effective_scroll_mode() != ScrollMode::SinglePage
+    }
+
+    pub(super) fn set_scroll_mode(&mut self, mode: ScrollMode) {
+        if self.view_mode == ViewMode::ContinuousScroll {
+            self.view_mode = ViewMode::FitWidth;
+            self.last_page_view_mode = ViewMode::FitWidth;
+        }
+        if !self.view_mode.is_page_view() {
+            self.view_mode = self.last_page_view_mode;
+            self.thumbnail_cache.clear();
+            self.cached_text_view = None;
+        }
+        self.scroll_mode = mode;
+        self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
+        self.pan_x = 0.0;
+        self.invalidate_page_caches();
+        self.status_notice = Some(format!("Scroll Mode: {}", mode.status_label()));
+        self.save_session_to_ini();
+        self.request_redraw();
+    }
+
+    pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
+        self.reading_filter = filter;
+        self.show_reading_mode_popover = false;
+        self.status_notice = Some(format!("Reading Mode: {}", filter.picker_title()));
+        self.request_redraw();
+    }
+
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
         // Print temp files left behind by a previous run that was killed mid-print.
         crate::print::remove_stale_print_temp_files(&std::env::temp_dir());
@@ -682,10 +1163,15 @@ impl<'a> PdfViewerApp<'a> {
             engine,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_scroll_offset: 0,
+            show_tab_list_popover: false,
+            tab_list_scroll: 0,
+            tab_context_menu: None,
             doc: None,
             file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
+            skip_pages: 0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             redacted: false,
@@ -704,9 +1190,11 @@ impl<'a> PdfViewerApp<'a> {
             drag_start: None,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: ScrollMode::SinglePage,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
+            scroll_x: 0.0,
             tile_cache: HashMap::new(),
             tile_lru_tick: 0,
             nav_back_stack: VecDeque::new(),
@@ -732,6 +1220,7 @@ impl<'a> PdfViewerApp<'a> {
             mouse_mode: MouseMode::Select,
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
+            show_reading_mode_popover: false,
             search_query: String::new(),
             search_matches: Vec::new(),
             current_search_match: 0,
@@ -742,6 +1231,7 @@ impl<'a> PdfViewerApp<'a> {
             hovered_thumb: None,
             grid_drag_page: None,
             last_thumb_click: None,
+            thumb_context_menu: None,
             show_bookmarks: false,
             bookmarks: Vec::new(),
             selected_bookmark: None,
@@ -755,24 +1245,119 @@ impl<'a> PdfViewerApp<'a> {
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
+            show_bookmark_format_overlay: false,
+            show_about_overlay: false,
+            show_customize_toolbar: false,
+            ui_theme_mode: UiThemeMode::Light,
+            ui_scale: 1.0,
+            show_toolbar: true,
+            toolbar_config: ToolbarConfig::default(),
+            hf_profiles: Vec::new(),
+            last_hf_profile: HeaderFooterProfile::default(),
+            annotation_color: AnnotationColor::Yellow,
+            ink_stroke_screen_pts: Vec::new(),
+            active_note_popover: None,
+            dragging_annotation: None,
+            print_preview: None,
+            manual_duplex_wait: None,
+            combine_modal: None,
+            header_footer_modal: None,
+            page_number_modal: None,
+            cached_text_view: None,
+            text_view_font_size: 14.5,
+            hovered_widget: None,
+            scrollbar_drag: false,
             is_fullscreen: false,
             is_presentation: false,
             pre_presentation_state: None,
             status_notice: if initial_path.is_none() {
-                Some("Open PDF (O) or drag and drop a file into this window".to_string())
+                Some("Drop a PDF here or press O to open".to_string())
             } else {
                 None
             },
+            notifications: VecDeque::with_capacity(50),
+            last_recorded_notice: None,
+            show_notifications: false,
             spare_pixel_buf: Vec::new(),
             surface: None,
             context: None,
             window: None,
         };
+        app.record_status_notice_if_new();
         app.load_session_from_ini(initial_path.is_none());
         if let Some(path) = initial_path {
             app.load_document(path)?;
         }
         Ok(app)
+    }
+
+    /// Formats the current local wall-clock time as `HH:MM:SS` using zero extra dependencies.
+    fn local_hms_timestamp() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct SystemTimeWin {
+                w_year: u16,
+                w_month: u16,
+                w_day_of_week: u16,
+                w_day: u16,
+                w_hour: u16,
+                w_minute: u16,
+                w_second: u16,
+                w_milliseconds: u16,
+            }
+            unsafe extern "system" {
+                fn GetLocalTime(lp_system_time: *mut SystemTimeWin);
+            }
+            let mut st = SystemTimeWin {
+                w_year: 0,
+                w_month: 0,
+                w_day_of_week: 0,
+                w_day: 0,
+                w_hour: 0,
+                w_minute: 0,
+                w_second: 0,
+                w_milliseconds: 0,
+            };
+            unsafe { GetLocalTime(&mut st) };
+            return format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let day_secs = secs % 86_400;
+            let h = day_secs / 3600;
+            let m = (day_secs % 3600) / 60;
+            let s = day_secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        }
+    }
+
+    /// Captures the current `self.status_notice` into the bounded session Notification Board (max 50).
+    pub(super) fn record_status_notice_if_new(&mut self) {
+        let Some(ref msg) = self.status_notice else {
+            return;
+        };
+        if self.last_recorded_notice.as_deref() == Some(msg.as_str()) {
+            return;
+        }
+        let is_error = msg.starts_with("Error")
+            || msg.starts_with("ERROR")
+            || msg.contains("failed")
+            || msg.contains("Invalid")
+            || msg.contains("error:");
+        if self.notifications.len() >= 50 {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(NotificationEntry {
+            timestamp: Self::local_hms_timestamp(),
+            message: msg.clone(),
+            is_error,
+        });
+        self.last_recorded_notice = Some(msg.clone());
     }
 
     /// Returns the portable `micropdf.ini` path next to the executable (or `custom_session_ini_path` in tests).
@@ -816,7 +1401,15 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
-        let mut out = String::from("# MicroPDF v1.2 Session & Recent Files\n");
+        let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
+        out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
+        out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
+        out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
+        out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
+        out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
+        for prof in &cfg.hf_profiles {
+            out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
+        }
         out.push_str(&format!("active_tab={}\n", cfg.active_tab));
         for tab in &cfg.tabs {
             let p_str = tab.path.to_string_lossy().replace('\n', "").replace('\r', "");
@@ -845,7 +1438,28 @@ impl<'a> PdfViewerApp<'a> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(val) = line.strip_prefix("active_tab=") {
+            if let Some(val) = line.strip_prefix("ui_theme=") {
+                cfg.ui_theme = UiThemeMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("ui_scale=") {
+                if let Ok(sc) = val.trim().parse::<f32>() {
+                    if sc.is_finite() {
+                        cfg.ui_scale = sc.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("scroll_mode=") {
+                cfg.scroll_mode = ScrollMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("show_toolbar=") {
+                let v = val.trim();
+                cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("toolbar_items=") {
+                cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("hf_profile=") {
+                if let Some(prof) = HeaderFooterProfile::from_ini_str(val) {
+                    if cfg.hf_profiles.len() < 24 {
+                        cfg.hf_profiles.push(prof);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("active_tab=") {
                 if let Ok(idx) = val.trim().parse::<usize>() {
                     cfg.active_tab = idx;
                 }
@@ -889,28 +1503,60 @@ impl<'a> PdfViewerApp<'a> {
         self.recent_files.truncate(MAX_RECENT_FILES);
     }
 
-    /// Saves open tabs, current page, view mode, and recent files to `micropdf.ini` next to the executable,
-    /// falling back to the OS config folder (and setting a status bar notice) if the exe folder isn't writable.
+    /// Saves open tabs, current page, view mode, recent files, and UI preferences to `micropdf.ini`
+    /// next to the executable, falling back to the OS config folder if not writable.
+    ///
+    /// IMPORTANT: Never calls `sync_active_tab_to_slot()` (which moves `self.doc` out into the slot),
+    /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
-        self.sync_active_tab_to_slot();
         let mut saved_tabs = Vec::new();
-        for tab in &self.tabs {
-            if !tab.file_path.as_os_str().is_empty() && tab.file_path.exists() {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let (path, page_index, vm, last_vm) = if i == self.active_tab {
+                (
+                    &self.file_path,
+                    self.current_page_index,
+                    self.view_mode,
+                    self.last_page_view_mode,
+                )
+            } else {
+                (
+                    &tab.file_path,
+                    tab.current_page_index,
+                    tab.view_mode,
+                    tab.last_page_view_mode,
+                )
+            };
+            if !path.as_os_str().is_empty() && path.exists() {
                 saved_tabs.push(SavedSessionTab {
-                    path: tab.file_path.clone(),
-                    page_index: tab.current_page_index,
-                    view_mode: if tab.view_mode.is_page_view() {
-                        tab.view_mode
-                    } else {
-                        tab.last_page_view_mode
-                    },
+                    path: path.clone(),
+                    page_index,
+                    view_mode: if vm.is_page_view() { vm } else { last_vm },
                 });
             }
+        }
+        // If no tabs slice entry exists yet but a doc is loaded directly on self
+        if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() && self.file_path.exists()
+        {
+            saved_tabs.push(SavedSessionTab {
+                path: self.file_path.clone(),
+                page_index: self.current_page_index,
+                view_mode: if self.view_mode.is_page_view() {
+                    self.view_mode
+                } else {
+                    self.last_page_view_mode
+                },
+            });
         }
         let cfg = SessionConfig {
             active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
+            ui_theme: self.ui_theme_mode,
+            ui_scale: self.ui_scale,
+            scroll_mode: self.scroll_mode,
+            show_toolbar: self.show_toolbar,
+            toolbar_config: self.toolbar_config.clone(),
+            hf_profiles: self.hf_profiles.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
         let primary_path = self.portable_session_ini_path();
@@ -947,6 +1593,14 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         let cfg = Self::parse_session_ini(&content);
+        self.ui_theme_mode = cfg.ui_theme;
+        self.ui_scale = cfg.ui_scale;
+        self.scroll_mode = cfg.scroll_mode;
+        self.show_toolbar = cfg.show_toolbar;
+        self.toolbar_config = cfg.toolbar_config;
+        self.hf_profiles = cfg.hf_profiles;
+        // Saved Header/Footer profiles stay opt-in via < > in the dialog; never auto-fill every PDF.
+        self.last_hf_profile = HeaderFooterProfile::default();
         self.recent_files = cfg
             .recent_files
             .into_iter()
@@ -1292,6 +1946,8 @@ impl<'a> PdfViewerApp<'a> {
         self.tile_form_copy = None;
         // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
         self.cached_char_boxes = None;
+        self.cached_text_view = None;
+        self.active_note_popover = None;
         self.selected_text.clear();
         self.selected_text_page = None;
         self.selected_text_rects.clear();
@@ -1378,10 +2034,6 @@ impl<'a> PdfViewerApp<'a> {
         Self::rotation_degrees_of_page(&page)
     }
 
-    pub(super) fn current_page_rotation_degrees(&self) -> i32 {
-        self.page_rotation_degrees(self.current_page_index)
-    }
-
     pub(super) fn filename_display(&self) -> String {
         if self.doc.is_none() && self.file_path.as_os_str().is_empty() {
             return "No PDF Open".to_string();
@@ -1459,6 +2111,7 @@ impl<'a> PdfViewerApp<'a> {
         if !self.is_presentation {
             self.pre_presentation_state = Some((
                 self.view_mode,
+                self.scroll_mode,
                 self.zoom_level,
                 self.pan_x,
                 self.scroll_y,
@@ -1468,9 +2121,11 @@ impl<'a> PdfViewerApp<'a> {
         self.is_fullscreen = true;
         self.open_menu = None;
         self.view_mode = ViewMode::FitPage;
+        self.scroll_mode = ScrollMode::SinglePage;
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         if let Some(w) = self.window.as_ref() {
             w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
         }
@@ -1491,8 +2146,9 @@ impl<'a> PdfViewerApp<'a> {
         self.is_presentation = false;
         self.is_fullscreen = false;
         if was_presentation {
-            if let Some((vm, zoom, px, sy)) = self.pre_presentation_state.take() {
+            if let Some((vm, sm, zoom, px, sy)) = self.pre_presentation_state.take() {
                 self.view_mode = vm;
+                self.scroll_mode = sm;
                 self.zoom_level = zoom;
                 self.pan_x = px;
                 self.scroll_y = sy;
@@ -1513,42 +2169,14 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
 
-        let title = if let Some(prompt) = self.format_active_prompt_text() {
-            format!("MicroPDF | {prompt}")
+        let title = if self.doc.is_none() {
+            "MicroPDF".to_string()
         } else {
-            let total = self.total_pages();
-            let current_1based = if total > 0 {
-                self.current_page_index + 1
-            } else {
-                0
-            };
-            let page_display = if total > 0 && self.roman_end > 0 {
-                let logical_lbl = PdfEngine::format_logical_page_label(
-                    self.current_page_index as usize,
-                    self.roman_end,
-                );
-                format!("Page {} ({} of {})", logical_lbl, current_1based, total)
-            } else if self.view_mode == ViewMode::TwoPageSpread && current_1based + 1 <= total {
-                format!("Pages {}-{} / {}", current_1based, current_1based + 1, total)
-            } else {
-                format!("Page {} / {}", current_1based, total)
-            };
-            let rotation = self.current_page_rotation_degrees();
-            let ram_mb = get_current_rss_mb().unwrap_or(0.0);
             let filename = self.filename_display();
-            let mode_tag = self.view_mode.short_label();
-            let mouse_tag = self.mouse_mode.short_label();
-            let filter_tag = self.reading_filter.label();
-
-            let suffix = if let Some(notice) = &self.status_notice {
-                notice.clone()
-            } else {
-                "Use Top Menu Bar or press ? for Shortcuts".to_string()
-            };
-
-            format!(
-                "MicroPDF [{mode_tag} | Mouse:{mouse_tag} | Filter:{filter_tag}] | {filename} | {page_display} | Rot:{rotation}° | RAM:{ram_mb:.1} MB | {suffix}"
-            )
+            let dirty = if self.has_unsaved_edits { "• " } else { "" };
+            let total = self.total_pages();
+            let cur = if total > 0 { self.current_page_index + 1 } else { 0 };
+            format!("{dirty}{filename} ({cur}/{total}) — MicroPDF")
         };
 
         window.set_title(&title);

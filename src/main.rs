@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod app_icon;
 mod engine;
+mod export;
 mod optimize;
 mod print;
 mod viewer;

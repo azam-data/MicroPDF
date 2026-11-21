@@ -1354,7 +1354,9 @@ dependencies = [
 name = "micro_pdf"
 version = "1.3.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
+ "flate2",
  "image",
  "lopdf",
  "pdfium-render",

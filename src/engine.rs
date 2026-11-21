@@ -13,8 +13,8 @@ pub enum MarginZone {
     PageNumber,
 }
 
-/// Horizontal alignment for headers and footers.
-#[derive(Copy, Clone, Debug, PartialEq)]
+/// Horizontal alignment for headers and footers (and 6-position page numbers).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MarginPosition {
     HeaderLeft,
     HeaderCenter,
@@ -25,6 +25,7 @@ pub enum MarginPosition {
 }
 
 impl MarginPosition {
+    #[allow(dead_code)]
     pub fn parse(input: &str) -> Option<Self> {
         match input.trim().to_ascii_uppercase().as_str() {
             "HL" => Some(Self::HeaderLeft),
@@ -49,6 +50,234 @@ impl MarginPosition {
             MarginZone::Header
         } else {
             MarginZone::Footer
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::HeaderLeft => "Top Left",
+            Self::HeaderCenter => "Top Center",
+            Self::HeaderRight => "Top Right",
+            Self::FooterLeft => "Bottom Left",
+            Self::FooterCenter => "Bottom Center",
+            Self::FooterRight => "Bottom Right",
+        }
+    }
+}
+
+/// Text color preset for Header/Footer & Page Numbering stamps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum HeaderFooterColor {
+    Gray,
+    Black,
+    Navy,
+}
+
+impl HeaderFooterColor {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gray => "Slate Gray",
+            Self::Black => "Black",
+            Self::Navy => "Navy",
+        }
+    }
+
+    pub fn pdf_color(self) -> PdfColor {
+        match self {
+            Self::Gray => PdfColor::new(90, 90, 90, 255),
+            Self::Black => PdfColor::new(20, 20, 20, 255),
+            Self::Navy => PdfColor::new(30, 58, 138, 255),
+        }
+    }
+
+    pub fn ui_rgb(self) -> u32 {
+        match self {
+            Self::Gray => 0x005A_5A5A,
+            Self::Black => 0x0014_1414,
+            Self::Navy => 0x001E_3A8A,
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::Gray => "gray",
+            Self::Black => "black",
+            Self::Navy => "navy",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "black" => Self::Black,
+            "navy" => Self::Navy,
+            _ => Self::Gray,
+        }
+    }
+}
+
+/// Reusable Header & Footer style profile persisted in portable `micropdf.ini`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeaderFooterProfile {
+    pub name: String,
+    pub header_left: String,
+    pub header_center: String,
+    pub header_right: String,
+    pub footer_left: String,
+    pub footer_center: String,
+    pub footer_right: String,
+    pub font_size: f32,
+    pub margin_pt: f32,
+    pub color: HeaderFooterColor,
+}
+
+impl Default for HeaderFooterProfile {
+    fn default() -> Self {
+        Self {
+            name: "Default".to_string(),
+            header_left: String::new(),
+            header_center: String::new(),
+            header_right: String::new(),
+            footer_left: String::new(),
+            footer_center: String::new(),
+            footer_right: String::new(),
+            font_size: 10.0,
+            margin_pt: 28.0,
+            color: HeaderFooterColor::Gray,
+        }
+    }
+}
+
+impl HeaderFooterProfile {
+    pub fn has_header(&self) -> bool {
+        !self.header_left.trim().is_empty()
+            || !self.header_center.trim().is_empty()
+            || !self.header_right.trim().is_empty()
+    }
+
+    pub fn has_footer(&self) -> bool {
+        !self.footer_left.trim().is_empty()
+            || !self.footer_center.trim().is_empty()
+            || !self.footer_right.trim().is_empty()
+    }
+
+    fn esc(s: &str) -> String {
+        s.replace('\\', "\\\\")
+            .replace('|', "\\p")
+            .replace('\n', " ")
+            .replace('\r', "")
+    }
+
+    fn unesc(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                match chars.next() {
+                    Some('p') => out.push('|'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => out.push(other),
+                    None => {}
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    pub fn to_ini_str(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}",
+            Self::esc(&self.name),
+            Self::esc(&self.header_left),
+            Self::esc(&self.header_center),
+            Self::esc(&self.header_right),
+            Self::esc(&self.footer_left),
+            Self::esc(&self.footer_center),
+            Self::esc(&self.footer_right),
+            self.font_size.clamp(6.0, 24.0),
+            self.margin_pt.clamp(12.0, 72.0),
+            self.color.to_ini_str(),
+        )
+    }
+
+    pub fn from_ini_str(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('|').collect();
+        if parts.len() < 10 {
+            return None;
+        }
+        let name = Self::unesc(parts[0]).trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            name,
+            header_left: Self::unesc(parts[1]),
+            header_center: Self::unesc(parts[2]),
+            header_right: Self::unesc(parts[3]),
+            footer_left: Self::unesc(parts[4]),
+            footer_center: Self::unesc(parts[5]),
+            footer_right: Self::unesc(parts[6]),
+            font_size: parts[7].trim().parse::<f32>().unwrap_or(10.0).clamp(6.0, 24.0),
+            margin_pt: parts[8].trim().parse::<f32>().unwrap_or(28.0).clamp(12.0, 72.0),
+            color: HeaderFooterColor::from_ini_str(parts[9]),
+        })
+    }
+}
+
+/// Formatting template for Page Numbering stamps.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageNumberFormat {
+    Plain,
+    PageN,
+    PageNOfTotal,
+    NSlashTotal,
+    Dashed,
+}
+
+impl PageNumberFormat {
+    pub const ALL: [Self; 5] = [
+        Self::Plain,
+        Self::PageN,
+        Self::PageNOfTotal,
+        Self::NSlashTotal,
+        Self::Dashed,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plain => "1",
+            Self::PageN => "Page 1",
+            Self::PageNOfTotal => "Page 1 of N",
+            Self::NSlashTotal => "1 / N",
+            Self::Dashed => "- 1 -",
+        }
+    }
+}
+
+/// Configuration for the visual Page Numbering modal.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PageNumberConfig {
+    pub position: MarginPosition,
+    pub format: PageNumberFormat,
+    pub roman_end: u16,
+    /// Number of leading cover/picture pages to leave completely unnumbered (0 = none).
+    pub skip_pages: u16,
+    pub font_size: f32,
+    pub margin_pt: f32,
+    pub color: HeaderFooterColor,
+}
+
+impl Default for PageNumberConfig {
+    fn default() -> Self {
+        Self {
+            position: MarginPosition::FooterCenter,
+            format: PageNumberFormat::Plain,
+            roman_end: 0,
+            skip_pages: 0,
+            font_size: 10.0,
+            margin_pt: 28.0,
+            color: HeaderFooterColor::Gray,
         }
     }
 }
@@ -76,6 +305,97 @@ pub struct StampImageBuffer {
     pub width: u32,
     pub height: u32,
     pub image: image::DynamicImage,
+}
+
+/// Color swatch for PDF annotations (Highlight, Underline, Strikethrough, Sticky Note, Ink, Text, Shapes).
+/// A Sticky Note or Text Box annotation on a page that can be clicked to inspect or dragged to reposition.
+#[derive(Clone, Debug)]
+pub struct MovableAnnotation {
+    pub index: usize,
+    pub is_sticky_note: bool,
+    pub bounds: PdfRect,
+    pub text: String,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum AnnotationColor {
+    Yellow,
+    Green,
+    Cyan,
+    Pink,
+    Red,
+    Blue,
+    Black,
+}
+
+impl Default for AnnotationColor {
+    fn default() -> Self {
+        Self::Yellow
+    }
+}
+
+impl AnnotationColor {
+    pub const ALL: [AnnotationColor; 7] = [
+        Self::Yellow,
+        Self::Green,
+        Self::Cyan,
+        Self::Pink,
+        Self::Red,
+        Self::Blue,
+        Self::Black,
+    ];
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&c| c == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Yellow => "Yellow",
+            Self::Green => "Green",
+            Self::Cyan => "Cyan",
+            Self::Pink => "Pink",
+            Self::Red => "Red",
+            Self::Blue => "Blue",
+            Self::Black => "Black",
+        }
+    }
+
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            Self::Yellow => (255, 224, 51),
+            Self::Green => (52, 211, 153),
+            Self::Cyan => (56, 189, 248),
+            Self::Pink => (244, 114, 182),
+            Self::Red => (220, 38, 38),
+            Self::Blue => (37, 99, 235),
+            Self::Black => (24, 24, 27),
+        }
+    }
+
+    /// Solid UI swatch color (`0x00RRGGBB`).
+    pub fn u32_rgb(self) -> u32 {
+        let (r, g, b) = self.rgb();
+        ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
+    }
+
+    /// Stroke / ink / text color (slightly deeper for Yellow so lines/text stay legible on white paper).
+    pub fn stroke_pdf_color(self) -> PdfColor {
+        match self {
+            Self::Yellow => PdfColor::new(202, 138, 4, 255),
+            _ => {
+                let (r, g, b) = self.rgb();
+                PdfColor::new(r, g, b, 255)
+            }
+        }
+    }
+
+    /// Translucent Multiply-blend fill for text highlights.
+    pub fn highlight_pdf_color(self) -> PdfColor {
+        let (r, g, b) = self.rgb();
+        PdfColor::new(r, g, b, 115)
+    }
 }
 
 /// Result of `flatten_and_unlock_doc`.
@@ -493,6 +813,17 @@ impl PdfEngine {
         roman_end: usize,
         total_pages: usize,
     ) -> Option<usize> {
+        Self::resolve_logical_page_str_with_skip(input, 0, roman_end, total_pages)
+    }
+
+    /// Resolves a logical page string (`input`) taking into account `skip_pages` unnumbered
+    /// leading cover/picture pages followed by `roman_end` lowercase Roman front-matter pages.
+    pub fn resolve_logical_page_str_with_skip(
+        input: &str,
+        skip_pages: usize,
+        roman_end: usize,
+        total_pages: usize,
+    ) -> Option<usize> {
         let trimmed = input.trim();
         if trimmed.is_empty() || total_pages == 0 {
             return None;
@@ -507,15 +838,16 @@ impl PdfEngine {
         }
 
         if let Some(r) = Self::from_roman(trimmed) {
-            if r >= 1 && r <= total_pages {
-                return Some(r - 1);
+            let phys_1based = skip_pages + r;
+            if phys_1based >= 1 && phys_1based <= total_pages {
+                return Some(phys_1based - 1);
             }
             return None;
         }
 
         if let Ok(n) = trimmed.parse::<usize>() {
             if n >= 1 {
-                let phys_1based = roman_end + n;
+                let phys_1based = skip_pages + roman_end + n;
                 if phys_1based >= 1 && phys_1based <= total_pages {
                     return Some(phys_1based - 1);
                 }
@@ -527,11 +859,25 @@ impl PdfEngine {
 
     /// Formats the logical label for 0-based `page_idx` given `roman_end`.
     pub fn format_logical_page_label(page_idx: usize, roman_end: usize) -> String {
+        Self::format_logical_page_label_with_skip(page_idx, 0, roman_end)
+    }
+
+    /// Formats the logical label for 0-based `page_idx` given `skip_pages` unnumbered front pages
+    /// followed by `roman_end` Roman pages. Skipped front pages return `"—"`.
+    pub fn format_logical_page_label_with_skip(
+        page_idx: usize,
+        skip_pages: usize,
+        roman_end: usize,
+    ) -> String {
         let phys_1based = page_idx + 1;
-        if roman_end > 0 && phys_1based <= roman_end {
-            Self::to_roman(phys_1based as u16)
+        if skip_pages > 0 && phys_1based <= skip_pages {
+            return "—".to_string();
+        }
+        let eff = phys_1based.saturating_sub(skip_pages);
+        if roman_end > 0 && eff <= roman_end {
+            Self::to_roman(eff as u16)
         } else {
-            format!("{}", phys_1based.saturating_sub(roman_end))
+            format!("{}", eff.saturating_sub(roman_end))
         }
     }
 
@@ -1250,98 +1596,90 @@ impl PdfEngine {
         Self::save_doc(&doc, output_path).context("Failed to save sample PDF")
     }
 
-    /// Highlights text in `pdf_rect` on `page_index` (0-based) of `doc`.
-    pub fn highlight_text_in_rect(
-        doc: &mut PdfDocument,
+    /// Collects merged line-level text rects overlapping `normalized_sel` on `page_index`.
+    fn collect_line_rects_in_selection(
+        doc: &PdfDocument,
         page_index: u16,
-        pdf_rect: PdfRect,
-    ) -> Result<usize> {
-        let sel_bottom = pdf_rect.bottom().value.min(pdf_rect.top().value);
-        let sel_top = pdf_rect.bottom().value.max(pdf_rect.top().value);
-        let sel_left = pdf_rect.left().value.min(pdf_rect.right().value);
-        let sel_right = pdf_rect.left().value.max(pdf_rect.right().value);
-
-        if (sel_right - sel_left) < 2.0 && (sel_top - sel_bottom) < 2.0 {
-            return Ok(0);
-        }
-
-        let normalized_sel = PdfRect::new_from_values(sel_bottom, sel_left, sel_top, sel_right);
+        normalized_sel: PdfRect,
+    ) -> Result<Vec<PdfRect>> {
+        let sel_bottom = normalized_sel.bottom().value;
+        let sel_top = normalized_sel.top().value;
+        let sel_left = normalized_sel.left().value;
+        let sel_right = normalized_sel.right().value;
 
         let mut target_rects: Vec<PdfRect> = Vec::new();
-        {
-            let page = doc
-                .pages()
-                .get(page_index)
-                .context("Page index out of bounds for highlighting")?;
+        let page = doc
+            .pages()
+            .get(page_index)
+            .context("Page index out of bounds for text markup")?;
 
-            if let Ok(text_page) = page.text() {
-                let mut char_boxes: Vec<PdfRect> = Vec::new();
-                for ch in text_page.chars().iter() {
-                    if let Some(uc) = ch.unicode_char() {
-                        if uc.is_control() {
-                            continue;
-                        }
+        if let Ok(text_page) = page.text() {
+            let mut char_boxes: Vec<PdfRect> = Vec::new();
+            for ch in text_page.chars().iter() {
+                if let Some(uc) = ch.unicode_char() {
+                    if uc.is_control() {
+                        continue;
                     }
-                    let bounds = ch.loose_bounds().or_else(|_| ch.tight_bounds());
-                    if let Ok(b) = bounds {
-                        let b_bottom = b.bottom().value.min(b.top().value);
-                        let b_top = b.bottom().value.max(b.top().value);
-                        let b_left = b.left().value.min(b.right().value);
-                        let b_right = b.left().value.max(b.right().value);
+                }
+                let bounds = ch.loose_bounds().or_else(|_| ch.tight_bounds());
+                if let Ok(b) = bounds {
+                    let b_bottom = b.bottom().value.min(b.top().value);
+                    let b_top = b.bottom().value.max(b.top().value);
+                    let b_left = b.left().value.min(b.right().value);
+                    let b_right = b.left().value.max(b.right().value);
 
-                        if (b_right - b_left) < 0.1 || (b_top - b_bottom) < 0.1 {
-                            continue;
-                        }
+                    if (b_right - b_left) < 0.1 || (b_top - b_bottom) < 0.1 {
+                        continue;
+                    }
 
-                        let overlaps = b_left <= sel_right
-                            && b_right >= sel_left
-                            && b_bottom <= sel_top
-                            && b_top >= sel_bottom;
-                        if overlaps {
-                            char_boxes.push(PdfRect::new_from_values(
-                                b_bottom, b_left, b_top, b_right,
+                    let overlaps = b_left <= sel_right
+                        && b_right >= sel_left
+                        && b_bottom <= sel_top
+                        && b_top >= sel_bottom;
+                    if overlaps {
+                        char_boxes.push(PdfRect::new_from_values(
+                            b_bottom, b_left, b_top, b_right,
+                        ));
+                    }
+                }
+            }
+
+            for cb in char_boxes {
+                if let Some(last) = target_rects.last_mut() {
+                    let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                    let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                    let line_height = (last.top().value - last.bottom().value).max(4.0);
+
+                    if (last_mid_y - cb_mid_y).abs() < line_height * 0.65 {
+                        let merged_bottom = last.bottom().value.min(cb.bottom().value);
+                        let merged_left = last.left().value.min(cb.left().value);
+                        let merged_top = last.top().value.max(cb.top().value);
+                        let merged_right = last.right().value.max(cb.right().value);
+                        *last = PdfRect::new_from_values(
+                            merged_bottom,
+                            merged_left,
+                            merged_top,
+                            merged_right,
+                        );
+                        continue;
+                    }
+                }
+                target_rects.push(cb);
+            }
+
+            if target_rects.is_empty() {
+                for seg in text_page.segments().iter() {
+                    let b = seg.bounds();
+                    if b.does_overlap(&normalized_sel) {
+                        let clip_left = b.left().value.max(sel_left);
+                        let clip_right = b.right().value.min(sel_right);
+                        if clip_right > clip_left {
+                            target_rects.push(PdfRect::new_from_values(
+                                b.bottom().value,
+                                clip_left,
+                                b.top().value,
+                                clip_right,
                             ));
-                        }
-                    }
-                }
-
-                for cb in char_boxes {
-                    if let Some(last) = target_rects.last_mut() {
-                        let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
-                        let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
-                        let line_height = (last.top().value - last.bottom().value).max(4.0);
-
-                        if (last_mid_y - cb_mid_y).abs() < line_height * 0.65 {
-                            let merged_bottom = last.bottom().value.min(cb.bottom().value);
-                            let merged_left = last.left().value.min(cb.left().value);
-                            let merged_top = last.top().value.max(cb.top().value);
-                            let merged_right = last.right().value.max(cb.right().value);
-                            *last = PdfRect::new_from_values(
-                                merged_bottom,
-                                merged_left,
-                                merged_top,
-                                merged_right,
-                            );
-                            continue;
-                        }
-                    }
-                    target_rects.push(cb);
-                }
-
-                if target_rects.is_empty() {
-                    for seg in text_page.segments().iter() {
-                        let b = seg.bounds();
-                        if b.does_overlap(&normalized_sel) {
-                            let clip_left = b.left().value.max(sel_left);
-                            let clip_right = b.right().value.min(sel_right);
-                            if clip_right > clip_left {
-                                target_rects.push(PdfRect::new_from_values(
-                                    b.bottom().value,
-                                    clip_left,
-                                    b.top().value,
-                                    clip_right,
-                                ));
-                            }
                         }
                     }
                 }
@@ -1351,10 +1689,52 @@ impl PdfEngine {
         if target_rects.is_empty() {
             target_rects.push(normalized_sel);
         }
+        Ok(target_rects)
+    }
 
-        let highlight_fill = PdfColor::new(255, 235, 59, 115);
+    fn normalize_sel_rect(pdf_rect: PdfRect) -> Option<PdfRect> {
+        let sel_bottom = pdf_rect.bottom().value.min(pdf_rect.top().value);
+        let sel_top = pdf_rect.bottom().value.max(pdf_rect.top().value);
+        let sel_left = pdf_rect.left().value.min(pdf_rect.right().value);
+        let sel_right = pdf_rect.left().value.max(pdf_rect.right().value);
+        if (sel_right - sel_left) < 2.0 && (sel_top - sel_bottom) < 2.0 {
+            return None;
+        }
+        Some(PdfRect::new_from_values(sel_bottom, sel_left, sel_top, sel_right))
+    }
+
+    /// Highlights text in `pdf_rect` on `page_index` (0-based) of `doc` in default Yellow.
+    #[allow(dead_code)]
+    pub fn highlight_text_in_rect(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+    ) -> Result<usize> {
+        Self::highlight_text_in_rect_with_color(doc, page_index, pdf_rect, AnnotationColor::Yellow)
+    }
+
+    /// Highlights text in `pdf_rect` on `page_index` (0-based) of `doc` using `color`.
+    /// Stored inside a PDF annotation so `Print Without Annotations` cleanly hides it.
+    pub fn highlight_text_in_rect_with_color(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+        color: AnnotationColor,
+    ) -> Result<usize> {
+        let Some(normalized_sel) = Self::normalize_sel_rect(pdf_rect) else {
+            return Ok(0);
+        };
+        let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
+        let highlight_fill = color.highlight_pdf_color();
 
         let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
         for rect in &target_rects {
             let padded = PdfRect::new_from_values(
                 rect.bottom().value - 1.0,
@@ -1362,32 +1742,705 @@ impl PdfEngine {
                 rect.top().value + 1.0,
                 rect.right().value + 1.0,
             );
+            min_x = min_x.min(padded.left().value);
+            min_y = min_y.min(padded.bottom().value);
+            max_x = max_x.max(padded.right().value);
+            max_y = max_y.max(padded.top().value);
             let mut path_obj =
                 PdfPagePathObject::new_rect(doc, padded, None, None, Some(highlight_fill))?;
             let _ = path_obj.set_blend_mode(PdfPageObjectBlendMode::Multiply);
             path_objects.push(path_obj);
         }
 
+        let bounds = PdfRect::new_from_values(min_y, min_x, max_y, max_x);
         let mut page = doc
             .pages_mut()
             .get(page_index)
             .context("Page index out of bounds for mutable highlight")?;
 
-        if let Ok(mut annot) = page.annotations_mut().create_highlight_annotation() {
-            let _ = annot.set_stroke_color(PdfColor::new(255, 235, 59, 160));
-            let _ = annot.set_bounds(normalized_sel);
-            for rect in &target_rects {
-                let _ = annot
-                    .attachment_points_mut()
-                    .create_attachment_point_at_end(rect.to_quad_points());
-            }
-        }
-
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Highlight");
         for path_obj in path_objects {
-            page.objects_mut().add_path_object(path_obj)?;
+            annot.objects_mut().add_path_object(path_obj)?;
         }
 
         Ok(target_rects.len())
+    }
+
+    /// Underlines text in `pdf_rect` on `page_index` (0-based) using `color`.
+    pub fn underline_text_in_rect(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+        color: AnnotationColor,
+    ) -> Result<usize> {
+        let Some(normalized_sel) = Self::normalize_sel_rect(pdf_rect) else {
+            return Ok(0);
+        };
+        let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
+        let stroke = color.stroke_pdf_color();
+
+        let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for rect in &target_rects {
+            let y = (rect.bottom().value - 0.8).max(0.0);
+            min_x = min_x.min(rect.left().value);
+            max_x = max_x.max(rect.right().value);
+            min_y = min_y.min(y - 2.0);
+            max_y = max_y.max(y + 2.0);
+            let line = PdfPagePathObject::new_line(
+                doc,
+                rect.left(),
+                PdfPoints::new(y),
+                rect.right(),
+                PdfPoints::new(y),
+                stroke,
+                PdfPoints::new(1.3),
+            )?;
+            path_objects.push(line);
+        }
+
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Underline");
+        for obj in path_objects {
+            annot.objects_mut().add_path_object(obj)?;
+        }
+        Ok(target_rects.len())
+    }
+
+    /// Strikes through text in `pdf_rect` on `page_index` (0-based) using `color`.
+    pub fn strikeout_text_in_rect(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+        color: AnnotationColor,
+    ) -> Result<usize> {
+        let Some(normalized_sel) = Self::normalize_sel_rect(pdf_rect) else {
+            return Ok(0);
+        };
+        let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
+        let stroke = color.stroke_pdf_color();
+
+        let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for rect in &target_rects {
+            let mid_y = (rect.bottom().value + rect.top().value) * 0.5;
+            min_x = min_x.min(rect.left().value);
+            max_x = max_x.max(rect.right().value);
+            min_y = min_y.min(mid_y - 2.0);
+            max_y = max_y.max(mid_y + 2.0);
+            let line = PdfPagePathObject::new_line(
+                doc,
+                rect.left(),
+                PdfPoints::new(mid_y),
+                rect.right(),
+                PdfPoints::new(mid_y),
+                stroke,
+                PdfPoints::new(1.3),
+            )?;
+            path_objects.push(line);
+        }
+
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Strikeout");
+        for obj in path_objects {
+            annot.objects_mut().add_path_object(obj)?;
+        }
+        Ok(target_rects.len())
+    }
+
+    /// Adds a draggable PDF Sticky Note annotation with visible note icon badge at `(pdf_x, pdf_y)`.
+    pub fn add_sticky_note(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_x: f32,
+        pdf_y: f32,
+        note_text: &str,
+        color: AnnotationColor,
+    ) -> Result<()> {
+        let trimmed = note_text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let size = 18.0f32;
+        let rect = PdfRect::new_from_values(
+            (pdf_y - size * 0.5).max(2.0),
+            (pdf_x - size * 0.5).max(2.0),
+            pdf_y + size * 0.5,
+            pdf_x + size * 0.5,
+        );
+        let (r, g, b) = color.rgb();
+        let fill = PdfColor::new(r, g, b, 235);
+        let border = color.stroke_pdf_color();
+
+        let badge = PdfPagePathObject::new_rect(
+            doc,
+            rect,
+            Some(border),
+            Some(PdfPoints::new(1.1)),
+            Some(fill),
+        )?;
+        let l1 = PdfPagePathObject::new_line(
+            doc,
+            PdfPoints::new(rect.left().value + 3.5),
+            PdfPoints::new(rect.top().value - 6.0),
+            PdfPoints::new(rect.right().value - 3.5),
+            PdfPoints::new(rect.top().value - 6.0),
+            PdfColor::new(30, 41, 59, 220),
+            PdfPoints::new(1.0),
+        )?;
+        let l2 = PdfPagePathObject::new_line(
+            doc,
+            PdfPoints::new(rect.left().value + 3.5),
+            PdfPoints::new(rect.top().value - 10.0),
+            PdfPoints::new(rect.right().value - 5.5),
+            PdfPoints::new(rect.top().value - 10.0),
+            PdfColor::new(30, 41, 59, 220),
+            PdfPoints::new(1.0),
+        )?;
+
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(rect);
+        let _ = annot.set_creator("MicroPDF:StickyNote");
+        let _ = annot.set_contents(trimmed);
+        annot.objects_mut().add_path_object(badge)?;
+        annot.objects_mut().add_path_object(l1)?;
+        annot.objects_mut().add_path_object(l2)?;
+        Ok(())
+    }
+
+    /// Reads all Sticky Note annotations (`/Text` or `MicroPDF:StickyNote` stamps) on `page`.
+    #[allow(dead_code)]
+    pub fn read_sticky_notes_on_page(page: &PdfPage) -> Vec<(PdfRect, String)> {
+        Self::find_movable_annotations_on_page(page)
+            .into_iter()
+            .filter(|m| m.is_sticky_note && !m.text.is_empty())
+            .map(|m| (m.bounds, m.text))
+            .collect()
+    }
+
+    /// Finds all Sticky Note and Text Box annotations on `page` so the user can click to read
+    /// or drag to reposition them cleanly.
+    pub fn find_movable_annotations_on_page(page: &PdfPage) -> Vec<MovableAnnotation> {
+        let mut out = Vec::new();
+        for (idx, annot) in page.annotations().iter().enumerate() {
+            let Ok(bounds) = annot.bounds() else {
+                continue;
+            };
+            match annot.annotation_type() {
+                PdfPageAnnotationType::Text => {
+                    out.push(MovableAnnotation {
+                        index: idx,
+                        is_sticky_note: true,
+                        bounds,
+                        text: annot.contents().unwrap_or_default().trim().to_string(),
+                    });
+                }
+                PdfPageAnnotationType::FreeText => {
+                    out.push(MovableAnnotation {
+                        index: idx,
+                        is_sticky_note: false,
+                        bounds,
+                        text: annot.contents().unwrap_or_default().trim().to_string(),
+                    });
+                }
+                PdfPageAnnotationType::Stamp => {
+                    let creator = annot.creator().unwrap_or_default();
+                    if creator == "MicroPDF:StickyNote" {
+                        out.push(MovableAnnotation {
+                            index: idx,
+                            is_sticky_note: true,
+                            bounds,
+                            text: annot.contents().unwrap_or_default().trim().to_string(),
+                        });
+                    } else if creator == "MicroPDF:FreeText" {
+                        out.push(MovableAnnotation {
+                            index: idx,
+                            is_sticky_note: false,
+                            bounds,
+                            text: annot.contents().unwrap_or_default().trim().to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Translates an existing Sticky Note or Text Box annotation (and its inner appearance objects)
+    /// by `(dx_pts, dy_pts)` in PDF point coordinates.
+    pub fn move_annotation_by(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+        dx_pts: f32,
+        dy_pts: f32,
+    ) -> Result<()> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        let old = annot.bounds()?;
+        let new_bounds = PdfRect::new_from_values(
+            (old.bottom().value + dy_pts).max(0.0),
+            (old.left().value + dx_pts).max(0.0),
+            (old.top().value + dy_pts).max(2.0),
+            (old.right().value + dx_pts).max(2.0),
+        );
+        let actual_dx = new_bounds.left().value - old.left().value;
+        let actual_dy = new_bounds.bottom().value - old.bottom().value;
+        annot.set_bounds(new_bounds)?;
+        if let Some(stamp) = annot.as_stamp_annotation_mut() {
+            for mut obj in stamp.objects_mut().iter() {
+                let _ = obj.translate(PdfPoints::new(actual_dx), PdfPoints::new(actual_dy));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a smooth vector freehand pen stroke stored inside a PDF annotation on `page_index`.
+    pub fn add_freehand_ink(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        points: &[(f32, f32)],
+        color: AnnotationColor,
+        stroke_width: f32,
+    ) -> Result<()> {
+        if points.len() < 2 {
+            return Ok(());
+        }
+        let stroke = color.stroke_pdf_color();
+        let sw = stroke_width.clamp(0.8, 8.0);
+        let mut path = PdfPagePathObject::new(
+            doc,
+            PdfPoints::new(points[0].0),
+            PdfPoints::new(points[0].1),
+            Some(stroke),
+            Some(PdfPoints::new(sw)),
+            None,
+        )?;
+        let mut min_x = points[0].0;
+        let mut max_x = points[0].0;
+        let mut min_y = points[0].1;
+        let mut max_y = points[0].1;
+        for &(x, y) in points.iter().skip(1) {
+            path.line_to(PdfPoints::new(x), PdfPoints::new(y))?;
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+
+        let bounds = PdfRect::new_from_values(
+            (min_y - sw - 2.0).max(0.0),
+            (min_x - sw - 2.0).max(0.0),
+            max_y + sw + 2.0,
+            max_x + sw + 2.0,
+        );
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Ink");
+        annot.objects_mut().add_path_object(path)?;
+        Ok(())
+    }
+
+    /// Adds a draggable FreeText / Text Box annotation at `(pdf_x, pdf_y)` (top-left anchor in PDF points).
+    pub fn add_freetext_box(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_x: f32,
+        pdf_y: f32,
+        text: &str,
+        font_size: f32,
+        color: AnnotationColor,
+    ) -> Result<()> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let font = doc.fonts_mut().helvetica();
+        let fsz = font_size.clamp(8.0, 36.0);
+        let fill = color.stroke_pdf_color();
+        let lines: Vec<&str> = trimmed.split('\n').collect();
+        let line_h = fsz * 1.25;
+        let mut text_objs = Vec::with_capacity(lines.len());
+        let mut min_x = pdf_x.max(4.0);
+        let mut max_x = min_x + 40.0;
+        let mut min_y = (pdf_y - fsz).max(4.0);
+        let mut max_y = pdf_y + fsz * 0.9;
+        for (i, line) in lines.iter().enumerate() {
+            let mut tobj = PdfPageTextObject::new(doc, *line, font, PdfPoints::new(fsz))?;
+            let _ = tobj.set_fill_color(fill);
+            let y = (pdf_y - (i as f32) * line_h).max(8.0);
+            tobj.translate(PdfPoints::new(pdf_x.max(4.0)), PdfPoints::new(y))?;
+            if let Ok(b) = tobj.bounds() {
+                min_x = min_x.min(b.left().value);
+                max_x = max_x.max(b.right().value);
+                min_y = min_y.min(b.bottom().value);
+                max_y = max_y.max(b.top().value);
+            }
+            text_objs.push(tobj);
+        }
+        let bounds = PdfRect::new_from_values(
+            (min_y - 3.0).max(2.0),
+            (min_x - 3.0).max(2.0),
+            max_y + 3.0,
+            max_x + 4.0,
+        );
+
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:FreeText");
+        let _ = annot.set_contents(trimmed);
+        for tobj in text_objs {
+            annot.objects_mut().add_text_object(tobj)?;
+        }
+        Ok(())
+    }
+
+    /// Adds a crisp stroked Rectangle shape stored inside a PDF annotation.
+    pub fn add_rectangle_shape(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        pdf_rect: PdfRect,
+        color: AnnotationColor,
+        stroke_width: f32,
+    ) -> Result<()> {
+        let Some(norm) = Self::normalize_sel_rect(pdf_rect) else {
+            return Ok(());
+        };
+        let sw = stroke_width.clamp(0.8, 8.0);
+        let stroke = color.stroke_pdf_color();
+        let rect_obj = PdfPagePathObject::new_rect(
+            doc,
+            norm,
+            Some(stroke),
+            Some(PdfPoints::new(sw)),
+            None,
+        )?;
+        let bounds = PdfRect::new_from_values(
+            (norm.bottom().value - sw - 1.0).max(0.0),
+            (norm.left().value - sw - 1.0).max(0.0),
+            norm.top().value + sw + 1.0,
+            norm.right().value + sw + 1.0,
+        );
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Rect");
+        annot.objects_mut().add_path_object(rect_obj)?;
+        Ok(())
+    }
+
+    /// Adds a crisp vector Arrow shape from `(x1, y1)` to `(x2, y2)` with a filled arrowhead,
+    /// stored inside a PDF annotation.
+    pub fn add_arrow_shape(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+        color: AnnotationColor,
+        stroke_width: f32,
+    ) -> Result<()> {
+        let dx = x2 - x1;
+        let dy = y2 - y1;
+        let len = (dx * dx + dy * dy).sqrt();
+        if len < 4.0 {
+            return Ok(());
+        }
+        let ux = dx / len;
+        let uy = dy / len;
+        let px = -uy;
+        let py = ux;
+        let head_len = (stroke_width * 5.2).min(len * 0.45).max(3.0);
+        let head_half_w = head_len * 0.42;
+
+        let base_x = x2 - ux * head_len;
+        let base_y = y2 - uy * head_len;
+        let left_x = base_x + px * head_half_w;
+        let left_y = base_y + py * head_half_w;
+        let right_x = base_x - px * head_half_w;
+        let right_y = base_y - py * head_half_w;
+
+        let sw = stroke_width.clamp(1.0, 8.0);
+        let stroke = color.stroke_pdf_color();
+        let shaft = PdfPagePathObject::new_line(
+            doc,
+            PdfPoints::new(x1),
+            PdfPoints::new(y1),
+            PdfPoints::new(base_x),
+            PdfPoints::new(base_y),
+            stroke,
+            PdfPoints::new(sw),
+        )?;
+        let mut head = PdfPagePathObject::new(
+            doc,
+            PdfPoints::new(x2),
+            PdfPoints::new(y2),
+            Some(stroke),
+            Some(PdfPoints::new(0.8)),
+            Some(stroke),
+        )?;
+        head.line_to(PdfPoints::new(left_x), PdfPoints::new(left_y))?;
+        head.line_to(PdfPoints::new(right_x), PdfPoints::new(right_y))?;
+        head.close_path()?;
+
+        let min_x = x1.min(x2).min(left_x).min(right_x) - sw - 2.0;
+        let max_x = x1.max(x2).max(left_x).max(right_x) + sw + 2.0;
+        let min_y = y1.min(y2).min(left_y).min(right_y) - sw - 2.0;
+        let max_y = y1.max(y2).max(left_y).max(right_y) + sw + 2.0;
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x.max(0.0), max_y, max_x);
+
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_is_printed(true);
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Arrow");
+        annot.objects_mut().add_path_object(shaft)?;
+        annot.objects_mut().add_path_object(head)?;
+        Ok(())
+    }
+
+    /// Marks visible annotations on all pages with the PDF PRINT flag (`/F` bit `0x04`) so
+    /// older PDFs whose annotations lacked `/F` still render when `With Annots` printing is selected.
+    pub fn ensure_annotations_printable(doc: &mut PdfDocument) {
+        let total = doc.pages().len();
+        for idx in 0..total {
+            if let Ok(mut page) = doc.pages_mut().get(idx) {
+                let count = page.annotations().len();
+                for a_idx in 0..count {
+                    if let Ok(mut annot) = page.annotations_mut().get(a_idx) {
+                        if !annot.is_hidden() && !annot.is_printed() {
+                            let _ = annot.set_is_printed(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Expands `{page}` and `{total}` placeholders inside header/footer strings for 1-based `page_num`.
+    pub fn expand_hf_tokens(template: &str, page_num: u16, total_pages: u16) -> String {
+        template
+            .replace("{page}", &page_num.to_string())
+            .replace("{total}", &total_pages.to_string())
+    }
+
+    /// Formats a page number label for 1-based `page_num` out of `total_pages` using `cfg`.
+    /// When `cfg.skip_pages > 0`, physical pages `1..=skip_pages` are left unnumbered (`None`),
+    /// the next `cfg.roman_end` pages are numbered `i, ii, iii...`, and subsequent pages start at `1`.
+    pub fn format_page_number_label(
+        cfg: &PageNumberConfig,
+        page_num: u16,
+        total_pages: u16,
+    ) -> Option<String> {
+        if page_num <= cfg.skip_pages {
+            return None;
+        }
+        let eff_num = page_num - cfg.skip_pages;
+        let is_roman = cfg.roman_end > 0 && eff_num <= cfg.roman_end;
+        let core = if is_roman {
+            Self::to_roman(eff_num)
+        } else {
+            format!("{}", eff_num.saturating_sub(cfg.roman_end))
+        };
+        let arabic_total = total_pages
+            .saturating_sub(cfg.skip_pages.saturating_add(cfg.roman_end))
+            .max(1);
+        let formatted = match cfg.format {
+            PageNumberFormat::Plain => core,
+            PageNumberFormat::PageN => format!("Page {core}"),
+            PageNumberFormat::PageNOfTotal => {
+                if is_roman {
+                    format!("Page {core}")
+                } else {
+                    format!("Page {core} of {arabic_total}")
+                }
+            }
+            PageNumberFormat::NSlashTotal => {
+                if is_roman {
+                    core
+                } else {
+                    format!("{core} / {arabic_total}")
+                }
+            }
+            PageNumberFormat::Dashed => format!("- {core} -"),
+        };
+        Some(formatted)
+    }
+
+    /// Stamps up to 6 aligned Header/Footer slots (HL/HC/HR/FL/FC/FR) across 0-based `page_indices`
+    /// with optional `{page}`/`{total}` tokens, font size, margin, color, and optional replace-existing clear.
+    pub fn apply_header_footer_full(
+        doc: &mut PdfDocument,
+        profile: &HeaderFooterProfile,
+        page_indices: &[u16],
+        replace_existing: bool,
+    ) -> Result<()> {
+        let total_pages = doc.pages().len();
+        if total_pages == 0 || page_indices.is_empty() {
+            return Ok(());
+        }
+        let font = doc.fonts_mut().helvetica();
+        let font_sz = profile.font_size.clamp(6.0, 24.0);
+        let edge_y = profile.margin_pt.clamp(12.0, 72.0);
+        let side_x = 36.0_f32;
+        let color = profile.color.pdf_color();
+        let has_hdr = profile.has_header();
+        let has_ftr = profile.has_footer();
+
+        for &idx in page_indices {
+            if idx >= total_pages {
+                continue;
+            }
+            if replace_existing {
+                let mut page = doc.pages_mut().get(idx)?;
+                if has_hdr {
+                    Self::clear_margin_zone(&mut page, MarginZone::Header)?;
+                }
+                if has_ftr {
+                    Self::clear_margin_zone(&mut page, MarginZone::Footer)?;
+                }
+            }
+
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value, page.height().value)
+            };
+            let pnum = idx + 1;
+
+            let slots: [(MarginPosition, &str); 6] = [
+                (MarginPosition::HeaderLeft, &profile.header_left),
+                (MarginPosition::HeaderCenter, &profile.header_center),
+                (MarginPosition::HeaderRight, &profile.header_right),
+                (MarginPosition::FooterLeft, &profile.footer_left),
+                (MarginPosition::FooterCenter, &profile.footer_center),
+                (MarginPosition::FooterRight, &profile.footer_right),
+            ];
+
+            let mut objs = Vec::new();
+            for (pos, raw_txt) in slots {
+                let expanded = Self::expand_hf_tokens(raw_txt.trim(), pnum, total_pages);
+                if expanded.is_empty() {
+                    continue;
+                }
+                let mut obj = PdfPageTextObject::new(doc, &expanded, font, PdfPoints::new(font_sz))?;
+                obj.set_fill_color(color)?;
+                let tw = obj.width().unwrap_or(PdfPoints::new(40.0)).value;
+                let x = match pos {
+                    MarginPosition::HeaderLeft | MarginPosition::FooterLeft => side_x,
+                    MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
+                        ((pw - tw) * 0.5).max(side_x)
+                    }
+                    MarginPosition::HeaderRight | MarginPosition::FooterRight => {
+                        (pw - tw - side_x).max(side_x)
+                    }
+                };
+                let y = if pos.is_header() {
+                    (ph - edge_y - font_sz * 0.75).max(0.0)
+                } else {
+                    edge_y
+                };
+                obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
+                objs.push(obj);
+            }
+
+            if !objs.is_empty() {
+                let mut page = doc.pages_mut().get(idx)?;
+                for obj in objs {
+                    page.objects_mut().add_text_object(obj)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stamps formatted Page Numbers across the document using `PageNumberConfig`, clearing
+    /// any existing page numbers in the target zone first.
+    pub fn apply_page_numbers_full(
+        doc: &mut PdfDocument,
+        cfg: &PageNumberConfig,
+    ) -> Result<()> {
+        let total_pages = doc.pages().len();
+        if total_pages == 0 {
+            return Ok(());
+        }
+        let font = doc.fonts_mut().helvetica();
+        let font_sz = cfg.font_size.clamp(6.0, 24.0);
+        let edge_y = cfg.margin_pt.clamp(12.0, 72.0);
+        let side_x = 36.0_f32;
+        let color = cfg.color.pdf_color();
+        let clear_zone = if cfg.position == MarginPosition::FooterCenter {
+            MarginZone::PageNumber
+        } else {
+            cfg.position.zone()
+        };
+
+        for idx in 0..total_pages {
+            {
+                let mut page = doc.pages_mut().get(idx)?;
+                Self::clear_margin_zone(&mut page, clear_zone)?;
+            }
+            let pnum = idx + 1;
+            let Some(label) = Self::format_page_number_label(cfg, pnum, total_pages) else {
+                continue;
+            };
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value, page.height().value)
+            };
+            let mut obj = PdfPageTextObject::new(doc, &label, font, PdfPoints::new(font_sz))?;
+            obj.set_fill_color(color)?;
+            let tw = obj.width().unwrap_or(PdfPoints::new(18.0)).value;
+            let x = match cfg.position {
+                MarginPosition::HeaderLeft | MarginPosition::FooterLeft => side_x,
+                MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
+                    ((pw - tw) * 0.5).max(side_x)
+                }
+                MarginPosition::HeaderRight | MarginPosition::FooterRight => {
+                    (pw - tw - side_x).max(side_x)
+                }
+            };
+            let y = if cfg.position.is_header() {
+                (ph - edge_y - font_sz * 0.75).max(0.0)
+            } else {
+                edge_y
+            };
+            obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
+            let mut page = doc.pages_mut().get(idx)?;
+            page.objects_mut().add_text_object(obj)?;
+        }
+        Ok(())
     }
 
     /// In-memory page numbering on a `PdfDocument`: automatically clears existing `MarginZone::PageNumber`
@@ -1609,22 +2662,58 @@ impl PdfEngine {
         external_path: &Path,
         target_page_index: u16,
     ) -> Result<u16> {
+        self.insert_external_pdf_pages_at_index(doc, external_path, None, target_page_index)
+    }
+
+    /// Imports either all pages (`page_indices == None`) or specific 0-based `page_indices`
+    /// from an external PDF file (`external_path`) into `doc` starting at 0-based
+    /// `target_page_index`. Returns the number of imported pages.
+    pub fn insert_external_pdf_pages_at_index(
+        &self,
+        doc: &mut PdfDocument,
+        external_path: &Path,
+        page_indices: Option<&[u16]>,
+        target_page_index: u16,
+    ) -> Result<u16> {
         let ext_doc = self.load_pdf_safe(external_path)?;
         let ext_count = ext_doc.pages().len();
         if ext_count == 0 {
             return Ok(0);
         }
-        let dest_idx = target_page_index.min(doc.pages().len());
-        if dest_idx >= doc.pages().len() {
-            doc.pages_mut()
-                .append(&ext_doc)
-                .with_context(|| format!("Failed to append pages from {:?}", external_path))?;
-        } else {
-            doc.pages_mut()
-                .copy_page_range_from_document(&ext_doc, 0..=(ext_count - 1), dest_idx)
-                .with_context(|| format!("Failed to import pages from {:?}", external_path))?;
+        let mut dest_idx = target_page_index.min(doc.pages().len());
+        match page_indices {
+            None => {
+                if dest_idx >= doc.pages().len() {
+                    doc.pages_mut()
+                        .append(&ext_doc)
+                        .with_context(|| format!("Failed to append pages from {:?}", external_path))?;
+                } else {
+                    doc.pages_mut()
+                        .copy_page_range_from_document(&ext_doc, 0..=(ext_count - 1), dest_idx)
+                        .with_context(|| format!("Failed to import pages from {:?}", external_path))?;
+                }
+                Ok(ext_count)
+            }
+            Some(indices) => {
+                let mut inserted: u16 = 0;
+                for &src_idx in indices {
+                    if src_idx < ext_count {
+                        doc.pages_mut()
+                            .copy_page_from_document(&ext_doc, src_idx, dest_idx)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to import page {} from {:?}",
+                                    src_idx + 1,
+                                    external_path
+                                )
+                            })?;
+                        dest_idx = dest_idx.saturating_add(1);
+                        inserted = inserted.saturating_add(1);
+                    }
+                }
+                Ok(inserted)
+            }
         }
-        Ok(ext_count)
     }
 
     /// Extracts a comma-separated 1-based page specification (e.g. `"1-3"` or `"2,4,6"`)
@@ -1653,12 +2742,40 @@ impl PdfEngine {
         Ok(count)
     }
 
-    /// Inserts a blank A4 page into `doc` at `insert_index` (0-based).
+    /// Inserts a blank page into `doc` at `insert_index` (0-based), matching adjacent page size or A4.
     pub fn insert_blank_page_in_doc(doc: &mut PdfDocument, insert_index: u16) -> Result<u16> {
-        let clamped_idx = insert_index.min(doc.pages().len());
-        doc.pages_mut()
-            .create_page_at_index(PdfPagePaperSize::a4(), clamped_idx)
-            .context("Failed to insert blank A4 page")?;
+        Self::insert_blank_pages_in_doc(doc, insert_index, 1)
+    }
+
+    /// Inserts `count` (1..=50) blank pages into `doc` starting at `insert_index` (0-based),
+    /// matching the adjacent page's paper dimensions (or A4 if empty).
+    pub fn insert_blank_pages_in_doc(
+        doc: &mut PdfDocument,
+        insert_index: u16,
+        count: u16,
+    ) -> Result<u16> {
+        let count = count.clamp(1, 50);
+        let total = doc.pages().len();
+        let clamped_idx = insert_index.min(total);
+        let paper = if total > 0 {
+            let ref_idx = if clamped_idx < total {
+                clamped_idx
+            } else {
+                total - 1
+            };
+            doc.pages()
+                .get(ref_idx)
+                .ok()
+                .map(|p| PdfPagePaperSize::Custom(p.width(), p.height()))
+                .unwrap_or_else(PdfPagePaperSize::a4)
+        } else {
+            PdfPagePaperSize::a4()
+        };
+        for offset in 0..count {
+            doc.pages_mut()
+                .create_page_at_index(paper, clamped_idx + offset)
+                .context("Failed to insert blank page")?;
+        }
         Ok(clamped_idx)
     }
 
@@ -1906,20 +3023,85 @@ impl PdfEngine {
         }
 
         if found && max_x > min_x && (max_x - min_x) >= page_w * 0.22 {
-            // Add a small 8pt breathing room on left/right of the detected text column
+            // Add a small 8pt breathing room on left/right/top/bottom of the detected content
             let pad = 8.0_f32;
             let cl_min_x = (min_x - pad).max(0.0);
             let cl_max_x = (max_x + pad).min(page_w);
-            let cl_min_y = min_y.clamp(0.0, page_h);
-            let cl_max_y = max_y.clamp(cl_min_y + 1.0, page_h);
+            let cl_min_y = (min_y - pad).clamp(0.0, page_h);
+            let cl_max_y = (max_y + pad).clamp(cl_min_y + 1.0, page_h);
             (cl_min_x, cl_min_y, cl_max_x, cl_max_y)
         } else {
             (page_w * 0.12, page_h * 0.08, page_w * 0.88, page_h * 0.92)
         }
     }
 
+    /// Enhanced content bounds for `FitTextWidth`: uses vector object bounds first, and falls back
+    /// to a fast low-res (~220px wide) non-white pixel scan when the page is a full-page scan image.
+    pub fn compute_page_content_bounds_with_scan(page: &PdfPage) -> (f32, f32, f32, f32) {
+        let page_w = page.width().value.max(1.0);
+        let page_h = page.height().value.max(1.0);
+        let (min_x, min_y, max_x, max_y) = Self::compute_page_content_bounds(page);
+
+        let looks_full_page = (max_x - min_x) > page_w * 0.90 || (max_y - min_y) > page_h * 0.92;
+        if !looks_full_page {
+            return (min_x, min_y, max_x, max_y);
+        }
+
+        let scan_w = 220i32;
+        let scan_h = ((scan_w as f32 * (page_h / page_w)).round() as i32).clamp(32, 440);
+        let cfg = PdfRenderConfig::new()
+            .set_target_width(scan_w)
+            .set_maximum_height(scan_h)
+            .render_form_data(true)
+            .render_annotations(true);
+        let Ok(bmp) = page.render_with_config(&cfg) else {
+            return (min_x, min_y, max_x, max_y);
+        };
+        let img = bmp.as_image().to_rgba8();
+        let (iw, ih) = img.dimensions();
+        if iw < 8 || ih < 8 {
+            return (min_x, min_y, max_x, max_y);
+        }
+
+        let mut p_min_x = iw;
+        let mut p_max_x = 0u32;
+        let mut p_min_y = ih;
+        let mut p_max_y = 0u32;
+        let mut ink = 0usize;
+        for y in 0..ih {
+            for x in 0..iw {
+                let px = img.get_pixel(x, y);
+                if px[0] < 242 || px[1] < 242 || px[2] < 242 {
+                    p_min_x = p_min_x.min(x);
+                    p_max_x = p_max_x.max(x);
+                    p_min_y = p_min_y.min(y);
+                    p_max_y = p_max_y.max(y);
+                    ink += 1;
+                }
+            }
+        }
+        if ink < 16 || p_max_x <= p_min_x || p_max_y <= p_min_y {
+            return (min_x, min_y, max_x, max_y);
+        }
+
+        let pad = 8.0f32;
+        let sx = page_w / iw as f32;
+        let sy = page_h / ih as f32;
+        let bx0 = (p_min_x as f32 * sx - pad).max(0.0);
+        let bx1 = ((p_max_x + 1) as f32 * sx + pad).min(page_w);
+        // Image y=0 is top of page (PDF y = page_h)
+        let by_top = (page_h - p_min_y as f32 * sy + pad).min(page_h);
+        let by_bot = (page_h - (p_max_y + 1) as f32 * sy - pad).max(0.0);
+        if (bx1 - bx0) >= page_w * 0.20 && by_top > by_bot {
+            (bx0, by_bot, bx1, by_top)
+        } else {
+            (min_x, min_y, max_x, max_y)
+        }
+    }
+
     /// Combines 2 or more PDF files in order into a single in-memory `Vec<u8>` buffer (`Shift+M`).
     /// Returns `(combined_pdf_bytes, total_pages)`.
+    #[allow(dead_code)]
     pub fn combine_multiple_pdfs(&self, paths: &[PathBuf]) -> Result<(Vec<u8>, u16)> {
         if paths.is_empty() {
             anyhow::bail!("No PDF files provided to combine");
@@ -1938,6 +3120,56 @@ impl PdfEngine {
         }
 
         let total_pages = combined_doc.pages().len();
+        let bytes = combined_doc
+            .save_to_bytes()
+            .context("Failed to serialize combined PDF document")?;
+        Ok((bytes, total_pages))
+    }
+
+    /// Combines PDF files in exact user order, selecting only the specified 0-based page indices
+    /// for each file (`None` or empty means all pages of that file).
+    pub fn combine_pdfs_with_ranges(
+        &self,
+        entries: &[(PathBuf, Option<Vec<u16>>)],
+    ) -> Result<(Vec<u8>, u16)> {
+        if entries.is_empty() {
+            anyhow::bail!("No PDF files queued to combine");
+        }
+        let mut combined_doc = self
+            .pdfium
+            .create_new_pdf()
+            .context("Failed to create combined PDF document")?;
+
+        for (path, custom_pages) in entries {
+            let src_doc = self.load_pdf_safe(path)?;
+            let src_len = src_doc.pages().len();
+            match custom_pages {
+                None => {
+                    combined_doc
+                        .pages_mut()
+                        .append(&src_doc)
+                        .with_context(|| format!("Failed to append pages from {:?}", path))?;
+                }
+                Some(indices) => {
+                    for &p_idx in indices {
+                        if p_idx < src_len {
+                            let dest_idx = combined_doc.pages().len();
+                            combined_doc
+                                .pages_mut()
+                                .copy_page_from_document(&src_doc, p_idx, dest_idx)
+                                .with_context(|| {
+                                    format!("Failed to copy page {} from {:?}", p_idx + 1, path)
+                                })?;
+                        }
+                    }
+                }
+            }
+        }
+
+        let total_pages = combined_doc.pages().len();
+        if total_pages == 0 {
+            anyhow::bail!("Combined PDF has 0 pages");
+        }
         let bytes = combined_doc
             .save_to_bytes()
             .context("Failed to serialize combined PDF document")?;

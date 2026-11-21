@@ -60,8 +60,8 @@ pub struct OptimizeOptions {
 impl OptimizeOptions {
     pub fn preset(preset: OptimizePreset) -> Self {
         let (target_dpi, jpeg_quality) = match preset {
-            OptimizePreset::Smaller => (150.0, 60),
-            OptimizePreset::Balanced => (200.0, 70),
+            OptimizePreset::Smaller => (150.0, 55),
+            OptimizePreset::Balanced => (200.0, 68),
             OptimizePreset::Print => (300.0, 80),
         };
         Self {
@@ -91,16 +91,16 @@ pub struct OptimizeReport {
     pub images_rewritten: usize,
     /// Images left untouched (transparency, rotation/flip, already-efficient bilevel, or no gain).
     pub images_skipped: usize,
+    /// Duplicate embedded streams merged into a single shared object.
+    pub deduped_streams: usize,
     /// True when the optimized file would not have been smaller; nothing should be written.
     pub kept_original: bool,
 }
 
-/// Images below this pixel count are left alone in colour mode (logos, icons). They save
-/// little, and because PDFium cannot share one new image across pages, rewriting a logo
-/// repeated on every page could make the file bigger.
-const MIN_PIXELS_COLOR_MODE: f32 = 250_000.0;
+/// Images below this pixel count (128×128) are left alone in colour mode (tiny icons/bullets).
+const MIN_PIXELS_COLOR_MODE: f32 = 16_384.0;
 /// Only downsample when the image is at least this much sharper than the target DPI.
-const DOWNSAMPLE_THRESHOLD: f32 = 1.25;
+const DOWNSAMPLE_THRESHOLD: f32 = 1.10;
 /// An image covering at least this share of the page is treated as a scanned page.
 const SCAN_AREA_SHARE: f32 = 0.85;
 
@@ -411,10 +411,19 @@ pub struct OptimizeJob {
     skipped: usize,
 }
 
+#[derive(Clone)]
+enum ImageColorKind {
+    Gray,
+    Rgb,
+    Cmyk,
+    Indexed(Vec<[u8; 3]>),
+}
+
+#[derive(Clone)]
 struct ImagePlan {
     id: lopdf::ObjectId,
-    /// Colour channels resolved at planning time (ICC profiles live in other objects).
-    channels: Option<usize>,
+    /// Colour space resolved at planning time (ICC profiles & palettes live in other objects).
+    color_kind: Option<ImageColorKind>,
     /// Largest size (in points) at which the image is drawn anywhere in the document.
     placed_w: f32,
     placed_h: f32,
@@ -430,7 +439,7 @@ impl OptimizeJob {
         Ok(Self { ldoc, queue, next: 0, opts, original_len, rewritten: 0, skipped: 0 })
     }
 
-    /// Number of images found on pages.
+    /// Number of images found on pages (including inside Form XObjects).
     #[allow(dead_code)]
     pub fn total(&self) -> usize {
         self.queue.len()
@@ -448,12 +457,19 @@ impl OptimizeJob {
 
     /// Rewrites the next image. Failures on one image only skip that image.
     pub fn step(&mut self) {
-        let Some(plan) = self.queue.get(self.next) else { return };
-        let (id, pw, ph, scan, channels) = (plan.id, plan.placed_w, plan.placed_h, plan.is_scan, plan.channels);
+        let Some(plan) = self.queue.get(self.next).cloned() else { return };
         self.next += 1;
-        let done = match self.ldoc.get_object_mut(id) {
-            Ok(lopdf::Object::Stream(stream)) => match channels {
-                Some(ch) => rewrite_image_stream(stream, pw, ph, scan, ch, &self.opts).unwrap_or(false),
+        let done = match self.ldoc.get_object_mut(plan.id) {
+            Ok(lopdf::Object::Stream(stream)) => match plan.color_kind {
+                Some(ref kind) => rewrite_image_stream(
+                    stream,
+                    plan.placed_w,
+                    plan.placed_h,
+                    plan.is_scan,
+                    kind,
+                    &self.opts,
+                )
+                .unwrap_or(false),
                 None => false,
             },
             _ => false,
@@ -467,8 +483,12 @@ impl OptimizeJob {
 
     pub fn finish(mut self) -> Result<OptimizeReport> {
         let images_seen = self.queue.len();
+        drop_opaque_smasks(&mut self.ldoc);
+        strip_bloat_metadata_and_thumbs(&mut self.ldoc);
+        let deduped_streams = deduplicate_streams(&mut self.ldoc);
         self.ldoc.prune_objects();
         self.ldoc.compress();
+        recompress_flate_streams_best(&mut self.ldoc);
         let mut out = Vec::with_capacity(self.original_len / 2);
         self.ldoc
             .save_to(&mut out)
@@ -480,16 +500,146 @@ impl OptimizeJob {
             images_seen,
             images_rewritten: self.rewritten,
             images_skipped: self.skipped,
+            deduped_streams,
             kept_original,
         })
     }
 }
 
-/// Finds every image XObject drawn directly by a page and the largest size it is drawn at,
-/// by following `q`/`Q`/`cm`/`Do` in each page's content stream. Images inside form
-/// XObjects and inline images are not touched.
+fn mul_ctm(v: [f32; 6], ctm: [f32; 6]) -> [f32; 6] {
+    [
+        v[0] * ctm[0] + v[1] * ctm[2],
+        v[0] * ctm[1] + v[1] * ctm[3],
+        v[2] * ctm[0] + v[3] * ctm[2],
+        v[2] * ctm[1] + v[3] * ctm[3],
+        v[4] * ctm[0] + v[5] * ctm[2] + ctm[4],
+        v[4] * ctm[1] + v[5] * ctm[3] + ctm[5],
+    ]
+}
+
+fn extract_xobjects_from_res_dict(
+    ldoc: &lopdf::Document,
+    res: &lopdf::Dictionary,
+) -> std::collections::HashMap<Vec<u8>, lopdf::ObjectId> {
+    let mut map = std::collections::HashMap::new();
+    let xo = match res.get(b"XObject") {
+        Ok(lopdf::Object::Reference(r)) => ldoc.get_dictionary(*r).ok(),
+        Ok(lopdf::Object::Dictionary(d)) => Some(d),
+        _ => None,
+    };
+    if let Some(xo) = xo {
+        for (name, val) in xo.iter() {
+            if let Ok(id) = val.as_reference() {
+                map.insert(name.clone(), id);
+            }
+        }
+    }
+    map
+}
+
+fn walk_content_for_images(
+    ldoc: &lopdf::Document,
+    content: &[u8],
+    xobjects: &std::collections::HashMap<Vec<u8>, lopdf::ObjectId>,
+    base_ctm: [f32; 6],
+    page_area: f32,
+    plans: &mut std::collections::BTreeMap<lopdf::ObjectId, ImagePlan>,
+    visited_forms: &mut std::collections::HashSet<lopdf::ObjectId>,
+    depth: usize,
+) {
+    if depth > 12 || xobjects.is_empty() {
+        return;
+    }
+    let Ok(ops) = lopdf::content::Content::decode(content) else { return };
+    let mut ctm = base_ctm;
+    let mut stack: Vec<[f32; 6]> = Vec::new();
+    for op in ops.operations {
+        match op.operator.as_str() {
+            "q" => stack.push(ctm),
+            "Q" => ctm = stack.pop().unwrap_or(base_ctm),
+            "cm" if op.operands.len() == 6 => {
+                let mut v = [0.0f32; 6];
+                for (i, o) in op.operands.iter().take(6).enumerate() {
+                    v[i] = o.as_float().unwrap_or(0.0);
+                }
+                ctm = mul_ctm(v, ctm);
+            }
+            "Do" => {
+                let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else { continue };
+                let Some(&id) = xobjects.get(name) else { continue };
+                let Ok(stream) = ldoc.get_object(id).and_then(|o| o.as_stream()) else { continue };
+                let subtype = stream.dict.get(b"Subtype").and_then(|v| v.as_name()).ok();
+                if subtype == Some(b"Image".as_slice()) {
+                    let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
+                    let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
+                    let entry = plans.entry(id).or_insert_with(|| ImagePlan {
+                        id,
+                        color_kind: resolve_image_color_kind(ldoc, &stream.dict),
+                        placed_w: 0.0,
+                        placed_h: 0.0,
+                        is_scan: false,
+                    });
+                    entry.placed_w = entry.placed_w.max(w);
+                    entry.placed_h = entry.placed_h.max(h);
+                    entry.is_scan |= w * h >= SCAN_AREA_SHARE * page_area;
+                } else if subtype == Some(b"Form".as_slice()) && visited_forms.insert(id) {
+                    // Recursively traverse Form XObjects (Word, PowerPoint, Chrome, Canva, LaTeX PDFs!)
+                    let form_mat = stream
+                        .dict
+                        .get(b"Matrix")
+                        .and_then(|o| o.as_array())
+                        .ok()
+                        .filter(|a| a.len() == 6)
+                        .map(|a| {
+                            [
+                                a[0].as_float().unwrap_or(1.0),
+                                a[1].as_float().unwrap_or(0.0),
+                                a[2].as_float().unwrap_or(0.0),
+                                a[3].as_float().unwrap_or(1.0),
+                                a[4].as_float().unwrap_or(0.0),
+                                a[5].as_float().unwrap_or(0.0),
+                            ]
+                        })
+                        .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                    let next_ctm = mul_ctm(form_mat, ctm);
+                    let form_res_xobj = match stream.dict.get(b"Resources") {
+                        Ok(lopdf::Object::Reference(r)) => ldoc
+                            .get_dictionary(*r)
+                            .ok()
+                            .map(|d| extract_xobjects_from_res_dict(ldoc, d)),
+                        Ok(lopdf::Object::Dictionary(d)) => Some(extract_xobjects_from_res_dict(ldoc, d)),
+                        _ => None,
+                    };
+                    let mut child_xobjs = xobjects.clone();
+                    if let Some(fm) = form_res_xobj {
+                        for (k, v) in fm {
+                            child_xobjs.insert(k, v);
+                        }
+                    }
+                    if let Some(form_bytes) = stream_data(stream) {
+                        walk_content_for_images(
+                            ldoc,
+                            &form_bytes,
+                            &child_xobjs,
+                            next_ctm,
+                            page_area,
+                            plans,
+                            visited_forms,
+                            depth + 1,
+                        );
+                    }
+                    visited_forms.remove(&id);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Finds every image XObject drawn by any page — including inside nested Form XObjects —
+/// and records the largest size (in points) it is placed at across the document.
 fn plan_images(ldoc: &lopdf::Document) -> Vec<ImagePlan> {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
     let mut plans: BTreeMap<lopdf::ObjectId, ImagePlan> = BTreeMap::new();
     for (_num, page_id) in ldoc.get_pages() {
         let (pw, ph) = page_size(ldoc, page_id);
@@ -499,55 +649,17 @@ fn plan_images(ldoc: &lopdf::Document) -> Vec<ImagePlan> {
             continue;
         }
         let Ok(content) = ldoc.get_page_content(page_id) else { continue };
-        let Ok(ops) = lopdf::content::Content::decode(&content) else { continue };
-        let mut ctm = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
-        let mut stack: Vec<[f32; 6]> = Vec::new();
-        for op in ops.operations {
-            match op.operator.as_str() {
-                "q" => stack.push(ctm),
-                "Q" => ctm = stack.pop().unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-                "cm" if op.operands.len() == 6 => {
-                    let v: Vec<f32> = op.operands.iter().map(|o| o.as_float().unwrap_or(0.0)).collect();
-                    ctm = [
-                        v[0] * ctm[0] + v[1] * ctm[2],
-                        v[0] * ctm[1] + v[1] * ctm[3],
-                        v[2] * ctm[0] + v[3] * ctm[2],
-                        v[2] * ctm[1] + v[3] * ctm[3],
-                        v[4] * ctm[0] + v[5] * ctm[2] + ctm[4],
-                        v[4] * ctm[1] + v[5] * ctm[3] + ctm[5],
-                    ];
-                }
-                "Do" => {
-                    let Some(name) = op.operands.first().and_then(|o| o.as_name().ok()) else { continue };
-                    let Some(&id) = xobjects.get(name) else { continue };
-                    let is_image = ldoc
-                        .get_object(id)
-                        .and_then(|o| o.as_stream())
-                        .map(|st| st.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image".as_slice()))
-                        .unwrap_or(false);
-                    if !is_image {
-                        continue;
-                    }
-                    let w = (ctm[0] * ctm[0] + ctm[1] * ctm[1]).sqrt();
-                    let h = (ctm[2] * ctm[2] + ctm[3] * ctm[3]).sqrt();
-                    let entry = plans.entry(id).or_insert_with(|| ImagePlan {
-                        id,
-                        channels: ldoc
-                            .get_object(id)
-                            .and_then(|o| o.as_stream())
-                            .ok()
-                            .and_then(|st| image_channels(ldoc, &st.dict)),
-                        placed_w: 0.0,
-                        placed_h: 0.0,
-                        is_scan: false,
-                    });
-                    entry.placed_w = entry.placed_w.max(w);
-                    entry.placed_h = entry.placed_h.max(h);
-                    entry.is_scan |= w * h >= SCAN_AREA_SHARE * page_area;
-                }
-                _ => {}
-            }
-        }
+        let mut visited = HashSet::new();
+        walk_content_for_images(
+            ldoc,
+            &content,
+            &xobjects,
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            page_area,
+            &mut plans,
+            &mut visited,
+            0,
+        );
     }
     plans.into_values().collect()
 }
@@ -592,30 +704,21 @@ fn page_xobjects(ldoc: &lopdf::Document, page_id: lopdf::ObjectId) -> std::colle
     }
     // Earlier (more specific) dictionaries win.
     for res in dicts.into_iter().rev() {
-        let xo = match res.get(b"XObject") {
-            Ok(lopdf::Object::Reference(r)) => ldoc.get_dictionary(*r).ok(),
-            Ok(lopdf::Object::Dictionary(d)) => Some(d),
-            _ => None,
-        };
-        if let Some(xo) = xo {
-            for (name, val) in xo.iter() {
-                if let Ok(id) = val.as_reference() {
-                    map.insert(name.clone(), id);
-                }
-            }
+        for (k, v) in extract_xobjects_from_res_dict(ldoc, res) {
+            map.insert(k, v);
         }
     }
     map
 }
 
 /// Decodes, cleans, resizes and re-encodes one image stream in place.
-/// Returns Ok(true) if the stream was replaced with a smaller version.
+/// Always tries JPEG quality recompression on oversized JPEGs, and keeps the original if not smaller.
 fn rewrite_image_stream(
     stream: &mut lopdf::Stream,
     placed_w: f32,
     placed_h: f32,
     is_scan: bool,
-    channels: usize,
+    color_kind: &ImageColorKind,
     opts: &OptimizeOptions,
 ) -> Result<bool> {
     let d = &stream.dict;
@@ -650,16 +753,17 @@ fn rewrite_image_stream(
     let target_h = (placed_h / 72.0 * opts.target_dpi).min(hf);
     let downsample = wf > target_w * DOWNSAMPLE_THRESHOLD && hf > target_h * DOWNSAMPLE_THRESHOLD;
     let clean = opts.clean_scans && is_scan;
-    let recolor = opts.mode != ColorMode::Color && !(opts.mode == ColorMode::Gray && channels == 1 && is_jpeg && !downsample && !clean);
+    let is_gray = matches!(color_kind, ImageColorKind::Gray);
+    let recolor = opts.mode != ColorMode::Color && !(opts.mode == ColorMode::Gray && is_gray && is_jpeg && !downsample && !clean);
     let small = wf * hf < MIN_PIXELS_COLOR_MODE;
-    if small && !recolor {
+    if small && !recolor && is_jpeg {
         return Ok(false);
     }
-    if !(downsample || clean || recolor || !is_jpeg) {
-        return Ok(false);
-    }
+    // Note: we intentionally DO allow already-JPEG images to be re-encoded at `opts.jpeg_quality`
+    // because high-quality (Q90–Q98) photos shrink 40–70% at Q55–Q68 even without downsampling,
+    // and we still strictly keep the original below if the new bytes are not smaller!
 
-    // Decode.
+    // Decode into a DynamicImage.
     let img = if is_jpeg {
         match image::load_from_memory_with_format(&stream.content, image::ImageFormat::Jpeg) {
             Ok(i) => i,
@@ -667,17 +771,57 @@ fn rewrite_image_stream(
         }
     } else {
         let Some(raw) = stream_data(stream) else { return Ok(false) };
-        if raw.len() != (w as usize) * (h as usize) * channels {
-            return Ok(false);
-        }
-        let built = if channels == 1 {
-            image::GrayImage::from_raw(w, h, raw).map(image::DynamicImage::ImageLuma8)
-        } else {
-            image::RgbImage::from_raw(w, h, raw).map(image::DynamicImage::ImageRgb8)
-        };
-        match built {
-            Some(i) => i,
-            None => return Ok(false),
+        let px_count = (w as usize).saturating_mul(h as usize);
+        match color_kind {
+            ImageColorKind::Gray => {
+                if raw.len() != px_count {
+                    return Ok(false);
+                }
+                match image::GrayImage::from_raw(w, h, raw) {
+                    Some(g) => image::DynamicImage::ImageLuma8(g),
+                    None => return Ok(false),
+                }
+            }
+            ImageColorKind::Rgb => {
+                if raw.len() != px_count.saturating_mul(3) {
+                    return Ok(false);
+                }
+                match image::RgbImage::from_raw(w, h, raw) {
+                    Some(rgb) => image::DynamicImage::ImageRgb8(rgb),
+                    None => return Ok(false),
+                }
+            }
+            ImageColorKind::Cmyk => {
+                if raw.len() != px_count.saturating_mul(4) {
+                    return Ok(false);
+                }
+                let mut rgb_bytes = Vec::with_capacity(px_count * 3);
+                for chunk in raw.chunks_exact(4) {
+                    let (c, m, y, k) = (chunk[0] as u32, chunk[1] as u32, chunk[2] as u32, chunk[3] as u32);
+                    let inv_k = 255 - k;
+                    rgb_bytes.push((((255 - c) * inv_k) / 255) as u8);
+                    rgb_bytes.push((((255 - m) * inv_k) / 255) as u8);
+                    rgb_bytes.push((((255 - y) * inv_k) / 255) as u8);
+                }
+                match image::RgbImage::from_raw(w, h, rgb_bytes) {
+                    Some(rgb) => image::DynamicImage::ImageRgb8(rgb),
+                    None => return Ok(false),
+                }
+            }
+            ImageColorKind::Indexed(palette) => {
+                if raw.len() != px_count || palette.is_empty() {
+                    return Ok(false);
+                }
+                let mut rgb_bytes = Vec::with_capacity(px_count * 3);
+                for &idx in &raw {
+                    let c = palette.get(idx as usize).copied().unwrap_or([255, 255, 255]);
+                    rgb_bytes.extend_from_slice(&c);
+                }
+                match image::RgbImage::from_raw(w, h, rgb_bytes) {
+                    Some(rgb) => image::DynamicImage::ImageRgb8(rgb),
+                    None => return Ok(false),
+                }
+            }
         }
     };
     if img.width() != w || img.height() != h {
@@ -685,8 +829,6 @@ fn rewrite_image_stream(
     }
 
     let img = if downsample {
-        // Area-averaging downscale: about 4x faster than a Triangle filter on 300-dpi pages
-        // and needs no floating-point intermediate buffer.
         img.thumbnail_exact(target_w.round().max(1.0) as u32, target_h.round().max(1.0) as u32)
     } else {
         img
@@ -707,7 +849,7 @@ fn rewrite_image_stream(
     let (ow, oh) = rgb.dimensions();
 
     let (data, color_space, bpc, filter) = match opts.mode {
-        ColorMode::Color if channels == 3 => (
+        ColorMode::Color if !is_gray => (
             encode_jpeg(image::DynamicImage::ImageRgb8(rgb), opts.jpeg_quality)?,
             "DeviceRGB",
             8,
@@ -752,7 +894,7 @@ fn rewrite_image_stream(
             let _ = new_stream.compress();
         }
     }
-    // Keep the original if the new encoding is not smaller.
+    // Keep the original if the new encoding is not strictly smaller.
     if new_stream.content.len() >= stream.content.len() {
         return Ok(false);
     }
@@ -760,22 +902,22 @@ fn rewrite_image_stream(
     Ok(true)
 }
 
-/// 1 for gray, 3 for RGB (Device, Cal or ICC-based with /N 1 or 3); None for anything else
-/// (CMYK, Indexed, Lab, Separation, ...).
-fn image_channels(ldoc: &lopdf::Document, d: &lopdf::Dictionary) -> Option<usize> {
+/// Resolves DeviceGray/RGB/CMYK, CalGray/RGB, ICCBased (1/3/4), and Indexed RGB palettes.
+fn resolve_image_color_kind(ldoc: &lopdf::Document, d: &lopdf::Dictionary) -> Option<ImageColorKind> {
     let cs = match d.get(b"ColorSpace").ok()? {
         lopdf::Object::Reference(r) => ldoc.get_object(*r).ok()?,
         other => other,
     };
     match cs {
         lopdf::Object::Name(n) => match n.as_slice() {
-            b"DeviceGray" | b"CalGray" => Some(1),
-            b"DeviceRGB" | b"CalRGB" => Some(3),
+            b"DeviceGray" | b"CalGray" => Some(ImageColorKind::Gray),
+            b"DeviceRGB" | b"CalRGB" => Some(ImageColorKind::Rgb),
+            b"DeviceCMYK" => Some(ImageColorKind::Cmyk),
             _ => None,
         },
         lopdf::Object::Array(a) => match a.first()?.as_name().ok()? {
-            b"CalGray" => Some(1),
-            b"CalRGB" => Some(3),
+            b"CalGray" => Some(ImageColorKind::Gray),
+            b"CalRGB" => Some(ImageColorKind::Rgb),
             b"ICCBased" => {
                 let profile = match a.get(1)? {
                     lopdf::Object::Reference(r) => ldoc.get_object(*r).ok()?.as_stream().ok()?,
@@ -783,14 +925,207 @@ fn image_channels(ldoc: &lopdf::Document, d: &lopdf::Dictionary) -> Option<usize
                     _ => return None,
                 };
                 match profile.dict.get(b"N").and_then(|v| v.as_i64()).ok()? {
-                    1 => Some(1),
-                    3 => Some(3),
+                    1 => Some(ImageColorKind::Gray),
+                    3 => Some(ImageColorKind::Rgb),
+                    4 => Some(ImageColorKind::Cmyk),
                     _ => None,
+                }
+            }
+            b"Indexed" if a.len() >= 4 => {
+                // Support Indexed over RGB or ICCBased(3)
+                let base_ok = match a.get(1)? {
+                    lopdf::Object::Name(n) => n == b"DeviceRGB" || n == b"CalRGB",
+                    lopdf::Object::Reference(r) => ldoc
+                        .get_object(*r)
+                        .ok()
+                        .and_then(|o| o.as_array().ok())
+                        .and_then(|arr| arr.get(1))
+                        .and_then(|p| match p {
+                            lopdf::Object::Reference(pr) => ldoc.get_object(*pr).ok()?.as_stream().ok(),
+                            lopdf::Object::Stream(st) => Some(st),
+                            _ => None,
+                        })
+                        .and_then(|st| st.dict.get(b"N").and_then(|v| v.as_i64()).ok())
+                        == Some(3),
+                    lopdf::Object::Array(arr) => {
+                        arr.first().and_then(|x| x.as_name().ok()) == Some(b"CalRGB".as_slice())
+                            || (arr.first().and_then(|x| x.as_name().ok()) == Some(b"ICCBased".as_slice())
+                                && arr.get(1).and_then(|p| match p {
+                                    lopdf::Object::Reference(pr) => ldoc.get_object(*pr).ok()?.as_stream().ok(),
+                                    lopdf::Object::Stream(st) => Some(st),
+                                    _ => None,
+                                }).and_then(|st| st.dict.get(b"N").and_then(|v| v.as_i64()).ok()) == Some(3))
+                    }
+                    _ => false,
+                };
+                if !base_ok {
+                    return None;
+                }
+                let lookup_bytes: Vec<u8> = match a.get(3)? {
+                    lopdf::Object::String(bytes, _) => bytes.clone(),
+                    lopdf::Object::Reference(r) => match ldoc.get_object(*r).ok()? {
+                        lopdf::Object::String(bytes, _) => bytes.clone(),
+                        lopdf::Object::Stream(st) => stream_data(st)?,
+                        _ => return None,
+                    },
+                    lopdf::Object::Stream(st) => stream_data(st)?,
+                    _ => return None,
+                };
+                let palette: Vec<[u8; 3]> = lookup_bytes
+                    .chunks_exact(3)
+                    .map(|c| [c[0], c[1], c[2]])
+                    .collect();
+                if palette.is_empty() {
+                    None
+                } else {
+                    Some(ImageColorKind::Indexed(palette))
                 }
             }
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Strips page `/Thumb` preview images and bloated XMP `/Metadata` streams from catalog and pages.
+fn strip_bloat_metadata_and_thumbs(ldoc: &mut lopdf::Document) {
+    let page_ids: Vec<lopdf::ObjectId> = ldoc.get_pages().into_values().collect();
+    for pid in page_ids {
+        if let Ok(dict) = ldoc.get_dictionary_mut(pid) {
+            dict.remove(b"Thumb");
+            dict.remove(b"Metadata");
+        }
+    }
+    if let Ok(cat) = ldoc.catalog_mut() {
+        cat.remove(b"Metadata");
+        cat.remove(b"PieceInfo");
+    }
+}
+
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+fn replace_object_refs(obj: &mut lopdf::Object, remap: &std::collections::HashMap<lopdf::ObjectId, lopdf::ObjectId>) {
+    match obj {
+        lopdf::Object::Reference(id) => {
+            if let Some(&canon) = remap.get(id) {
+                *id = canon;
+            }
+        }
+        lopdf::Object::Array(arr) => {
+            for item in arr {
+                replace_object_refs(item, remap);
+            }
+        }
+        lopdf::Object::Dictionary(dict) => {
+            for (_, val) in dict.iter_mut() {
+                replace_object_refs(val, remap);
+            }
+        }
+        lopdf::Object::Stream(st) => {
+            for (_, val) in st.dict.iter_mut() {
+                replace_object_refs(val, remap);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Deduplicates identical streams (common in merged PDFs and multi-page exports with repeated logos/fonts).
+fn deduplicate_streams(ldoc: &mut lopdf::Document) -> usize {
+    use std::collections::HashMap;
+    // Key: (len, hash, subtype_name, width, height, bpc, filter_name)
+    type BucketKey = (usize, u64, Vec<u8>, i64, i64, i64, Vec<u8>);
+    let mut buckets: HashMap<BucketKey, Vec<lopdf::ObjectId>> = HashMap::new();
+    let mut remap: HashMap<lopdf::ObjectId, lopdf::ObjectId> = HashMap::new();
+
+    let mut ids: Vec<lopdf::ObjectId> = ldoc.objects.keys().copied().collect();
+    ids.sort();
+
+    for id in ids {
+        let Some(lopdf::Object::Stream(st)) = ldoc.objects.get(&id) else { continue };
+        if st.content.len() < 256 {
+            continue;
+        }
+        let ty = st.dict.get(b"Type").and_then(|v| v.as_name()).ok();
+        if matches!(ty, Some(b"XRef") | Some(b"ObjStm") | Some(b"Page") | Some(b"Pages") | Some(b"Catalog")) {
+            continue;
+        }
+        let subtype = st.dict.get(b"Subtype").and_then(|v| v.as_name()).unwrap_or(b"").to_vec();
+        let w = st.dict.get(b"Width").and_then(|v| v.as_i64()).unwrap_or(0);
+        let h = st.dict.get(b"Height").and_then(|v| v.as_i64()).unwrap_or(0);
+        let bpc = st.dict.get(b"BitsPerComponent").and_then(|v| v.as_i64()).unwrap_or(0);
+        let filter = match st.dict.get(b"Filter") {
+            Ok(lopdf::Object::Name(n)) => n.clone(),
+            _ => Vec::new(),
+        };
+        let key = (st.content.len(), fnv1a_64(&st.content), subtype, w, h, bpc, filter);
+        let bucket = buckets.entry(key).or_default();
+        let mut matched: Option<lopdf::ObjectId> = None;
+        for &cand_id in bucket.iter() {
+            if let Some(lopdf::Object::Stream(cand)) = ldoc.objects.get(&cand_id) {
+                if cand.content == st.content && cand.dict == st.dict {
+                    matched = Some(cand_id);
+                    break;
+                }
+            }
+        }
+        if let Some(canon) = matched {
+            remap.insert(id, canon);
+        } else {
+            bucket.push(id);
+        }
+    }
+
+    if remap.is_empty() {
+        return 0;
+    }
+    let count = remap.len();
+    for obj in ldoc.objects.values_mut() {
+        replace_object_refs(obj, &remap);
+    }
+    for (_, val) in ldoc.trailer.iter_mut() {
+        replace_object_refs(val, &remap);
+    }
+    for dup_id in remap.keys() {
+        ldoc.objects.remove(dup_id);
+    }
+    count
+}
+
+/// Re-compresses single-filter FlateDecode streams using `flate2::Compression::best()` (level 9),
+/// keeping the new bytes only when strictly smaller.
+fn recompress_flate_streams_best(ldoc: &mut lopdf::Document) {
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    for obj in ldoc.objects.values_mut() {
+        let lopdf::Object::Stream(st) = obj else { continue };
+        let is_single_flate = match st.dict.get(b"Filter") {
+            Ok(lopdf::Object::Name(n)) => n == b"FlateDecode",
+            _ => false,
+        };
+        if !is_single_flate || st.dict.has(b"DecodeParms") || st.content.len() < 128 {
+            continue;
+        }
+        let Some(raw) = stream_data(st) else { continue };
+        let mut enc = ZlibEncoder::new(Vec::with_capacity(st.content.len()), Compression::best());
+        if enc.write_all(&raw).is_err() {
+            continue;
+        }
+        if let Ok(better) = enc.finish() {
+            if better.len() < st.content.len() {
+                st.content = better;
+                st.dict.set("Length", st.content.len() as i64);
+            }
+        }
     }
 }
 
@@ -1143,5 +1478,97 @@ mod tests {
         );
         repack_to_one_bit(&mut g);
         assert_eq!(g.dict.get(b"BitsPerComponent").unwrap().as_i64().unwrap(), 8);
+    }
+
+    #[test]
+    fn optimize_form_xobject_jpeg_and_deduplicates_streams() -> Result<()> {
+        // Build a synthetic PDF with a Q98 JPEG wrapped inside a Form XObject (like Word/Chrome/Canva exports)
+        // plus two identical 2KB payload streams to verify Form traversal, JPEG recompression, and dedup.
+        let mut photo = image::RgbImage::new(400, 300);
+        for (x, y, p) in photo.enumerate_pixels_mut() {
+            *p = image::Rgb([
+                ((x * 3 + y) % 256) as u8,
+                ((x + y * 5) % 256) as u8,
+                (((x ^ y) * 7) % 256) as u8,
+            ]);
+        }
+        let jpg_q98 = encode_jpeg(image::DynamicImage::ImageRgb8(photo), 98)?;
+
+        let mut doc = lopdf::Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let img_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => 400,
+                "Height" => 300,
+                "ColorSpace" => "DeviceRGB",
+                "BitsPerComponent" => 8,
+                "Filter" => "DCTDecode",
+            },
+            jpg_q98,
+        ));
+        let form_res = dictionary! {
+            "XObject" => dictionary! { "Im1" => img_id },
+        };
+        let form_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 150.into()],
+                "Resources" => form_res,
+            },
+            b"q 200 0 0 150 0 0 cm /Im1 Do Q".to_vec(),
+        ));
+        let dup_payload = vec![b'A'; 4096];
+        let dup1 = doc.add_object(lopdf::Stream::new(dictionary! {}, dup_payload.clone()));
+        let dup2 = doc.add_object(lopdf::Stream::new(dictionary! {}, dup_payload));
+        let content_id = doc.add_object(lopdf::Stream::new(
+            dictionary! {},
+            b"q 1 0 0 1 50 50 cm /Fm1 Do Q".to_vec(),
+        ));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+            "Resources" => dictionary! {
+                "XObject" => dictionary! { "Fm1" => form_id },
+                "Properties" => dictionary! { "P1" => dup1, "P2" => dup2 },
+            },
+            "Contents" => content_id,
+        });
+        doc.objects.insert(
+            pages_id,
+            lopdf::Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_id.into()],
+                "Count" => 1,
+            }),
+        );
+        let cat_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", cat_id);
+
+        let mut src = Vec::new();
+        doc.save_to(&mut src)?;
+
+        let mut job = OptimizeJob::new(src.clone(), OptimizeOptions::preset(OptimizePreset::Smaller))?;
+        assert_eq!(job.total(), 1, "must discover image nested inside Form XObject");
+        while !job.is_done() {
+            job.step();
+        }
+        let report = job.finish()?;
+        assert!(!report.kept_original, "optimized PDF should be significantly smaller");
+        assert_eq!(report.images_rewritten, 1);
+        assert!(report.deduped_streams >= 1, "expected duplicate streams to be merged");
+        assert!(
+            report.bytes.len() * 2 < report.original_len,
+            "expected >50% reduction on Q98 JPEG + duplicate streams: {} -> {}",
+            report.original_len,
+            report.bytes.len()
+        );
+        Ok(())
     }
 }

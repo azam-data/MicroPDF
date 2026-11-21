@@ -12,5 +12,8 @@ MicroPDF depends on the following components. Each keeps its own license.
 | rfd | MIT | Native file dialogs |
 | image | MIT OR Apache-2.0 | PNG/JPEG decoding |
 | anyhow | MIT OR Apache-2.0 | Error handling |
+| ab_glyph | Apache-2.0 | CPU TrueType font rasterizer for UI text |
+| flate2 | MIT OR Apache-2.0 | Zlib decompression for embedded UI fonts |
+| Liberation Sans (Latin subset) | SIL Open Font License 1.1 | Embedded UI font (`assets/ui_regular.ttf.z`, `assets/ui_bold.ttf.z`) |
 
 Run `cargo tree` for the full dependency list. Tools such as `cargo-about` can generate a complete notice file for release builds.

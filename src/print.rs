@@ -74,6 +74,397 @@ pub fn strip_bands(render_h: u32, strip_rows: u32) -> impl Iterator<Item = (u32,
         .map(move |y| (y, rows.min(render_h - y)))
 }
 
+/// Parity filter applied on top of a page selection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PageParity {
+    All,
+    Odd,
+    Even,
+}
+
+impl PageParity {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Odd => "Odd",
+            Self::Even => "Even",
+        }
+    }
+}
+
+/// Both-sided (duplex) printing mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DuplexMode {
+    Off,
+    /// Flip along the long edge (book style / portrait).
+    LongEdge,
+    /// Flip along the short edge (calendar / landscape).
+    ShortEdge,
+}
+
+impl DuplexMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "1-Sided",
+            Self::LongEdge => "Long Edge",
+            Self::ShortEdge => "Short Edge",
+        }
+    }
+
+    pub fn cups_sides_arg(self) -> &'static str {
+        match self {
+            Self::Off => "sides=one-sided",
+            Self::LongEdge => "sides=two-sided-long-edge",
+            Self::ShortEdge => "sides=two-sided-short-edge",
+        }
+    }
+}
+
+/// Sheet orientation override for Print Preview & printing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrintOrientation {
+    Auto,
+    Portrait,
+    Landscape,
+}
+
+impl PrintOrientation {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto",
+            Self::Portrait => "Portrait",
+            Self::Landscape => "Landscape",
+        }
+    }
+
+    pub fn is_landscape(self, page_w: f32, page_h: f32) -> bool {
+        match self {
+            Self::Auto => page_w > page_h,
+            Self::Portrait => false,
+            Self::Landscape => true,
+        }
+    }
+}
+
+/// Standard sheet paper sizes for Print Preview, Windows GDI & CUPS media selection.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PrintPaperSize {
+    Auto,
+    A4,
+    A5,
+    A3,
+    B5,
+    Letter,
+    Legal,
+    Executive,
+    Tabloid,
+    Statement,
+}
+
+impl PrintPaperSize {
+    pub const ALL: [Self; 10] = [
+        Self::A4,
+        Self::Letter,
+        Self::Legal,
+        Self::A5,
+        Self::A3,
+        Self::B5,
+        Self::Executive,
+        Self::Tabloid,
+        Self::Statement,
+        Self::Auto,
+    ];
+
+    pub fn prev(self) -> Self {
+        let idx = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(idx + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&p| p == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "Auto (PDF Size)",
+            Self::A4 => "A4 (210×297 mm)",
+            Self::A5 => "A5 (148×210 mm)",
+            Self::A3 => "A3 (297×420 mm)",
+            Self::B5 => "B5 (176×250 mm)",
+            Self::Letter => "Letter (8.5×11 in)",
+            Self::Legal => "Legal (8.5×14 in)",
+            Self::Executive => "Executive (7.25×10.5 in)",
+            Self::Tabloid => "Tabloid (11×17 in)",
+            Self::Statement => "Statement (5.5×8.5 in)",
+        }
+    }
+
+    /// Portrait `(width_pts, height_pts)` in PDF points (1/72 inch).
+    pub fn portrait_pts(self) -> (f32, f32) {
+        match self {
+            Self::Auto | Self::A4 => (595.28, 841.89),
+            Self::A5 => (419.53, 595.28),
+            Self::A3 => (841.89, 1190.55),
+            Self::B5 => (498.90, 708.66),
+            Self::Letter => (612.0, 792.0),
+            Self::Legal => (612.0, 1008.0),
+            Self::Executive => (522.0, 756.0),
+            Self::Tabloid => (792.0, 1224.0),
+            Self::Statement => (396.0, 612.0),
+        }
+    }
+
+    /// Returns portrait `(short_pts, long_pts)` matching the page's own dimensions when `Auto`.
+    pub fn portrait_pts_for_page(self, page_w: f32, page_h: f32) -> (f32, f32) {
+        if self == Self::Auto && page_w > 10.0 && page_h > 10.0 {
+            (page_w.min(page_h), page_w.max(page_h))
+        } else {
+            self.portrait_pts()
+        }
+    }
+
+    pub fn cups_media(self) -> Option<&'static str> {
+        match self {
+            Self::Auto => None,
+            Self::A4 => Some("A4"),
+            Self::A5 => Some("A5"),
+            Self::A3 => Some("A3"),
+            Self::B5 => Some("ISOB5"),
+            Self::Letter => Some("Letter"),
+            Self::Legal => Some("Legal"),
+            Self::Executive => Some("Executive"),
+            Self::Tabloid => Some("Tabloid"),
+            Self::Statement => Some("Statement"),
+        }
+    }
+}
+
+/// Rendering options shared between Print Preview and actual printing.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct PrintRenderOptions {
+    pub fit_to_page: bool,
+    pub orientation: PrintOrientation,
+    pub grayscale: bool,
+    pub auto_trim_margins: bool,
+    /// Print zoom percentage (`100..=200`): values above 100 zoom into the page center/content
+    /// to crop outer white margins and enlarge text.
+    pub zoom_percent: u16,
+    /// When printing multiple copies, collate (`1,2,3 1,2,3`) if true, else group (`1,1 2,2`).
+    pub collate: bool,
+    /// Saddle-stitch 2-up booklet imposition (landscape short-edge folded booklet).
+    pub booklet: bool,
+    /// Whether to include PDF annotations (highlights, notes, shapes, markups) when printing.
+    pub include_annotations: bool,
+}
+
+impl Default for PrintRenderOptions {
+    fn default() -> Self {
+        Self {
+            fit_to_page: true,
+            orientation: PrintOrientation::Auto,
+            grayscale: false,
+            auto_trim_margins: false,
+            zoom_percent: 100,
+            collate: true,
+            booklet: false,
+            include_annotations: true,
+        }
+    }
+}
+
+/// One physical side of a 2-up saddle-stitch booklet sheet (`None` = blank padding page).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BookletSheet {
+    pub left: Option<u16>,
+    pub right: Option<u16>,
+    pub is_front: bool,
+}
+
+/// Computes saddle-stitch 2-up booklet imposition for `pages` (0-based indices).
+/// Pads up to a multiple of 4 with `None` blank pages, producing `[Front1, Back1, Front2, Back2, ...]`.
+pub fn compute_booklet_sheets(pages: &[u16]) -> Vec<BookletSheet> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    let padded_len = ((pages.len() + 3) / 4) * 4;
+    let get = |idx: usize| -> Option<u16> { pages.get(idx).copied() };
+    let mut sheets = Vec::with_capacity(padded_len / 2);
+    let pairs = padded_len / 4;
+    for k in 0..pairs {
+        // Front of sheet k: [N - 1 - 2k | 2k]
+        sheets.push(BookletSheet {
+            left: get(padded_len - 1 - 2 * k),
+            right: get(2 * k),
+            is_front: true,
+        });
+        // Back of sheet k: [2k + 1 | N - 2 - 2k]
+        sheets.push(BookletSheet {
+            left: get(2 * k + 1),
+            right: get(padded_len - 2 - 2 * k),
+            is_front: false,
+        });
+    }
+    sheets
+}
+
+/// Flattens `BookletSheet`s into sequential `[left, right, left, right, ...]` slots for 2-up output.
+pub fn flatten_booklet_sheets(sheets: &[BookletSheet]) -> Vec<Option<u16>> {
+    let mut out = Vec::with_capacity(sheets.len() * 2);
+    for s in sheets {
+        out.push(s.left);
+        out.push(s.right);
+    }
+    out
+}
+
+/// Two-pass plan for printing duplex on a simplex (single-sided) printer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManualDuplexPasses {
+    /// Pass 1 page slots (front sides). In booklet mode, flattened `[L, R]` pairs.
+    pub pass1_pages: Vec<Option<u16>>,
+    /// Pass 2 page slots (back sides, optionally reversed). In booklet mode, flattened `[L, R]` pairs.
+    pub pass2_pages: Vec<Option<u16>>,
+    /// Number of physical sheets printed per pass.
+    pub sheets_per_pass: usize,
+}
+
+/// Splits `pages` into Pass 1 (Fronts) and Pass 2 (Backs) for guided manual duplex on simplex printers.
+/// For odd page counts in normal mode, pads Pass 2 with a blank page (`None`) before reversing so
+/// the last front page remains blank on the back instead of shifting every subsequent sheet.
+pub fn build_manual_duplex_passes(
+    pages: &[u16],
+    booklet: bool,
+    reverse_backs: bool,
+) -> ManualDuplexPasses {
+    if pages.is_empty() {
+        return ManualDuplexPasses {
+            pass1_pages: Vec::new(),
+            pass2_pages: Vec::new(),
+            sheets_per_pass: 0,
+        };
+    }
+    if booklet {
+        let sheets = compute_booklet_sheets(pages);
+        let fronts: Vec<BookletSheet> = sheets.iter().copied().filter(|s| s.is_front).collect();
+        let mut backs: Vec<BookletSheet> = sheets.iter().copied().filter(|s| !s.is_front).collect();
+        if reverse_backs {
+            backs.reverse();
+        }
+        return ManualDuplexPasses {
+            sheets_per_pass: fronts.len(),
+            pass1_pages: flatten_booklet_sheets(&fronts),
+            pass2_pages: flatten_booklet_sheets(&backs),
+        };
+    }
+
+    let mut fronts: Vec<Option<u16>> = Vec::new();
+    let mut backs: Vec<Option<u16>> = Vec::new();
+    for (i, &p) in pages.iter().enumerate() {
+        if i % 2 == 0 {
+            fronts.push(Some(p));
+        } else {
+            backs.push(Some(p));
+        }
+    }
+    if backs.len() < fronts.len() {
+        backs.push(None);
+    }
+    if reverse_backs {
+        backs.reverse();
+    }
+    ManualDuplexPasses {
+        sheets_per_pass: fronts.len(),
+        pass1_pages: fronts,
+        pass2_pages: backs,
+    }
+}
+
+/// Computes the effective `(min_x, min_y, max_x, max_y)` region (in PDF points, origin bottom-left)
+/// to print from `page`, applying optional white-margin auto-trim and manual zoom (`100..=200`).
+///
+/// For vector/text PDFs `auto_trim` uses `PdfEngine::compute_page_content_bounds`. If the object
+/// bounds span >90% of the page (typical of full-page scans) and `pixel_scan` is provided, it
+/// scans those pixels for non-white ink bounds instead.
+pub fn compute_effective_crop_box(
+    page: &PdfPage,
+    auto_trim: bool,
+    zoom_percent: u16,
+    pixel_scan: Option<(&[u32], u32, u32)>,
+) -> (f32, f32, f32, f32) {
+    let pw = page.width().value.max(1.0);
+    let ph = page.height().value.max(1.0);
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (0.0f32, 0.0f32, pw, ph);
+
+    if auto_trim {
+        let (ox0, oy0, ox1, oy1) = PdfEngine::compute_page_content_bounds(page);
+        let obj_covers_most = (ox1 - ox0) >= pw * 0.90 && (oy1 - oy0) >= ph * 0.90;
+        let mut trimmed = false;
+
+        if obj_covers_most {
+            if let Some((pxs, bw, bh)) = pixel_scan {
+                if bw > 4 && bh > 4 && pxs.len() >= (bw as usize * bh as usize) {
+                    let mut p_min_x = bw;
+                    let mut p_max_x = 0u32;
+                    let mut p_min_y = bh;
+                    let mut p_max_y = 0u32;
+                    for y in 0..bh {
+                        let row = (y * bw) as usize;
+                        for x in 0..bw {
+                            let c = pxs[row + x as usize];
+                            let r = (c >> 16) & 0xFF;
+                            let g = (c >> 8) & 0xFF;
+                            let b = c & 0xFF;
+                            if r < 242 || g < 242 || b < 242 {
+                                p_min_x = p_min_x.min(x);
+                                p_max_x = p_max_x.max(x);
+                                p_min_y = p_min_y.min(y);
+                                p_max_y = p_max_y.max(y);
+                            }
+                        }
+                    }
+                    if p_max_x > p_min_x + 4 && p_max_y > p_min_y + 4 {
+                        let pad_x = (pw * 0.025).max(8.0);
+                        let pad_y = (ph * 0.025).max(8.0);
+                        min_x = ((p_min_x as f32 / bw as f32) * pw - pad_x).max(0.0);
+                        max_x = (((p_max_x + 1) as f32 / bw as f32) * pw + pad_x).min(pw);
+                        // Pixel y=0 is top; PDF y=0 is bottom
+                        let pdf_top = (1.0 - (p_min_y as f32 / bh as f32)) * ph;
+                        let pdf_bot = (1.0 - ((p_max_y + 1) as f32 / bh as f32)) * ph;
+                        min_y = (pdf_bot - pad_y).max(0.0);
+                        max_y = (pdf_top + pad_y).min(ph);
+                        trimmed = (max_x - min_x) >= pw * 0.20 && (max_y - min_y) >= ph * 0.20;
+                    }
+                }
+            }
+        }
+        if !trimmed && (ox1 - ox0) >= pw * 0.20 && (oy1 - oy0) >= ph * 0.20 {
+            let pad_y = (ph * 0.02).max(8.0);
+            min_x = ox0.clamp(0.0, (pw - 1.0).max(0.0));
+            max_x = ox1.clamp((min_x + 1.0).min(pw), pw);
+            min_y = (oy0 - pad_y).max(0.0);
+            max_y = (oy1 + pad_y).min(ph);
+        }
+    }
+
+    let z = zoom_percent.clamp(100, 200);
+    if z > 100 {
+        let frac = 100.0 / (z as f32);
+        let cw = max_x - min_x;
+        let ch = max_y - min_y;
+        let cx = (min_x + max_x) * 0.5;
+        let cy = (min_y + max_y) * 0.5;
+        let nw = (cw * frac).max(pw * 0.20);
+        let nh = (ch * frac).max(ph * 0.20);
+        min_x = (cx - nw * 0.5).clamp(0.0, (pw - 1.0).max(0.0));
+        max_x = (cx + nw * 0.5).clamp((min_x + 1.0).min(pw), pw);
+        min_y = (cy - nh * 0.5).clamp(0.0, (ph - 1.0).max(0.0));
+        max_y = (cy + nh * 0.5).clamp((min_y + 1.0).min(ph), ph);
+    }
+
+    (min_x, min_y, max_x, max_y)
+}
+
 #[cfg_attr(not(any(windows, test)), allow(dead_code))] // GDI printing is Windows-only
 /// Renders page `page_idx` of `doc` for printing at `dpi_x` x `dpi_y` onto a printable area of
 /// `avail_w` x `avail_h` device pixels, one horizontal strip at a time. `strip_buf` is reused for
@@ -104,11 +495,39 @@ pub fn render_page_in_horizontal_strips<F>(
 where
     F: FnMut(u32, u32, u32, u32, &[u32]) -> Result<()>,
 {
+    let opts = PrintRenderOptions {
+        fit_to_page,
+        ..PrintRenderOptions::default()
+    };
+    render_page_in_horizontal_strips_with_options(
+        engine, doc, page_idx, dpi_x, dpi_y, avail_w, avail_h, strip_rows, opts, strip_buf,
+        on_strip,
+    )
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn render_page_in_horizontal_strips_with_options<F>(
+    engine: &PdfEngine,
+    doc: &PdfDocument,
+    page_idx: u16,
+    dpi_x: u32,
+    dpi_y: u32,
+    avail_w: u32,
+    avail_h: u32,
+    strip_rows: u32,
+    opts: PrintRenderOptions,
+    strip_buf: &mut Vec<u32>,
+    on_strip: F,
+) -> Result<PrintPlacement>
+where
+    F: FnMut(u32, u32, u32, u32, &[u32]) -> Result<()>,
+{
     let page = doc
         .pages()
         .get(page_idx)
         .with_context(|| format!("Page {} is out of range for printing", page_idx + 1))?;
-    let args = (dpi_x, dpi_y, avail_w, avail_h, fit_to_page, strip_rows);
+    let args = (dpi_x, dpi_y, avail_w, avail_h, opts, strip_rows);
     if !PdfEngine::page_has_form_widgets(&page) {
         return render_strips_of_page(engine, page, args, strip_buf, on_strip);
     }
@@ -125,27 +544,41 @@ where
 fn render_strips_of_page<F>(
     engine: &PdfEngine,
     page: PdfPage,
-    (dpi_x, dpi_y, avail_w, avail_h, fit_to_page, strip_rows): (u32, u32, u32, u32, bool, u32),
+    (dpi_x, dpi_y, avail_w, avail_h, opts, strip_rows): (
+        u32,
+        u32,
+        u32,
+        u32,
+        PrintRenderOptions,
+        u32,
+    ),
     strip_buf: &mut Vec<u32>,
     mut on_strip: F,
 ) -> Result<PrintPlacement>
 where
     F: FnMut(u32, u32, u32, u32, &[u32]) -> Result<()>,
 {
-    let page_w_pts = page.width().value.max(1.0);
     let page_h_pts = page.height().value.max(1.0);
+    let (crop_x0, crop_y0, crop_x1, crop_y1) =
+        compute_effective_crop_box(&page, opts.auto_trim_margins, opts.zoom_percent, None);
+    let eff_w_pts = (crop_x1 - crop_x0).max(1.0);
+    let eff_h_pts = (crop_y1 - crop_y0).max(1.0);
     let placement = place_page_on_printable_area(
-        page_w_pts,
-        page_h_pts,
+        eff_w_pts,
+        eff_h_pts,
         dpi_x,
         dpi_y,
         avail_w,
         avail_h,
-        fit_to_page,
+        opts.fit_to_page,
     );
     let render_w = placement.render_w;
-    let sx = render_w as f32 / page_w_pts;
-    let sy = placement.render_h as f32 / page_h_pts;
+    let sx = render_w as f32 / eff_w_pts;
+    let sy = placement.render_h as f32 / eff_h_pts;
+    // PDFium top-down device shift for the cropped sub-box:
+    let shift_x = -(crop_x0 * sx);
+    let top_trim_pts = (page_h_pts - crop_y1).max(0.0);
+    let shift_y_base = -(top_trim_pts * sy);
     let bindings = engine.pdfium.bindings();
 
     for (strip_y, strip_h) in strip_bands(placement.render_h, strip_rows) {
@@ -153,17 +586,22 @@ where
         strip_buf.clear();
         strip_buf.resize(pixel_count, 0x00FF_FFFF);
 
-        // Same transform as the zoom tiles: scale page points to device pixels, then shift the
-        // page up by `strip_y` so this strip's rows land in the bitmap.
         let config = PdfRenderConfig::new()
             .set_fixed_width(render_w as i32)
             .set_fixed_height(strip_h as i32)
             .render_form_data(false)
-            .render_annotations(true)
-            .use_print_quality(true)
+            .render_annotations(opts.include_annotations)
+            .use_print_quality(!opts.include_annotations)
             .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
-            .reset_matrix(PdfMatrix::new(sx, 0.0, 0.0, sy, 0.0, -(strip_y as f32)))
+            .reset_matrix(PdfMatrix::new(
+                sx,
+                0.0,
+                0.0,
+                sy,
+                shift_x,
+                shift_y_base - (strip_y as f32),
+            ))
             .context("Invalid print strip transformation matrix")?;
 
         {
@@ -183,8 +621,19 @@ where
             page.render_into_bitmap_with_config(&mut bitmap, &config)
                 .context("Failed to render PDF print strip")?;
         }
-        for px in strip_buf.iter_mut() {
-            *px &= 0x00FF_FFFF;
+        if opts.grayscale {
+            for px in strip_buf.iter_mut() {
+                let c = *px & 0x00FF_FFFF;
+                let r = (c >> 16) & 0xFF;
+                let g = (c >> 8) & 0xFF;
+                let b = c & 0xFF;
+                let y = (77 * r + 150 * g + 29 * b) >> 8;
+                *px = (y << 16) | (y << 8) | y;
+            }
+        } else {
+            for px in strip_buf.iter_mut() {
+                *px &= 0x00FF_FFFF;
+            }
         }
 
         on_strip(
@@ -244,6 +693,41 @@ pub fn parse_page_selection(input: &str, total_pages: u16) -> Result<Vec<u16>> {
         anyhow::bail!("no pages selected");
     }
     Ok(pages.into_iter().collect())
+}
+
+/// Resolves a page range plus odd/even parity filter and optional reverse ordering into 0-based
+/// page indices in the exact order they should be previewed and printed.
+pub fn resolve_print_pages(
+    range_input: &str,
+    total_pages: u16,
+    parity: PageParity,
+    reverse: bool,
+) -> Result<Vec<u16>> {
+    let mut pages = parse_page_selection(range_input, total_pages)?;
+    match parity {
+        PageParity::All => {}
+        PageParity::Odd => pages.retain(|&p| (p + 1) % 2 == 1),
+        PageParity::Even => pages.retain(|&p| (p + 1) % 2 == 0),
+    }
+    if pages.is_empty() {
+        anyhow::bail!("no {} pages in the selected range", parity.label().to_ascii_lowercase());
+    }
+    if reverse {
+        pages.reverse();
+    }
+    Ok(pages)
+}
+
+/// Discovers installed printers and returns `(printer_names, default_index)` across platforms.
+pub fn discover_system_printers() -> (Vec<String>, usize) {
+    #[cfg(target_os = "windows")]
+    {
+        gdi::discover_printers()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        discover_cups_printers()
+    }
 }
 
 #[cfg_attr(windows, allow(dead_code))] // CUPS printing is macOS/Linux-only
@@ -398,6 +882,76 @@ pub fn write_pages_to_temp_pdf(
     Ok(temp)
 }
 
+/// Like `write_pages_to_temp_pdf`, but accepts `Option<u16>` slots where `None` inserts a
+/// matching-size blank white page (used for Booklet multiple-of-4 padding and Odd Manual Duplex).
+pub fn write_optional_pages_to_temp_pdf(
+    engine: &PdfEngine,
+    doc: &PdfDocument,
+    slots: &[Option<u16>],
+    redacted: bool,
+    dir: &Path,
+) -> Result<TempPrintFile> {
+    if slots.is_empty() {
+        anyhow::bail!("No pages selected to print");
+    }
+    // Fast path when there are no blank slots
+    if slots.iter().all(|s| s.is_some()) {
+        let plain: Vec<u16> = slots.iter().flatten().copied().collect();
+        return write_pages_to_temp_pdf(engine, doc, &plain, redacted, dir);
+    }
+
+    let total = doc.pages().len();
+    let default_size = slots
+        .iter()
+        .flatten()
+        .find_map(|&idx| {
+            doc.pages().page_size(idx).ok().map(|r| {
+                PdfPagePaperSize::Custom(r.width(), r.height())
+            })
+        })
+        .unwrap_or_else(PdfPagePaperSize::a4);
+
+    remove_stale_print_temp_files(dir);
+    let mut dest = engine
+        .pdfium
+        .create_new_pdf()
+        .context("Failed to create temporary print PDF")?;
+
+    for slot in slots {
+        match slot {
+            Some(src_idx) => {
+                if *src_idx >= total {
+                    anyhow::bail!("Page {} out of range (1-{total})", src_idx + 1);
+                }
+                let dst_len = dest.pages().len();
+                dest.pages_mut()
+                    .copy_page_from_document(doc, *src_idx, dst_len)
+                    .with_context(|| format!("Failed to copy page {} for printing", src_idx + 1))?;
+            }
+            None => {
+                dest.pages_mut()
+                    .create_page_at_end(default_size)
+                    .context("Failed to insert blank padding page for printing")?;
+            }
+        }
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!("{TEMP_PRINT_PREFIX}{}_{nanos}.pdf", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("Failed to create temporary print PDF {path:?}"))?;
+    let temp = TempPrintFile { path };
+    write_doc_for_print(&dest, redacted, &mut file)?;
+    drop(file);
+    Ok(temp)
+}
+
 /// Writes `doc` to `file`: streamed by PDFium, or deep-cleaned first after a redaction.
 fn write_doc_for_print(doc: &PdfDocument, redacted: bool, file: &mut std::fs::File) -> Result<()> {
     use std::io::Write;
@@ -547,6 +1101,229 @@ pub fn start_cups_print_with(
     })
 }
 
+/// Extended CUPS print request used by Print Preview (supports duplex, paper size, orientation,
+/// grayscale, Collate, Booklet 2-up, Manual Duplex passes, and Auto-Trim / Zoom margin cropping).
+#[cfg_attr(windows, allow(dead_code))]
+pub struct CupsPrintExtendedRequest<'a> {
+    pub printer: &'a str,
+    pub copies: u16,
+    /// Optional explicit page slots (`None` = blank padding page for Booklet or Manual Duplex).
+    /// When `None`, `page_indices` is used directly (or auto-imposed if `render_opts.booklet` is true).
+    pub optional_pages: Option<&'a [Option<u16>]>,
+    pub page_indices: &'a [u16],
+    pub title: &'a str,
+    pub paper: PrintPaperSize,
+    pub duplex: DuplexMode,
+    pub render_opts: PrintRenderOptions,
+}
+
+/// Adjusts each page's `/CropBox` inside `pdf_path` according to `crop_boxes` (one per page in
+/// `pdf_path`, in PDF points) so CUPS prints cropped/zoomed margins at full vector sharpness.
+#[cfg_attr(windows, allow(dead_code))]
+fn apply_crop_boxes_to_temp_pdf(pdf_path: &Path, crop_boxes: &[(f32, f32, f32, f32)]) -> Result<()> {
+    let raw = std::fs::read(pdf_path).context("Failed to read temp print PDF for margin trim")?;
+    let mut ldoc = lopdf::Document::load_mem(&raw).context("lopdf could not open temp print PDF")?;
+    let pages = ldoc.get_pages();
+    for ((_pnum, page_id), &(x0, y0, x1, y1)) in pages.iter().zip(crop_boxes.iter()) {
+        if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(*page_id) {
+            dict.set(
+                "CropBox",
+                lopdf::Object::Array(vec![
+                    lopdf::Object::Real(x0),
+                    lopdf::Object::Real(y0),
+                    lopdf::Object::Real(x1),
+                    lopdf::Object::Real(y1),
+                ]),
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    ldoc.save_to(&mut out).context("lopdf could not save cropped temp print PDF")?;
+    std::fs::write(pdf_path, &out).context("Failed to write cropped temp print PDF")?;
+    Ok(())
+}
+
+/// Removes all `/Annots` entries from every page of the temporary print PDF so CUPS prints
+/// without any highlights, sticky notes, shapes, or markup annotations (original file untouched).
+#[cfg_attr(windows, allow(dead_code))]
+fn strip_annotations_from_temp_pdf(pdf_path: &Path) -> Result<()> {
+    let raw = std::fs::read(pdf_path).context("Failed to read temp print PDF for annotation strip")?;
+    let mut ldoc = lopdf::Document::load_mem(&raw).context("lopdf could not open temp print PDF")?;
+    let pages = ldoc.get_pages();
+    for (_pnum, page_id) in pages {
+        if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(page_id) {
+            let _ = dict.remove(b"Annots");
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    ldoc.save_to(&mut out).context("lopdf could not save annotation-free temp print PDF")?;
+    std::fs::write(pdf_path, &out).context("Failed to write annotation-free temp print PDF")?;
+    Ok(())
+}
+
+/// Ensures every visible annotation in the temporary print PDF has the PDF PRINT flag (`/F` bit `0x04`)
+/// set so CUPS/macOS PDF filters always render annotations when `With Annots` is chosen.
+#[cfg_attr(windows, allow(dead_code))]
+fn ensure_annotations_printable_in_temp_pdf(pdf_path: &Path) -> Result<()> {
+    let raw = std::fs::read(pdf_path)?;
+    let mut ldoc = lopdf::Document::load_mem(&raw)?;
+    let mut changed = false;
+    let mut annot_ids = Vec::new();
+    for (_pnum, page_id) in ldoc.get_pages() {
+        let Ok(page_dict) = ldoc.get_dictionary(page_id) else { continue };
+        let Ok(annots_obj) = page_dict.get(b"Annots") else { continue };
+        let arr = match annots_obj {
+            lopdf::Object::Reference(r) => ldoc.get_object(*r).and_then(|o| o.as_array()).ok(),
+            lopdf::Object::Array(a) => Some(a),
+            _ => None,
+        };
+        if let Some(arr) = arr {
+            for item in arr {
+                if let Ok(r) = item.as_reference() {
+                    annot_ids.push(r);
+                }
+            }
+        }
+    }
+    for aid in annot_ids {
+        if let Ok(lopdf::Object::Dictionary(ad)) = ldoc.get_object_mut(aid) {
+            let f = ad.get(b"F").and_then(|v| v.as_i64()).unwrap_or(0);
+            // Skip Hidden (0x02) or Invisible (0x01) annotations; set Print (0x04) on all others
+            if (f & 0x03) == 0 && (f & 0x04) == 0 {
+                ad.set("F", f | 0x04);
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        let mut out = Vec::with_capacity(raw.len());
+        ldoc.save_to(&mut out)?;
+        std::fs::write(pdf_path, &out)?;
+    }
+    Ok(())
+}
+
+/// Starts printing with full Print Preview options through CUPS (`lp`).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn start_cups_print_extended(
+    engine: &PdfEngine,
+    doc: &PdfDocument,
+    req: &CupsPrintExtendedRequest,
+    redacted: bool,
+    lp_program: &std::ffi::OsStr,
+    temp_dir: &Path,
+) -> Result<PendingLpJob> {
+    let printer = req.printer.trim();
+    if printer.is_empty() {
+        anyhow::bail!("No printer selected");
+    }
+    let effective_slots: Vec<Option<u16>> = if let Some(explicit) = req.optional_pages {
+        explicit.to_vec()
+    } else if req.render_opts.booklet {
+        let sheets = compute_booklet_sheets(req.page_indices);
+        flatten_booklet_sheets(&sheets)
+    } else {
+        req.page_indices.iter().copied().map(Some).collect()
+    };
+    if effective_slots.is_empty() {
+        anyhow::bail!("No pages selected to print");
+    }
+
+    let copies = req.copies.clamp(1, 99);
+    let temp = write_optional_pages_to_temp_pdf(engine, doc, &effective_slots, redacted, temp_dir)?;
+
+    if !req.render_opts.include_annotations {
+        let _ = strip_annotations_from_temp_pdf(temp.path());
+    } else {
+        let _ = ensure_annotations_printable_in_temp_pdf(temp.path());
+    }
+
+    if req.render_opts.auto_trim_margins || req.render_opts.zoom_percent > 100 {
+        let mut boxes = Vec::with_capacity(effective_slots.len());
+        for slot in &effective_slots {
+            match slot {
+                Some(p_idx) => {
+                    if let Ok(page) = doc.pages().get(*p_idx) {
+                        boxes.push(compute_effective_crop_box(
+                            &page,
+                            req.render_opts.auto_trim_margins,
+                            req.render_opts.zoom_percent,
+                            None,
+                        ));
+                    }
+                }
+                None => {
+                    let (w, h) = req.paper.portrait_pts();
+                    boxes.push((0.0, 0.0, w, h));
+                }
+            }
+        }
+        if boxes.len() == effective_slots.len() {
+            let _ = apply_crop_boxes_to_temp_pdf(temp.path(), &boxes);
+        }
+    }
+
+    let mut cmd = std::process::Command::new(lp_program);
+    cmd.arg("-d")
+        .arg(printer)
+        .arg("-n")
+        .arg(copies.to_string())
+        .arg("-t")
+        .arg(if req.title.is_empty() { "MicroPDF" } else { req.title })
+        .arg("-o")
+        .arg(req.duplex.cups_sides_arg());
+    if let Some(media) = req.paper.cups_media() {
+        cmd.arg("-o").arg(format!("media={media}"));
+    }
+    if copies > 1 {
+        cmd.arg("-o")
+            .arg(if req.render_opts.collate { "Collate=True" } else { "Collate=False" });
+    }
+    if req.render_opts.booklet {
+        cmd.arg("-o")
+            .arg("number-up=2")
+            .arg("-o")
+            .arg("orientation-requested=4");
+    } else {
+        match req.render_opts.orientation {
+            PrintOrientation::Auto => {}
+            PrintOrientation::Portrait => {
+                cmd.arg("-o").arg("orientation-requested=3");
+            }
+            PrintOrientation::Landscape => {
+                cmd.arg("-o").arg("orientation-requested=4");
+            }
+        }
+    }
+    if req.render_opts.fit_to_page
+        || req.render_opts.booklet
+        || req.render_opts.auto_trim_margins
+        || req.render_opts.zoom_percent > 100
+    {
+        cmd.arg("-o").arg("fit-to-page");
+    }
+    if req.render_opts.grayscale {
+        cmd.arg("-o").arg("ColorModel=Gray");
+    }
+    cmd.arg(temp.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let child = cmd.spawn().context("Failed to run 'lp'")?;
+    let reported_pages = if req.render_opts.booklet {
+        (effective_slots.len() + 1) / 2
+    } else {
+        effective_slots.len()
+    };
+    Ok(PendingLpJob {
+        child: Some(child),
+        temp: Some(temp),
+        pages: reported_pages,
+        copies,
+    })
+}
+
 /// `start_cups_print_with`, then wait for `lp` (tests).
 #[cfg(all(test, unix))]
 pub fn print_document_cups_with(
@@ -593,6 +1370,7 @@ pub struct PagedPrintJob<'e> {
     next: usize,
     pages_per_copy: usize,
     copies: u16,
+    render_opts: PrintRenderOptions,
     strip_buf: Vec<u32>,
     closed: bool,
 }
@@ -610,9 +1388,65 @@ impl<'e> PagedPrintJob<'e> {
         reported_copies: u16,
         redacted: bool,
         temp_dir: &Path,
+        sink: Box<dyn PrintSink>,
+    ) -> Result<Self> {
+        Self::new_with_options(
+            engine,
+            source,
+            page_indices,
+            loop_copies,
+            reported_copies,
+            redacted,
+            PrintRenderOptions::default(),
+            temp_dir,
+            sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_options(
+        engine: &'e PdfEngine,
+        source: &PdfDocument,
+        page_indices: &[u16],
+        loop_copies: u16,
+        reported_copies: u16,
+        redacted: bool,
+        render_opts: PrintRenderOptions,
+        temp_dir: &Path,
+        sink: Box<dyn PrintSink>,
+    ) -> Result<Self> {
+        let slots: Vec<Option<u16>> = if render_opts.booklet {
+            let sheets = compute_booklet_sheets(page_indices);
+            flatten_booklet_sheets(&sheets)
+        } else {
+            page_indices.iter().copied().map(Some).collect()
+        };
+        Self::new_with_optional_pages(
+            engine,
+            source,
+            &slots,
+            loop_copies,
+            reported_copies,
+            redacted,
+            render_opts,
+            temp_dir,
+            sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_optional_pages(
+        engine: &'e PdfEngine,
+        source: &PdfDocument,
+        slots: &[Option<u16>],
+        loop_copies: u16,
+        reported_copies: u16,
+        redacted: bool,
+        render_opts: PrintRenderOptions,
+        temp_dir: &Path,
         mut sink: Box<dyn PrintSink>,
     ) -> Result<Self> {
-        let snapshot = write_pages_to_temp_pdf(engine, source, page_indices, redacted, temp_dir)
+        let snapshot = write_optional_pages_to_temp_pdf(engine, source, slots, redacted, temp_dir)
             .and_then(|temp| {
                 let doc = engine
                     .load_pdf_safe(temp.path())
@@ -626,9 +1460,20 @@ impl<'e> PagedPrintJob<'e> {
                 return Err(e);
             }
         };
-        let per_copy = doc.pages().len();
+        let total_snap_pages = doc.pages().len();
+        let per_copy: u16 = if render_opts.booklet {
+            ((total_snap_pages as usize + 1) / 2) as u16
+        } else {
+            total_snap_pages
+        };
         let loop_copies = loop_copies.max(1);
-        let order = (0..loop_copies).flat_map(|_| 0..per_copy).collect();
+        let order: Vec<u16> = if render_opts.collate {
+            (0..loop_copies).flat_map(|_| 0..per_copy).collect()
+        } else {
+            (0..per_copy)
+                .flat_map(|p| std::iter::repeat(p).take(loop_copies as usize))
+                .collect()
+        };
         Ok(Self {
             doc,
             _temp: temp,
@@ -637,6 +1482,7 @@ impl<'e> PagedPrintJob<'e> {
             next: 0,
             pages_per_copy: per_copy as usize,
             copies: reported_copies.max(loop_copies),
+            render_opts,
             strip_buf: Vec::new(),
             closed: false,
         })
@@ -666,37 +1512,88 @@ impl<'e> PagedPrintJob<'e> {
         self._temp.path()
     }
 
-    /// Renders and sends the next page. `Ok(true)`: more pages remain; `Ok(false)`: the
-    /// document is complete. On error the printer document is aborted.
+    /// Renders and sends the next page (or 2-up booklet sheet). `Ok(true)`: more remain;
+    /// `Ok(false)`: document complete. On error the printer document is aborted.
     pub fn step(&mut self, engine: &PdfEngine) -> Result<bool> {
         if self.closed {
             return Ok(false);
         }
-        let Self { doc, sink, strip_buf, order, next, .. } = self;
-        let page_idx = order[*next];
+        let Self { doc, sink, strip_buf, order, next, render_opts, .. } = self;
+        let opts = *render_opts;
+        let sheet_idx = order[*next];
         let page_res = (|| -> Result<()> {
-            let landscape = doc
-                .pages()
-                .page_size(page_idx)
-                .map(|s| s.width().value > s.height().value)
-                .unwrap_or(false);
-            let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(landscape)?;
-            let rendered = render_page_in_horizontal_strips(
-                engine,
-                doc,
-                page_idx,
-                dpi_x,
-                dpi_y,
-                avail_w,
-                avail_h,
-                true,
-                PRINT_STRIP_ROWS,
-                strip_buf,
-                |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
-            );
-            let ended = sink.end_page();
-            rendered?;
-            ended
+            if opts.booklet {
+                let left_idx = sheet_idx.saturating_mul(2);
+                let right_idx = left_idx + 1;
+                let snap_len = doc.pages().len();
+                let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(true)?;
+                let half_w = (avail_w / 2).max(1);
+                let right_w = avail_w.saturating_sub(half_w).max(1);
+                let half_opts = PrintRenderOptions {
+                    fit_to_page: true,
+                    ..opts
+                };
+                let mut rendered: Result<()> = Ok(());
+                if left_idx < snap_len {
+                    rendered = render_page_in_horizontal_strips_with_options(
+                        engine,
+                        doc,
+                        left_idx,
+                        dpi_x,
+                        dpi_y,
+                        half_w,
+                        avail_h,
+                        PRINT_STRIP_ROWS,
+                        half_opts,
+                        strip_buf,
+                        |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
+                    )
+                    .map(|_| ());
+                }
+                if rendered.is_ok() && right_idx < snap_len {
+                    rendered = render_page_in_horizontal_strips_with_options(
+                        engine,
+                        doc,
+                        right_idx,
+                        dpi_x,
+                        dpi_y,
+                        right_w,
+                        avail_h,
+                        PRINT_STRIP_ROWS,
+                        half_opts,
+                        strip_buf,
+                        |x, y, w, h, px| sink.draw_strip(half_w + x, y, w, h, px),
+                    )
+                    .map(|_| ());
+                }
+                let ended = sink.end_page();
+                rendered?;
+                ended
+            } else {
+                let page_idx = sheet_idx;
+                let landscape = doc
+                    .pages()
+                    .page_size(page_idx)
+                    .map(|s| opts.orientation.is_landscape(s.width().value, s.height().value))
+                    .unwrap_or(opts.orientation == PrintOrientation::Landscape);
+                let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(landscape)?;
+                let rendered = render_page_in_horizontal_strips_with_options(
+                    engine,
+                    doc,
+                    page_idx,
+                    dpi_x,
+                    dpi_y,
+                    avail_w,
+                    avail_h,
+                    PRINT_STRIP_ROWS,
+                    opts,
+                    strip_buf,
+                    |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
+                );
+                let ended = sink.end_page();
+                rendered?;
+                ended
+            }
         })();
         if let Err(e) = page_res {
             self.sink.abort();
@@ -752,10 +1649,24 @@ pub fn show_windows_print_dialog(
     gdi::show_dialog(doc_title, total_pages, hwnd_owner)
 }
 
+/// Opens a specific Windows printer directly (using the printer chosen in Print Preview) with
+/// duplex, copies, and paper size applied to `DEVMODEW`, and starts `StartDocW`.
+#[cfg(target_os = "windows")]
+pub fn open_windows_printer_direct(
+    printer_name: &str,
+    doc_title: &str,
+    page_indices: Vec<u16>,
+    copies: u16,
+    duplex: DuplexMode,
+    paper: PrintPaperSize,
+) -> Result<WindowsPrintSetup> {
+    gdi::open_printer_direct(printer_name, doc_title, page_indices, copies, duplex, paper)
+}
+
 /// Win32 print dialog and GDI printing, declared by hand (no extra crate).
 #[cfg(target_os = "windows")]
 pub mod gdi {
-    use super::{PrintSink, WindowsPrintSetup};
+    use super::{DuplexMode, PrintPaperSize, PrintSink, WindowsPrintSetup};
     use anyhow::Result;
     use std::ffi::c_void;
 
@@ -776,9 +1687,29 @@ pub mod gdi {
     const GDI_ERROR: i32 = -1;
 
     const DM_ORIENTATION: u32 = 0x0000_0001;
+    const DM_PAPERSIZE: u32 = 0x0000_0002;
     const DM_COPIES: u32 = 0x0000_0100;
+    const DM_DUPLEX: u32 = 0x0000_1000;
     const DMORIENT_PORTRAIT: i16 = 1;
     const DMORIENT_LANDSCAPE: i16 = 2;
+    const DMPAPER_LETTER: i16 = 1;
+    const DMPAPER_TABLOID: i16 = 3;
+    const DMPAPER_LEGAL: i16 = 5;
+    const DMPAPER_STATEMENT: i16 = 6;
+    const DMPAPER_EXECUTIVE: i16 = 7;
+    const DMPAPER_A3: i16 = 8;
+    const DMPAPER_A4: i16 = 9;
+    const DMPAPER_A5: i16 = 11;
+    const DMPAPER_B5: i16 = 13;
+    const DMDUP_SIMPLEX: i16 = 1;
+    const DMDUP_VERTICAL: i16 = 2;
+    const DMDUP_HORIZONTAL: i16 = 3;
+    const DM_OUT_BUFFER: u32 = 2;
+    const DM_IN_BUFFER: u32 = 8;
+
+    const PRINTER_ENUM_LOCAL: u32 = 0x0000_0002;
+    const PRINTER_ENUM_CONNECTIONS: u32 = 0x0000_0004;
+    const GMEM_MOVEABLE: u32 = 0x0002;
 
     // commdlg.h packs its structs to 1 byte on 32-bit Windows only.
     #[cfg_attr(target_pointer_width = "32", repr(C, packed))]
@@ -837,7 +1768,7 @@ pub mod gdi {
         bmi_colors: [u32; 1],
     }
 
-    /// The leading fields of DEVMODEW, up to dmCopies.
+    /// The leading fields of DEVMODEW, up through dmDuplex.
     #[repr(C)]
     struct DevModeWPrefix {
         dm_device_name: [u16; 32],
@@ -852,6 +1783,45 @@ pub mod gdi {
         dm_paper_width: i16,
         dm_scale: i16,
         dm_copies: i16,
+        dm_default_source: i16,
+        dm_print_quality: i16,
+        dm_color: i16,
+        dm_duplex: i16,
+    }
+
+    #[repr(C)]
+    struct PrinterInfo4W {
+        p_printer_name: *mut u16,
+        p_server_name: *mut u16,
+        attributes: u32,
+    }
+
+    #[link(name = "winspool")]
+    unsafe extern "system" {
+        fn EnumPrintersW(
+            flags: u32,
+            name: *const u16,
+            level: u32,
+            p_printer_enum: *mut u8,
+            cb_buf: u32,
+            pcb_needed: *mut u32,
+            pc_returned: *mut u32,
+        ) -> i32;
+        fn GetDefaultPrinterW(psz_buffer: *mut u16, pcch_buffer: *mut u32) -> i32;
+        fn OpenPrinterW(
+            p_printer_name: *const u16,
+            ph_printer: *mut *mut c_void,
+            p_default: *const c_void,
+        ) -> i32;
+        fn ClosePrinter(h_printer: *mut c_void) -> i32;
+        fn DocumentPropertiesW(
+            hwnd: *mut c_void,
+            h_printer: *mut c_void,
+            p_device_name: *const u16,
+            p_dev_mode_output: *mut c_void,
+            p_dev_mode_input: *const c_void,
+            f_mode: u32,
+        ) -> i32;
     }
 
     #[link(name = "comdlg32")]
@@ -861,6 +1831,12 @@ pub mod gdi {
 
     #[link(name = "gdi32")]
     unsafe extern "system" {
+        fn CreateDCW(
+            pwsz_driver: *const u16,
+            pwsz_device: *const u16,
+            psz_port: *const u16,
+            pdm: *const c_void,
+        ) -> *mut c_void;
         fn StartDocW(hdc: *mut c_void, lpdi: *const DocInfoW) -> i32;
         fn EndDoc(hdc: *mut c_void) -> i32;
         fn StartPage(hdc: *mut c_void) -> i32;
@@ -888,9 +1864,211 @@ pub mod gdi {
 
     #[link(name = "kernel32")]
     unsafe extern "system" {
+        fn GlobalAlloc(u_flags: u32, dw_bytes: usize) -> *mut c_void;
         fn GlobalLock(hmem: *mut c_void) -> *mut c_void;
         fn GlobalUnlock(hmem: *mut c_void) -> i32;
         fn GlobalFree(hmem: *mut c_void) -> *mut c_void;
+    }
+
+    unsafe fn utf16_ptr_to_string(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        while unsafe { *ptr.add(len) } != 0 {
+            len += 1;
+        }
+        String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    pub(super) fn discover_printers() -> (Vec<String>, usize) {
+        let mut printers = Vec::new();
+        let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+        let mut needed: u32 = 0;
+        let mut returned: u32 = 0;
+        unsafe {
+            EnumPrintersW(flags, std::ptr::null(), 4, std::ptr::null_mut(), 0, &mut needed, &mut returned);
+        }
+        if needed > 0 {
+            let mut buf = vec![0u8; needed as usize];
+            let ok = unsafe {
+                EnumPrintersW(
+                    flags,
+                    std::ptr::null(),
+                    4,
+                    buf.as_mut_ptr(),
+                    needed,
+                    &mut needed,
+                    &mut returned,
+                )
+            };
+            if ok != 0 && returned > 0 {
+                let infos = unsafe {
+                    std::slice::from_raw_parts(buf.as_ptr() as *const PrinterInfo4W, returned as usize)
+                };
+                for info in infos {
+                    let name = unsafe { utf16_ptr_to_string(info.p_printer_name) };
+                    if !name.is_empty() && !printers.contains(&name) {
+                        printers.push(name);
+                    }
+                }
+            }
+        }
+
+        let mut def_len: u32 = 0;
+        unsafe {
+            GetDefaultPrinterW(std::ptr::null_mut(), &mut def_len);
+        }
+        let default_name = if def_len > 1 {
+            let mut dbuf = vec![0u16; def_len as usize];
+            if unsafe { GetDefaultPrinterW(dbuf.as_mut_ptr(), &mut def_len) } != 0 {
+                let s = String::from_utf16_lossy(&dbuf);
+                Some(s.trim_end_matches('\0').to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(ref def) = default_name {
+            if !def.is_empty() && !printers.contains(def) {
+                printers.insert(0, def.clone());
+            }
+        }
+        let selected = default_name
+            .and_then(|d| printers.iter().position(|p| p == &d))
+            .unwrap_or(0);
+        (printers, selected)
+    }
+
+    pub(super) fn open_printer_direct(
+        printer_name: &str,
+        doc_title: &str,
+        page_indices: Vec<u16>,
+        copies: u16,
+        duplex: DuplexMode,
+        paper: PrintPaperSize,
+    ) -> Result<WindowsPrintSetup> {
+        let name_w: Vec<u16> = printer_name.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut h_printer: *mut c_void = std::ptr::null_mut();
+        if unsafe { OpenPrinterW(name_w.as_ptr(), &mut h_printer, std::ptr::null()) } == 0
+            || h_printer.is_null()
+        {
+            anyhow::bail!("Could not open Windows printer '{printer_name}'");
+        }
+
+        let dm_size = unsafe {
+            DocumentPropertiesW(
+                std::ptr::null_mut(),
+                h_printer,
+                name_w.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                0,
+            )
+        };
+
+        let mut h_dev_mode: *mut c_void = std::ptr::null_mut();
+        if dm_size > 0 && (dm_size as usize) >= std::mem::size_of::<DevModeWPrefix>() {
+            h_dev_mode = unsafe { GlobalAlloc(GMEM_MOVEABLE, dm_size as usize) };
+            if !h_dev_mode.is_null() {
+                unsafe {
+                    let dm_ptr = GlobalLock(h_dev_mode);
+                    if !dm_ptr.is_null() {
+                        let res = DocumentPropertiesW(
+                            std::ptr::null_mut(),
+                            h_printer,
+                            name_w.as_ptr(),
+                            dm_ptr,
+                            std::ptr::null(),
+                            DM_OUT_BUFFER,
+                        );
+                        if res > 0 {
+                            let dm = dm_ptr as *mut DevModeWPrefix;
+                            (*dm).dm_fields |= DM_DUPLEX;
+                            (*dm).dm_duplex = match duplex {
+                                DuplexMode::Off => DMDUP_SIMPLEX,
+                                DuplexMode::LongEdge => DMDUP_VERTICAL,
+                                DuplexMode::ShortEdge => DMDUP_HORIZONTAL,
+                            };
+                            let dm_paper = match paper {
+                                PrintPaperSize::Auto => None,
+                                PrintPaperSize::A4 => Some(DMPAPER_A4),
+                                PrintPaperSize::A5 => Some(DMPAPER_A5),
+                                PrintPaperSize::A3 => Some(DMPAPER_A3),
+                                PrintPaperSize::B5 => Some(DMPAPER_B5),
+                                PrintPaperSize::Letter => Some(DMPAPER_LETTER),
+                                PrintPaperSize::Legal => Some(DMPAPER_LEGAL),
+                                PrintPaperSize::Executive => Some(DMPAPER_EXECUTIVE),
+                                PrintPaperSize::Tabloid => Some(DMPAPER_TABLOID),
+                                PrintPaperSize::Statement => Some(DMPAPER_STATEMENT),
+                            };
+                            if let Some(pcode) = dm_paper {
+                                (*dm).dm_fields |= DM_PAPERSIZE;
+                                (*dm).dm_paper_size = pcode;
+                            }
+                            let _ = DocumentPropertiesW(
+                                std::ptr::null_mut(),
+                                h_printer,
+                                name_w.as_ptr(),
+                                dm_ptr,
+                                dm_ptr,
+                                DM_IN_BUFFER | DM_OUT_BUFFER,
+                            );
+                        }
+                        GlobalUnlock(h_dev_mode);
+                    }
+                }
+            }
+        }
+        unsafe { ClosePrinter(h_printer) };
+
+        let hdc = unsafe {
+            let dm_ptr = if !h_dev_mode.is_null() {
+                GlobalLock(h_dev_mode)
+            } else {
+                std::ptr::null_mut()
+            };
+            let dc = CreateDCW(std::ptr::null(), name_w.as_ptr(), std::ptr::null(), dm_ptr);
+            if !h_dev_mode.is_null() {
+                GlobalUnlock(h_dev_mode);
+            }
+            dc
+        };
+        if hdc.is_null() {
+            if !h_dev_mode.is_null() {
+                unsafe { GlobalFree(h_dev_mode) };
+            }
+            anyhow::bail!("CreateDCW failed for printer '{printer_name}'");
+        }
+
+        let mut sink = GdiPrintSink {
+            hdc,
+            h_dev_mode,
+            h_dev_names: std::ptr::null_mut(),
+            orientation: None,
+            doc_open: false,
+        };
+        let title_utf16: Vec<u16> = doc_title.encode_utf16().chain(std::iter::once(0)).collect();
+        let doc_info = DocInfoW {
+            cb_size: std::mem::size_of::<DocInfoW>() as i32,
+            lpsz_doc_name: title_utf16.as_ptr(),
+            lpsz_output: std::ptr::null(),
+            lpsz_datatype: std::ptr::null(),
+            fw_type: 0,
+        };
+        if unsafe { StartDocW(sink.hdc, &doc_info) } <= 0 {
+            anyhow::bail!("StartDocW failed for '{printer_name}'");
+        }
+        sink.doc_open = true;
+
+        let copies = copies.clamp(1, 99);
+        Ok(WindowsPrintSetup {
+            sink,
+            page_indices,
+            loop_copies: copies,
+            reported_copies: copies,
+        })
     }
 
     /// An open GDI printer document. Freed (and aborted if unfinished) on drop.
@@ -1950,5 +3128,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
         let _ = std::fs::remove_dir_all(&log_dir);
         Ok(())
+    }
+
+    #[test]
+    fn test_resolve_print_pages_all_custom_odd_even_reverse() -> Result<()> {
+        assert_eq!(resolve_print_pages("all", 6, PageParity::All, false)?, vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!(resolve_print_pages("all", 6, PageParity::Odd, false)?, vec![0, 2, 4]);
+        assert_eq!(resolve_print_pages("all", 6, PageParity::Even, false)?, vec![1, 3, 5]);
+        assert_eq!(resolve_print_pages("all", 6, PageParity::Odd, true)?, vec![4, 2, 0]);
+        assert_eq!(resolve_print_pages("1-5, 8", 10, PageParity::All, false)?, vec![0, 1, 2, 3, 4, 7]);
+        assert_eq!(resolve_print_pages("1-5, 8", 10, PageParity::Even, true)?, vec![7, 3, 1]);
+        // Only page 1 selected with Even parity should return an error (no pages matched)
+        assert!(resolve_print_pages("1", 5, PageParity::Even, false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_duplex_orientation_paper_helpers() {
+        assert_eq!(DuplexMode::Off.cups_sides_arg(), "sides=one-sided");
+        assert_eq!(DuplexMode::LongEdge.cups_sides_arg(), "sides=two-sided-long-edge");
+        assert_eq!(DuplexMode::ShortEdge.cups_sides_arg(), "sides=two-sided-short-edge");
+        assert_eq!(DuplexMode::Off.label(), "1-Sided");
+        assert_eq!(DuplexMode::LongEdge.label(), "Long Edge");
+        assert_eq!(DuplexMode::ShortEdge.label(), "Short Edge");
+
+        assert!(PrintOrientation::Auto.is_landscape(800.0, 600.0));
+        assert!(!PrintOrientation::Auto.is_landscape(600.0, 800.0));
+        assert!(!PrintOrientation::Portrait.is_landscape(800.0, 600.0));
+        assert!(PrintOrientation::Landscape.is_landscape(600.0, 800.0));
+
+        assert_eq!(PrintPaperSize::A4.cups_media(), Some("A4"));
+        assert_eq!(PrintPaperSize::Letter.cups_media(), Some("Letter"));
+        assert_eq!(PrintPaperSize::Legal.cups_media(), Some("Legal"));
+        assert_eq!(PrintPaperSize::A3.cups_media(), Some("A3"));
+        assert_eq!(PrintPaperSize::A5.cups_media(), Some("A5"));
+        assert_eq!(PrintPaperSize::Tabloid.cups_media(), Some("Tabloid"));
+        assert_eq!(PrintPaperSize::Auto.cups_media(), None);
+        assert_eq!(PrintPaperSize::A4.next().prev(), PrintPaperSize::A4);
+        let (a4w, a4h) = PrintPaperSize::A4.portrait_pts();
+        assert!(a4h > a4w && (a4w - 595.28).abs() < 0.1);
+        assert_eq!(PrintPaperSize::Auto.portrait_pts_for_page(500.0, 300.0), (300.0, 500.0));
+    }
+
+    #[test]
+    fn test_booklet_imposition_and_manual_duplex_passes() {
+        // 6 pages -> padded to 8 -> 2 physical sheets (4 sides):
+        // Sheet 1 Front: [blank(7), p1(0)], Sheet 1 Back: [p2(1), blank(6)]
+        // Sheet 2 Front: [p6(5), p3(2)],    Sheet 2 Back: [p4(3), p5(4)]
+        let sheets = compute_booklet_sheets(&[0, 1, 2, 3, 4, 5]);
+        assert_eq!(sheets.len(), 4);
+        assert_eq!((sheets[0].left, sheets[0].right, sheets[0].is_front), (None, Some(0), true));
+        assert_eq!((sheets[1].left, sheets[1].right, sheets[1].is_front), (Some(1), None, false));
+        assert_eq!((sheets[2].left, sheets[2].right, sheets[2].is_front), (Some(5), Some(2), true));
+        assert_eq!((sheets[3].left, sheets[3].right, sheets[3].is_front), (Some(3), Some(4), false));
+
+        // Normal Manual Duplex on 5 pages (odd): Pass 1 = [0, 2, 4], Pass 2 reversed = [None, 3, 1]
+        let md = build_manual_duplex_passes(&[0, 1, 2, 3, 4], false, true);
+        assert_eq!(md.sheets_per_pass, 3);
+        assert_eq!(md.pass1_pages, vec![Some(0), Some(2), Some(4)]);
+        assert_eq!(md.pass2_pages, vec![None, Some(3), Some(1)]);
+
+        // Booklet Manual Duplex on 6 pages: Pass 1 = Fronts [None, 0, 5, 2], Pass 2 reversed = Backs [3, 4, 1, None]
+        let md_bk = build_manual_duplex_passes(&[0, 1, 2, 3, 4, 5], true, true);
+        assert_eq!(md_bk.sheets_per_pass, 2);
+        assert_eq!(md_bk.pass1_pages, vec![None, Some(0), Some(5), Some(2)]);
+        assert_eq!(md_bk.pass2_pages, vec![Some(3), Some(4), Some(1), None]);
     }
 }
