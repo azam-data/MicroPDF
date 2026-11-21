@@ -45,6 +45,7 @@ pub(super) enum HeaderFooterHit {
     ProfileNext,
     ProfileSave,
     ProfileDelete,
+    ResetFields,
     FocusField(HfField),
     ScopeAll,
     ScopeCustom,
@@ -71,30 +72,31 @@ pub(super) struct HeaderFooterModalState {
     pub(super) custom_range: String,
     pub(super) replace_existing: bool,
     pub(super) focused_field: HfField,
+    /// When true (e.g. after Ctrl+A), next typed char replaces whole field and Backspace/Delete clears it.
+    pub(super) select_all: bool,
     pub(super) preview_page: u16,
-    pub(super) preview_cache: Option<(u16, u32, u32, Vec<u32>)>,
-    pub(super) error_msg: Option<String>,
+    /// `(page_idx, avail_w, avail_h, rw, rh, pixels)`
+    pub(super) preview_cache: Option<(u16, u32, u32, u32, u32, Vec<u32>)>,
+    /// Inline modal feedback banner: `Some((message, is_error))`.
+    pub(super) status_msg: Option<(String, bool)>,
 }
 
 impl HeaderFooterModalState {
-    pub(super) fn new(
-        current_page: u16,
-        last_profile: &HeaderFooterProfile,
-        saved_profiles: &[HeaderFooterProfile],
-    ) -> Self {
-        let selected_profile_idx = saved_profiles
-            .iter()
-            .position(|p| p.name == last_profile.name);
+    /// Opens cleanly with blank fields so saved style profiles never auto-contaminate other PDFs.
+    pub(super) fn new(current_page: u16) -> Self {
+        let mut blank = HeaderFooterProfile::default();
+        blank.name.clear();
         Self {
-            profile: last_profile.clone(),
-            selected_profile_idx,
+            profile: blank,
+            selected_profile_idx: None,
             all_pages: true,
             custom_range: String::new(),
             replace_existing: true,
             focused_field: HfField::HeaderCenter,
+            select_all: false,
             preview_page: current_page,
             preview_cache: None,
-            error_msg: None,
+            status_msg: None,
         }
     }
 
@@ -117,14 +119,23 @@ impl HeaderFooterModalState {
 // ---------------------------------------------------------------------------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum PnNumericFocus {
+    SkipPages,
+    RomanPages,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum PageNumberHit {
     PrevPage,
     NextPage,
     Pos(MarginPosition),
     Format(PageNumberFormat),
+    SkipMinus,
+    SkipPlus,
+    FocusSkip,
     RomanMinus,
     RomanPlus,
-    ToggleSkipFirst,
+    FocusRoman,
     FontMinus,
     FontPlus,
     ColorGray,
@@ -138,18 +149,24 @@ pub(super) enum PageNumberHit {
 
 pub(super) struct PageNumberModalState {
     pub(super) config: PageNumberConfig,
+    pub(super) focused_numeric: Option<PnNumericFocus>,
     pub(super) preview_page: u16,
-    pub(super) preview_cache: Option<(u16, u32, u32, Vec<u32>)>,
+    /// `(page_idx, avail_w, avail_h, rw, rh, pixels)`
+    pub(super) preview_cache: Option<(u16, u32, u32, u32, u32, Vec<u32>)>,
+    pub(super) status_msg: Option<(String, bool)>,
 }
 
 impl PageNumberModalState {
-    pub(super) fn new(current_page: u16, roman_end: usize) -> Self {
+    pub(super) fn new(current_page: u16, roman_end: usize, skip_pages: usize) -> Self {
         let mut cfg = PageNumberConfig::default();
         cfg.roman_end = roman_end as u16;
+        cfg.skip_pages = skip_pages as u16;
         Self {
             config: cfg,
+            focused_numeric: None,
             preview_page: current_page,
             preview_cache: None,
+            status_msg: None,
         }
     }
 }
@@ -181,7 +198,9 @@ struct SplitModalLayout<T: Copy> {
 }
 
 impl<'a> PdfViewerApp<'a> {
-    /// Renders a clean single-page preview bitmap for the Header/Footer or Page Numbering modals.
+    /// Renders a full-page scaled preview bitmap for the Header/Footer or Page Numbering modals.
+    /// Uses `set_target_width` + `set_maximum_height` so PDFium auto-scales the entire page to fit
+    /// cleanly (never cropping to the top-left quarter at 1:1 pt scale).
     fn render_doc_tool_preview_page(
         &self,
         page_idx: u16,
@@ -193,12 +212,12 @@ impl<'a> PdfViewerApp<'a> {
         let pw = page.width().value.max(1.0);
         let ph = page.height().value.max(1.0);
         let scale = (max_w as f32 / pw).min(max_h as f32 / ph);
-        let rw = (pw * scale).round().max(40.0) as u32;
-        let rh = (ph * scale).round().max(40.0) as u32;
+        let rw = (pw * scale).round().max(40.0) as i32;
+        let rh = (ph * scale).round().max(40.0) as i32;
         let cfg = PdfRenderConfig::new()
-            .set_fixed_width(rw as i32)
-            .set_fixed_height(rh as i32)
-            .render_form_data(false)
+            .set_target_width(rw)
+            .set_maximum_height(rh)
+            .render_form_data(true)
             .render_annotations(true)
             .limit_render_image_cache_size(true);
         let bmp = page.render_with_config(&cfg).ok()?;
@@ -224,19 +243,19 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.open_menu = None;
         self.show_help_overlay = false;
+        self.show_bookmark_format_overlay = false;
         self.show_about_overlay = false;
         self.show_customize_toolbar = false;
         self.show_notifications = false;
         self.show_reading_mode_popover = false;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
         self.print_preview = None;
         self.combine_modal = None;
         self.page_number_modal = None;
         self.input_mode = InputMode::Normal;
-        self.header_footer_modal = Some(HeaderFooterModalState::new(
-            self.current_page_index,
-            &self.last_hf_profile,
-            &self.hf_profiles,
-        ));
+        self.header_footer_modal = Some(HeaderFooterModalState::new(self.current_page_index));
         self.request_redraw();
     }
 
@@ -271,12 +290,12 @@ impl<'a> PdfViewerApp<'a> {
 
         let mut cy = my + (40.0 * s).round() as i32;
 
-        // 1. Style Profiles row (< Profile >) + Profile Name + Save / Del
+        // 1. Style Profiles row (< Profile Name > Save Del)
         cy += lbl_h;
         let arr_w = (24.0 * s).round() as u32;
         let save_w = (46.0 * s).round() as u32;
         let del_w = (40.0 * s).round() as u32;
-        let name_w = iw.saturating_sub(arr_w * 2 + save_w + del_w + (gap * 3) as u32);
+        let name_w = iw.saturating_sub(arr_w * 2 + save_w + del_w + (gap * 3) as u32 + 4);
         hits.push(ModalBox { x: ix, y: cy, w: arr_w, h: row_h, hit: HeaderFooterHit::ProfilePrev });
         hits.push(ModalBox { x: ix + arr_w as i32 + 2, y: cy, w: name_w, h: row_h, hit: HeaderFooterHit::FocusField(HfField::ProfileName) });
         let nx = ix + arr_w as i32 + name_w as i32 + 4;
@@ -284,6 +303,16 @@ impl<'a> PdfViewerApp<'a> {
         let sx = nx + arr_w as i32 + gap;
         hits.push(ModalBox { x: sx, y: cy, w: save_w, h: row_h, hit: HeaderFooterHit::ProfileSave });
         hits.push(ModalBox { x: sx + save_w as i32 + gap, y: cy, w: del_w, h: row_h, hit: HeaderFooterHit::ProfileDelete });
+        // Compact "Reset Fields" button aligned right on the Profile header line
+        let rst_w = (76.0 * s).round() as u32;
+        let rst_h = (18.0 * s).round() as u32;
+        hits.push(ModalBox {
+            x: ix + iw as i32 - rst_w as i32,
+            y: cy - lbl_h - (2.0 * s).round() as i32,
+            w: rst_w,
+            h: rst_h,
+            hit: HeaderFooterHit::ResetFields,
+        });
         cy += row_h as i32 + sec_gap;
 
         // 2. Page Range (All / Custom + input)
@@ -374,15 +403,18 @@ impl<'a> PdfViewerApp<'a> {
         let avail_w = layout.left_w.saturating_sub((48.0 * s).round() as u32).max(80);
         let avail_h = layout.mh.saturating_sub((104.0 * s).round() as u32).max(80);
 
-        // Ensure preview page bitmap is cached
+        // Ensure preview page bitmap is cached for current page and modal viewport size
         let need_render = self.header_footer_modal.as_ref().is_some_and(|m| {
-            m.preview_cache.as_ref().map(|c| c.0) != Some(m.preview_page)
+            m.preview_cache
+                .as_ref()
+                .map(|c| (c.0, c.1, c.2))
+                != Some((m.preview_page, avail_w, avail_h))
         });
         if need_render {
             let p_idx = self.header_footer_modal.as_ref().unwrap().preview_page;
             if let Some((rw, rh, px)) = self.render_doc_tool_preview_page(p_idx, avail_w, avail_h) {
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    m.preview_cache = Some((p_idx, rw, rh, px));
+                    m.preview_cache = Some((p_idx, avail_w, avail_h, rw, rh, px));
                 }
             }
         }
@@ -407,7 +439,7 @@ impl<'a> PdfViewerApp<'a> {
         stroke_rounded_rect(buffer, buf_w, buf_h, layout.mx, layout.my, layout.mw, layout.mh, rad, theme.border_subtle);
 
         // Left pane: Live Page Preview with real-time Header/Footer overlay!
-        if let Some((_, rw, rh, ref pixels)) = m.preview_cache {
+        if let Some((_, _, _, rw, rh, ref pixels)) = m.preview_cache {
             let sx = layout.mx + ((layout.left_w.saturating_sub(rw)) / 2) as i32;
             let sy = layout.my + (20.0 * s).round() as i32 + ((avail_h.saturating_sub(rh)) / 2) as i32;
             draw_soft_shadow(buffer, buf_w, buf_h, sx, sy, rw, rh, 2.0, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
@@ -432,7 +464,6 @@ impl<'a> PdfViewerApp<'a> {
             let band_h = (55.0 * px_per_pt).round().max(10.0) as u32;
             if m.replace_existing && m.profile.has_header() {
                 fill_rect_clipped(buffer, buf_w, buf_h, sx + 1, sy + 1, rw.saturating_sub(2), band_h.min(rh), 0x00FF_FFFF);
-                // Subtle dashed guide line showing header zone
                 fill_rect_clipped(buffer, buf_w, buf_h, sx + 4, sy + band_h as i32, rw.saturating_sub(8), 1, 0x00BF_DBFE);
             }
             if m.replace_existing && m.profile.has_footer() {
@@ -479,6 +510,7 @@ impl<'a> PdfViewerApp<'a> {
         let title_sz = (14.0 * s).clamp(11.0, 22.0);
         let lbl_sz = (10.5 * s).clamp(9.0, 17.0);
         let body_sz = (11.5 * s).clamp(9.5, 18.0);
+        let small_sz = (10.0 * s).clamp(8.5, 16.0);
         let lbl_h = (15.0 * s).round() as i32;
         let pill_rad = (5.0 * s).clamp(3.0, 8.0);
         let ic_sz = (11.0 * s).round() as u32;
@@ -517,28 +549,44 @@ impl<'a> PdfViewerApp<'a> {
 
         let draw_input = |buffer: &mut [u32], r: ModalBox<HeaderFooterHit>, field: HfField, val: &str, placeholder: &str| {
             let focused = m.focused_field == field;
-            fill_rounded_rect(buffer, buf_w, buf_h, r.x, r.y, r.w, r.h, pill_rad, theme.surface_bg);
+            let sel = focused && m.select_all && !val.is_empty();
+            let bg = if sel { theme.accent_soft_bg } else { theme.surface_bg };
+            fill_rounded_rect(buffer, buf_w, buf_h, r.x, r.y, r.w, r.h, pill_rad, bg);
             stroke_rounded_rect(buffer, buf_w, buf_h, r.x, r.y, r.w, r.h, pill_rad, if focused { theme.accent } else { theme.input_border });
             let show = if val.is_empty() && !focused {
                 placeholder.to_string()
-            } else if focused {
+            } else if focused && !sel {
                 format!("{val}|")
             } else {
                 val.to_string()
             };
-            let fg = if val.is_empty() && !focused { theme.text_muted } else { theme.text_primary };
+            let fg = if val.is_empty() && !focused {
+                theme.text_muted
+            } else if sel {
+                theme.accent_soft_fg
+            } else {
+                theme.text_primary
+            };
             let clipped = truncate_ellipsis(&show, (r.w as f32 - 10.0).max(12.0), body_sz, false);
             draw_text_vcenter(buffer, buf_w, buf_h, r.x + 6, r.y, r.h, r.x + r.w as i32 - 4, &clipped, body_sz, fg, false);
         };
 
-        // 1. Style Profiles
+        // 1. Style Profiles + Reset Fields
         if let Some(r) = find(HeaderFooterHit::ProfilePrev) {
             let p_lbl = format!("Saved Style Profiles ({})", self.hf_profiles.len());
             draw_text(buffer, buf_w, buf_h, ix, r.y - lbl_h, &p_lbl, lbl_sz, theme.text_muted, true);
             draw_pill(buffer, r, "<", false);
         }
+        if let Some(r) = find(HeaderFooterHit::ResetFields) {
+            let hov = self.hovered_widget == Some(UiHit::HeaderFooter(r.hit));
+            fill_rounded_rect(buffer, buf_w, buf_h, r.x, r.y, r.w, r.h, (4.0 * s).max(3.0), if hov { theme.hover_bg } else { theme.surface_elevated });
+            stroke_rounded_rect(buffer, buf_w, buf_h, r.x, r.y, r.w, r.h, (4.0 * s).max(3.0), theme.border_subtle);
+            let txt = "Reset Fields";
+            let tw = measure_text(txt, small_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, r.x + ((r.w as f32 - tw) * 0.5).round() as i32, r.y, r.h, r.x + r.w as i32 - 2, txt, small_sz, theme.text_secondary, false);
+        }
         if let Some(r) = find(HeaderFooterHit::FocusField(HfField::ProfileName)) {
-            draw_input(buffer, r, HfField::ProfileName, &m.profile.name, "Profile name");
+            draw_input(buffer, r, HfField::ProfileName, &m.profile.name, "Profile name...");
         }
         if let Some(r) = find(HeaderFooterHit::ProfileNext) {
             draw_pill(buffer, r, ">", false);
@@ -640,11 +688,19 @@ impl<'a> PdfViewerApp<'a> {
             draw_pill(buffer, r, "Clear Both", false);
         }
 
-        // Error message if any
-        if let Some(ref err) = m.error_msg {
+        // Inline status/error message banner right above Apply/Cancel (always visible inside modal!)
+        if let Some((ref msg, is_err)) = m.status_msg {
             if let Some(ap) = find(HeaderFooterHit::Apply) {
-                draw_text(buffer, buf_w, buf_h, ix, ap.y - (18.0 * s).round() as i32, err, lbl_sz, theme.danger, false);
+                let col = if is_err { theme.danger } else { theme.success };
+                let max_w = (layout.panel_w.saturating_sub((p * 2) as u32)) as f32;
+                let clipped = truncate_ellipsis(msg, max_w, lbl_sz, true);
+                draw_text(buffer, buf_w, buf_h, ix, ap.y - (20.0 * s).round() as i32, &clipped, lbl_sz, col, true);
             }
+        } else if let Some(ap) = find(HeaderFooterHit::Apply) {
+            let hint = "Tip: Ctrl+A selects all, Delete clears focused field";
+            let max_w = (layout.panel_w.saturating_sub((p * 2) as u32)) as f32;
+            let clipped = truncate_ellipsis(hint, max_w, small_sz, false);
+            draw_text(buffer, buf_w, buf_h, ix, ap.y - (18.0 * s).round() as i32, &clipped, small_sz, theme.text_muted, false);
         }
 
         // Primary Apply & Cancel buttons
@@ -680,57 +736,121 @@ impl<'a> PdfViewerApp<'a> {
                     m.preview_page = (m.preview_page + 1).min(total.saturating_sub(1));
                 }
             }
+            HeaderFooterHit::ResetFields => {
+                if let Some(m) = self.header_footer_modal.as_mut() {
+                    let mut blank = HeaderFooterProfile::default();
+                    blank.name.clear();
+                    m.profile = blank;
+                    m.selected_profile_idx = None;
+                    m.select_all = false;
+                    m.status_msg = Some(("Cleared all text fields.".to_string(), false));
+                }
+            }
             HeaderFooterHit::ProfilePrev | HeaderFooterHit::ProfileNext => {
-                if !self.hf_profiles.is_empty() {
+                if self.hf_profiles.is_empty() {
                     if let Some(m) = self.header_footer_modal.as_mut() {
-                        let len = self.hf_profiles.len();
-                        let next_idx = match m.selected_profile_idx {
-                            None => 0,
-                            Some(i) if hit == HeaderFooterHit::ProfileNext => (i + 1) % len,
-                            Some(i) => (i + len - 1) % len,
-                        };
-                        m.selected_profile_idx = Some(next_idx);
-                        m.profile = self.hf_profiles[next_idx].clone();
-                        m.error_msg = None;
+                        m.status_msg = Some(("No saved profiles yet — enter a name and click Save.".to_string(), true));
                     }
+                } else if let Some(m) = self.header_footer_modal.as_mut() {
+                    let len = self.hf_profiles.len();
+                    let next_idx = match m.selected_profile_idx {
+                        None => 0,
+                        Some(i) if hit == HeaderFooterHit::ProfileNext => (i + 1) % len,
+                        Some(i) => (i + len - 1) % len,
+                    };
+                    m.selected_profile_idx = Some(next_idx);
+                    m.profile = self.hf_profiles[next_idx].clone();
+                    m.select_all = false;
+                    m.status_msg = Some((
+                        format!("Loaded profile '{}' ({}/{})", m.profile.name, next_idx + 1, len),
+                        false,
+                    ));
                 }
             }
             HeaderFooterHit::ProfileSave => {
+                let mut saved_name: Option<String> = None;
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    let name = m.profile.name.trim().to_string();
+                    let mut name = m.profile.name.trim().to_string();
                     if name.is_empty() {
-                        m.error_msg = Some("Enter a profile name to save.".to_string());
-                    } else {
-                        m.profile.name = name.clone();
-                        if let Some(pos) = self.hf_profiles.iter().position(|p| p.name.eq_ignore_ascii_case(&name)) {
-                            self.hf_profiles[pos] = m.profile.clone();
-                            m.selected_profile_idx = Some(pos);
-                        } else {
-                            self.hf_profiles.push(m.profile.clone());
-                            m.selected_profile_idx = Some(self.hf_profiles.len() - 1);
+                        let mut n = self.hf_profiles.len() + 1;
+                        while self
+                            .hf_profiles
+                            .iter()
+                            .any(|p| p.name.eq_ignore_ascii_case(&format!("Profile {n}")))
+                        {
+                            n += 1;
                         }
-                        self.last_hf_profile = m.profile.clone();
-                        self.status_notice = Some(format!("Saved Header/Footer profile '{name}' to micropdf.ini"));
-                        m.error_msg = None;
-                        self.save_session_to_ini();
+                        name = format!("Profile {n}");
                     }
+                    m.profile.name = name.clone();
+                    if let Some(pos) = self
+                        .hf_profiles
+                        .iter()
+                        .position(|p| p.name.eq_ignore_ascii_case(&name))
+                    {
+                        self.hf_profiles[pos] = m.profile.clone();
+                        m.selected_profile_idx = Some(pos);
+                    } else {
+                        self.hf_profiles.push(m.profile.clone());
+                        m.selected_profile_idx = Some(self.hf_profiles.len() - 1);
+                    }
+                    m.select_all = false;
+                    m.status_msg = Some((
+                        format!("Saved profile '{}' ({} saved)", name, self.hf_profiles.len()),
+                        false,
+                    ));
+                    saved_name = Some(name);
+                }
+                if let Some(name) = saved_name {
+                    self.status_notice = Some(format!("Saved Header/Footer profile '{name}' to micropdf.ini"));
+                    self.save_session_to_ini();
                 }
             }
             HeaderFooterHit::ProfileDelete => {
+                let mut deleted_name: Option<String> = None;
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    if let Some(idx) = m.selected_profile_idx {
-                        if idx < self.hf_profiles.len() {
-                            let removed = self.hf_profiles.remove(idx);
-                            m.selected_profile_idx = None;
-                            self.status_notice = Some(format!("Deleted profile '{}'", removed.name));
-                            self.save_session_to_ini();
-                        }
+                    let target_idx = m
+                        .selected_profile_idx
+                        .filter(|&i| i < self.hf_profiles.len())
+                        .or_else(|| {
+                            let typed = m.profile.name.trim();
+                            if typed.is_empty() {
+                                None
+                            } else {
+                                self.hf_profiles
+                                    .iter()
+                                    .position(|p| p.name.eq_ignore_ascii_case(typed))
+                            }
+                        });
+                    if let Some(idx) = target_idx {
+                        let removed = self.hf_profiles.remove(idx);
+                        let mut blank = HeaderFooterProfile::default();
+                        blank.name.clear();
+                        m.profile = blank;
+                        m.selected_profile_idx = None;
+                        m.select_all = false;
+                        m.status_msg = Some((
+                            format!("Deleted profile '{}' ({} remaining)", removed.name, self.hf_profiles.len()),
+                            false,
+                        ));
+                        deleted_name = Some(removed.name);
+                    } else {
+                        m.status_msg = Some((
+                            "Select a saved profile using < > first to delete.".to_string(),
+                            true,
+                        ));
                     }
+                }
+                if let Some(name) = deleted_name {
+                    self.last_hf_profile = HeaderFooterProfile::default();
+                    self.status_notice = Some(format!("Deleted Header/Footer profile '{name}'"));
+                    self.save_session_to_ini();
                 }
             }
             HeaderFooterHit::FocusField(f) => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
                     m.focused_field = f;
+                    m.select_all = false;
                     if f == HfField::CustomRange {
                         m.all_pages = false;
                     }
@@ -739,13 +859,14 @@ impl<'a> PdfViewerApp<'a> {
             HeaderFooterHit::ScopeAll => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
                     m.all_pages = true;
-                    m.error_msg = None;
+                    m.status_msg = None;
                 }
             }
             HeaderFooterHit::ScopeCustom => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
                     m.all_pages = false;
                     m.focused_field = HfField::CustomRange;
+                    m.select_all = false;
                 }
             }
             HeaderFooterHit::FontMinus => {
@@ -786,7 +907,7 @@ impl<'a> PdfViewerApp<'a> {
                 let pages = match self.resolve_hf_pages() {
                     Ok(p) => p,
                     Err(msg) => {
-                        if let Some(m) = self.header_footer_modal.as_mut() { m.error_msg = Some(msg); }
+                        if let Some(m) = self.header_footer_modal.as_mut() { m.status_msg = Some((msg, true)); }
                         self.request_redraw();
                         return;
                     }
@@ -818,21 +939,22 @@ impl<'a> PdfViewerApp<'a> {
                     Ok(()) => {
                         self.has_unsaved_edits = true;
                         self.invalidate_page_caches();
-                        if let Some(m) = self.header_footer_modal.as_mut() {
-                            m.preview_cache = None;
-                            m.error_msg = None;
-                        }
                         let what = match hit {
                             HeaderFooterHit::ClearHeader => "Headers",
                             HeaderFooterHit::ClearFooter => "Footers",
                             _ => "Headers & Footers",
                         };
-                        self.status_notice = Some(format!("Cleared existing {what} on {} page(s)", pages.len()));
+                        let done_msg = format!("Cleared existing {what} on {} page(s)", pages.len());
+                        if let Some(m) = self.header_footer_modal.as_mut() {
+                            m.preview_cache = None;
+                            m.status_msg = Some((done_msg.clone(), false));
+                        }
+                        self.status_notice = Some(done_msg);
                         self.update_title_bar();
                     }
                     Err(e) => {
                         if let Some(m) = self.header_footer_modal.as_mut() {
-                            m.error_msg = Some(format!("Clear failed: {e}"));
+                            m.status_msg = Some((format!("Clear failed: {e}"), true));
                         }
                     }
                 }
@@ -860,7 +982,7 @@ impl<'a> PdfViewerApp<'a> {
         let pages = match self.resolve_hf_pages() {
             Ok(p) => p,
             Err(msg) => {
-                if let Some(m) = self.header_footer_modal.as_mut() { m.error_msg = Some(msg); }
+                if let Some(m) = self.header_footer_modal.as_mut() { m.status_msg = Some((msg, true)); }
                 self.request_redraw();
                 return;
             }
@@ -874,7 +996,7 @@ impl<'a> PdfViewerApp<'a> {
         };
         if !profile.has_header() && !profile.has_footer() {
             if let Some(m) = self.header_footer_modal.as_mut() {
-                m.error_msg = Some("Enter header/footer text or use Clear buttons.".to_string());
+                m.status_msg = Some(("Enter header/footer text or use Clear buttons.".to_string(), true));
             }
             self.request_redraw();
             return;
@@ -900,7 +1022,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             Err(e) => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    m.error_msg = Some(format!("Failed: {e}"));
+                    m.status_msg = Some((format!("Failed: {e}"), true));
                 }
             }
         }
@@ -919,10 +1041,14 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.open_menu = None;
         self.show_help_overlay = false;
+        self.show_bookmark_format_overlay = false;
         self.show_about_overlay = false;
         self.show_customize_toolbar = false;
         self.show_notifications = false;
         self.show_reading_mode_popover = false;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
         self.print_preview = None;
         self.combine_modal = None;
         self.header_footer_modal = None;
@@ -930,17 +1056,18 @@ impl<'a> PdfViewerApp<'a> {
         self.page_number_modal = Some(PageNumberModalState::new(
             self.current_page_index,
             self.roman_end,
+            self.skip_pages,
         ));
         self.request_redraw();
     }
 
     fn layout_page_number_modal(&self, buf_w: u32, buf_h: u32, sf: f64) -> SplitModalLayout<PageNumberHit> {
         let s = sf as f32;
-        let mw = ((860.0 * s).round() as u32).min(buf_w.saturating_sub(28));
-        let mh = ((570.0 * s).round() as u32).min(buf_h.saturating_sub(28));
+        let mw = ((940.0 * s).round() as u32).min(buf_w.saturating_sub(28));
+        let mh = ((625.0 * s).round() as u32).min(buf_h.saturating_sub(28));
         let mx = (buf_w.saturating_sub(mw) / 2) as i32;
         let my = (buf_h.saturating_sub(mh) / 2) as i32;
-        let panel_w = ((340.0 * s).round() as u32).min(mw.saturating_sub(200));
+        let panel_w = ((405.0 * s).round() as u32).min(mw.saturating_sub(200));
         let left_w = mw.saturating_sub(panel_w);
         let panel_x = mx + left_w as i32;
 
@@ -952,10 +1079,10 @@ impl<'a> PdfViewerApp<'a> {
         let lbl_h = (15.0 * s).round() as i32;
         let sec_gap = (9.0 * s).round() as i32;
 
-        let mut hits = Vec::with_capacity(24);
+        let mut hits = Vec::with_capacity(28);
 
         // Left pane bottom page stepper
-        let step_w = (220.0 * s).round().min(left_w as f32 - 24.0) as u32;
+        let step_w = (250.0 * s).round().min(left_w as f32 - 24.0) as u32;
         let step_h = (28.0 * s).round() as u32;
         let step_x = mx + ((left_w.saturating_sub(step_w)) / 2) as i32;
         let step_y = my + mh as i32 - (44.0 * s).round() as i32;
@@ -967,7 +1094,7 @@ impl<'a> PdfViewerApp<'a> {
         let col3 = (iw.saturating_sub((gap * 2) as u32)) / 3;
         let col3_last = iw.saturating_sub(col3 * 2 + (gap * 2) as u32);
 
-        // 1. Position (2×3 grid)
+        // 1. Position (2×3 grid — wide enough for full "Bottom Left / Bottom Center / Bottom Right")
         cy += lbl_h;
         hits.push(ModalBox { x: ix, y: cy, w: col3, h: row_h, hit: PageNumberHit::Pos(MarginPosition::HeaderLeft) });
         hits.push(ModalBox { x: ix + col3 as i32 + gap, y: cy, w: col3, h: row_h, hit: PageNumberHit::Pos(MarginPosition::HeaderCenter) });
@@ -989,26 +1116,33 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(ModalBox { x: ix + half_w as i32 + gap, y: cy, w: iw.saturating_sub(half_w + gap as u32), h: row_h, hit: PageNumberHit::Format(PageNumberFormat::Dashed) });
         cy += row_h as i32 + sec_gap;
 
-        // 3. Roman Front-Matter & Font Size row
+        // 3. Skip Front Pages (Cover/Pictures) & Roman Front-Matter row (both clickable to type digits!)
         cy += lbl_h;
         let sm_btn = (26.0 * s).round() as u32;
-        hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::RomanMinus });
-        hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::RomanPlus });
-        let fx = ix + half_w as i32 + gap;
-        hits.push(ModalBox { x: fx, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontMinus });
-        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPlus });
+        let mid_w = half_w.saturating_sub(sm_btn * 2 + 4);
+        hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::SkipMinus });
+        hits.push(ModalBox { x: ix + sm_btn as i32 + 2, y: cy, w: mid_w, h: row_h, hit: PageNumberHit::FocusSkip });
+        hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::SkipPlus });
+        let rx = ix + half_w as i32 + gap;
+        let r_half = iw.saturating_sub(half_w + gap as u32);
+        let r_mid_w = r_half.saturating_sub(sm_btn * 2 + 4);
+        hits.push(ModalBox { x: rx, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::RomanMinus });
+        hits.push(ModalBox { x: rx + sm_btn as i32 + 2, y: cy, w: r_mid_w, h: row_h, hit: PageNumberHit::FocusRoman });
+        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::RomanPlus });
         cy += row_h as i32 + sec_gap;
 
-        // 4. Text Color
+        // 4. Font Size row
+        cy += lbl_h;
+        hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontMinus });
+        hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPlus });
+        cy += row_h as i32 + sec_gap;
+
+        // 5. Text Color
         cy += lbl_h;
         hits.push(ModalBox { x: ix, y: cy, w: col3, h: row_h, hit: PageNumberHit::ColorGray });
         hits.push(ModalBox { x: ix + col3 as i32 + gap, y: cy, w: col3, h: row_h, hit: PageNumberHit::ColorBlack });
         hits.push(ModalBox { x: ix + (col3 as i32 + gap) * 2, y: cy, w: col3_last, h: row_h, hit: PageNumberHit::ColorNavy });
-        cy += row_h as i32 + sec_gap;
-
-        // 5. Skip Page 1 toggle
-        hits.push(ModalBox { x: ix, y: cy, w: iw, h: row_h, hit: PageNumberHit::ToggleSkipFirst });
-        cy += row_h as i32 + sec_gap;
+        cy += row_h as i32 + sec_gap + (4.0 * s).round() as i32;
 
         // 6. Clear Existing Page Numbers
         hits.push(ModalBox { x: ix, y: cy, w: iw, h: row_h, hit: PageNumberHit::ClearExisting });
@@ -1016,7 +1150,7 @@ impl<'a> PdfViewerApp<'a> {
         // Bottom Apply & Cancel
         let foot_h = (32.0 * s).round() as u32;
         let foot_y = my + mh as i32 - p - foot_h as i32;
-        let cancel_w = (80.0 * s).round() as u32;
+        let cancel_w = (84.0 * s).round() as u32;
         let apply_w = iw.saturating_sub(cancel_w + gap as u32);
         hits.push(ModalBox { x: ix, y: foot_y, w: apply_w, h: foot_h, hit: PageNumberHit::Apply });
         hits.push(ModalBox { x: ix + apply_w as i32 + gap, y: foot_y, w: cancel_w, h: foot_h, hit: PageNumberHit::Cancel });
@@ -1049,13 +1183,16 @@ impl<'a> PdfViewerApp<'a> {
         let avail_h = layout.mh.saturating_sub((104.0 * s).round() as u32).max(80);
 
         let need_render = self.page_number_modal.as_ref().is_some_and(|m| {
-            m.preview_cache.as_ref().map(|c| c.0) != Some(m.preview_page)
+            m.preview_cache
+                .as_ref()
+                .map(|c| (c.0, c.1, c.2))
+                != Some((m.preview_page, avail_w, avail_h))
         });
         if need_render {
             let p_idx = self.page_number_modal.as_ref().unwrap().preview_page;
             if let Some((rw, rh, px)) = self.render_doc_tool_preview_page(p_idx, avail_w, avail_h) {
                 if let Some(m) = self.page_number_modal.as_mut() {
-                    m.preview_cache = Some((p_idx, rw, rh, px));
+                    m.preview_cache = Some((p_idx, avail_w, avail_h, rw, rh, px));
                 }
             }
         }
@@ -1080,7 +1217,7 @@ impl<'a> PdfViewerApp<'a> {
         stroke_rounded_rect(buffer, buf_w, buf_h, layout.mx, layout.my, layout.mw, layout.mh, rad, theme.border_subtle);
 
         // Left pane live preview + live formatted page number badge
-        if let Some((_, rw, rh, ref pixels)) = m.preview_cache {
+        if let Some((_, _, _, rw, rh, ref pixels)) = m.preview_cache {
             let sx = layout.mx + ((layout.left_w.saturating_sub(rw)) / 2) as i32;
             let sy = layout.my + (20.0 * s).round() as i32 + ((avail_h.saturating_sub(rh)) / 2) as i32;
             draw_soft_shadow(buffer, buf_w, buf_h, sx, sy, rw, rh, 2.0, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
@@ -1121,7 +1258,6 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     sy + rh as i32 - edge_px - preview_fs.ceil() as i32
                 };
-                // Subtle highlight box so user immediately spots the new page number placement
                 fill_rounded_rect(buffer, buf_w, buf_h, tx - 5, ty - 3, tw.ceil() as u32 + 10, preview_fs.ceil() as u32 + 6, 3.0, 0x00EF_F6FF);
                 stroke_rounded_rect(buffer, buf_w, buf_h, tx - 5, ty - 3, tw.ceil() as u32 + 10, preview_fs.ceil() as u32 + 6, 3.0, theme.accent);
                 draw_text(buffer, buf_w, buf_h, tx, ty, &label, preview_fs, m.config.color.ui_rgb(), false);
@@ -1131,6 +1267,7 @@ impl<'a> PdfViewerApp<'a> {
         let title_sz = (14.0 * s).clamp(11.0, 22.0);
         let lbl_sz = (10.5 * s).clamp(9.0, 17.0);
         let body_sz = (11.5 * s).clamp(9.5, 18.0);
+        let small_sz = (10.0 * s).clamp(8.5, 16.0);
         let lbl_h = (15.0 * s).round() as i32;
         let pill_rad = (5.0 * s).clamp(3.0, 8.0);
         let ic_sz = (11.0 * s).round() as u32;
@@ -1190,16 +1327,54 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
-        // 3. Roman Front-Matter & Font Size
-        if let (Some(rm), Some(rp)) = (find(PageNumberHit::RomanMinus), find(PageNumberHit::RomanPlus)) {
+        // 3. Skip Front Pages & Roman Front-Matter (clickable boxes support direct digit entry!)
+        if let (Some(sm), Some(sf_box), Some(sp)) = (
+            find(PageNumberHit::SkipMinus),
+            find(PageNumberHit::FocusSkip),
+            find(PageNumberHit::SkipPlus),
+        ) {
+            draw_text(buffer, buf_w, buf_h, sm.x, sm.y - lbl_h, "Skip Front Pages", lbl_sz, theme.text_muted, true);
+            draw_pill(buffer, sm, "-", false);
+            draw_pill(buffer, sp, "+", false);
+            let focused = m.focused_numeric == Some(PnNumericFocus::SkipPages);
+            fill_rounded_rect(buffer, buf_w, buf_h, sf_box.x, sf_box.y, sf_box.w, sf_box.h, pill_rad, theme.surface_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, sf_box.x, sf_box.y, sf_box.w, sf_box.h, pill_rad, if focused { theme.accent } else { theme.input_border });
+            let txt = if focused {
+                format!("{}|", m.config.skip_pages)
+            } else if m.config.skip_pages == 0 {
+                "0 (None)".to_string()
+            } else if m.config.skip_pages == 1 {
+                "1 page".to_string()
+            } else {
+                format!("{} pages", m.config.skip_pages)
+            };
+            let tw = measure_text(&txt, body_sz, true);
+            draw_text_vcenter(buffer, buf_w, buf_h, sf_box.x + ((sf_box.w as f32 - tw) * 0.5).round() as i32, sf_box.y, sf_box.h, sf_box.x + sf_box.w as i32 - 2, &txt, body_sz, theme.text_primary, true);
+        }
+        if let (Some(rm), Some(rf_box), Some(rp)) = (
+            find(PageNumberHit::RomanMinus),
+            find(PageNumberHit::FocusRoman),
+            find(PageNumberHit::RomanPlus),
+        ) {
             draw_text(buffer, buf_w, buf_h, rm.x, rm.y - lbl_h, "Roman Pages (i, ii...)", lbl_sz, theme.text_muted, true);
             draw_pill(buffer, rm, "-", false);
             draw_pill(buffer, rp, "+", false);
-            let txt = if m.config.roman_end == 0 { "None".to_string() } else { format!("1-{}", m.config.roman_end) };
-            let tw = measure_text(&txt, body_sz, true);
-            let cx = rm.x + rm.w as i32 + (((rp.x - (rm.x + rm.w as i32)) as f32 - tw) * 0.5).round() as i32;
-            draw_text_vcenter(buffer, buf_w, buf_h, cx, rm.y, rm.h, rp.x, &txt, body_sz, theme.text_primary, true);
+            let focused = m.focused_numeric == Some(PnNumericFocus::RomanPages);
+            fill_rounded_rect(buffer, buf_w, buf_h, rf_box.x, rf_box.y, rf_box.w, rf_box.h, pill_rad, theme.surface_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, rf_box.x, rf_box.y, rf_box.w, rf_box.h, pill_rad, if focused { theme.accent } else { theme.input_border });
+            let txt = if focused {
+                format!("{}|", m.config.roman_end)
+            } else if m.config.roman_end == 0 {
+                "0 (None)".to_string()
+            } else {
+                format!("{} (i–{})", m.config.roman_end, PdfEngine::to_roman(m.config.roman_end))
+            };
+            let clipped = truncate_ellipsis(&txt, (rf_box.w as f32 - 6.0).max(16.0), body_sz, true);
+            let tw = measure_text(&clipped, body_sz, true);
+            draw_text_vcenter(buffer, buf_w, buf_h, rf_box.x + ((rf_box.w as f32 - tw) * 0.5).round() as i32, rf_box.y, rf_box.h, rf_box.x + rf_box.w as i32 - 2, &clipped, body_sz, theme.text_primary, true);
         }
+
+        // 4. Font Size
         if let (Some(fm), Some(fp)) = (find(PageNumberHit::FontMinus), find(PageNumberHit::FontPlus)) {
             draw_text(buffer, buf_w, buf_h, fm.x, fm.y - lbl_h, "Font Size", lbl_sz, theme.text_muted, true);
             draw_pill(buffer, fm, "-", false);
@@ -1208,9 +1383,20 @@ impl<'a> PdfViewerApp<'a> {
             let tw = measure_text(&txt, body_sz, true);
             let cx = fm.x + fm.w as i32 + (((fp.x - (fm.x + fm.w as i32)) as f32 - tw) * 0.5).round() as i32;
             draw_text_vcenter(buffer, buf_w, buf_h, cx, fm.y, fm.h, fp.x, &txt, body_sz, theme.text_primary, true);
+            // Live summary on right half of the Font Size row
+            let sum_x = fp.x + fp.w as i32 + (12.0 * s).round() as i32;
+            let first_arabic = m.config.skip_pages + m.config.roman_end + 1;
+            let summary = if first_arabic <= total {
+                format!("Body p.1 starts at sheet #{first_arabic}")
+            } else {
+                "All pages skipped/Roman".to_string()
+            };
+            let max_sw = (layout.panel_x + layout.panel_w as i32 - p - sum_x).max(40) as f32;
+            let clip_sum = truncate_ellipsis(&summary, max_sw, small_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, sum_x, fm.y, fm.h, layout.panel_x + layout.panel_w as i32 - p, &clip_sum, small_sz, theme.text_muted, false);
         }
 
-        // 4. Color
+        // 5. Color
         if let Some(r) = find(PageNumberHit::ColorGray) {
             draw_text(buffer, buf_w, buf_h, ix, r.y - lbl_h, "Text Color", lbl_sz, theme.text_muted, true);
             draw_pill(buffer, r, HeaderFooterColor::Gray.label(), m.config.color == HeaderFooterColor::Gray);
@@ -1222,19 +1408,19 @@ impl<'a> PdfViewerApp<'a> {
             draw_pill(buffer, r, HeaderFooterColor::Navy.label(), m.config.color == HeaderFooterColor::Navy);
         }
 
-        // 5. Skip Page 1
-        if let Some(r) = find(PageNumberHit::ToggleSkipFirst) {
-            let txt = if m.config.skip_first_page {
-                "✓ Skip First Page (Cover Page)"
-            } else {
-                "Skip First Page (Cover Page)"
-            };
-            draw_pill(buffer, r, txt, m.config.skip_first_page);
-        }
-
         // 6. Clear existing page numbers
         if let Some(r) = find(PageNumberHit::ClearExisting) {
             draw_pill(buffer, r, "Clear Existing Page Numbers", false);
+        }
+
+        // Inline status banner
+        if let Some((ref msg, is_err)) = m.status_msg {
+            if let Some(ap) = find(PageNumberHit::Apply) {
+                let col = if is_err { theme.danger } else { theme.success };
+                let max_w = (layout.panel_w.saturating_sub((p * 2) as u32)) as f32;
+                let clipped = truncate_ellipsis(msg, max_w, lbl_sz, true);
+                draw_text(buffer, buf_w, buf_h, ix, ap.y - (20.0 * s).round() as i32, &clipped, lbl_sz, col, true);
+            }
         }
 
         // Apply & Cancel
@@ -1271,10 +1457,36 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             PageNumberHit::Pos(pos) => {
-                if let Some(m) = self.page_number_modal.as_mut() { m.config.position = pos; }
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.position = pos;
+                    m.focused_numeric = None;
+                }
             }
             PageNumberHit::Format(fmt) => {
-                if let Some(m) = self.page_number_modal.as_mut() { m.config.format = fmt; }
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.format = fmt;
+                    m.focused_numeric = None;
+                }
+            }
+            PageNumberHit::FocusSkip => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.focused_numeric = Some(PnNumericFocus::SkipPages);
+                }
+            }
+            PageNumberHit::FocusRoman => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.focused_numeric = Some(PnNumericFocus::RomanPages);
+                }
+            }
+            PageNumberHit::SkipMinus => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.skip_pages = m.config.skip_pages.saturating_sub(1);
+                }
+            }
+            PageNumberHit::SkipPlus => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.skip_pages = (m.config.skip_pages + 1).min(total.saturating_sub(1));
+                }
             }
             PageNumberHit::RomanMinus => {
                 if let Some(m) = self.page_number_modal.as_mut() {
@@ -1283,12 +1495,8 @@ impl<'a> PdfViewerApp<'a> {
             }
             PageNumberHit::RomanPlus => {
                 if let Some(m) = self.page_number_modal.as_mut() {
-                    m.config.roman_end = (m.config.roman_end + 1).min(total);
-                }
-            }
-            PageNumberHit::ToggleSkipFirst => {
-                if let Some(m) = self.page_number_modal.as_mut() {
-                    m.config.skip_first_page = !m.config.skip_first_page;
+                    let max_r = total.saturating_sub(m.config.skip_pages);
+                    m.config.roman_end = (m.config.roman_end + 1).min(max_r);
                 }
             }
             PageNumberHit::FontMinus => {
@@ -1325,7 +1533,10 @@ impl<'a> PdfViewerApp<'a> {
                 if res.is_ok() {
                     self.has_unsaved_edits = true;
                     self.invalidate_page_caches();
-                    if let Some(m) = self.page_number_modal.as_mut() { m.preview_cache = None; }
+                    if let Some(m) = self.page_number_modal.as_mut() {
+                        m.preview_cache = None;
+                        m.status_msg = Some(("Cleared existing page numbers.".to_string(), false));
+                    }
                     self.status_notice = Some("Cleared existing page numbers".to_string());
                     self.update_title_bar();
                 }
@@ -1351,6 +1562,7 @@ impl<'a> PdfViewerApp<'a> {
         match res {
             Ok(()) => {
                 self.roman_end = cfg.roman_end as usize;
+                self.skip_pages = cfg.skip_pages as usize;
                 self.has_unsaved_edits = true;
                 self.page_number_modal = None;
                 self.invalidate_page_caches();
@@ -1362,7 +1574,9 @@ impl<'a> PdfViewerApp<'a> {
                 self.update_title_bar();
             }
             Err(e) => {
-                self.status_notice = Some(format!("Page Numbering failed: {e}"));
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.status_msg = Some((format!("Page Numbering failed: {e}"), true));
+                }
             }
         }
         self.request_redraw();

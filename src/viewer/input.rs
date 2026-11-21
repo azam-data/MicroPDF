@@ -698,6 +698,39 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    /// Reads plain UTF-8 text from the OS system clipboard without external crate dependencies.
+    pub(super) fn read_text_from_os_clipboard() -> anyhow::Result<String> {
+        use std::process::Command;
+
+        #[cfg(target_os = "macos")]
+        let out = Command::new("pbpaste").output()?;
+
+        #[cfg(target_os = "windows")]
+        let out = {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            Command::new("powershell")
+                .args(["-NoProfile", "-Command", "Get-Clipboard"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()?
+        };
+
+        #[cfg(target_os = "linux")]
+        let out = Command::new("wl-paste")
+            .arg("-n")
+            .output()
+            .or_else(|_| {
+                Command::new("xclip")
+                    .args(["-selection", "clipboard", "-o"])
+                    .output()
+            })?;
+
+        if !out.status.success() {
+            anyhow::bail!("Clipboard read failed with status {}", out.status);
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
     /// Copies `self.selected_text` to the OS clipboard (`Ctrl/Cmd+C`).
     pub(super) fn copy_selected_text_to_clipboard(&mut self) {
         if self.selected_text.is_empty() {
@@ -1182,27 +1215,56 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    pub(super) fn insert_blank_page_after_current(&mut self) {
+    pub(super) fn insert_blank_pages_at(&mut self, insert_at: u16, count: u16, before: bool) {
+        let count = count.clamp(1, 50);
+        if self.doc.is_none() {
+            return;
+        }
         self.push_undo_snapshot();
         let Some(doc) = self.doc.as_mut() else {
             return;
         };
-        let target_idx = (self.current_page_index + 1).min(doc.pages().len());
-        match PdfEngine::insert_blank_page_in_doc(doc, target_idx) {
+        let clamped_idx = insert_at.min(doc.pages().len());
+        match PdfEngine::insert_blank_pages_in_doc(doc, clamped_idx, count) {
             Ok(inserted_idx) => {
                 self.current_page_index = inserted_idx;
+                self.has_unsaved_edits = true;
                 self.invalidate_page_caches();
                 self.thumbnail_cache.clear();
-                self.status_notice =
-                    Some(format!("Inserted blank A4 page at #{}", inserted_idx + 1));
+                let plural = if count == 1 { "page" } else { "pages" };
+                let where_str = if before {
+                    format!("before Page {}", inserted_idx + 1)
+                } else {
+                    format!("at Page {}", inserted_idx + 1)
+                };
+                self.status_notice = Some(format!("Inserted {count} blank {plural} {where_str}"));
                 self.update_title_bar();
                 self.request_redraw();
             }
             Err(e) => {
-                self.status_notice = Some(format!("Insert failed: {e}"));
+                self.status_notice = Some(format!("Insert blank pages failed: {e}"));
                 self.update_title_bar();
+                self.request_redraw();
             }
         }
+    }
+
+    pub(super) fn insert_blank_page_after_current(&mut self) {
+        let target = if self.view_mode == ViewMode::ThumbnailGrid {
+            self.hovered_thumb.unwrap_or(self.current_page_index)
+        } else {
+            self.current_page_index
+        };
+        self.insert_blank_pages_at(target.saturating_add(1), 1, false);
+    }
+
+    pub(super) fn insert_blank_page_before_current(&mut self) {
+        let target = if self.view_mode == ViewMode::ThumbnailGrid {
+            self.hovered_thumb.unwrap_or(self.current_page_index)
+        } else {
+            self.current_page_index
+        };
+        self.insert_blank_pages_at(target, 1, true);
     }
 
     pub(super) fn merge_pdf_dialog(&mut self) {
@@ -1737,6 +1799,137 @@ impl<'a> PdfViewerApp<'a> {
             }
             Err(e) => {
                 self.status_notice = Some(format!("LaTeX export failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Exports the currently open PDF to a native Microsoft Word (`.docx`) document using pure Rust.
+    pub(super) fn export_docx_dialog(&mut self) {
+        if self.doc.is_none() {
+            self.status_notice = Some("Open a PDF first to export to Word (.docx)".to_string());
+            self.request_redraw();
+            return;
+        }
+        let stem = self
+            .file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document")
+            .to_string();
+        let default_name = format!("{stem}.docx");
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export PDF as Word Document (.docx)")
+            .add_filter("Word Document", &["docx"])
+            .set_file_name(&default_name);
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        let Some(save_path) = dialog.save_file() else {
+            return;
+        };
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let bytes = crate::export::export_document_to_docx(doc, &stem);
+        match std::fs::write(&save_path, &bytes) {
+            Ok(()) => {
+                let fname = save_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("export.docx");
+                self.status_notice = Some(format!(
+                    "Exported Word document to '{fname}' ({} KB)",
+                    (bytes.len() + 1023) / 1024
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Word (.docx) export failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Exports tables and page text from the currently open PDF to an Excel (`.xlsx`) workbook using pure Rust.
+    pub(super) fn export_xlsx_dialog(&mut self) {
+        if self.doc.is_none() {
+            self.status_notice = Some("Open a PDF first to export to Excel (.xlsx)".to_string());
+            self.request_redraw();
+            return;
+        }
+        let stem = self
+            .file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document")
+            .to_string();
+        let default_name = format!("{stem}.xlsx");
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export PDF as Excel Workbook (.xlsx)")
+            .add_filter("Excel Workbook", &["xlsx"])
+            .set_file_name(&default_name);
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        let Some(save_path) = dialog.save_file() else {
+            return;
+        };
+        let Some(doc) = self.doc.as_ref() else {
+            return;
+        };
+        let bytes = crate::export::export_document_to_xlsx(doc);
+        match std::fs::write(&save_path, &bytes) {
+            Ok(()) => {
+                let fname = save_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("export.xlsx");
+                self.status_notice = Some(format!(
+                    "Exported Excel workbook to '{fname}' ({} KB)",
+                    (bytes.len() + 1023) / 1024
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Excel (.xlsx) export failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Saves a ready-to-edit sample bookmark `.txt` template (`Help -> Bookmark Import Format (.txt)`).
+    pub(super) fn save_bookmark_sample_txt_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save Sample Bookmark Import File (.txt)")
+            .add_filter("Text File", &["txt"])
+            .set_file_name("bookmarks_sample.txt");
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        let Some(save_path) = dialog.save_file() else {
+            return;
+        };
+        match std::fs::write(&save_path, super::overlays::BOOKMARK_SAMPLE_TXT.as_bytes()) {
+            Ok(()) => {
+                let fname = save_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("bookmarks_sample.txt");
+                self.show_bookmark_format_overlay = false;
+                self.status_notice = Some(format!(
+                    "Saved sample bookmark template to '{fname}' — edit and press L to import"
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Failed to save sample .txt: {e}"));
             }
         }
         self.update_title_bar();
@@ -2328,15 +2521,21 @@ impl<'a> PdfViewerApp<'a> {
             }
             InputMode::JumpToPage { input } => {
                 let total = self.total_pages() as usize;
-                if let Some(target_idx) =
-                    PdfEngine::resolve_logical_page_str(&input, self.roman_end, total)
-                {
+                if let Some(target_idx) = PdfEngine::resolve_logical_page_str_with_skip(
+                    &input,
+                    self.skip_pages,
+                    self.roman_end,
+                    total,
+                ) {
                     self.push_nav_history();
                     self.current_page_index = target_idx as u16;
                     self.scroll_y = 0.0;
                     self.invalidate_page_caches();
-                    let lbl =
-                        PdfEngine::format_logical_page_label(target_idx, self.roman_end);
+                    let lbl = PdfEngine::format_logical_page_label_with_skip(
+                        target_idx,
+                        self.skip_pages,
+                        self.roman_end,
+                    );
                     self.status_notice = Some(format!(
                         "Jumped to Page {} (Physical {} of {})",
                         lbl,
@@ -2799,6 +2998,58 @@ impl<'a> PdfViewerApp<'a> {
         // 0d. Header & Footer visual modal
         if self.header_footer_modal.is_some() {
             use super::doc_tools_modal::{HeaderFooterHit, HfField};
+            // Ctrl/Cmd + A selects all text in the focused field; Ctrl/Cmd + V pastes clipboard text
+            if self.cmd_or_ctrl_pressed {
+                if let Key::Character(ch) = &logical_key {
+                    let s = ch.as_str();
+                    if s.eq_ignore_ascii_case("a") {
+                        if let Some(m) = self.header_footer_modal.as_mut() {
+                            m.select_all = true;
+                        }
+                        self.request_redraw();
+                        return;
+                    } else if s.eq_ignore_ascii_case("v") {
+                        if let Ok(clip) = Self::read_text_from_os_clipboard() {
+                            let clean: String = clip
+                                .chars()
+                                .map(|c| if c == '\n' || c == '\r' || c == '\t' { ' ' } else { c })
+                                .filter(|c| !c.is_control())
+                                .collect();
+                            if !clean.is_empty() {
+                                if let Some(m) = self.header_footer_modal.as_mut() {
+                                    if m.select_all {
+                                        m.focused_text_mut().clear();
+                                        m.select_all = false;
+                                    }
+                                    match m.focused_field {
+                                        HfField::CustomRange => {
+                                            m.all_pages = false;
+                                            for c in clean.chars() {
+                                                if c.is_ascii_digit() || c == '-' || c == ',' || c == ' ' {
+                                                    m.custom_range.push(c);
+                                                }
+                                            }
+                                        }
+                                        HfField::ProfileName => {
+                                            for c in clean.chars() {
+                                                if c != '|' {
+                                                    m.profile.name.push(c);
+                                                }
+                                            }
+                                        }
+                                        _ => {
+                                            m.focused_text_mut().push_str(&clean);
+                                        }
+                                    }
+                                    m.status_msg = None;
+                                }
+                                self.request_redraw();
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.handle_header_footer_click(HeaderFooterHit::Cancel);
@@ -2825,20 +3076,37 @@ impl<'a> PdfViewerApp<'a> {
                             (idx + 1) % ORDER.len()
                         };
                         m.focused_field = ORDER[next_idx];
+                        m.select_all = false;
                         if m.focused_field == HfField::CustomRange {
                             m.all_pages = false;
                         }
                     }
                     self.request_redraw();
                 }
+                Key::Named(NamedKey::Delete) => {
+                    if let Some(m) = self.header_footer_modal.as_mut() {
+                        m.focused_text_mut().clear();
+                        m.select_all = false;
+                        m.status_msg = None;
+                    }
+                    self.request_redraw();
+                }
                 Key::Named(NamedKey::Backspace) => {
                     if let Some(m) = self.header_footer_modal.as_mut() {
-                        m.focused_text_mut().pop();
-                        m.error_msg = None;
+                        if m.select_all || self.cmd_or_ctrl_pressed {
+                            m.focused_text_mut().clear();
+                            m.select_all = false;
+                        } else {
+                            m.focused_text_mut().pop();
+                        }
+                        m.status_msg = None;
                     }
                     self.request_redraw();
                 }
                 _ => {
+                    if self.cmd_or_ctrl_pressed {
+                        return;
+                    }
                     let mut typed = String::new();
                     if let Some(t) = text {
                         for c in t.chars() {
@@ -2857,6 +3125,10 @@ impl<'a> PdfViewerApp<'a> {
                     }
                     if !typed.is_empty() {
                         if let Some(m) = self.header_footer_modal.as_mut() {
+                            if m.select_all {
+                                m.focused_text_mut().clear();
+                                m.select_all = false;
+                            }
                             match m.focused_field {
                                 HfField::CustomRange => {
                                     m.all_pages = false;
@@ -2877,7 +3149,7 @@ impl<'a> PdfViewerApp<'a> {
                                     m.focused_text_mut().push_str(&typed);
                                 }
                             }
-                            m.error_msg = None;
+                            m.status_msg = None;
                         }
                         self.request_redraw();
                     }
@@ -2887,7 +3159,8 @@ impl<'a> PdfViewerApp<'a> {
         }
         // 0e. Page Numbering visual modal
         if self.page_number_modal.is_some() {
-            use super::doc_tools_modal::PageNumberHit;
+            use super::doc_tools_modal::{PageNumberHit, PnNumericFocus};
+            let total = self.total_pages().max(1);
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.handle_page_number_click(PageNumberHit::Cancel);
@@ -2901,14 +3174,91 @@ impl<'a> PdfViewerApp<'a> {
                 Key::Named(NamedKey::ArrowRight) => {
                     self.handle_page_number_click(PageNumberHit::NextPage);
                 }
-                _ => {}
+                Key::Named(NamedKey::Tab) => {
+                    if let Some(m) = self.page_number_modal.as_mut() {
+                        m.focused_numeric = Some(match m.focused_numeric {
+                            Some(PnNumericFocus::SkipPages) => PnNumericFocus::RomanPages,
+                            _ => PnNumericFocus::SkipPages,
+                        });
+                    }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(m) = self.page_number_modal.as_mut() {
+                        match m.focused_numeric {
+                            Some(PnNumericFocus::SkipPages) => {
+                                m.config.skip_pages /= 10;
+                                m.status_msg = None;
+                            }
+                            Some(PnNumericFocus::RomanPages) => {
+                                m.config.roman_end /= 10;
+                                m.status_msg = None;
+                            }
+                            None => {}
+                        }
+                    }
+                    self.request_redraw();
+                }
+                Key::Named(NamedKey::Delete) => {
+                    if let Some(m) = self.page_number_modal.as_mut() {
+                        match m.focused_numeric {
+                            Some(PnNumericFocus::SkipPages) => {
+                                m.config.skip_pages = 0;
+                                m.status_msg = None;
+                            }
+                            Some(PnNumericFocus::RomanPages) => {
+                                m.config.roman_end = 0;
+                                m.status_msg = None;
+                            }
+                            None => {}
+                        }
+                    }
+                    self.request_redraw();
+                }
+                _ => {
+                    let digit_char = text
+                        .and_then(|t| t.chars().find(|c| c.is_ascii_digit()))
+                        .or_else(|| {
+                            if let Key::Character(ch) = &logical_key {
+                                ch.chars().find(|c| c.is_ascii_digit())
+                            } else {
+                                None
+                            }
+                        });
+                    if let Some(d_ch) = digit_char {
+                        let d = (d_ch as u8 - b'0') as u16;
+                        if let Some(m) = self.page_number_modal.as_mut() {
+                            match m.focused_numeric {
+                                Some(PnNumericFocus::SkipPages) => {
+                                    let max_skip = total.saturating_sub(1);
+                                    let next = m.config.skip_pages.saturating_mul(10).saturating_add(d);
+                                    m.config.skip_pages = next.min(max_skip);
+                                    let max_rom = total.saturating_sub(m.config.skip_pages);
+                                    if m.config.roman_end > max_rom {
+                                        m.config.roman_end = max_rom;
+                                    }
+                                    m.status_msg = None;
+                                }
+                                Some(PnNumericFocus::RomanPages) => {
+                                    let max_rom = total.saturating_sub(m.config.skip_pages);
+                                    let next = m.config.roman_end.saturating_mul(10).saturating_add(d);
+                                    m.config.roman_end = next.min(max_rom);
+                                    m.status_msg = None;
+                                }
+                                None => {}
+                            }
+                        }
+                        self.request_redraw();
+                    }
+                }
             }
             return;
         }
-        if self.show_customize_toolbar || self.show_about_overlay {
+        if self.show_customize_toolbar || self.show_about_overlay || self.show_bookmark_format_overlay {
             if matches!(logical_key, Key::Named(NamedKey::Escape)) {
                 self.show_customize_toolbar = false;
                 self.show_about_overlay = false;
+                self.show_bookmark_format_overlay = false;
                 self.request_redraw();
             }
             return;
@@ -3256,13 +3606,8 @@ impl<'a> PdfViewerApp<'a> {
                     }
                     return;
                 } else if s.eq_ignore_ascii_case("w") {
-                    if self.tabs.len() > 1 {
+                    if !self.tabs.is_empty() {
                         let _ = self.close_tab(self.active_tab);
-                    } else {
-                        self.status_notice =
-                            Some("Cannot close the last remaining tab".to_string());
-                        self.update_title_bar();
-                        self.request_redraw();
                     }
                     return;
                 }
@@ -3322,6 +3667,18 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Escape) => {
                 if self.open_menu.is_some() {
                     self.open_menu = None;
+                    self.request_redraw();
+                } else if self.tab_context_menu.is_some() {
+                    self.tab_context_menu = None;
+                    self.request_redraw();
+                } else if self.show_tab_list_popover {
+                    self.show_tab_list_popover = false;
+                    self.request_redraw();
+                } else if self.thumb_context_menu.is_some() {
+                    self.thumb_context_menu = None;
+                    self.request_redraw();
+                } else if self.show_bookmark_format_overlay {
+                    self.show_bookmark_format_overlay = false;
                     self.request_redraw();
                 } else if self.show_reading_mode_popover {
                     self.show_reading_mode_popover = false;
@@ -3646,9 +4003,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::CombineAddFiles => self.combine_add_files_dialog(),
                 PendingDialog::ExportMarkdown => self.export_markdown_dialog(),
                 PendingDialog::ExportLatex => self.export_latex_dialog(),
+                PendingDialog::ExportDocx => self.export_docx_dialog(),
+                PendingDialog::ExportXlsx => self.export_xlsx_dialog(),
                 PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
                 PendingDialog::ImportBookmarksTxt => self.import_bookmarks_txt_dialog(),
+                PendingDialog::SaveBookmarkSampleTxt => self.save_bookmark_sample_txt_dialog(),
             }
         }
     }
@@ -3810,6 +4170,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     || self.combine_modal.is_some()
                     || self.header_footer_modal.is_some()
                     || self.page_number_modal.is_some()
+                    || self.show_bookmark_format_overlay
                 {
                     return;
                 }
@@ -3817,6 +4178,53 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     MouseScrollDelta::LineDelta(x, y) => ((x as f64) * 36.0, (y as f64) * 36.0),
                     MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
+
+                // Scroll inside the `▾` All-Tabs overflow dropdown popover if open and hovered
+                if self.show_tab_list_popover {
+                    if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = self.effective_scale_factor(w.scale_factor());
+                        let top_bars_h = self.top_bars_height_px(sf).min(sz.height.saturating_sub(32));
+                        if self
+                            .hit_test_tab_list_popover(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                sz.width.max(1),
+                                sz.height.max(1),
+                                top_bars_h,
+                                sf,
+                            )
+                            .is_some()
+                        {
+                            if dy < -4.0 && self.tab_list_scroll + 1 < self.tabs.len() {
+                                self.tab_list_scroll += 1;
+                                self.request_redraw();
+                            } else if dy > 4.0 && self.tab_list_scroll > 0 {
+                                self.tab_list_scroll -= 1;
+                                self.request_redraw();
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                // Scroll horizontal tab strip when wheeling directly over the Tab Bar
+                if let Some(w) = self.window.as_ref() {
+                    let sz = w.inner_size();
+                    let sf = self.effective_scale_factor(w.scale_factor());
+                    let mb_h = self.menu_bar_height_px(sf).min(sz.height.saturating_sub(48));
+                    let tb_h = self.tab_bar_height_px(sf).min(sz.height.saturating_sub(mb_h + 24));
+                    let cy = self.cursor_pos.1 as i32;
+                    if cy >= mb_h as i32 && cy < (mb_h + tb_h) as i32 {
+                        let dir = if dy.abs() >= dx.abs() { dy } else { dx };
+                        if dir < -4.0 {
+                            self.scroll_tab_strip(1);
+                        } else if dir > 4.0 {
+                            self.scroll_tab_strip(-1);
+                        }
+                        return;
+                    }
+                }
 
                 // Ctrl/Cmd + MouseWheel zooms around the cursor position (25%..=800%)
                 if self.cmd_or_ctrl_pressed && self.view_mode.is_page_view() {
@@ -3956,6 +4364,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::PageNumber(h));
                         }
                     }
+                } else if self.show_bookmark_format_overlay {
+                    if let Some(h) = self.hit_test_bookmark_format_overlay(position.x, position.y, win_w, win_h, sf) {
+                        new_hover = Some(h);
+                    }
                 } else if self.show_customize_toolbar {
                     if let Some(h) = self.hit_test_customize_toolbar_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::toolbar::CustomizeHit::InsideModal {
@@ -3971,6 +4383,22 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         new_hover = Some(UiHit::MenuHeader(hovered_cat));
                     } else if let Some((_, idx)) = self.hit_test_open_menu_dropdown(position.x, position.y, win_w, menu_bar_h, sf) {
                         new_hover = Some(UiHit::MenuItem(idx));
+                    }
+                } else if self.tab_context_menu.is_some() {
+                    if let Some(h) = self.hit_test_tab_context_menu(position.x, position.y, win_w, win_h, sf) {
+                        new_hover = Some(UiHit::TabContext(h));
+                    }
+                } else if self.show_tab_list_popover {
+                    if let Some(h) = self.hit_test_tab_list_popover(position.x, position.y, win_w, win_h, top_bars_h, sf) {
+                        if h != TabListHit::InsidePopover {
+                            new_hover = Some(UiHit::TabList(h));
+                        }
+                    }
+                } else if self.thumb_context_menu.is_some() && self.view_mode == ViewMode::ThumbnailGrid {
+                    if let Some(h) = self.hit_test_thumb_context_menu(position.x, position.y, win_w, win_h, sf) {
+                        if h != ThumbContextHit::InsideMenu {
+                            new_hover = Some(UiHit::ThumbContext(h));
+                        }
                     }
                 } else {
                     if self.show_reading_mode_popover {
@@ -4011,9 +4439,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     } else if new_hover.is_none() && (position.y as i32) < top_bars_h as i32 {
                         if let Some(th) = self.hit_test_tab_bar(position.x, position.y, win_w, menu_bar_h, tab_bar_h, sf) {
                             new_hover = Some(match th {
+                                TabBarHit::ScrollLeft => UiHit::TabScrollLeft,
+                                TabBarHit::ScrollRight => UiHit::TabScrollRight,
                                 TabBarHit::SwitchTab(i) => UiHit::Tab(i),
                                 TabBarHit::CloseTab(i) => UiHit::TabClose(i),
                                 TabBarHit::NewTab => UiHit::TabNew,
+                                TabBarHit::TabListToggle => UiHit::TabListToggle,
                             });
                         }
                     } else if new_hover.is_none()
@@ -4068,8 +4499,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     || self.combine_modal.is_some()
                     || self.header_footer_modal.is_some()
                     || self.page_number_modal.is_some()
+                    || self.show_bookmark_format_overlay
                     || self.show_customize_toolbar
                     || self.open_menu.is_some()
+                    || self.tab_context_menu.is_some()
+                    || self.show_tab_list_popover
+                    || self.thumb_context_menu.is_some()
                 {
                     return;
                 }
@@ -4242,6 +4677,29 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                // Bookmark Import Format Guide modal (`Help -> Bookmark Import Format (.txt)`)
+                if self.show_bookmark_format_overlay {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_bookmark_format_overlay(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(UiHit::BookmarkFormatSaveSample) => {
+                                self.pending_dialog = Some(PendingDialog::SaveBookmarkSampleTxt);
+                            }
+                            Some(UiHit::BookmarkFormatClose) => {
+                                self.show_bookmark_format_overlay = false;
+                                self.request_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                    return;
+                }
+
                 // Help & About modals
                 if self.show_help_overlay || self.show_about_overlay {
                     if state == ElementState::Pressed {
@@ -4297,6 +4755,102 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         self.request_redraw();
                     }
                     return;
+                }
+
+                // 0a-tabctx. Right-click Tab Context Menu
+                if self.tab_context_menu.is_some() {
+                    if state == ElementState::Pressed {
+                        if button == MouseButton::Left {
+                            if let Some(hit) = self.hit_test_tab_context_menu(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                scale_factor,
+                            ) {
+                                self.execute_tab_context_action(hit);
+                            } else {
+                                self.tab_context_menu = None;
+                                self.request_redraw();
+                            }
+                            return;
+                        } else if button == MouseButton::Right {
+                            self.tab_context_menu = None;
+                            self.request_redraw();
+                        }
+                    } else {
+                        return;
+                    }
+                }
+
+                // 0a-tablist. All-Tabs Overflow Dropdown Popover (`▾`)
+                if self.show_tab_list_popover && state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(hit) = self.hit_test_tab_list_popover(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                        top_bars_h,
+                        scale_factor,
+                    ) {
+                        match hit {
+                            TabListHit::SwitchTab(idx) => {
+                                self.switch_to_tab(idx);
+                            }
+                            TabListHit::CloseTab(idx) => {
+                                let _ = self.close_tab(idx);
+                            }
+                            TabListHit::CloseOthers => {
+                                self.close_other_tabs(self.active_tab);
+                            }
+                            TabListHit::CloseAll => {
+                                self.close_all_tabs();
+                            }
+                            TabListHit::InsidePopover => {}
+                        }
+                        return;
+                    }
+                    let clicking_toggle = (self.cursor_pos.1 as i32) >= menu_bar_h as i32
+                        && (self.cursor_pos.1 as i32) < top_bars_h as i32
+                        && self.hit_test_tab_bar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            menu_bar_h,
+                            tab_bar_h,
+                            scale_factor,
+                        ) == Some(TabBarHit::TabListToggle);
+                    if !clicking_toggle {
+                        self.show_tab_list_popover = false;
+                        self.request_redraw();
+                        return;
+                    }
+                }
+
+                // 0a-thumbctx. Thumbnail Grid Right-Click Context Menu
+                if self.thumb_context_menu.is_some() && self.view_mode == ViewMode::ThumbnailGrid {
+                    if state == ElementState::Pressed {
+                        if button == MouseButton::Left {
+                            if let Some(hit) = self.hit_test_thumb_context_menu(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                scale_factor,
+                            ) {
+                                self.handle_thumb_context_click(hit);
+                            } else {
+                                self.thumb_context_menu = None;
+                                self.request_redraw();
+                            }
+                            return;
+                        } else if button == MouseButton::Right {
+                            self.thumb_context_menu = None;
+                            self.request_redraw();
+                        }
+                    } else {
+                        return;
+                    }
                 }
 
                 // 0a0. Reading Mode picker popover clicks
@@ -4410,23 +4964,50 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             scale_factor,
                         ) {
                             match hit {
+                                TabBarHit::ScrollLeft => {
+                                    self.scroll_tab_strip(-1);
+                                }
+                                TabBarHit::ScrollRight => {
+                                    self.scroll_tab_strip(1);
+                                }
                                 TabBarHit::SwitchTab(idx) => {
                                     self.switch_to_tab(idx);
                                 }
                                 TabBarHit::CloseTab(idx) => {
-                                    if self.tabs.len() > 1 {
+                                    if !self.tabs.is_empty() {
                                         let _ = self.close_tab(idx);
-                                    } else {
-                                        self.status_notice = Some(
-                                            "Cannot close the last remaining tab".to_string(),
-                                        );
-                                        self.update_title_bar();
-                                        self.request_redraw();
                                     }
                                 }
                                 TabBarHit::NewTab => {
                                     self.pending_dialog = Some(PendingDialog::Open);
                                 }
+                                TabBarHit::TabListToggle => {
+                                    self.show_tab_list_popover = !self.show_tab_list_popover;
+                                    self.tab_list_scroll = 0;
+                                    self.tab_context_menu = None;
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    } else if state == ElementState::Pressed && button == MouseButton::Right {
+                        if !self.tabs.is_empty() {
+                            if let Some(TabBarHit::SwitchTab(idx) | TabBarHit::CloseTab(idx)) =
+                                self.hit_test_tab_bar(
+                                    self.cursor_pos.0,
+                                    self.cursor_pos.1,
+                                    win_w,
+                                    menu_bar_h,
+                                    tab_bar_h,
+                                    scale_factor,
+                                )
+                            {
+                                self.show_tab_list_popover = false;
+                                self.tab_context_menu = Some((
+                                    idx,
+                                    self.cursor_pos.0.round() as i32,
+                                    self.cursor_pos.1.round() as i32,
+                                ));
+                                self.request_redraw();
                             }
                         }
                     }
@@ -4689,6 +5270,24 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     self.request_redraw();
                                 }
                             }
+                        }
+                    } else if button == MouseButton::Right && state == ElementState::Pressed {
+                        if let Some((clicked_idx, _)) = self.hit_test_thumbnail(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            sidebar_w,
+                            top_bars_h,
+                        ) {
+                            self.current_page_index = clicked_idx;
+                            self.thumb_context_menu = Some(ThumbContextMenuState {
+                                page_idx: clicked_idx,
+                                x: self.cursor_pos.0.round() as i32,
+                                y: self.cursor_pos.1.round() as i32,
+                                blank_count: 1,
+                            });
+                            self.update_title_bar();
+                            self.request_redraw();
                         }
                     }
                     return;

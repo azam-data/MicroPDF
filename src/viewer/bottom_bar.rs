@@ -95,7 +95,18 @@ impl<'a> PdfViewerApp<'a> {
         let font_sz = (11.0 * s).clamp(9.0, 22.0);
 
         let page_txt = if self.doc.is_some() {
-            format!("{}/{}", self.current_page_index + 1, self.total_pages())
+            let phys = self.current_page_index + 1;
+            let total = self.total_pages();
+            if self.roman_end > 0 || self.skip_pages > 0 {
+                let logical = crate::engine::PdfEngine::format_logical_page_label_with_skip(
+                    self.current_page_index as usize,
+                    self.skip_pages,
+                    self.roman_end,
+                );
+                format!("{logical} ({phys}/{total})")
+            } else {
+                format!("{phys}/{total}")
+            }
         } else {
             "— / —".to_string()
         };

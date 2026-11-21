@@ -151,7 +151,7 @@ impl<'a> PdfViewerApp<'a> {
     /// Splits a menu label like `"Open PDF in Tab (O)"` into `("Open PDF in Tab", Some("O"))`
     /// so shortcuts can be cleanly right-aligned in the dropdown.
     fn split_label_and_shortcut(item: &str) -> (&str, Option<&str>) {
-        if item.starts_with("Recent") || item.ends_with("(default)") {
+        if item.starts_with("Recent") || item.ends_with("(default)") || item.ends_with("(.txt)") {
             return (item, None);
         }
         if let Some(open_idx) = item.rfind(" (") {
@@ -238,9 +238,11 @@ impl<'a> PdfViewerApp<'a> {
         for (idx, item_str) in items.iter().enumerate() {
             let ry = drop_y + pad_v + (idx as i32) * (row_h as i32);
             // Draw subtle group separators between logical menu sections
-            if (cat == MenuCategory::File && (idx == 5 || idx == 7 || idx == file_base_len))
-                || (cat == MenuCategory::View && (idx == 6 || idx == 9 || idx == 14 || idx == 16))
+            if (cat == MenuCategory::File && (idx == 3 || idx == 5 || idx == 6 || idx == file_base_len))
+                || (cat == MenuCategory::View && (idx == 4 || idx == 7 || idx == 8 || idx == 11 || idx == 14 || idx == 16 || idx == 18))
                 || (cat == MenuCategory::Edit && (idx == 3 || idx == 13))
+                || (cat == MenuCategory::Page && (idx == 2 || idx == 5))
+                || (cat == MenuCategory::Export && idx == 2)
             {
                 fill_rect_clipped(
                     buffer,
@@ -380,24 +382,21 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             (MenuCategory::File, 5) => {
-                if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::ExportMarkdown);
-                }
+                self.trigger_print();
             }
             (MenuCategory::File, 6) => {
-                if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::ExportLatex);
+                if !self.tabs.is_empty() {
+                    let _ = self.close_tab(self.active_tab);
+                    return;
                 }
             }
             (MenuCategory::File, 7) => {
-                self.trigger_print();
+                self.close_other_tabs(self.active_tab);
+                return;
             }
             (MenuCategory::File, 8) => {
-                if self.tabs.len() > 1 {
-                    let _ = self.close_tab(self.active_tab);
-                } else {
-                    self.status_notice = Some("Cannot close the last remaining tab".to_string());
-                }
+                self.close_all_tabs();
+                return;
             }
             (MenuCategory::File, idx) if idx >= MenuCategory::File.items().len() => {
                 let recent_idx = idx - MenuCategory::File.items().len();
@@ -604,8 +603,18 @@ impl<'a> PdfViewerApp<'a> {
                 self.rotate_page_clockwise(target);
             }
             (MenuCategory::Page, 2) => self.insert_blank_page_after_current(),
-            (MenuCategory::Page, 3) => self.delete_current_page(),
+            (MenuCategory::Page, 3) => self.insert_blank_page_before_current(),
             (MenuCategory::Page, 4) => {
+                let target = if self.view_mode == ViewMode::ThumbnailGrid {
+                    self.hovered_thumb.unwrap_or(self.current_page_index)
+                } else {
+                    self.current_page_index
+                };
+                self.open_insert_pdf_modal(false, target);
+                return;
+            }
+            (MenuCategory::Page, 5) => self.delete_current_page(),
+            (MenuCategory::Page, 6) => {
                 let target = if self.view_mode == ViewMode::ThumbnailGrid {
                     self.hovered_thumb.unwrap_or(self.current_page_index)
                 } else {
@@ -613,7 +622,7 @@ impl<'a> PdfViewerApp<'a> {
                 };
                 self.convert_page_to_bw_in_place(target);
             }
-            (MenuCategory::Page, 5) => self.reset_current_page_crop(),
+            (MenuCategory::Page, 7) => self.reset_current_page_crop(),
 
             // Tools menu
             (MenuCategory::Tools, 0) => {
@@ -640,14 +649,51 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::Tools, 5) => self.flatten_and_unlock_current_pdf(),
             (MenuCategory::Tools, 6) => self.open_optimize_prompt(),
 
+            // Export menu
+            (MenuCategory::Export, 0) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportDocx);
+                } else {
+                    self.status_notice = Some("Open a PDF first to export to Word (.docx)".to_string());
+                }
+            }
+            (MenuCategory::Export, 1) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportXlsx);
+                } else {
+                    self.status_notice = Some("Open a PDF first to export to Excel (.xlsx)".to_string());
+                }
+            }
+            (MenuCategory::Export, 2) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportMarkdown);
+                } else {
+                    self.status_notice = Some("Open a PDF first to export to Markdown (.md)".to_string());
+                }
+            }
+            (MenuCategory::Export, 3) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportLatex);
+                } else {
+                    self.status_notice = Some("Open a PDF first to export to LaTeX (.tex)".to_string());
+                }
+            }
+
             // Help menu
             (MenuCategory::Help, 0) => {
                 self.show_help_overlay = !self.show_help_overlay;
+                self.show_bookmark_format_overlay = false;
                 self.show_about_overlay = false;
             }
             (MenuCategory::Help, 1) => {
+                self.show_bookmark_format_overlay = !self.show_bookmark_format_overlay;
+                self.show_help_overlay = false;
+                self.show_about_overlay = false;
+            }
+            (MenuCategory::Help, 2) => {
                 self.show_about_overlay = !self.show_about_overlay;
                 self.show_help_overlay = false;
+                self.show_bookmark_format_overlay = false;
             }
             _ => {}
         }

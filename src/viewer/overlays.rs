@@ -808,4 +808,219 @@ impl<'a> PdfViewerApp<'a> {
         self.update_title_bar();
         self.request_redraw();
     }
+
+    /// Computes layout for the `Help -> Bookmark Import Format (.txt)` modal card.
+    /// Returns `(card_rect, save_sample_btn_rect, close_btn_rect)`.
+    fn bookmark_format_overlay_layout(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        sf: f64,
+    ) -> ((i32, i32, u32, u32), (i32, i32, u32, u32), (i32, i32, u32, u32)) {
+        let s = sf as f32;
+        let cw = ((660.0 * s).round() as u32).min(buf_w.saturating_sub(28));
+        let ch = ((485.0 * s).round() as u32).min(buf_h.saturating_sub(28));
+        let cx = (buf_w.saturating_sub(cw) / 2) as i32;
+        let cy = (buf_h.saturating_sub(ch) / 2) as i32;
+        let pad = (18.0 * s).round() as i32;
+        let btn_h = (30.0 * s).round() as u32;
+        let by = cy + ch as i32 - btn_h as i32 - (14.0 * s).round() as i32;
+        let close_w = (88.0 * s).round() as u32;
+        let sample_w = (168.0 * s).round() as u32;
+        let close_x = cx + cw as i32 - pad - close_w as i32;
+        let sample_x = close_x - sample_w as i32 - (10.0 * s).round() as i32;
+        (
+            (cx, cy, cw, ch),
+            (sample_x, by, sample_w, btn_h),
+            (close_x, by, close_w, btn_h),
+        )
+    }
+
+    /// Clean `Help -> Bookmark Import Format (.txt)` documentation card with live example
+    /// and a one-click `Save Sample .txt...` button.
+    pub(super) fn draw_bookmark_format_overlay(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sf: f64,
+    ) {
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
+
+        let ((cx, cy, cw, ch), (sx, sy, sw, sh), (kx, ky, kw, kh)) =
+            self.bookmark_format_overlay_layout(buf_w, buf_h, sf);
+        let rad = (10.0 * s).clamp(6.0, 16.0);
+        let pad = (18.0 * s).round() as i32;
+        let title_sz = (15.0 * s).clamp(12.0, 32.0);
+        let head_sz = (11.5 * s).clamp(10.0, 22.0);
+        let body_sz = (11.5 * s).clamp(10.0, 22.0);
+        let code_sz = (11.0 * s).clamp(9.5, 21.0);
+        let hint_sz = (10.5 * s).clamp(9.0, 20.0);
+
+        draw_soft_shadow(
+            buffer, buf_w, buf_h, cx, cy, cw, ch, rad,
+            (12.0 * s).round() as i32, (4.0 * s).round() as i32,
+            theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        fill_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.border_subtle);
+
+        draw_text(
+            buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32,
+            "Bookmark Import Format (.txt) — File -> Import Bookmarks (L)",
+            title_sz, theme.text_primary, true,
+        );
+        let esc_hint = "Esc to close";
+        let ehw = measure_text(esc_hint, hint_sz, false);
+        draw_text(
+            buffer, buf_w, buf_h, cx + cw as i32 - pad - ehw.ceil() as i32, cy + (17.0 * s).round() as i32,
+            esc_hint, hint_sz, theme.text_muted, false,
+        );
+        fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
+
+        let max_x = cx + cw as i32 - pad;
+        let mut y = cy + (54.0 * s).round() as i32;
+        let line_h = (20.0 * s).round() as i32;
+
+        draw_text(buffer, buf_w, buf_h, cx + pad, y, "Line Syntax (recommended — double-hyphen separated):", head_sz, theme.accent, true);
+        y += line_h;
+
+        let syn_h = (26.0 * s).round() as u32;
+        fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, y, cw.saturating_sub((pad * 2) as u32), syn_h, (6.0 * s).max(4.0), theme.accent_soft_bg);
+        draw_text_vcenter(
+            buffer, buf_w, buf_h, cx + pad + (10.0 * s).round() as i32, y, syn_h, max_x - 8,
+            "Serial -- Bookmark Title -- Page", body_sz, theme.accent_soft_fg, true,
+        );
+        y += syn_h as i32 + (12.0 * s).round() as i32;
+
+        let rules: &[(&str, &str)] = &[
+            ("Hierarchy:", "Serial starting with a digit (1, 2, 3) = Top-Level Chapter; starting with a letter (a, b, c) = Nested Sub-Section."),
+            ("Page Numbers:", "Supports Roman (i, ii, iii), logical Arabic (1, 2, 15 — auto-offset after Roman pages), or exact physical (#5)."),
+            ("Comments:", "Blank lines and lines starting with // are ignored."),
+            ("Titles with '--':", "Extra '--' inside the title are preserved; first token is Serial and last token is Page."),
+            ("Legacy Tab Format:", "Also supports 1-based physical page + TAB + Title (e.g. 5<TAB>Chapter One)."),
+        ];
+        let key_w = (128.0 * s).round() as i32;
+        for &(label, desc) in rules {
+            draw_text_clipped(buffer, buf_w, buf_h, cx + pad, y, cx + pad + key_w, label, body_sz, theme.text_primary, true);
+            draw_text_clipped(buffer, buf_w, buf_h, cx + pad + key_w + (6.0 * s).round() as i32, y, max_x, desc, hint_sz, theme.text_secondary, false);
+            y += line_h;
+        }
+
+        y += (8.0 * s).round() as i32;
+        draw_text(buffer, buf_w, buf_h, cx + pad, y, "Example bookmarks.txt:", head_sz, theme.text_primary, true);
+        y += (18.0 * s).round() as i32;
+
+        let code_lines = [
+            "// Front matter (Roman numerals when PDF uses Roman labels)",
+            "1 -- Preface -- i",
+            "2 -- Table of Contents -- iii",
+            "3 -- Chapter 1: Introduction -- 1",
+            "a -- 1.1 Overview -- 1",
+            "b -- 1.2 Architecture -- 4",
+            "4 -- Chapter 2: Results -- 12",
+            "5 -- Appendix (exact physical sheet #25) -- #25",
+        ];
+        let code_line_h = (18.0 * s).round() as i32;
+        let box_h = ((code_lines.len() as i32) * code_line_h + (14.0 * s).round() as i32).max(40) as u32;
+        let max_box_h = (sy - y - (12.0 * s).round() as i32).max(40) as u32;
+        let box_h = box_h.min(max_box_h);
+        fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, y, cw.saturating_sub((pad * 2) as u32), box_h, (7.0 * s).max(4.0), theme.surface_elevated);
+        stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, y, cw.saturating_sub((pad * 2) as u32), box_h, (7.0 * s).max(4.0), theme.border_subtle);
+
+        let mut cy_code = y + (7.0 * s).round() as i32;
+        for line in code_lines {
+            if cy_code + code_line_h > y + box_h as i32 {
+                break;
+            }
+            let fg = if line.starts_with("//") {
+                theme.text_muted
+            } else if line.starts_with('a') || line.starts_with('b') {
+                theme.text_secondary
+            } else {
+                theme.text_primary
+            };
+            let indent = if line.starts_with('a') || line.starts_with('b') {
+                (22.0 * s).round() as i32
+            } else {
+                (10.0 * s).round() as i32
+            };
+            draw_text_clipped(buffer, buf_w, buf_h, cx + pad + indent, cy_code, max_x - 8, line, code_sz, fg, false);
+            cy_code += code_line_h;
+        }
+
+        // Bottom note on left + action buttons on right
+        draw_text_clipped(
+            buffer, buf_w, buf_h, cx + pad, sy + (8.0 * s).round() as i32, sx - 8,
+            "Tip: Press L or use File -> Import Bookmarks .txt to load your file.",
+            hint_sz, theme.text_muted, false,
+        );
+
+        let s_hov = self.hovered_widget == Some(UiHit::BookmarkFormatSaveSample);
+        fill_rounded_rect(buffer, buf_w, buf_h, sx, sy, sw, sh, (6.0 * s).max(4.0), if s_hov { theme.accent_soft_bg } else { theme.surface_elevated });
+        stroke_rounded_rect(buffer, buf_w, buf_h, sx, sy, sw, sh, (6.0 * s).max(4.0), if s_hov { theme.accent } else { theme.border_subtle });
+        let slbl = "Save Sample .txt...";
+        let slw = measure_text(slbl, body_sz, true);
+        draw_text_vcenter(buffer, buf_w, buf_h, sx + ((sw as f32 - slw) * 0.5).round() as i32, sy, sh, sx + sw as i32 - 2, slbl, body_sz, if s_hov { theme.accent_soft_fg } else { theme.text_primary }, true);
+
+        let k_hov = self.hovered_widget == Some(UiHit::BookmarkFormatClose);
+        fill_rounded_rect(buffer, buf_w, buf_h, kx, ky, kw, kh, (6.0 * s).max(4.0), if k_hov { theme.accent_hover } else { theme.accent });
+        let klw = measure_text("Close", body_sz, true);
+        draw_text_vcenter(buffer, buf_w, buf_h, kx + ((kw as f32 - klw) * 0.5).round() as i32, ky, kh, kx + kw as i32, "Close", body_sz, theme.text_on_accent, true);
+    }
+
+    /// Hit-tests `Help -> Bookmark Import Format (.txt)` overlay.
+    /// Returns `Some(true)` for `Save Sample .txt...`, `Some(false)` for `Close` or outside click,
+    /// `None` if clicked inside the card body (non-button area).
+    pub(super) fn hit_test_bookmark_format_overlay(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        buf_h: u32,
+        sf: f64,
+    ) -> Option<UiHit> {
+        if !self.show_bookmark_format_overlay {
+            return None;
+        }
+        let ((cx, cy, cw, ch), (sx, sy, sw, sh), (kx, ky, kw, kh)) =
+            self.bookmark_format_overlay_layout(buf_w, buf_h, sf);
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix >= sx && ix < sx + sw as i32 && iy >= sy && iy < sy + sh as i32 {
+            return Some(UiHit::BookmarkFormatSaveSample);
+        }
+        if ix >= kx && ix < kx + kw as i32 && iy >= ky && iy < ky + kh as i32 {
+            return Some(UiHit::BookmarkFormatClose);
+        }
+        if ix < cx || ix >= cx + cw as i32 || iy < cy || iy >= cy + ch as i32 {
+            return Some(UiHit::BookmarkFormatClose);
+        }
+        None
+    }
 }
+
+/// Ready-to-edit template written by `Help -> Bookmark Import Format (.txt) -> Save Sample .txt...`.
+pub(super) const BOOKMARK_SAMPLE_TXT: &str = "\
+// MicroPDF Bookmark Import File
+// Format: Serial -- Bookmark Title -- Page
+//
+// Rules:
+// - Serial starting with a digit (1, 2, 3...) creates a Top-Level Chapter bookmark.
+// - Serial starting with a letter (a, b, c...) creates a Nested Sub-Section bookmark.
+// - Page can be Roman (i, ii, iii), logical Arabic (1, 2, 15), or exact physical (#5).
+// - Lines starting with // and blank lines are ignored.
+// - Legacy fallback also supported: <1-based physical page><TAB><Title>
+
+1 -- Preface -- i
+2 -- Table of Contents -- iii
+3 -- Chapter 1: Introduction -- 1
+a -- 1.1 Overview -- 1
+b -- 1.2 Architecture -- 4
+4 -- Chapter 2: Results -- 12
+a -- 2.1 Summary Table -- 13
+5 -- Appendix (exact physical page #25) -- #25
+";
+

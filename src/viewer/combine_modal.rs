@@ -52,6 +52,13 @@ pub(super) struct CombinePreviewBitmap {
     pub(super) pixels: Vec<u32>,
 }
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct InsertPdfTarget {
+    pub(super) before: bool,
+    /// 1-based target page number in the currently open document (`1..=total_pages`).
+    pub(super) target_page: u16,
+}
+
 pub(super) struct CombineModalState {
     pub(super) entries: Vec<CombineEntry>,
     pub(super) selected: usize,
@@ -59,6 +66,8 @@ pub(super) struct CombineModalState {
     pub(super) preview_page: u16,
     pub(super) editing_range: bool,
     pub(super) cached_preview: Option<CombinePreviewBitmap>,
+    /// `None` = Combine into new `Combined.pdf` tab; `Some` = Insert directly into active PDF!
+    pub(super) insert_target: Option<InsertPdfTarget>,
 }
 
 impl CombineModalState {
@@ -70,7 +79,17 @@ impl CombineModalState {
             preview_page: 0,
             editing_range: false,
             cached_preview: None,
+            insert_target: None,
         }
+    }
+
+    pub(super) fn new_insert(before: bool, target_page_1based: u16) -> Self {
+        let mut st = Self::new();
+        st.insert_target = Some(InsertPdfTarget {
+            before,
+            target_page: target_page_1based.max(1),
+        });
+        st
     }
 
     pub(super) fn total_output_pages(&self) -> usize {
@@ -85,6 +104,12 @@ impl CombineModalState {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum CombineHit {
     AddFiles,
+    InsertBefore,
+    InsertAfter,
+    InsertPageMinus,
+    InsertPagePlus,
+    InsertStart,
+    InsertEnd,
     SelectRow(usize),
     RangeBox(usize),
     MoveUp(usize),
@@ -129,8 +154,14 @@ impl<'a> PdfViewerApp<'a> {
         self.open_menu = None;
         self.show_customize_toolbar = false;
         self.show_help_overlay = false;
+        self.show_bookmark_format_overlay = false;
         self.show_about_overlay = false;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
         self.print_preview = None;
+        self.header_footer_modal = None;
+        self.page_number_modal = None;
         let mut st = CombineModalState::new();
         // If a PDF is already open on disk, pre-seed it as the first item for convenience!
         if self.doc.is_some() && !self.file_path.as_os_str().is_empty() && self.file_path.exists() {
@@ -144,6 +175,30 @@ impl<'a> PdfViewerApp<'a> {
             });
         }
         self.combine_modal = Some(st);
+        self.request_redraw();
+    }
+
+    /// Opens the visual "Insert PDF(s) Before / After Page N" dialog targeting the active document.
+    pub(super) fn open_insert_pdf_modal(&mut self, before: bool, target_page_0based: u16) {
+        if self.doc.is_none() {
+            self.status_notice = Some("Open a PDF first to insert pages into it".to_string());
+            self.request_redraw();
+            return;
+        }
+        self.open_menu = None;
+        self.show_customize_toolbar = false;
+        self.show_help_overlay = false;
+        self.show_bookmark_format_overlay = false;
+        self.show_about_overlay = false;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
+        self.print_preview = None;
+        self.header_footer_modal = None;
+        self.page_number_modal = None;
+        let max_p = self.total_pages().max(1);
+        let p1 = (target_page_0based + 1).clamp(1, max_p);
+        self.combine_modal = Some(CombineModalState::new_insert(before, p1));
         self.request_redraw();
     }
 
@@ -263,8 +318,41 @@ impl<'a> PdfViewerApp<'a> {
         let add_y = my + (12.0 * s).round() as i32;
         hits.push(CombineBox { x: add_x, y: add_y, w: add_w, h: add_h, hit: CombineHit::AddFiles });
 
+        let is_insert = self
+            .combine_modal
+            .as_ref()
+            .is_some_and(|c| c.insert_target.is_some());
+
+        // Optional Insertion Point bar when inserting PDF(s) into the active document
+        let mut list_top = my + (54.0 * s).round() as i32;
+        if is_insert {
+            let bar_y = my + (54.0 * s).round() as i32;
+            let bar_h = (26.0 * s).round() as u32;
+            let gap = (5.0 * s).round() as i32;
+            let mut cx = mx + pad;
+            let bef_w = (62.0 * s).round() as u32;
+            let aft_w = (54.0 * s).round() as u32;
+            let sm_w = (24.0 * s).round() as u32;
+            let page_w = (74.0 * s).round() as u32;
+            let st_w = (46.0 * s).round() as u32;
+            let en_w = (42.0 * s).round() as u32;
+            hits.push(CombineBox { x: cx, y: bar_y, w: bef_w, h: bar_h, hit: CombineHit::InsertBefore });
+            cx += bef_w as i32 + gap;
+            hits.push(CombineBox { x: cx, y: bar_y, w: aft_w, h: bar_h, hit: CombineHit::InsertAfter });
+            cx += aft_w as i32 + gap * 2;
+            hits.push(CombineBox { x: cx, y: bar_y, w: sm_w, h: bar_h, hit: CombineHit::InsertPageMinus });
+            cx += sm_w as i32 + page_w as i32;
+            hits.push(CombineBox { x: cx, y: bar_y, w: sm_w, h: bar_h, hit: CombineHit::InsertPagePlus });
+            let end_x = preview_x - pad - en_w as i32;
+            let start_x = end_x - gap - st_w as i32;
+            if start_x > cx + sm_w as i32 + gap {
+                hits.push(CombineBox { x: start_x, y: bar_y, w: st_w, h: bar_h, hit: CombineHit::InsertStart });
+                hits.push(CombineBox { x: end_x, y: bar_y, w: en_w, h: bar_h, hit: CombineHit::InsertEnd });
+            }
+            list_top = bar_y + bar_h as i32 + (12.0 * s).round() as i32;
+        }
+
         // List rows
-        let list_top = my + (54.0 * s).round() as i32;
         let footer_h = (56.0 * s).round() as i32;
         let list_h = (mh as i32 - (list_top - my) - footer_h).max(60);
         let row_h = (48.0 * s).round() as i32;
@@ -308,11 +396,11 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(CombineBox { x: nav_x, y: nav_y, w: arrow_w, h: nav_h, hit: CombineHit::PreviewPrev });
         hits.push(CombineBox { x: nav_x + nav_w as i32 - arrow_w as i32, y: nav_y, w: arrow_w, h: nav_h, hit: CombineHit::PreviewNext });
 
-        // Footer buttons: Cancel & Combine PDFs
+        // Footer buttons: Cancel & Combine/Insert PDFs
         let act_h = (32.0 * s).round() as u32;
         let act_y = my + mh as i32 - (44.0 * s).round() as i32;
         let cancel_w = (88.0 * s).round() as u32;
-        let ok_w = (138.0 * s).round() as u32;
+        let ok_w = (146.0 * s).round() as u32;
         let cancel_x = mx + mw as i32 - pad - cancel_w as i32;
         let ok_x = cancel_x - (10.0 * s).round() as i32 - ok_w as i32;
         hits.push(CombineBox { x: ok_x, y: act_y, w: ok_w, h: act_h, hit: CombineHit::CombineNow });
@@ -353,7 +441,6 @@ impl<'a> PdfViewerApp<'a> {
             (12.0 * s).round() as i32, (5.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha,
         );
         fill_rounded_rect(buffer, buf_w, buf_h, layout.mx, layout.my, layout.mw, layout.mh, rad, theme.surface_bg);
-        // Right preview stage background (preserving top-right rounded corner, flush with left & footer dividers)
         let prev_h = layout.mh.saturating_sub(footer_h as u32);
         let r_seam = (rad.ceil() as u32).min(layout.preview_w).min(prev_h);
         fill_rounded_rect(
@@ -380,7 +467,12 @@ impl<'a> PdfViewerApp<'a> {
         let small_sz = (10.5 * s).clamp(9.0, 20.0);
         let icon_sz = (12.0 * s).round().clamp(10.0, 22.0) as u32;
 
-        draw_text(buffer, buf_w, buf_h, layout.mx + pad, layout.my + (14.0 * s).round() as i32, "Combine Multiple PDFs", title_sz, theme.text_primary, true);
+        let modal_title = if cm.insert_target.is_some() {
+            "Insert PDF(s) into Document"
+        } else {
+            "Combine Multiple PDFs"
+        };
+        draw_text(buffer, buf_w, buf_h, layout.mx + pad, layout.my + (14.0 * s).round() as i32, modal_title, title_sz, theme.text_primary, true);
         fill_rect_clipped(buffer, buf_w, buf_h, layout.mx + 1, layout.my + (46.0 * s).round() as i32, layout.left_w.saturating_sub(1), 1, theme.divider);
 
         let find_box = |hit: CombineHit| layout.hits.iter().copied().find(|b| b.hit == hit);
@@ -392,6 +484,34 @@ impl<'a> PdfViewerApp<'a> {
             let lbl = "+ Add PDFs...";
             let lw = measure_text(lbl, body_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, b.x + ((b.w as f32 - lw) * 0.5).round() as i32, b.y, b.h, b.x + b.w as i32, lbl, body_sz, theme.text_on_accent, true);
+        }
+
+        // Insertion Point controls bar (when inserting into active document)
+        if let Some(target) = cm.insert_target {
+            let draw_small_pill = |buffer: &mut [u32], hit: CombineHit, txt: &str, active: bool| {
+                if let Some(b) = find_box(hit) {
+                    let hov = self.hovered_widget == Some(UiHit::Combine(hit));
+                    let bg = if active { theme.accent_soft_bg } else if hov { theme.hover_bg } else { theme.surface_elevated };
+                    let bd = if active { theme.accent } else { theme.border_subtle };
+                    let fg = if active { theme.accent_soft_fg } else { theme.text_primary };
+                    fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, (5.0 * s).max(3.0), bg);
+                    stroke_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, (5.0 * s).max(3.0), bd);
+                    let lw = measure_text(txt, small_sz, active);
+                    draw_text_vcenter(buffer, buf_w, buf_h, b.x + ((b.w as f32 - lw) * 0.5).round() as i32, b.y, b.h, b.x + b.w as i32 - 2, txt, small_sz, fg, active);
+                }
+            };
+            draw_small_pill(buffer, CombineHit::InsertBefore, "Before", target.before);
+            draw_small_pill(buffer, CombineHit::InsertAfter, "After", !target.before);
+            draw_small_pill(buffer, CombineHit::InsertPageMinus, "-", false);
+            draw_small_pill(buffer, CombineHit::InsertPagePlus, "+", false);
+            draw_small_pill(buffer, CombineHit::InsertStart, "Start", false);
+            draw_small_pill(buffer, CombineHit::InsertEnd, "End", false);
+            if let (Some(pm), Some(pp)) = (find_box(CombineHit::InsertPageMinus), find_box(CombineHit::InsertPagePlus)) {
+                let txt = format!("Page {}", target.target_page);
+                let tw = measure_text(&txt, small_sz, true);
+                let cx = pm.x + pm.w as i32 + (((pp.x - (pm.x + pm.w as i32)) as f32 - tw) * 0.5).round() as i32;
+                draw_text_vcenter(buffer, buf_w, buf_h, cx, pm.y, pm.h, pp.x, &txt, small_sz, theme.text_primary, true);
+            }
         }
 
         // Queue list or empty drop-zone hint
@@ -563,7 +683,11 @@ impl<'a> PdfViewerApp<'a> {
                 theme.accent
             };
             fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, (6.0 * s).max(4.0), bg);
-            let lbl = "Combine PDFs";
+            let lbl = if cm.insert_target.is_some() {
+                "Insert PDF(s)"
+            } else {
+                "Combine PDFs"
+            };
             let lw = measure_text(lbl, body_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, b.x + ((b.w as f32 - lw) * 0.5).round() as i32, b.y, b.h, b.x + b.w as i32, lbl, body_sz, theme.text_on_accent, true);
         }
@@ -601,6 +725,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn handle_combine_click(&mut self, hit: CombineHit) {
+        let max_doc_page = self.total_pages().max(1);
         match hit {
             CombineHit::Cancel => {
                 self.close_combine_modal();
@@ -610,6 +735,38 @@ impl<'a> PdfViewerApp<'a> {
                 self.pending_dialog = Some(PendingDialog::CombineAddFiles);
                 self.request_redraw();
                 return;
+            }
+            CombineHit::InsertBefore => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.before = true;
+                }
+            }
+            CombineHit::InsertAfter => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.before = false;
+                }
+            }
+            CombineHit::InsertPageMinus => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.target_page = t.target_page.saturating_sub(1).max(1);
+                }
+            }
+            CombineHit::InsertPagePlus => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.target_page = (t.target_page + 1).min(max_doc_page);
+                }
+            }
+            CombineHit::InsertStart => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.before = true;
+                    t.target_page = 1;
+                }
+            }
+            CombineHit::InsertEnd => {
+                if let Some(t) = self.combine_modal.as_mut().and_then(|c| c.insert_target.as_mut()) {
+                    t.before = false;
+                    t.target_page = max_doc_page;
+                }
             }
             CombineHit::CombineNow => {
                 self.execute_combine_from_modal();
@@ -786,10 +943,11 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn execute_combine_from_modal(&mut self) {
         let Some(cm) = self.combine_modal.as_ref() else { return };
         if cm.entries.is_empty() {
-            self.status_notice = Some("Add at least 1 PDF to combine".to_string());
+            self.status_notice = Some("Add at least 1 PDF first".to_string());
             self.request_redraw();
             return;
         }
+        let insert_target = cm.insert_target;
         let mut plan: Vec<(PathBuf, Option<Vec<u16>>)> = Vec::with_capacity(cm.entries.len());
         for entry in &cm.entries {
             match entry.resolved_pages() {
@@ -804,6 +962,55 @@ impl<'a> PdfViewerApp<'a> {
         let file_count = plan.len();
         let first_dir = plan[0].0.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         self.close_combine_modal();
+
+        if let Some(target) = insert_target {
+            let cur_total = self.total_pages();
+            let base_idx = if target.before {
+                target.target_page.saturating_sub(1).min(cur_total)
+            } else {
+                target.target_page.min(cur_total)
+            };
+            self.push_undo_snapshot();
+            let mut cursor_idx = base_idx;
+            let mut total_inserted: u16 = 0;
+            let mut insert_err: Option<String> = None;
+            if let Some(doc) = self.doc.as_mut() {
+                for (path, opt_pages) in &plan {
+                    match self.engine.insert_external_pdf_pages_at_index(
+                        doc,
+                        path,
+                        opt_pages.as_deref(),
+                        cursor_idx,
+                    ) {
+                        Ok(n) => {
+                            cursor_idx = cursor_idx.saturating_add(n);
+                            total_inserted = total_inserted.saturating_add(n);
+                        }
+                        Err(e) => {
+                            insert_err = Some(format!("{e}"));
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(err) = insert_err {
+                let _ = self.undo_stack.pop_back();
+                self.status_notice = Some(format!("Insert PDF failed: {err}"));
+            } else {
+                self.has_unsaved_edits = true;
+                self.current_page_index = base_idx.min(self.total_pages().saturating_sub(1));
+                self.invalidate_page_caches();
+                self.thumbnail_cache.clear();
+                let pos_word = if target.before { "before" } else { "after" };
+                self.status_notice = Some(format!(
+                    "Inserted {total_inserted} page(s) from {file_count} PDF(s) {pos_word} Page {} (Ctrl/Cmd+Z to undo)",
+                    target.target_page
+                ));
+            }
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
 
         match self.engine.combine_pdfs_with_ranges(&plan) {
             Ok((combined_bytes, total_pages)) => {

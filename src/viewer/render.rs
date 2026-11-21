@@ -1941,6 +1941,10 @@ impl<'a> PdfViewerApp<'a> {
             && !self.show_customize_toolbar
             && !self.show_help_overlay
             && !self.show_about_overlay
+            && !self.show_bookmark_format_overlay
+            && !self.show_tab_list_popover
+            && self.tab_context_menu.is_none()
+            && self.thumb_context_menu.is_none()
             && self.combine_modal.is_none()
             && self.print_preview.is_none()
             && self.manual_duplex_wait.is_none()
@@ -1948,6 +1952,21 @@ impl<'a> PdfViewerApp<'a> {
             && self.page_number_modal.is_none()
         {
             self.draw_floating_hover_tooltip(buffer, width, height, menu_bar_h, status_bar_h, scale_factor);
+        }
+
+        // Thumbnail Grid Right-Click Context Menu
+        if self.thumb_context_menu.is_some() && self.view_mode == ViewMode::ThumbnailGrid {
+            self.draw_thumb_context_menu(buffer, width, height, scale_factor);
+        }
+
+        // All-Tabs Overflow Dropdown Popover (`▾`)
+        if self.show_tab_list_popover {
+            self.draw_tab_list_popover(buffer, width, height, top_bars_h, scale_factor);
+        }
+
+        // Tab Bar Right-Click Context Menu
+        if self.tab_context_menu.is_some() {
+            self.draw_tab_context_menu(buffer, width, height, scale_factor);
         }
 
         // Floating Search Bar / Optimize / Prompt Card
@@ -1970,12 +1989,17 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_themed_help_overlay(buffer, width, height, scale_factor);
         }
 
+        // Bookmark Import Format Guide Modal (`Help -> Bookmark Import Format (.txt)`)
+        if self.show_bookmark_format_overlay {
+            self.draw_bookmark_format_overlay(buffer, width, height, scale_factor);
+        }
+
         // About MicroPDF Modal (`Help -> About MicroPDF`)
         if self.show_about_overlay {
             self.draw_about_overlay(buffer, width, height, scale_factor);
         }
 
-        // Interactive Combine Multiple PDFs Modal (`Shift+M`)
+        // Interactive Combine / Insert Multiple PDFs Modal (`Shift+M` / `Page -> Insert PDF(s)...`)
         if self.combine_modal.is_some() {
             self.draw_combine_modal(buffer, width, height, scale_factor);
         }

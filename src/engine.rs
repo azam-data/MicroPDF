@@ -58,9 +58,9 @@ impl MarginPosition {
             Self::HeaderLeft => "Top Left",
             Self::HeaderCenter => "Top Center",
             Self::HeaderRight => "Top Right",
-            Self::FooterLeft => "Bot Left",
-            Self::FooterCenter => "Bot Center",
-            Self::FooterRight => "Bot Right",
+            Self::FooterLeft => "Bottom Left",
+            Self::FooterCenter => "Bottom Center",
+            Self::FooterRight => "Bottom Right",
         }
     }
 }
@@ -261,7 +261,8 @@ pub struct PageNumberConfig {
     pub position: MarginPosition,
     pub format: PageNumberFormat,
     pub roman_end: u16,
-    pub skip_first_page: bool,
+    /// Number of leading cover/picture pages to leave completely unnumbered (0 = none).
+    pub skip_pages: u16,
     pub font_size: f32,
     pub margin_pt: f32,
     pub color: HeaderFooterColor,
@@ -273,7 +274,7 @@ impl Default for PageNumberConfig {
             position: MarginPosition::FooterCenter,
             format: PageNumberFormat::Plain,
             roman_end: 0,
-            skip_first_page: false,
+            skip_pages: 0,
             font_size: 10.0,
             margin_pt: 28.0,
             color: HeaderFooterColor::Gray,
@@ -812,6 +813,17 @@ impl PdfEngine {
         roman_end: usize,
         total_pages: usize,
     ) -> Option<usize> {
+        Self::resolve_logical_page_str_with_skip(input, 0, roman_end, total_pages)
+    }
+
+    /// Resolves a logical page string (`input`) taking into account `skip_pages` unnumbered
+    /// leading cover/picture pages followed by `roman_end` lowercase Roman front-matter pages.
+    pub fn resolve_logical_page_str_with_skip(
+        input: &str,
+        skip_pages: usize,
+        roman_end: usize,
+        total_pages: usize,
+    ) -> Option<usize> {
         let trimmed = input.trim();
         if trimmed.is_empty() || total_pages == 0 {
             return None;
@@ -826,15 +838,16 @@ impl PdfEngine {
         }
 
         if let Some(r) = Self::from_roman(trimmed) {
-            if r >= 1 && r <= total_pages {
-                return Some(r - 1);
+            let phys_1based = skip_pages + r;
+            if phys_1based >= 1 && phys_1based <= total_pages {
+                return Some(phys_1based - 1);
             }
             return None;
         }
 
         if let Ok(n) = trimmed.parse::<usize>() {
             if n >= 1 {
-                let phys_1based = roman_end + n;
+                let phys_1based = skip_pages + roman_end + n;
                 if phys_1based >= 1 && phys_1based <= total_pages {
                     return Some(phys_1based - 1);
                 }
@@ -846,11 +859,25 @@ impl PdfEngine {
 
     /// Formats the logical label for 0-based `page_idx` given `roman_end`.
     pub fn format_logical_page_label(page_idx: usize, roman_end: usize) -> String {
+        Self::format_logical_page_label_with_skip(page_idx, 0, roman_end)
+    }
+
+    /// Formats the logical label for 0-based `page_idx` given `skip_pages` unnumbered front pages
+    /// followed by `roman_end` Roman pages. Skipped front pages return `"—"`.
+    pub fn format_logical_page_label_with_skip(
+        page_idx: usize,
+        skip_pages: usize,
+        roman_end: usize,
+    ) -> String {
         let phys_1based = page_idx + 1;
-        if roman_end > 0 && phys_1based <= roman_end {
-            Self::to_roman(phys_1based as u16)
+        if skip_pages > 0 && phys_1based <= skip_pages {
+            return "—".to_string();
+        }
+        let eff = phys_1based.saturating_sub(skip_pages);
+        if roman_end > 0 && eff <= roman_end {
+            Self::to_roman(eff as u16)
         } else {
-            format!("{}", phys_1based.saturating_sub(roman_end))
+            format!("{}", eff.saturating_sub(roman_end))
         }
     }
 
@@ -2230,32 +2257,38 @@ impl PdfEngine {
     }
 
     /// Formats a page number label for 1-based `page_num` out of `total_pages` using `cfg`.
+    /// When `cfg.skip_pages > 0`, physical pages `1..=skip_pages` are left unnumbered (`None`),
+    /// the next `cfg.roman_end` pages are numbered `i, ii, iii...`, and subsequent pages start at `1`.
     pub fn format_page_number_label(
         cfg: &PageNumberConfig,
         page_num: u16,
         total_pages: u16,
     ) -> Option<String> {
-        if cfg.skip_first_page && page_num == 1 {
+        if page_num <= cfg.skip_pages {
             return None;
         }
-        let core = if page_num <= cfg.roman_end {
-            Self::to_roman(page_num)
+        let eff_num = page_num - cfg.skip_pages;
+        let is_roman = cfg.roman_end > 0 && eff_num <= cfg.roman_end;
+        let core = if is_roman {
+            Self::to_roman(eff_num)
         } else {
-            format!("{}", page_num.saturating_sub(cfg.roman_end))
+            format!("{}", eff_num.saturating_sub(cfg.roman_end))
         };
-        let arabic_total = total_pages.saturating_sub(cfg.roman_end).max(1);
+        let arabic_total = total_pages
+            .saturating_sub(cfg.skip_pages.saturating_add(cfg.roman_end))
+            .max(1);
         let formatted = match cfg.format {
             PageNumberFormat::Plain => core,
             PageNumberFormat::PageN => format!("Page {core}"),
             PageNumberFormat::PageNOfTotal => {
-                if page_num <= cfg.roman_end {
+                if is_roman {
                     format!("Page {core}")
                 } else {
                     format!("Page {core} of {arabic_total}")
                 }
             }
             PageNumberFormat::NSlashTotal => {
-                if page_num <= cfg.roman_end {
+                if is_roman {
                     core
                 } else {
                     format!("{core} / {arabic_total}")
@@ -2629,22 +2662,58 @@ impl PdfEngine {
         external_path: &Path,
         target_page_index: u16,
     ) -> Result<u16> {
+        self.insert_external_pdf_pages_at_index(doc, external_path, None, target_page_index)
+    }
+
+    /// Imports either all pages (`page_indices == None`) or specific 0-based `page_indices`
+    /// from an external PDF file (`external_path`) into `doc` starting at 0-based
+    /// `target_page_index`. Returns the number of imported pages.
+    pub fn insert_external_pdf_pages_at_index(
+        &self,
+        doc: &mut PdfDocument,
+        external_path: &Path,
+        page_indices: Option<&[u16]>,
+        target_page_index: u16,
+    ) -> Result<u16> {
         let ext_doc = self.load_pdf_safe(external_path)?;
         let ext_count = ext_doc.pages().len();
         if ext_count == 0 {
             return Ok(0);
         }
-        let dest_idx = target_page_index.min(doc.pages().len());
-        if dest_idx >= doc.pages().len() {
-            doc.pages_mut()
-                .append(&ext_doc)
-                .with_context(|| format!("Failed to append pages from {:?}", external_path))?;
-        } else {
-            doc.pages_mut()
-                .copy_page_range_from_document(&ext_doc, 0..=(ext_count - 1), dest_idx)
-                .with_context(|| format!("Failed to import pages from {:?}", external_path))?;
+        let mut dest_idx = target_page_index.min(doc.pages().len());
+        match page_indices {
+            None => {
+                if dest_idx >= doc.pages().len() {
+                    doc.pages_mut()
+                        .append(&ext_doc)
+                        .with_context(|| format!("Failed to append pages from {:?}", external_path))?;
+                } else {
+                    doc.pages_mut()
+                        .copy_page_range_from_document(&ext_doc, 0..=(ext_count - 1), dest_idx)
+                        .with_context(|| format!("Failed to import pages from {:?}", external_path))?;
+                }
+                Ok(ext_count)
+            }
+            Some(indices) => {
+                let mut inserted: u16 = 0;
+                for &src_idx in indices {
+                    if src_idx < ext_count {
+                        doc.pages_mut()
+                            .copy_page_from_document(&ext_doc, src_idx, dest_idx)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to import page {} from {:?}",
+                                    src_idx + 1,
+                                    external_path
+                                )
+                            })?;
+                        dest_idx = dest_idx.saturating_add(1);
+                        inserted = inserted.saturating_add(1);
+                    }
+                }
+                Ok(inserted)
+            }
         }
-        Ok(ext_count)
     }
 
     /// Extracts a comma-separated 1-based page specification (e.g. `"1-3"` or `"2,4,6"`)
@@ -2673,12 +2742,40 @@ impl PdfEngine {
         Ok(count)
     }
 
-    /// Inserts a blank A4 page into `doc` at `insert_index` (0-based).
+    /// Inserts a blank page into `doc` at `insert_index` (0-based), matching adjacent page size or A4.
     pub fn insert_blank_page_in_doc(doc: &mut PdfDocument, insert_index: u16) -> Result<u16> {
-        let clamped_idx = insert_index.min(doc.pages().len());
-        doc.pages_mut()
-            .create_page_at_index(PdfPagePaperSize::a4(), clamped_idx)
-            .context("Failed to insert blank A4 page")?;
+        Self::insert_blank_pages_in_doc(doc, insert_index, 1)
+    }
+
+    /// Inserts `count` (1..=50) blank pages into `doc` starting at `insert_index` (0-based),
+    /// matching the adjacent page's paper dimensions (or A4 if empty).
+    pub fn insert_blank_pages_in_doc(
+        doc: &mut PdfDocument,
+        insert_index: u16,
+        count: u16,
+    ) -> Result<u16> {
+        let count = count.clamp(1, 50);
+        let total = doc.pages().len();
+        let clamped_idx = insert_index.min(total);
+        let paper = if total > 0 {
+            let ref_idx = if clamped_idx < total {
+                clamped_idx
+            } else {
+                total - 1
+            };
+            doc.pages()
+                .get(ref_idx)
+                .ok()
+                .map(|p| PdfPagePaperSize::Custom(p.width(), p.height()))
+                .unwrap_or_else(PdfPagePaperSize::a4)
+        } else {
+            PdfPagePaperSize::a4()
+        };
+        for offset in 0..count {
+            doc.pages_mut()
+                .create_page_at_index(paper, clamped_idx + offset)
+                .context("Failed to insert blank page")?;
+        }
         Ok(clamped_idx)
     }
 

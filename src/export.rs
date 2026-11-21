@@ -1140,6 +1140,603 @@ pub fn export_document_to_latex(doc: &PdfDocument, doc_title: &str) -> String {
     render_blocks_to_latex(doc_title, &pages)
 }
 
+/// Converts an open `PdfDocument` to an editable Microsoft Word OOXML (`.docx`) archive.
+/// Uses pure-Rust ZIP + XML generation with existing `flate2` (zero new dependencies, zero idle RAM).
+pub fn export_document_to_docx(doc: &PdfDocument, doc_title: &str) -> Vec<u8> {
+    let pages = extract_document_blocks(doc);
+    render_blocks_to_docx(doc_title, &pages)
+}
+
+/// Converts an open `PdfDocument` to a Microsoft Excel OOXML (`.xlsx`) workbook.
+/// Detected tables become clean formatted worksheets with typed numbers & headers; non-table
+/// documents export cleanly as structured text sheets.
+pub fn export_document_to_xlsx(doc: &PdfDocument) -> Vec<u8> {
+    let pages = extract_document_blocks(doc);
+    render_blocks_to_xlsx(&pages)
+}
+
+// ---------------------------------------------------------------------------
+// Minimal Pure-Rust ZIP Writer (IEEE CRC32 + flate2 raw Deflate)
+// ---------------------------------------------------------------------------
+
+fn crc32_ieee(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
+struct MiniZipWriter {
+    buf: Vec<u8>,
+    entries: Vec<(String, u32, u32, u32, u16, u32)>,
+}
+
+impl MiniZipWriter {
+    fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(8192),
+            entries: Vec::new(),
+        }
+    }
+
+    fn add_file(&mut self, name: &str, data: &[u8]) {
+        use flate2::write::DeflateEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let crc = crc32_ieee(data);
+        let uncomp_len = data.len() as u32;
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        let deflated = if enc.write_all(data).is_ok() {
+            enc.finish().ok()
+        } else {
+            None
+        };
+        let (method, payload): (u16, &[u8]) = match deflated.as_deref() {
+            Some(c) if c.len() < data.len() => (8, c),
+            _ => (0, data),
+        };
+        let comp_len = payload.len() as u32;
+        let offset = self.buf.len() as u32;
+        let name_bytes = name.as_bytes();
+
+        // Local file header (PK\x03\x04)
+        self.buf.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+        self.buf.extend_from_slice(&20u16.to_le_bytes()); // version needed 2.0
+        self.buf.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 filename flag
+        self.buf.extend_from_slice(&method.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes()); // mod time
+        self.buf.extend_from_slice(&0x5821u16.to_le_bytes()); // mod date (2024-01-01)
+        self.buf.extend_from_slice(&crc.to_le_bytes());
+        self.buf.extend_from_slice(&comp_len.to_le_bytes());
+        self.buf.extend_from_slice(&uncomp_len.to_le_bytes());
+        self.buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes()); // extra len
+        self.buf.extend_from_slice(name_bytes);
+        self.buf.extend_from_slice(payload);
+
+        self.entries.push((name.to_string(), crc, comp_len, uncomp_len, method, offset));
+    }
+
+    fn finish(mut self) -> Vec<u8> {
+        let cd_offset = self.buf.len() as u32;
+        for (name, crc, comp_len, uncomp_len, method, offset) in &self.entries {
+            let nb = name.as_bytes();
+            // Central directory file header (PK\x01\x02)
+            self.buf.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            self.buf.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            self.buf.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            self.buf.extend_from_slice(&0x0800u16.to_le_bytes()); // UTF-8 flag
+            self.buf.extend_from_slice(&method.to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes());
+            self.buf.extend_from_slice(&0x5821u16.to_le_bytes());
+            self.buf.extend_from_slice(&crc.to_le_bytes());
+            self.buf.extend_from_slice(&comp_len.to_le_bytes());
+            self.buf.extend_from_slice(&uncomp_len.to_le_bytes());
+            self.buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            self.buf.extend_from_slice(&0u16.to_le_bytes()); // extra
+            self.buf.extend_from_slice(&0u16.to_le_bytes()); // comment
+            self.buf.extend_from_slice(&0u16.to_le_bytes()); // disk start
+            self.buf.extend_from_slice(&0u16.to_le_bytes()); // internal attr
+            self.buf.extend_from_slice(&0u32.to_le_bytes()); // external attr
+            self.buf.extend_from_slice(&offset.to_le_bytes());
+            self.buf.extend_from_slice(nb);
+        }
+        let cd_size = (self.buf.len() as u32).saturating_sub(cd_offset);
+        let count = self.entries.len() as u16;
+        // End of central directory record (PK\x05\x06)
+        self.buf.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf.extend_from_slice(&count.to_le_bytes());
+        self.buf.extend_from_slice(&count.to_le_bytes());
+        self.buf.extend_from_slice(&cd_size.to_le_bytes());
+        self.buf.extend_from_slice(&cd_offset.to_le_bytes());
+        self.buf.extend_from_slice(&0u16.to_le_bytes());
+        self.buf
+    }
+}
+
+fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            // Strip illegal XML 1.0 control characters
+            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Pure-Rust Word (.docx) OOXML Generator
+// ---------------------------------------------------------------------------
+
+pub fn render_blocks_to_docx(doc_title: &str, pages: &[Vec<ExportBlock>]) -> Vec<u8> {
+    let mut links: Vec<(String, String)> = Vec::new();
+    let mut body = String::with_capacity(4096);
+
+    let push_run = |dst: &mut String, text: &str, bold: bool, italic: bool, is_link: bool| {
+        if text.is_empty() {
+            return;
+        }
+        dst.push_str("<w:r>");
+        if bold || italic || is_link {
+            dst.push_str("<w:rPr>");
+            if bold {
+                dst.push_str("<w:b/>");
+            }
+            if italic {
+                dst.push_str("<w:i/>");
+            }
+            if is_link {
+                dst.push_str("<w:color w:val=\"1D4ED8\"/><w:u w:val=\"single\"/>");
+            }
+            dst.push_str("</w:rPr>");
+        }
+        dst.push_str("<w:t xml:space=\"preserve\">");
+        dst.push_str(&xml_escape(text));
+        dst.push_str("</w:t></w:r>");
+    };
+
+    let mut push_spans = |dst: &mut String, spans: &[StyledSpan]| {
+        for sp in spans {
+            if let Some(ref url) = sp.link {
+                let rid = format!("rId{}", links.len() + 2); // rId1 is styles.xml
+                links.push((rid.clone(), url.clone()));
+                dst.push_str(&format!("<w:hyperlink r:id=\"{rid}\">"));
+                push_run(dst, &sp.text, sp.bold, sp.italic, true);
+                dst.push_str("</w:hyperlink>");
+            } else {
+                push_run(dst, &sp.text, sp.bold, sp.italic, false);
+            }
+        }
+    };
+
+    let mut any_content = false;
+    for (p_idx, blocks) in pages.iter().enumerate() {
+        if p_idx > 0 && any_content && !blocks.is_empty() {
+            body.push_str("<w:p><w:r><w:br w:type=\"page\"/></w:r></w:p>");
+        }
+        for block in blocks {
+            any_content = true;
+            match block {
+                ExportBlock::Heading { level, text } => {
+                    let style = match level {
+                        1 => "Heading1",
+                        2 => "Heading2",
+                        _ => "Heading3",
+                    };
+                    body.push_str(&format!(
+                        "<w:p><w:pPr><w:pStyle w:val=\"{style}\"/></w:pPr>"
+                    ));
+                    push_run(&mut body, text, true, false, false);
+                    body.push_str("</w:p>");
+                }
+                ExportBlock::Paragraph(spans) => {
+                    body.push_str("<w:p>");
+                    push_spans(&mut body, spans);
+                    body.push_str("</w:p>");
+                }
+                ExportBlock::BulletItem(spans) => {
+                    body.push_str("<w:p><w:pPr><w:ind w:left=\"360\" w:hanging=\"180\"/></w:pPr>");
+                    push_run(&mut body, "• ", true, false, false);
+                    push_spans(&mut body, spans);
+                    body.push_str("</w:p>");
+                }
+                ExportBlock::NumberedItem { num, spans } => {
+                    body.push_str("<w:p><w:pPr><w:ind w:left=\"360\" w:hanging=\"220\"/></w:pPr>");
+                    push_run(&mut body, &format!("{num} "), true, false, false);
+                    push_spans(&mut body, spans);
+                    body.push_str("</w:p>");
+                }
+                ExportBlock::Table(rows) => {
+                    let cols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                    if cols == 0 {
+                        continue;
+                    }
+                    let col_w = (9360usize / cols.max(1)).max(720);
+                    body.push_str(
+                        "<w:tbl><w:tblPr><w:tblW w:w=\"9360\" w:type=\"dxa\"/>\
+                         <w:tblBorders>\
+                         <w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>\
+                         <w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>\
+                         <w:bottom w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>\
+                         <w:right w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"CBD5E1\"/>\
+                         <w:insideH w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"E2E8F0\"/>\
+                         <w:insideV w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"E2E8F0\"/>\
+                         </w:tblBorders>\
+                         <w:tblCellMar>\
+                         <w:top w:w=\"60\" w:type=\"dxa\"/><w:bottom w:w=\"60\" w:type=\"dxa\"/>\
+                         <w:left w:w=\"100\" w:type=\"dxa\"/><w:right w:w=\"100\" w:type=\"dxa\"/>\
+                         </w:tblCellMar></w:tblPr>",
+                    );
+                    for (r_idx, row) in rows.iter().enumerate() {
+                        let is_hdr = r_idx == 0;
+                        body.push_str("<w:tr>");
+                        for c_idx in 0..cols {
+                            let cell_txt = row.get(c_idx).map(|s| s.as_str()).unwrap_or("");
+                            body.push_str(&format!(
+                                "<w:tc><w:tcPr><w:tcW w:w=\"{col_w}\" w:type=\"dxa\"/>"
+                            ));
+                            if is_hdr {
+                                body.push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"EFF6FF\"/>");
+                            } else if r_idx % 2 == 0 {
+                                body.push_str("<w:shd w:val=\"clear\" w:color=\"auto\" w:fill=\"F8FAFC\"/>");
+                            }
+                            body.push_str("</w:tcPr><w:p><w:pPr><w:spacing w:before=\"0\" w:after=\"0\"/></w:pPr>");
+                            push_run(&mut body, cell_txt, is_hdr, false, false);
+                            body.push_str("</w:p></w:tc>");
+                        }
+                        body.push_str("</w:tr>");
+                    }
+                    body.push_str("</w:tbl><w:p/>");
+                }
+            }
+        }
+    }
+    if !any_content {
+        body.push_str("<w:p><w:r><w:t>(No extractable text found in PDF)</w:t></w:r></w:p>");
+    }
+
+    let document_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <w:body>{body}<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/>\
+         <w:pgMar w:top=\"1440\" w:right=\"1440\" w:bottom=\"1440\" w:left=\"1440\"/></w:sectPr>\
+         </w:body></w:document>"
+    );
+
+    let mut doc_rels = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+    );
+    for (rid, url) in &links {
+        doc_rels.push_str(&format!(
+            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" Target=\"{}\" TargetMode=\"External\"/>",
+            xml_escape(url)
+        ));
+    }
+    doc_rels.push_str("</Relationships>");
+
+    let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <w:styles xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
+        <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:ascii=\"Calibri\" w:hAnsi=\"Calibri\"/>\
+        <w:sz w:val=\"22\"/><w:color w:val=\"1E293B\"/></w:rPr></w:rPrDefault>\
+        <w:pPrDefault><w:pPr><w:spacing w:after=\"120\" w:line=\"276\" w:lineRule=\"auto\"/></w:pPr></w:pPrDefault></w:docDefaults>\
+        <w:style w:type=\"paragraph\" w:default=\"1\" w:styleId=\"Normal\"><w:name w:val=\"Normal\"/></w:style>\
+        <w:style w:type=\"paragraph\" w:styleId=\"Heading1\"><w:name w:val=\"heading 1\"/>\
+        <w:basedOn w:val=\"Normal\"/><w:pPr><w:spacing w:before=\"240\" w:after=\"100\"/></w:pPr>\
+        <w:rPr><w:b/><w:sz w:val=\"32\"/><w:color w:val=\"0F172A\"/></w:rPr></w:style>\
+        <w:style w:type=\"paragraph\" w:styleId=\"Heading2\"><w:name w:val=\"heading 2\"/>\
+        <w:basedOn w:val=\"Normal\"/><w:pPr><w:spacing w:before=\"200\" w:after=\"80\"/></w:pPr>\
+        <w:rPr><w:b/><w:sz w:val=\"26\"/><w:color w:val=\"1E3A8A\"/></w:rPr></w:style>\
+        <w:style w:type=\"paragraph\" w:styleId=\"Heading3\"><w:name w:val=\"heading 3\"/>\
+        <w:basedOn w:val=\"Normal\"/><w:pPr><w:spacing w:before=\"160\" w:after=\"60\"/></w:pPr>\
+        <w:rPr><w:b/><w:sz w:val=\"24\"/><w:color w:val=\"334155\"/></w:rPr></w:style>\
+        </w:styles>";
+
+    let core_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <cp:coreProperties xmlns:cp=\"http://schemas.openxmlformats.org/package/2006/metadata/core-properties\" \
+         xmlns:dc=\"http://purl.org/dc/elements/1.1/\">\
+         <dc:title>{}</dc:title><dc:creator>MicroPDF</dc:creator></cp:coreProperties>",
+        xml_escape(doc_title)
+    );
+
+    let content_types = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+        <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+        <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+        <Override PartName=\"/word/document.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml\"/>\
+        <Override PartName=\"/word/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml\"/>\
+        <Override PartName=\"/docProps/core.xml\" ContentType=\"application/vnd.openxmlformats-package.core-properties+xml\"/>\
+        </Types>";
+
+    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"word/document.xml\"/>\
+        <Relationship Id=\"rId2\" Type=\"http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties\" Target=\"docProps/core.xml\"/>\
+        </Relationships>";
+
+    let mut zip = MiniZipWriter::new();
+    zip.add_file("[Content_Types].xml", content_types.as_bytes());
+    zip.add_file("_rels/.rels", root_rels.as_bytes());
+    zip.add_file("docProps/core.xml", core_xml.as_bytes());
+    zip.add_file("word/document.xml", document_xml.as_bytes());
+    zip.add_file("word/styles.xml", styles_xml.as_bytes());
+    zip.add_file("word/_rels/document.xml.rels", doc_rels.as_bytes());
+    zip.finish()
+}
+
+// ---------------------------------------------------------------------------
+// Pure-Rust Excel (.xlsx) OOXML Generator
+// ---------------------------------------------------------------------------
+
+fn xlsx_col_letter(mut col_zero_based: usize) -> String {
+    let mut chars = Vec::new();
+    loop {
+        chars.push((b'A' + (col_zero_based % 26) as u8) as char);
+        if col_zero_based < 26 {
+            break;
+        }
+        col_zero_based = col_zero_based / 26 - 1;
+    }
+    chars.into_iter().rev().collect()
+}
+
+fn parse_excel_numeric(cell: &str) -> Option<(f64, u8)> {
+    let s = cell.trim();
+    if s.is_empty() || s.len() > 24 {
+        return None;
+    }
+    // Style 3 = plain/comma number, Style 4 = percentage
+    if let Some(pct) = s.strip_suffix('%') {
+        let cleaned = pct.trim().replace(',', "");
+        if let Ok(v) = cleaned.parse::<f64>() {
+            if v.is_finite() {
+                return Some((v / 100.0, 4));
+            }
+        }
+        return None;
+    }
+    // Allow optional leading currency or accounting parens only for plain numbers without alpha
+    let cleaned = s.replace(',', "");
+    if let Ok(v) = cleaned.parse::<f64>() {
+        if v.is_finite() {
+            return Some((v, 3));
+        }
+    }
+    None
+}
+
+fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
+    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let mut col_widths = vec![12usize; max_cols];
+    for row in rows {
+        for (c, cell) in row.iter().enumerate() {
+            let len = cell.chars().count();
+            if len + 3 > col_widths[c] {
+                col_widths[c] = (len + 3).min(56);
+            }
+        }
+    }
+
+    let mut xml = String::with_capacity(2048);
+    xml.push_str(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+         <cols>",
+    );
+    for (i, w) in col_widths.iter().enumerate() {
+        let col_idx = i + 1;
+        xml.push_str(&format!(
+            "<col min=\"{col_idx}\" max=\"{col_idx}\" width=\"{w}\" customWidth=\"1\"/>"
+        ));
+    }
+    xml.push_str("</cols><sheetData>");
+
+    for (r_idx, row) in rows.iter().enumerate() {
+        let row_num = r_idx + 1;
+        let is_hdr = bold_first_row && r_idx == 0;
+        xml.push_str(&format!("<row r=\"{row_num}\">"));
+        for (c_idx, val) in row.iter().enumerate() {
+            let col_ref = format!("{}{}", xlsx_col_letter(c_idx), row_num);
+            if !is_hdr {
+                if let Some((num, num_style)) = parse_excel_numeric(val) {
+                    xml.push_str(&format!(
+                        "<c r=\"{col_ref}\" s=\"{num_style}\"><v>{num}</v></c>"
+                    ));
+                    continue;
+                }
+            }
+            let style = if is_hdr { 1 } else { 2 };
+            xml.push_str(&format!(
+                "<c r=\"{col_ref}\" t=\"inlineStr\" s=\"{style}\"><is><t xml:space=\"preserve\">{}</t></is></c>",
+                xml_escape(val)
+            ));
+        }
+        xml.push_str("</row>");
+    }
+
+    xml.push_str("</sheetData></worksheet>");
+    xml
+}
+
+pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
+    let mut sheets: Vec<(String, Vec<Vec<String>>, bool)> = Vec::new();
+    let mut text_rows: Vec<Vec<String>> = Vec::new();
+    let mut table_num = 0usize;
+
+    for (p_idx, blocks) in pages.iter().enumerate() {
+        let page_lbl = format!("Page {}", p_idx + 1);
+        for block in blocks {
+            match block {
+                ExportBlock::Table(rows) if !rows.is_empty() => {
+                    table_num += 1;
+                    if sheets.len() < 28 {
+                        let name = format!("Table {table_num} (p.{})", p_idx + 1);
+                        sheets.push((name, rows.clone(), true));
+                    } else if let Some((_, last_rows, _)) = sheets.last_mut() {
+                        last_rows.push(Vec::new());
+                        last_rows.push(vec![format!("Table {table_num} ({page_lbl})")]);
+                        last_rows.extend(rows.iter().cloned());
+                    }
+                }
+                ExportBlock::Heading { text, .. } => {
+                    text_rows.push(vec![page_lbl.clone(), "Heading".to_string(), text.clone()]);
+                }
+                ExportBlock::Paragraph(spans) => {
+                    let s: String = spans.iter().map(|sp| sp.text.as_str()).collect();
+                    if !s.trim().is_empty() {
+                        text_rows.push(vec![page_lbl.clone(), "Text".to_string(), s.trim().to_string()]);
+                    }
+                }
+                ExportBlock::BulletItem(spans) => {
+                    let s: String = spans.iter().map(|sp| sp.text.as_str()).collect();
+                    if !s.trim().is_empty() {
+                        text_rows.push(vec![page_lbl.clone(), "Bullet".to_string(), s.trim().to_string()]);
+                    }
+                }
+                ExportBlock::NumberedItem { num, spans } => {
+                    let s: String = spans.iter().map(|sp| sp.text.as_str()).collect();
+                    if !s.trim().is_empty() {
+                        text_rows.push(vec![
+                            page_lbl.clone(),
+                            format!("Item {num}"),
+                            s.trim().to_string(),
+                        ]);
+                    }
+                }
+                ExportBlock::Table(_) => {}
+            }
+        }
+    }
+
+    if !text_rows.is_empty() {
+        let mut with_hdr = Vec::with_capacity(text_rows.len() + 1);
+        with_hdr.push(vec!["Page".to_string(), "Type".to_string(), "Content".to_string()]);
+        with_hdr.extend(text_rows);
+        sheets.push(("Document Text".to_string(), with_hdr, true));
+    }
+
+    if sheets.is_empty() {
+        sheets.push((
+            "Sheet1".to_string(),
+            vec![vec!["(No extractable text or tables found in PDF)".to_string()]],
+            false,
+        ));
+    }
+
+    let mut content_types = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+         <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+         <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
+         <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+    );
+    let mut wb_sheets = String::new();
+    let mut wb_rels = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+    );
+
+    let mut zip = MiniZipWriter::new();
+    for (idx, (raw_name, rows, bold_hdr)) in sheets.iter().enumerate() {
+        let s_num = idx + 1;
+        let rid = format!("rId{}", s_num + 1);
+        // Excel sheet names max 31 chars, no : \ / ? * [ ]
+        let safe_name: String = raw_name
+            .chars()
+            .filter(|c| !matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
+            .take(31)
+            .collect();
+        content_types.push_str(&format!(
+            "<Override PartName=\"/xl/worksheets/sheet{s_num}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        ));
+        wb_sheets.push_str(&format!(
+            "<sheet name=\"{}\" sheetId=\"{s_num}\" r:id=\"{rid}\"/>",
+            xml_escape(&safe_name)
+        ));
+        wb_rels.push_str(&format!(
+            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{s_num}.xml\"/>"
+        ));
+        let sheet_xml = build_xlsx_sheet_xml(rows, *bold_hdr);
+        zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
+    }
+    content_types.push_str("</Types>");
+    wb_rels.push_str("</Relationships>");
+
+    let workbook_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <sheets>{wb_sheets}</sheets></workbook>"
+    );
+
+    // Cell styles: 0=default, 1=bold blue-tinted header with border, 2=text with border, 3=number with border, 4=percent with border
+    let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+        <fonts count=\"2\">\
+          <font><sz val=\"11\"/><name val=\"Calibri\"/></font>\
+          <font><b/><sz val=\"11\"/><color rgb=\"FF0F172A\"/><name val=\"Calibri\"/></font>\
+        </fonts>\
+        <fills count=\"3\">\
+          <fill><patternFill patternType=\"none\"/></fill>\
+          <fill><patternFill patternType=\"gray125\"/></fill>\
+          <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFEFF6FF\"/></patternFill></fill>\
+        </fills>\
+        <borders count=\"2\">\
+          <border><left/><right/><top/><bottom/><diagonal/></border>\
+          <border>\
+            <left style=\"thin\"><color rgb=\"FFCBD5E1\"/></left>\
+            <right style=\"thin\"><color rgb=\"FFCBD5E1\"/></right>\
+            <top style=\"thin\"><color rgb=\"FFCBD5E1\"/></top>\
+            <bottom style=\"thin\"><color rgb=\"FFCBD5E1\"/></bottom>\
+            <diagonal/>\
+          </border>\
+        </borders>\
+        <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
+        <cellXfs count=\"5\">\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
+          <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"4\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+        </cellXfs>\
+        </styleSheet>";
+
+    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
+        </Relationships>";
+
+    zip.add_file("[Content_Types].xml", content_types.as_bytes());
+    zip.add_file("_rels/.rels", root_rels.as_bytes());
+    zip.add_file("xl/workbook.xml", workbook_xml.as_bytes());
+    zip.add_file("xl/styles.xml", styles_xml.as_bytes());
+    zip.add_file("xl/_rels/workbook.xml.rels", wb_rels.as_bytes());
+    zip.finish()
+}
+
 /// Extracts reflowable plain-text paragraphs for the single-page Text View mode.
 pub fn extract_page_text_blocks(page: &PdfPage) -> Vec<ExportBlock> {
     let (pw, _ph, runs) = extract_page_runs(page);
@@ -1340,4 +1937,86 @@ mod tests {
         assert!(lines[8].plain_text().starts_with("Left column prose line 8"));
         assert!(lines[9].plain_text().starts_with("Right column prose line 0"));
     }
+
+    fn read_zip_entries(zip: &[u8]) -> Vec<(String, String)> {
+        use flate2::read::DeflateDecoder;
+        use std::io::Read;
+
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 30 <= zip.len() {
+            let sig = u32::from_le_bytes(zip[pos..pos + 4].try_into().unwrap());
+            if sig != 0x0403_4b50 {
+                break;
+            }
+            let method = u16::from_le_bytes(zip[pos + 8..pos + 10].try_into().unwrap());
+            let crc = u32::from_le_bytes(zip[pos + 14..pos + 18].try_into().unwrap());
+            let comp_len = u32::from_le_bytes(zip[pos + 18..pos + 22].try_into().unwrap()) as usize;
+            let uncomp_len = u32::from_le_bytes(zip[pos + 22..pos + 26].try_into().unwrap()) as usize;
+            let name_len = u16::from_le_bytes(zip[pos + 26..pos + 28].try_into().unwrap()) as usize;
+            let extra_len = u16::from_le_bytes(zip[pos + 28..pos + 30].try_into().unwrap()) as usize;
+            let name_start = pos + 30;
+            let data_start = name_start + name_len + extra_len;
+            let name = String::from_utf8(zip[name_start..name_start + name_len].to_vec()).unwrap();
+            let raw_payload = &zip[data_start..data_start + comp_len];
+            let data = if method == 8 {
+                let mut dec = DeflateDecoder::new(raw_payload);
+                let mut v = Vec::new();
+                dec.read_to_end(&mut v).unwrap();
+                v
+            } else {
+                raw_payload.to_vec()
+            };
+            assert_eq!(data.len(), uncomp_len, "uncompressed len mismatch for {name}");
+            assert_eq!(crc32_ieee(&data), crc, "CRC32 mismatch for {name}");
+            out.push((name, String::from_utf8(data).unwrap()));
+            pos = data_start + comp_len;
+        }
+        out
+    }
+
+    #[test]
+    fn test_docx_and_xlsx_export_produce_valid_ooxml_zips() {
+        let pages = vec![vec![
+            ExportBlock::Heading {
+                level: 1,
+                text: "Q4 Financial Summary".to_string(),
+            },
+            ExportBlock::Paragraph(vec![
+                StyledSpan { text: "Visit ".to_string(), bold: false, italic: false, link: None },
+                StyledSpan {
+                    text: "MicroPDF".to_string(),
+                    bold: true,
+                    italic: false,
+                    link: Some("https://example.com".to_string()),
+                },
+            ]),
+            ExportBlock::Table(vec![
+                vec!["Metric".to_string(), "Value".to_string(), "Growth".to_string()],
+                vec!["Revenue".to_string(), "12,450".to_string(), "25.5%".to_string()],
+            ]),
+        ]];
+
+        let docx = render_blocks_to_docx("Q4 Report", &pages);
+        assert!(docx.starts_with(b"PK\x03\x04"));
+        let docx_entries = read_zip_entries(&docx);
+        let doc_xml = &docx_entries.iter().find(|(n, _)| n == "word/document.xml").unwrap().1;
+        let rels_xml = &docx_entries.iter().find(|(n, _)| n == "word/_rels/document.xml.rels").unwrap().1;
+        assert!(doc_xml.contains("Heading1"));
+        assert!(doc_xml.contains("Q4 Financial Summary"));
+        assert!(doc_xml.contains("<w:hyperlink r:id=\"rId2\">"));
+        assert!(doc_xml.contains("<w:tbl>"));
+        assert!(rels_xml.contains("https://example.com"));
+
+        let xlsx = render_blocks_to_xlsx(&pages);
+        assert!(xlsx.starts_with(b"PK\x03\x04"));
+        let xlsx_entries = read_zip_entries(&xlsx);
+        let sheet1 = &xlsx_entries.iter().find(|(n, _)| n == "xl/worksheets/sheet1.xml").unwrap().1;
+        let wb = &xlsx_entries.iter().find(|(n, _)| n == "xl/workbook.xml").unwrap().1;
+        assert!(wb.contains("Table 1 (p.1)"));
+        assert!(wb.contains("Document Text"));
+        assert!(sheet1.contains("<v>12450</v>"), "numeric cell should store raw number: {sheet1}");
+        assert!(sheet1.contains("<v>0.255</v>"), "percentage cell should store numeric ratio: {sheet1}");
+    }
 }
+

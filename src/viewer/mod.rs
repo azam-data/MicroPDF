@@ -1134,8 +1134,8 @@ mod tests {
         let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
         app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
 
-        // 1. Open Tools -> Optimize... (item 7 in Tools menu)
-        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        // 1. Open Tools -> Optimize... (item 6 in Tools menu)
+        app.execute_menu_item(state::MenuCategory::Tools, 6);
         assert_eq!(
             app.input_mode,
             state::InputMode::OptimizePrompt {
@@ -1206,7 +1206,7 @@ mod tests {
         assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
 
         // 5. Re-open Tools -> Optimize... and run all steps to completion
-        app.execute_menu_item(state::MenuCategory::Tools, 7);
+        app.execute_menu_item(state::MenuCategory::Tools, 6);
         app.handle_key_input(
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
             None,
@@ -2658,28 +2658,49 @@ mod tests {
 
     #[test]
     fn test_page_number_config_formatting_and_roman_cover_skip() {
-        use crate::engine::{PageNumberConfig, PageNumberFormat, PdfEngine};
+        use crate::engine::{MarginPosition, PageNumberConfig, PageNumberFormat, PdfEngine};
 
+        // Full non-abbreviated "Bottom Left / Center / Right" labels (#2c)
+        assert_eq!(MarginPosition::FooterLeft.label(), "Bottom Left");
+        assert_eq!(MarginPosition::FooterCenter.label(), "Bottom Center");
+        assert_eq!(MarginPosition::FooterRight.label(), "Bottom Right");
+
+        // Multi-page front skip (2 unnumbered cover/picture pages) + 3 Roman pages + Arabic body (#2d)
         let mut cfg = PageNumberConfig::default();
-        cfg.roman_end = 2;
-        cfg.skip_first_page = true;
+        cfg.skip_pages = 2;
+        cfg.roman_end = 3;
         cfg.format = PageNumberFormat::PageNOfTotal;
 
         assert_eq!(PdfEngine::format_page_number_label(&cfg, 1, 10), None);
-        assert_eq!(
-            PdfEngine::format_page_number_label(&cfg, 2, 10),
-            Some("Page ii".to_string())
-        );
+        assert_eq!(PdfEngine::format_page_number_label(&cfg, 2, 10), None);
         assert_eq!(
             PdfEngine::format_page_number_label(&cfg, 3, 10),
-            Some("Page 1 of 8".to_string())
+            Some("Page i".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 5, 10),
+            Some("Page iii".to_string())
+        );
+        assert_eq!(
+            PdfEngine::format_page_number_label(&cfg, 6, 10),
+            Some("Page 1 of 5".to_string())
         );
         assert_eq!(
             PdfEngine::format_page_number_label(&cfg, 10, 10),
-            Some("Page 8 of 8".to_string())
+            Some("Page 5 of 5".to_string())
         );
 
-        cfg.skip_first_page = false;
+        // Logical page resolution & display labels match skip_pages + roman_end (#2b)
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("i", 2, 3, 10), Some(2));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("iii", 2, 3, 10), Some(4));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("1", 2, 3, 10), Some(5));
+        assert_eq!(PdfEngine::resolve_logical_page_str_with_skip("#2", 2, 3, 10), Some(1));
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(0, 2, 3), "—");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(2, 2, 3), "i");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(4, 2, 3), "iii");
+        assert_eq!(PdfEngine::format_logical_page_label_with_skip(5, 2, 3), "1");
+
+        cfg.skip_pages = 0;
         cfg.roman_end = 0;
         cfg.format = PageNumberFormat::Dashed;
         assert_eq!(
@@ -2691,6 +2712,50 @@ mod tests {
             PdfEngine::format_page_number_label(&cfg, 4, 5),
             Some("4 / 5".to_string())
         );
+    }
+
+    #[test]
+    fn test_header_footer_modal_opens_blank_and_export_help_menus_complete() {
+        use super::doc_tools_modal::HeaderFooterModalState;
+        use super::overlays::BOOKMARK_SAMPLE_TXT;
+        use super::state::MenuCategory;
+        use crate::engine::PdfEngine;
+
+        // #1c: Header & Footer modal must always start completely blank (never stale footer text)
+        let hf = HeaderFooterModalState::new(0);
+        assert!(hf.profile.name.is_empty());
+        assert!(hf.profile.header_left.is_empty());
+        assert!(hf.profile.header_center.is_empty());
+        assert!(hf.profile.header_right.is_empty());
+        assert!(hf.profile.footer_left.is_empty());
+        assert!(hf.profile.footer_center.is_empty());
+        assert!(hf.profile.footer_right.is_empty());
+        assert!(!hf.select_all);
+
+        // #9: Dedicated Export menu with .docx, .xlsx, .md, .tex (and removed from File)
+        assert!(MenuCategory::ALL.contains(&MenuCategory::Export));
+        let exp = MenuCategory::Export.items();
+        assert!(exp.iter().any(|s| s.contains(".docx")));
+        assert!(exp.iter().any(|s| s.contains(".xlsx")));
+        assert!(exp.iter().any(|s| s.contains(".md")));
+        assert!(exp.iter().any(|s| s.contains(".tex")));
+        assert!(!MenuCategory::File.items().iter().any(|s| s.contains("Markdown")));
+        assert!(MenuCategory::File.items().iter().any(|s| s.contains("Close Other Tabs")));
+        assert!(MenuCategory::File.items().iter().any(|s| s.contains("Close All Tabs")));
+
+        // #3: Page menu has Insert Blank Page Before and Insert PDF(s) Before / After Page...
+        assert!(MenuCategory::Page.items().iter().any(|s| s.contains("Insert Blank Page Before")));
+        assert!(MenuCategory::Page.items().iter().any(|s| s.contains("Insert PDF(s)")));
+
+        // #8: Help menu has Bookmark Import Format (.txt) & bundled sample parses cleanly
+        assert!(MenuCategory::Help.items().iter().any(|s| s.contains("Bookmark Import Format")));
+        let parsed = PdfEngine::parse_bookmarks_txt(BOOKMARK_SAMPLE_TXT, 4, 30);
+        assert!(parsed.len() >= 7, "sample bookmark template must parse cleanly");
+        assert_eq!(parsed[0].title, "Preface");
+        assert_eq!(parsed[0].page_index, 0);
+        assert_eq!(parsed[0].level, 0);
+        assert!(parsed.iter().any(|b| b.level == 1 && b.title.contains("Overview")));
+        assert!(parsed.iter().any(|b| b.page_index == 24 && b.title.contains("Appendix")));
     }
 
     #[test]

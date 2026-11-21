@@ -62,16 +62,18 @@ pub enum MenuCategory {
     Edit,
     Page,
     Tools,
+    Export,
     Help,
 }
 
 impl MenuCategory {
-    pub const ALL: [MenuCategory; 6] = [
+    pub const ALL: [MenuCategory; 7] = [
         MenuCategory::File,
         MenuCategory::View,
         MenuCategory::Edit,
         MenuCategory::Page,
         MenuCategory::Tools,
+        MenuCategory::Export,
         MenuCategory::Help,
     ];
 
@@ -82,6 +84,7 @@ impl MenuCategory {
             MenuCategory::Edit => "Edit",
             MenuCategory::Page => "Page",
             MenuCategory::Tools => "Tools",
+            MenuCategory::Export => "Export",
             MenuCategory::Help => "Help",
         }
     }
@@ -94,10 +97,10 @@ impl MenuCategory {
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
                 "Save As... (Ctrl+Shift+S)",
-                "Export as Markdown (.md)...",
-                "Export as LaTeX (.tex)...",
                 "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
+                "Close Other Tabs",
+                "Close All Tabs",
             ],
             MenuCategory::View => &[
                 "Fit Full Page (1)",
@@ -143,7 +146,9 @@ impl MenuCategory {
             MenuCategory::Page => &[
                 "Jump to Page... (G)",
                 "Rotate Current Page 90° (R)",
-                "Insert Blank Page (I)",
+                "Insert Blank Page After (I)",
+                "Insert Blank Page Before",
+                "Insert PDF(s) Before / After Page...",
                 "Delete Current Page (D)",
                 "Convert Page to Black & White (K)",
                 "Reset Page Crop",
@@ -157,8 +162,15 @@ impl MenuCategory {
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
             ],
+            MenuCategory::Export => &[
+                "Export as Word (.docx)...",
+                "Export as Excel (.xlsx)...",
+                "Export as Markdown (.md)...",
+                "Export as LaTeX (.tex)...",
+            ],
             MenuCategory::Help => &[
                 "Keyboard & Mouse Shortcuts (? / F1)",
+                "Bookmark Import Format (.txt)",
                 "About MicroPDF",
             ],
         }
@@ -515,6 +527,7 @@ pub(super) struct DocumentTab<'a> {
     pub(super) nav_back_stack: VecDeque<(u16, f32)>,
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     pub(super) roman_end: usize,
+    pub(super) skip_pages: usize,
     pub(super) bookmarks: Vec<Bookmark>,
     pub(super) selected_bookmark: Option<usize>,
     pub(super) bookmark_scroll_y: usize,
@@ -529,11 +542,53 @@ pub(super) struct DocumentTab<'a> {
     pub(super) last_file_mtime: Option<std::time::SystemTime>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum TabBarHit {
+    ScrollLeft,
+    ScrollRight,
     SwitchTab(usize),
     CloseTab(usize),
     NewTab,
+    TabListToggle,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum TabListHit {
+    SwitchTab(usize),
+    CloseTab(usize),
+    CloseOthers,
+    CloseAll,
+    InsidePopover,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum TabContextHit {
+    CloseThis,
+    CloseOthers,
+    CloseRight,
+    CloseAll,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ThumbContextHit {
+    BlankCountMinus,
+    BlankCountPlus,
+    InsertBlankBefore,
+    InsertBlankAfter,
+    InsertPdfBefore,
+    InsertPdfAfter,
+    RotateCw,
+    ConvertBw,
+    DeletePage,
+    InsideMenu,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(super) struct ThumbContextMenuState {
+    pub(super) page_idx: u16,
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) blank_count: u16,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -559,7 +614,13 @@ pub(super) enum UiHit {
     BottomBar(BottomBarAction),
     Tab(usize),
     TabClose(usize),
+    TabScrollLeft,
+    TabScrollRight,
     TabNew,
+    TabListToggle,
+    TabList(TabListHit),
+    TabContext(TabContextHit),
+    ThumbContext(ThumbContextHit),
     SidebarAdd,
     SidebarImport,
     SidebarRow(usize),
@@ -574,6 +635,8 @@ pub(super) enum UiHit {
     ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
     Overlay(OverlayHit),
+    BookmarkFormatSaveSample,
+    BookmarkFormatClose,
     NotificationClear,
 }
 
@@ -800,9 +863,12 @@ pub(super) enum PendingDialog {
     CombineAddFiles,
     ExportMarkdown,
     ExportLatex,
+    ExportDocx,
+    ExportXlsx,
     PickStampImage,
     Split(String),
     ImportBookmarksTxt,
+    SaveBookmarkSampleTxt,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -810,11 +876,21 @@ pub struct PdfViewerApp<'a> {
     /// Open document tabs; inactive tabs hold zero rendered bitmaps.
     pub(super) tabs: Vec<DocumentTab<'a>>,
     pub(super) active_tab: usize,
+    /// First visible tab index when tabs overflow the horizontal tab strip.
+    pub(super) tab_scroll_offset: usize,
+    /// True when the `▾` All-Tabs overflow dropdown is open.
+    pub(super) show_tab_list_popover: bool,
+    /// Scroll offset (first visible row) inside the `▾` All-Tabs dropdown.
+    pub(super) tab_list_scroll: usize,
+    /// Right-click Tab Context Menu: `Some((target_tab_idx, screen_x, screen_y))`.
+    pub(super) tab_context_menu: Option<(usize, i32, i32)>,
     /// Active tab state mirrored directly for fast, conflict-free access.
     pub(super) doc: Option<PdfDocument<'a>>,
     pub(super) file_path: PathBuf,
     pub(super) current_page_index: u16,
     pub(super) roman_end: usize,
+    /// Number of leading unnumbered cover/picture pages set via Page Numbering.
+    pub(super) skip_pages: usize,
     pub(super) bw_pages: HashSet<u16>,
     pub(super) undo_stack: VecDeque<Vec<u8>>,
     /// True once any redaction has been applied to the active document.
@@ -923,6 +999,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) grid_drag_page: Option<(u16, f64, f64)>,
     /// Last double-click tracking in Grid View: `(page_idx, timestamp)`.
     pub(super) last_thumb_click: Option<(u16, Instant)>,
+    /// Right-click context menu on a thumbnail card in Grid View.
+    pub(super) thumb_context_menu: Option<ThumbContextMenuState>,
     /// Left Bookmark Sidebar (`B` to toggle).
     pub(super) show_bookmarks: bool,
     pub(super) bookmarks: Vec<Bookmark>,
@@ -938,6 +1016,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) input_mode: InputMode,
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
+    pub(super) show_bookmark_format_overlay: bool,
     pub(super) show_about_overlay: bool,
     pub(super) show_customize_toolbar: bool,
     /// Bright Light default UI theme with Dark Mode toggle.
@@ -1084,10 +1163,15 @@ impl<'a> PdfViewerApp<'a> {
             engine,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_scroll_offset: 0,
+            show_tab_list_popover: false,
+            tab_list_scroll: 0,
+            tab_context_menu: None,
             doc: None,
             file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
+            skip_pages: 0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
             redacted: false,
@@ -1147,6 +1231,7 @@ impl<'a> PdfViewerApp<'a> {
             hovered_thumb: None,
             grid_drag_page: None,
             last_thumb_click: None,
+            thumb_context_menu: None,
             show_bookmarks: false,
             bookmarks: Vec::new(),
             selected_bookmark: None,
@@ -1160,6 +1245,7 @@ impl<'a> PdfViewerApp<'a> {
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
+            show_bookmark_format_overlay: false,
             show_about_overlay: false,
             show_customize_toolbar: false,
             ui_theme_mode: UiThemeMode::Light,
@@ -1513,9 +1599,8 @@ impl<'a> PdfViewerApp<'a> {
         self.show_toolbar = cfg.show_toolbar;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
-        if let Some(first_prof) = self.hf_profiles.first() {
-            self.last_hf_profile = first_prof.clone();
-        }
+        // Saved Header/Footer profiles stay opt-in via < > in the dialog; never auto-fill every PDF.
+        self.last_hf_profile = HeaderFooterProfile::default();
         self.recent_files = cfg
             .recent_files
             .into_iter()
