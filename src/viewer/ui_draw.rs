@@ -838,18 +838,32 @@ pub enum UiIcon {
     Grid,
     Open,
     Save,
+    SaveAs,
     Print,
     ChevronLeft,
     ChevronRight,
     ChevronDown,
+    MoveUp,
+    MoveDown,
     ZoomOut,
     ZoomIn,
     FitPage,
     FitWidth,
+    FitText,
     TwoPage,
     Continuous,
+    TextView,
+    Fullscreen,
+    Presentation,
     Select,
     Highlight,
+    Underline,
+    Strikethrough,
+    Note,
+    Pen,
+    TextBox,
+    RectShape,
+    ArrowShape,
     Redact,
     Crop,
     Stamp,
@@ -1091,6 +1105,125 @@ pub fn draw_icon(
             line(buffer, 0.60, 0.30, 0.78, 0.30);
             line(buffer, 0.34, 0.48, 0.66, 0.48);
             line(buffer, 0.34, 0.64, 0.66, 0.64);
+        }
+        UiIcon::SaveAs => {
+            // Floppy outline + small '+' badge on bottom-right
+            line(buffer, 0.14, 0.14, 0.66, 0.14);
+            line(buffer, 0.66, 0.14, 0.80, 0.28);
+            line(buffer, 0.80, 0.28, 0.80, 0.56);
+            line(buffer, 0.14, 0.14, 0.14, 0.84);
+            line(buffer, 0.14, 0.84, 0.54, 0.84);
+            line(buffer, 0.28, 0.14, 0.28, 0.38);
+            line(buffer, 0.28, 0.38, 0.60, 0.38);
+            line(buffer, 0.60, 0.38, 0.60, 0.14);
+            // '+' badge
+            line(buffer, 0.62, 0.76, 0.90, 0.76);
+            line(buffer, 0.76, 0.62, 0.76, 0.90);
+        }
+        UiIcon::MoveUp => {
+            line(buffer, 0.50, 0.20, 0.50, 0.82);
+            line(buffer, 0.26, 0.44, 0.50, 0.20);
+            line(buffer, 0.74, 0.44, 0.50, 0.20);
+        }
+        UiIcon::MoveDown => {
+            line(buffer, 0.50, 0.18, 0.50, 0.80);
+            line(buffer, 0.26, 0.56, 0.50, 0.80);
+            line(buffer, 0.74, 0.56, 0.50, 0.80);
+        }
+        UiIcon::FitText => {
+            // Left & right inward crop brackets + text lines between them
+            line(buffer, 0.14, 0.22, 0.14, 0.78);
+            line(buffer, 0.86, 0.22, 0.86, 0.78);
+            line(buffer, 0.28, 0.32, 0.72, 0.32);
+            line(buffer, 0.28, 0.50, 0.72, 0.50);
+            line(buffer, 0.28, 0.68, 0.62, 0.68);
+        }
+        UiIcon::TextView => {
+            line(buffer, 0.16, 0.24, 0.84, 0.24);
+            line(buffer, 0.16, 0.42, 0.84, 0.42);
+            line(buffer, 0.16, 0.60, 0.76, 0.60);
+            line(buffer, 0.16, 0.78, 0.58, 0.78);
+        }
+        UiIcon::Fullscreen => {
+            // Four outward corners
+            line(buffer, 0.16, 0.36, 0.16, 0.16);
+            line(buffer, 0.16, 0.16, 0.36, 0.16);
+            line(buffer, 0.64, 0.16, 0.84, 0.16);
+            line(buffer, 0.84, 0.16, 0.84, 0.36);
+            line(buffer, 0.84, 0.64, 0.84, 0.84);
+            line(buffer, 0.84, 0.84, 0.64, 0.84);
+            line(buffer, 0.36, 0.84, 0.16, 0.84);
+            line(buffer, 0.16, 0.84, 0.16, 0.64);
+        }
+        UiIcon::Presentation => {
+            // Screen frame + play triangle
+            line(buffer, 0.14, 0.18, 0.86, 0.18);
+            line(buffer, 0.86, 0.18, 0.86, 0.72);
+            line(buffer, 0.86, 0.72, 0.14, 0.72);
+            line(buffer, 0.14, 0.72, 0.14, 0.18);
+            line(buffer, 0.50, 0.72, 0.50, 0.86);
+            line(buffer, 0.34, 0.86, 0.66, 0.86);
+            line(buffer, 0.42, 0.33, 0.62, 0.45);
+            line(buffer, 0.62, 0.45, 0.42, 0.57);
+            line(buffer, 0.42, 0.57, 0.42, 0.33);
+        }
+        UiIcon::Underline => {
+            // 'U' + bottom bar
+            line(buffer, 0.28, 0.18, 0.28, 0.54);
+            line(buffer, 0.28, 0.54, 0.38, 0.66);
+            line(buffer, 0.38, 0.66, 0.62, 0.66);
+            line(buffer, 0.62, 0.66, 0.72, 0.54);
+            line(buffer, 0.72, 0.54, 0.72, 0.18);
+            line(buffer, 0.20, 0.84, 0.80, 0.84);
+        }
+        UiIcon::Strikethrough => {
+            // Stylized 'S' + center strike line
+            line(buffer, 0.68, 0.24, 0.34, 0.24);
+            line(buffer, 0.34, 0.24, 0.30, 0.38);
+            line(buffer, 0.30, 0.38, 0.68, 0.58);
+            line(buffer, 0.68, 0.58, 0.66, 0.76);
+            line(buffer, 0.66, 0.76, 0.30, 0.76);
+            line(buffer, 0.14, 0.50, 0.86, 0.50);
+        }
+        UiIcon::Note => {
+            // Sticky note square with folded bottom-right corner
+            line(buffer, 0.18, 0.16, 0.82, 0.16);
+            line(buffer, 0.82, 0.16, 0.82, 0.62);
+            line(buffer, 0.82, 0.62, 0.62, 0.82);
+            line(buffer, 0.62, 0.82, 0.18, 0.82);
+            line(buffer, 0.18, 0.82, 0.18, 0.16);
+            line(buffer, 0.62, 0.82, 0.62, 0.62);
+            line(buffer, 0.62, 0.62, 0.82, 0.62);
+            line(buffer, 0.30, 0.34, 0.68, 0.34);
+            line(buffer, 0.30, 0.50, 0.58, 0.50);
+        }
+        UiIcon::Pen => {
+            // Diagonal fountain/ink pen + freehand wave
+            line(buffer, 0.22, 0.78, 0.74, 0.22);
+            line(buffer, 0.62, 0.16, 0.82, 0.34);
+            line(buffer, 0.22, 0.78, 0.34, 0.74);
+            line(buffer, 0.42, 0.84, 0.60, 0.74);
+            line(buffer, 0.60, 0.74, 0.82, 0.84);
+        }
+        UiIcon::TextBox => {
+            // Outer box + 'T' inside
+            line(buffer, 0.14, 0.18, 0.86, 0.18);
+            line(buffer, 0.86, 0.18, 0.86, 0.82);
+            line(buffer, 0.86, 0.82, 0.14, 0.82);
+            line(buffer, 0.14, 0.82, 0.14, 0.18);
+            line(buffer, 0.32, 0.36, 0.68, 0.36);
+            line(buffer, 0.50, 0.36, 0.50, 0.68);
+        }
+        UiIcon::RectShape => {
+            line(buffer, 0.16, 0.24, 0.84, 0.24);
+            line(buffer, 0.84, 0.24, 0.84, 0.76);
+            line(buffer, 0.84, 0.76, 0.16, 0.76);
+            line(buffer, 0.16, 0.76, 0.16, 0.24);
+        }
+        UiIcon::ArrowShape => {
+            line(buffer, 0.20, 0.80, 0.78, 0.22);
+            line(buffer, 0.46, 0.22, 0.78, 0.22);
+            line(buffer, 0.78, 0.22, 0.78, 0.54);
         }
     }
 }

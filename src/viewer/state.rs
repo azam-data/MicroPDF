@@ -1,5 +1,5 @@
 use crate::engine::{
-    Bookmark, MarginPosition, PdfEngine, SearchMatch, StampImageBuffer,
+    AnnotationColor, Bookmark, MarginPosition, PdfEngine, SearchMatch, StampImageBuffer,
 };
 use anyhow::Result;
 use pdfium_render::prelude::*;
@@ -10,8 +10,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::window::Window;
 
+use super::bottom_bar::BottomBarAction;
+use super::combine_modal::{CombineHit, CombineModalState};
 use super::overlays::OverlayHit;
-use super::print_preview::{PrintPreviewHit, PrintPreviewState};
+use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
+use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
 
@@ -23,7 +26,8 @@ pub(super) const SIDEBAR_WIDTH_LOGICAL: u32 = 248;
 /// Unified top bar hosting both menus (`File..Help`) and the inline customizable icon toolbar.
 pub(super) const MENU_BAR_HEIGHT_LOGICAL: u32 = 32;
 pub(super) const TAB_BAR_HEIGHT_LOGICAL: u32 = 28;
-pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 24;
+/// Centered bottom page-view & status bar.
+pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 30;
 pub(super) const PAGE_MARGIN_PX: u32 = 24;
 pub(super) const SPREAD_GAP_PX: u32 = 12;
 pub(super) const THUMB_W: u32 = 140;
@@ -35,6 +39,8 @@ pub(super) const MAX_TILE_CACHE_ENTRIES: usize =
     MAX_TILE_CACHE_BYTES / ((TILE_SIZE_PX as usize) * (TILE_SIZE_PX as usize) * 4);
 pub(super) const MIN_ZOOM_LEVEL: f32 = 0.25;
 pub(super) const MAX_ZOOM_LEVEL: f32 = 8.0;
+pub(super) const MIN_UI_SCALE: f32 = 0.80;
+pub(super) const MAX_UI_SCALE: f32 = 1.60;
 pub(super) const MAX_NAV_HISTORY: usize = 50;
 pub(super) const MAX_RECENT_FILES: usize = 10;
 pub(super) const MAX_UNDO_STATES: usize = 8;
@@ -83,6 +89,9 @@ impl MenuCategory {
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
                 "Save PDF (S)",
+                "Save As... (Ctrl+Shift+S)",
+                "Export as Markdown (.md)...",
+                "Export as LaTeX (.tex)...",
                 "Optimize -> _optimized.pdf (Z)",
                 "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
@@ -90,9 +99,10 @@ impl MenuCategory {
             MenuCategory::View => &[
                 "Fit Full Page (1)",
                 "Fit Page Width (2)",
-                "Fit Text Width (3)",
+                "Fit Text Width — Crop Margins (3)",
                 "Two-Page Side-by-Side (4)",
                 "Continuous Vertical Scroll (5)",
+                "Text View — Reflowable Reader (T)",
                 "Zoom In (+ / Ctrl+Wheel Up)",
                 "Zoom Out (- / Ctrl+Wheel Down)",
                 "Reset Zoom 100% (0)",
@@ -103,6 +113,9 @@ impl MenuCategory {
                 "Presentation Mode (F5)",
                 "Show Toolbar",
                 "Customize Toolbar...",
+                "UI Scale: Larger (+10%)",
+                "UI Scale: Smaller (-10%)",
+                "UI Scale: Reset 100%",
                 "Switch Light / Dark UI",
             ],
             MenuCategory::Edit => &[
@@ -110,7 +123,15 @@ impl MenuCategory {
                 "Copy Selected Text (Ctrl+C / Cmd+C)",
                 "Find Text in PDF... (Ctrl+F / Cmd+F)",
                 "Mouse Mode: Select Text (default)",
-                "Mouse Mode: Highlight Text",
+                "Annotate: Highlight Text",
+                "Annotate: Underline Text",
+                "Annotate: Strikethrough Text",
+                "Annotate: Sticky Note / Comment",
+                "Annotate: Freehand Pen (Ink)",
+                "Annotate: Text Box (FreeText)",
+                "Annotate: Rectangle Shape",
+                "Annotate: Arrow Shape",
+                "Cycle Annotation Color",
                 "Mouse Mode: Black-Box Redact",
                 "Mouse Mode: Crop Page Area",
             ],
@@ -140,11 +161,18 @@ impl MenuCategory {
     }
 }
 
-/// Interactive Mouse Drag Mode in Single-Page / Spread Views.
+/// Interactive Mouse Drag / Click Mode in Single-Page / Spread Views.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseMode {
     Select,
     Highlight,
+    Underline,
+    Strikethrough,
+    StickyNote,
+    InkPen,
+    FreeText,
+    RectShape,
+    ArrowShape,
     Redact,
     Crop,
     StampImage,
@@ -155,10 +183,31 @@ impl MouseMode {
         match self {
             MouseMode::Select => "Select",
             MouseMode::Highlight => "Highlight",
+            MouseMode::Underline => "Underline",
+            MouseMode::Strikethrough => "Strike",
+            MouseMode::StickyNote => "Note",
+            MouseMode::InkPen => "Pen",
+            MouseMode::FreeText => "TextBox",
+            MouseMode::RectShape => "Rect",
+            MouseMode::ArrowShape => "Arrow",
             MouseMode::Redact => "REDACT",
             MouseMode::Crop => "CROP",
             MouseMode::StampImage => "STAMP",
         }
+    }
+
+    pub fn uses_annotation_color(self) -> bool {
+        matches!(
+            self,
+            MouseMode::Highlight
+                | MouseMode::Underline
+                | MouseMode::Strikethrough
+                | MouseMode::StickyNote
+                | MouseMode::InkPen
+                | MouseMode::FreeText
+                | MouseMode::RectShape
+                | MouseMode::ArrowShape
+        )
     }
 }
 
@@ -188,7 +237,7 @@ impl ReadingFilter {
     }
 }
 
-/// Page & Grid View Modes (`1`, `2`, `3`, `4`, `5`, and `Tab`).
+/// Page, Text & Grid View Modes (`1`, `2`, `3`, `4`, `5`, `T`, and `Tab`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ViewMode {
     FitPage,
@@ -196,10 +245,12 @@ pub enum ViewMode {
     FitTextWidth,
     TwoPageSpread,
     ContinuousScroll,
+    TextView,
     ThumbnailGrid,
 }
 
 impl ViewMode {
+    #[allow(dead_code)]
     pub fn short_label(self) -> &'static str {
         match self {
             ViewMode::FitPage => "FitPage",
@@ -207,12 +258,13 @@ impl ViewMode {
             ViewMode::FitTextWidth => "FitText",
             ViewMode::TwoPageSpread => "2-Page",
             ViewMode::ContinuousScroll => "Cont",
+            ViewMode::TextView => "Text",
             ViewMode::ThumbnailGrid => "Grid",
         }
     }
 
     pub fn is_page_view(self) -> bool {
-        !matches!(self, ViewMode::ThumbnailGrid)
+        !matches!(self, ViewMode::ThumbnailGrid | ViewMode::TextView)
     }
 
     pub fn to_ini_str(self) -> &'static str {
@@ -222,6 +274,7 @@ impl ViewMode {
             ViewMode::FitTextWidth => "FitTextWidth",
             ViewMode::TwoPageSpread => "TwoPageSpread",
             ViewMode::ContinuousScroll => "ContinuousScroll",
+            ViewMode::TextView => "TextView",
             ViewMode::ThumbnailGrid => "ThumbnailGrid",
         }
     }
@@ -232,6 +285,7 @@ impl ViewMode {
             "FitTextWidth" => ViewMode::FitTextWidth,
             "TwoPageSpread" => ViewMode::TwoPageSpread,
             "ContinuousScroll" => ViewMode::ContinuousScroll,
+            "TextView" => ViewMode::TextView,
             "ThumbnailGrid" => ViewMode::ThumbnailGrid,
             _ => ViewMode::FitPage,
         }
@@ -253,6 +307,7 @@ pub(super) struct SessionConfig {
     pub(super) tabs: Vec<SavedSessionTab>,
     pub(super) recent_files: Vec<PathBuf>,
     pub(super) ui_theme: UiThemeMode,
+    pub(super) ui_scale: f32,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
 }
@@ -264,6 +319,7 @@ impl Default for SessionConfig {
             tabs: Vec::new(),
             recent_files: Vec::new(),
             ui_theme: UiThemeMode::Light,
+            ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
         }
@@ -281,6 +337,8 @@ pub(super) struct CachedPageBitmap {
     pub(super) bitmap_height: u32,
     pub(super) content_min_x: f32,
     pub(super) content_max_x: f32,
+    pub(super) content_min_y: f32,
+    pub(super) content_max_y: f32,
     pub(super) rotation_deg: i32,
     pub(super) pixels: Vec<u32>,
 }
@@ -380,6 +438,7 @@ pub(super) enum UiHit {
     MenuHeader(MenuCategory),
     MenuItem(usize),
     Toolbar(ToolbarAction),
+    BottomBar(BottomBarAction),
     Tab(usize),
     TabClose(usize),
     TabNew,
@@ -390,6 +449,9 @@ pub(super) enum UiHit {
     Scrollbar,
     Customize(CustomizeHit),
     PrintPreview(PrintPreviewHit),
+    ManualDuplex(ManualDuplexHit),
+    Combine(CombineHit),
+    TextView(TextViewHit),
     Overlay(OverlayHit),
 }
 
@@ -435,6 +497,16 @@ pub(super) enum InputMode {
     EditBookmark {
         bookmark_idx: usize,
         title_input: String,
+    },
+    StickyNotePrompt {
+        pdf_x: f32,
+        pdf_y: f32,
+        text_input: String,
+    },
+    FreeTextPrompt {
+        pdf_x: f32,
+        pdf_y: f32,
+        text_input: String,
     },
     ConfirmExternalUrl {
         url: String,
@@ -573,8 +645,12 @@ pub(super) struct IncrementalSearchState {
 pub(super) enum PendingDialog {
     Open,
     Save,
+    SaveAs,
     Merge,
     CombineMultiple,
+    CombineAddFiles,
+    ExportMarkdown,
+    ExportLatex,
     PickStampImage,
     Split(String),
     ImportBookmarksTxt,
@@ -711,12 +787,28 @@ pub struct PdfViewerApp<'a> {
     pub(super) show_customize_toolbar: bool,
     /// Bright Light default UI theme with Dark Mode toggle.
     pub(super) ui_theme_mode: UiThemeMode,
+    /// User-adjustable UI interface scale multiplier (`0.80..=1.60`, persisted in `micropdf.ini`).
+    pub(super) ui_scale: f32,
     /// Inline icon toolbar beside the menus on the unified top bar (`View -> Show Toolbar`).
     pub(super) show_toolbar: bool,
     /// Per-button customization persisted in `micropdf.ini`.
     pub(super) toolbar_config: ToolbarConfig,
+    /// Active annotation color swatch (Highlight, Underline, Strikethrough, Note, Pen, TextBox, Shapes).
+    pub(super) annotation_color: AnnotationColor,
+    /// Live freehand pen stroke points in window physical pixels while dragging `MouseMode::InkPen`.
+    pub(super) ink_stroke_screen_pts: Vec<(f32, f32)>,
+    /// Floating sticky-note popover `(note_text, screen_x, screen_y)` when user clicks a sticky note.
+    pub(super) active_note_popover: Option<(String, i32, i32)>,
     /// Active Print Preview modal state (0 bytes when closed).
     pub(super) print_preview: Option<PrintPreviewState>,
+    /// Active Manual Duplex Pass 2 wait modal state (0 bytes when closed).
+    pub(super) manual_duplex_wait: Option<ManualDuplexWaitState>,
+    /// Active Interactive Combine PDFs modal state (0 bytes when closed).
+    pub(super) combine_modal: Option<CombineModalState>,
+    /// Cached extracted blocks for `ViewMode::TextView` (0 bytes when not in Text View).
+    pub(super) cached_text_view: Option<CachedTextViewPage>,
+    /// Reading font size in logical pixels for `ViewMode::TextView`.
+    pub(super) text_view_font_size: f32,
     /// Unified hovered UI widget to coalesce redraws and show crisp hover feedback.
     pub(super) hovered_widget: Option<UiHit>,
     /// True while dragging the right-edge overlay vertical scrollbar.
@@ -740,6 +832,28 @@ pub struct PdfViewerApp<'a> {
 impl<'a> PdfViewerApp<'a> {
     pub(super) fn ui_theme(&self) -> UiTheme {
         self.ui_theme_mode.theme()
+    }
+
+    /// Effective UI scale combining OS display HiDPI `window_sf` with user's `ui_scale` preference.
+    pub(super) fn effective_scale_factor(&self, window_sf: f64) -> f64 {
+        (window_sf * (self.ui_scale as f64)).clamp(0.75, 4.0)
+    }
+
+    pub(super) fn adjust_ui_scale(&mut self, delta: f32) {
+        let next = ((self.ui_scale + delta) * 20.0).round() / 20.0;
+        self.ui_scale = next.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+        self.status_notice = Some(format!("UI Scale: {}%", (self.ui_scale * 100.0).round() as i32));
+        self.save_session_to_ini();
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn reset_ui_scale(&mut self) {
+        self.ui_scale = 1.0;
+        self.status_notice = Some("UI Scale reset to 100%".to_string());
+        self.save_session_to_ini();
+        self.update_title_bar();
+        self.request_redraw();
     }
 
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
@@ -825,9 +939,17 @@ impl<'a> PdfViewerApp<'a> {
             show_about_overlay: false,
             show_customize_toolbar: false,
             ui_theme_mode: UiThemeMode::Light,
+            ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
+            annotation_color: AnnotationColor::Yellow,
+            ink_stroke_screen_pts: Vec::new(),
+            active_note_popover: None,
             print_preview: None,
+            manual_duplex_wait: None,
+            combine_modal: None,
+            cached_text_view: None,
+            text_view_font_size: 14.5,
             hovered_widget: None,
             scrollbar_drag: false,
             is_fullscreen: false,
@@ -893,6 +1015,7 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
         let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
+        out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         out.push_str(&format!("active_tab={}\n", cfg.active_tab));
@@ -925,6 +1048,12 @@ impl<'a> PdfViewerApp<'a> {
             }
             if let Some(val) = line.strip_prefix("ui_theme=") {
                 cfg.ui_theme = UiThemeMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("ui_scale=") {
+                if let Ok(sc) = val.trim().parse::<f32>() {
+                    if sc.is_finite() {
+                        cfg.ui_scale = sc.clamp(MIN_UI_SCALE, MAX_UI_SCALE);
+                    }
+                }
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
@@ -997,6 +1126,7 @@ impl<'a> PdfViewerApp<'a> {
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
             ui_theme: self.ui_theme_mode,
+            ui_scale: self.ui_scale,
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
         };
@@ -1036,6 +1166,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let cfg = Self::parse_session_ini(&content);
         self.ui_theme_mode = cfg.ui_theme;
+        self.ui_scale = cfg.ui_scale;
         self.show_toolbar = cfg.show_toolbar;
         self.toolbar_config = cfg.toolbar_config;
         self.recent_files = cfg
@@ -1383,6 +1514,8 @@ impl<'a> PdfViewerApp<'a> {
         self.tile_form_copy = None;
         // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
         self.cached_char_boxes = None;
+        self.cached_text_view = None;
+        self.active_note_popover = None;
         self.selected_text.clear();
         self.selected_text_page = None;
         self.selected_text_rects.clear();

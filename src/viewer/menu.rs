@@ -96,7 +96,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // Inline customizable icon toolbar directly beside Help
         let tb_x = self.toolbar_start_x(scale_factor);
-        self.draw_unified_toolbar(buffer, buf_w, buf_h, tb_x, menu_bar_h, scale_factor);
+        self.draw_inline_toolbar(buffer, buf_w, buf_h, tb_x, menu_bar_h, scale_factor);
     }
 
     pub(super) fn menu_items_for_category(&self, cat: MenuCategory) -> Vec<String> {
@@ -124,16 +124,24 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 2) => self.view_mode == ViewMode::FitTextWidth,
             (MenuCategory::View, 3) => self.view_mode == ViewMode::TwoPageSpread,
             (MenuCategory::View, 4) => self.view_mode == ViewMode::ContinuousScroll,
-            (MenuCategory::View, 8) => self.view_mode == ViewMode::ThumbnailGrid,
-            (MenuCategory::View, 9) => self.show_bookmarks,
-            (MenuCategory::View, 11) => self.is_fullscreen && !self.is_presentation,
-            (MenuCategory::View, 12) => self.is_presentation,
-            (MenuCategory::View, 13) => self.show_toolbar,
-            (MenuCategory::View, 15) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
+            (MenuCategory::View, 5) => self.view_mode == ViewMode::TextView,
+            (MenuCategory::View, 9) => self.view_mode == ViewMode::ThumbnailGrid,
+            (MenuCategory::View, 10) => self.show_bookmarks,
+            (MenuCategory::View, 12) => self.is_fullscreen && !self.is_presentation,
+            (MenuCategory::View, 13) => self.is_presentation,
+            (MenuCategory::View, 14) => self.show_toolbar,
+            (MenuCategory::View, 19) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
             (MenuCategory::Edit, 3) => self.mouse_mode == MouseMode::Select,
             (MenuCategory::Edit, 4) => self.mouse_mode == MouseMode::Highlight,
-            (MenuCategory::Edit, 5) => self.mouse_mode == MouseMode::Redact,
-            (MenuCategory::Edit, 6) => self.mouse_mode == MouseMode::Crop,
+            (MenuCategory::Edit, 5) => self.mouse_mode == MouseMode::Underline,
+            (MenuCategory::Edit, 6) => self.mouse_mode == MouseMode::Strikethrough,
+            (MenuCategory::Edit, 7) => self.mouse_mode == MouseMode::StickyNote,
+            (MenuCategory::Edit, 8) => self.mouse_mode == MouseMode::InkPen,
+            (MenuCategory::Edit, 9) => self.mouse_mode == MouseMode::FreeText,
+            (MenuCategory::Edit, 10) => self.mouse_mode == MouseMode::RectShape,
+            (MenuCategory::Edit, 11) => self.mouse_mode == MouseMode::ArrowShape,
+            (MenuCategory::Edit, 13) => self.mouse_mode == MouseMode::Redact,
+            (MenuCategory::Edit, 14) => self.mouse_mode == MouseMode::Crop,
             _ => false,
         }
     }
@@ -227,10 +235,10 @@ impl<'a> PdfViewerApp<'a> {
 
         for (idx, item_str) in items.iter().enumerate() {
             let ry = drop_y + pad_v + (idx as i32) * (row_h as i32);
-            // Draw subtle group separator before Recent files in File menu and before Toolbar in View menu
-            if (cat == MenuCategory::File && idx == file_base_len)
-                || (cat == MenuCategory::View && (idx == 5 || idx == 8 || idx == 13))
-                || (cat == MenuCategory::Edit && idx == 3)
+            // Draw subtle group separators between logical menu sections
+            if (cat == MenuCategory::File && (idx == 5 || idx == 7 || idx == file_base_len))
+                || (cat == MenuCategory::View && (idx == 6 || idx == 9 || idx == 14 || idx == 16))
+                || (cat == MenuCategory::Edit && (idx == 3 || idx == 13))
             {
                 fill_rect_clipped(
                     buffer,
@@ -355,7 +363,8 @@ impl<'a> PdfViewerApp<'a> {
                 self.pending_dialog = Some(PendingDialog::Open);
             }
             (MenuCategory::File, 1) => {
-                self.pending_dialog = Some(PendingDialog::CombineMultiple);
+                self.open_combine_modal();
+                return;
             }
             (MenuCategory::File, 2) => {
                 self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
@@ -364,12 +373,27 @@ impl<'a> PdfViewerApp<'a> {
                 self.pending_dialog = Some(PendingDialog::Save);
             }
             (MenuCategory::File, 4) => {
-                self.compress_current_pdf();
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::SaveAs);
+                }
             }
             (MenuCategory::File, 5) => {
-                self.trigger_print();
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportMarkdown);
+                }
             }
             (MenuCategory::File, 6) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportLatex);
+                }
+            }
+            (MenuCategory::File, 7) => {
+                self.compress_current_pdf();
+            }
+            (MenuCategory::File, 8) => {
+                self.trigger_print();
+            }
+            (MenuCategory::File, 9) => {
                 if self.tabs.len() > 1 {
                     let _ = self.close_tab(self.active_tab);
                 } else {
@@ -401,11 +425,18 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 2) => self.set_view_mode(ViewMode::FitTextWidth),
             (MenuCategory::View, 3) => self.set_view_mode(ViewMode::TwoPageSpread),
             (MenuCategory::View, 4) => self.set_view_mode(ViewMode::ContinuousScroll),
-            (MenuCategory::View, 5) => self.zoom_by_step(1.25),
-            (MenuCategory::View, 6) => self.zoom_by_step(0.8),
-            (MenuCategory::View, 7) => self.reset_zoom(),
-            (MenuCategory::View, 8) => self.toggle_view_mode(),
-            (MenuCategory::View, 9) => {
+            (MenuCategory::View, 5) => {
+                if self.view_mode == ViewMode::TextView {
+                    self.set_view_mode(self.last_page_view_mode);
+                } else {
+                    self.set_view_mode(ViewMode::TextView);
+                }
+            }
+            (MenuCategory::View, 6) => self.zoom_by_step(1.25),
+            (MenuCategory::View, 7) => self.zoom_by_step(0.8),
+            (MenuCategory::View, 8) => self.reset_zoom(),
+            (MenuCategory::View, 9) => self.toggle_view_mode(),
+            (MenuCategory::View, 10) => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
                 self.status_notice = Some(if self.show_bookmarks {
@@ -414,34 +445,48 @@ impl<'a> PdfViewerApp<'a> {
                     "Bookmarks Sidebar OFF".to_string()
                 });
             }
-            (MenuCategory::View, 10) => {
+            (MenuCategory::View, 11) => {
                 self.reading_filter = self.reading_filter.next();
                 self.status_notice = Some(format!(
                     "Reading Filter: {} (Zero-RAM CPU Blit Filter)",
                     self.reading_filter.label()
                 ));
             }
-            (MenuCategory::View, 11) => self.toggle_fullscreen(),
-            (MenuCategory::View, 12) => {
+            (MenuCategory::View, 12) => self.toggle_fullscreen(),
+            (MenuCategory::View, 13) => {
                 if self.is_presentation {
                     self.exit_presentation_or_fullscreen();
                 } else {
                     self.enter_presentation_mode();
                 }
             }
-            (MenuCategory::View, 13) => {
+            (MenuCategory::View, 14) => {
                 self.show_toolbar = !self.show_toolbar;
+                self.save_session_to_ini();
                 self.status_notice = Some(if self.show_toolbar {
                     "Toolbar shown beside menus".to_string()
                 } else {
                     "Toolbar hidden (re-enable via View -> Show Toolbar)".to_string()
                 });
             }
-            (MenuCategory::View, 14) => {
+            (MenuCategory::View, 15) => {
                 self.show_customize_toolbar = true;
             }
-            (MenuCategory::View, 15) => {
+            (MenuCategory::View, 16) => {
+                self.adjust_ui_scale(0.10);
+                return;
+            }
+            (MenuCategory::View, 17) => {
+                self.adjust_ui_scale(-0.10);
+                return;
+            }
+            (MenuCategory::View, 18) => {
+                self.reset_ui_scale();
+                return;
+            }
+            (MenuCategory::View, 19) => {
                 self.ui_theme_mode = self.ui_theme_mode.toggle();
+                self.save_session_to_ini();
                 self.status_notice = Some(format!("UI Theme: {}", self.ui_theme_mode.label()));
             }
 
@@ -462,17 +507,75 @@ impl<'a> PdfViewerApp<'a> {
             }
             (MenuCategory::Edit, 4) => {
                 self.mouse_mode = MouseMode::Highlight;
-                self.status_notice =
-                    Some("Mouse Mode: Highlight Text (Drag across text)".to_string());
+                self.status_notice = Some(format!(
+                    "Annotate: Highlight ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
             }
             (MenuCategory::Edit, 5) => {
+                self.mouse_mode = MouseMode::Underline;
+                self.status_notice = Some(format!(
+                    "Annotate: Underline ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 6) => {
+                self.mouse_mode = MouseMode::Strikethrough;
+                self.status_notice = Some(format!(
+                    "Annotate: Strikethrough ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 7) => {
+                self.mouse_mode = MouseMode::StickyNote;
+                self.status_notice = Some(format!(
+                    "Annotate: Sticky Note ({}) — click page to place note",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 8) => {
+                self.mouse_mode = MouseMode::InkPen;
+                self.status_notice = Some(format!(
+                    "Annotate: Freehand Pen ({}) — drag to draw",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 9) => {
+                self.mouse_mode = MouseMode::FreeText;
+                self.status_notice = Some(format!(
+                    "Annotate: Text Box ({}) — click page to add text",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 10) => {
+                self.mouse_mode = MouseMode::RectShape;
+                self.status_notice = Some(format!(
+                    "Annotate: Rectangle ({}) — drag box",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 11) => {
+                self.mouse_mode = MouseMode::ArrowShape;
+                self.status_notice = Some(format!(
+                    "Annotate: Arrow ({}) — drag start to tip",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 12) => {
+                self.annotation_color = self.annotation_color.next();
+                self.status_notice = Some(format!(
+                    "Annotation color: {}",
+                    self.annotation_color.label()
+                ));
+            }
+            (MenuCategory::Edit, 13) => {
                 self.mouse_mode = MouseMode::Redact;
                 self.status_notice = Some(
                     "Mouse Mode: Black-Box Redact (Drag red box to permanently purge & black out)"
                         .to_string(),
                 );
             }
-            (MenuCategory::Edit, 6) => {
+            (MenuCategory::Edit, 14) => {
                 self.mouse_mode = MouseMode::Crop;
                 self.status_notice = Some(
                     "Mouse Mode: Crop Page Area (Drag green box to crop page)".to_string(),

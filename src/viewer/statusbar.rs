@@ -1,10 +1,6 @@
-//! Clean Light/Dark bottom status bar with hovered toolbar tooltips, page/zoom info,
-//! and interactive command prompt formatting (preserved for keyboard & test parity).
+//! Interactive command prompt formatting (for accessibility & tests) and bottom bar entry point.
 
-use super::get_current_rss_mb;
-use super::render::fill_rect_clipped;
 use super::state::*;
-use super::ui_draw::*;
 
 impl<'a> PdfViewerApp<'a> {
     /// Formats the active interactive prompt string (if any) for accessibility & tests.
@@ -67,6 +63,14 @@ impl<'a> PdfViewerApp<'a> {
                     page_num, title_input
                 ))
             }
+            InputMode::StickyNotePrompt { text_input, .. } => Some(format!(
+                "STICKY NOTE: Type comment and press Enter: {}_",
+                text_input
+            )),
+            InputMode::FreeTextPrompt { text_input, .. } => Some(format!(
+                "TEXT BOX: Type text to place on page and press Enter: {}_",
+                text_input
+            )),
             InputMode::ConfirmExternalUrl { url } => Some(format!(
                 "OPEN EXTERNAL URL IN BROWSER? {}  (Press Enter to confirm, Esc to cancel)",
                 url
@@ -153,57 +157,6 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         scale_factor: f64,
     ) {
-        if status_bar_h == 0 || buf_h < status_bar_h {
-            return;
-        }
-        let theme = self.ui_theme();
-        let s = scale_factor as f32;
-        let bar_y = (buf_h - status_bar_h) as i32;
-        let font_sz = (11.0 * s).clamp(9.5, 24.0);
-        let pad_x = (12.0 * s).round() as i32;
-
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, bar_y, buf_w, status_bar_h, theme.statusbar_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, bar_y, buf_w, 1, theme.divider);
-
-        let total = self.total_pages();
-        let cur = if total > 0 { self.current_page_index + 1 } else { 0 };
-        let zoom_pct = (self.zoom_level * 100.0).round() as u32;
-        let ram_mb = get_current_rss_mb().unwrap_or(0.0);
-
-        let right_text = format!(
-            "{}  ·  {}  ·  {ram_mb:.1} MB",
-            self.mouse_mode.short_label(),
-            self.reading_filter.label()
-        );
-        let right_w = measure_text(&right_text, font_sz, false).ceil() as i32;
-        let right_x = (buf_w as i32 - pad_x - right_w).max(pad_x + 40);
-
-        // Show toolbar hover tooltip when hovering a toolbar button, otherwise page + notice
-        let left_text = if let Some(UiHit::Toolbar(action)) = self.hovered_widget {
-            action.tooltip().to_string()
-        } else if let Some(ref notice) = self.status_notice {
-            if total > 0 {
-                format!("Page {cur} of {total}  ·  {} ({zoom_pct}%)  ·  {notice}", self.view_mode.short_label())
-            } else {
-                notice.clone()
-            }
-        } else if total > 0 {
-            format!("Page {cur} of {total}  ·  {} ({zoom_pct}%)", self.view_mode.short_label())
-        } else {
-            "Ready — Drop a PDF or press O to open".to_string()
-        };
-
-        let left_budget = (right_x - pad_x - (16.0 * s).round() as i32).max(20) as f32;
-        let left_clipped = truncate_ellipsis(&left_text, left_budget, font_sz, false);
-        draw_text_vcenter(buffer, buf_w, buf_h, pad_x, bar_y, status_bar_h, right_x - 8, &left_clipped, font_sz, theme.text_secondary, false);
-
-        let tool_color = match self.mouse_mode {
-            MouseMode::Select => theme.text_muted,
-            MouseMode::Highlight => theme.warning,
-            MouseMode::Redact => theme.danger,
-            MouseMode::Crop => theme.success,
-            MouseMode::StampImage => theme.violet,
-        };
-        draw_text_vcenter(buffer, buf_w, buf_h, right_x, bar_y, status_bar_h, buf_w as i32 - 4, &right_text, font_sz, tool_color, false);
+        self.draw_bottom_view_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
     }
 }

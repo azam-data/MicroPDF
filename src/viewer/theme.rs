@@ -84,10 +84,15 @@ pub struct UiTheme {
     pub danger: u32,
     pub danger_soft_bg: u32,
     pub warning: u32,
+    #[allow(dead_code)]
     pub warning_soft_bg: u32,
+    #[allow(dead_code)]
     pub success: u32,
+    #[allow(dead_code)]
     pub success_soft_bg: u32,
+    #[allow(dead_code)]
     pub violet: u32,
+    #[allow(dead_code)]
     pub violet_soft_bg: u32,
     pub scrollbar_track: (u32, u32, u32, u32),
     pub scrollbar_thumb: (u32, u32, u32, u32),

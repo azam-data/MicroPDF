@@ -1,4 +1,6 @@
 mod bookmarks;
+mod bottom_bar;
+mod combine_modal;
 mod grid;
 mod input;
 mod menu;
@@ -8,6 +10,7 @@ mod render;
 mod state;
 mod statusbar;
 mod tabs;
+mod text_view;
 mod theme;
 mod toolbar;
 mod ui_draw;
@@ -2442,14 +2445,15 @@ mod tests {
         let mut cfg = ToolbarConfig::default();
         assert!(cfg.is_enabled(ToolbarItem::Sidebar));
         assert!(cfg.is_enabled(ToolbarItem::Open));
+        assert!(cfg.is_enabled(ToolbarItem::SaveAs));
         assert!(cfg.is_enabled(ToolbarItem::Print));
+        assert!(cfg.is_enabled(ToolbarItem::Annotations));
+        assert!(cfg.is_enabled(ToolbarItem::UiScale));
         assert!(cfg.is_enabled(ToolbarItem::ThemeToggle));
-        assert!(!cfg.is_enabled(ToolbarItem::ViewModes));
-        assert!(!cfg.is_enabled(ToolbarItem::ReadingFilter));
 
-        cfg.toggle(ToolbarItem::ViewModes);
+        cfg.toggle(ToolbarItem::Annotations);
         cfg.toggle(ToolbarItem::Print);
-        assert!(cfg.is_enabled(ToolbarItem::ViewModes));
+        assert!(!cfg.is_enabled(ToolbarItem::Annotations));
         assert!(!cfg.is_enabled(ToolbarItem::Print));
 
         let serialized = cfg.to_ini_str();
@@ -2469,23 +2473,26 @@ mod tests {
         use super::theme::UiThemeMode;
         use super::toolbar::{ToolbarConfig, ToolbarItem};
 
-        // Legacy v1.2 ini without ui_theme / show_toolbar / toolbar_items should default cleanly
+        // Legacy v1.2 ini without ui_theme / show_toolbar / toolbar_items / ui_scale should default cleanly
         let legacy = "recent=foo.pdf\ntab=bar.pdf|2\nactive_tab=0\n";
         let loaded_legacy = PdfViewerApp::parse_session_ini(legacy);
         assert_eq!(loaded_legacy.ui_theme, UiThemeMode::Light);
         assert!(loaded_legacy.show_toolbar);
+        assert!((loaded_legacy.ui_scale - 1.0).abs() < 0.001);
         assert_eq!(loaded_legacy.toolbar_config, ToolbarConfig::default());
 
-        // Roundtrip with custom UI preferences
+        // Roundtrip with custom UI preferences including UI scale
         let mut cfg = SessionConfig::default();
         cfg.ui_theme = UiThemeMode::Dark;
         cfg.show_toolbar = false;
+        cfg.ui_scale = 1.25;
         cfg.toolbar_config.toggle(ToolbarItem::Open);
-        cfg.toolbar_config.toggle(ToolbarItem::Tools);
+        cfg.toolbar_config.toggle(ToolbarItem::EditTools);
         let serialized = PdfViewerApp::serialize_session_ini(&cfg);
         let roundtripped = PdfViewerApp::parse_session_ini(&serialized);
         assert_eq!(roundtripped.ui_theme, UiThemeMode::Dark);
         assert!(!roundtripped.show_toolbar);
+        assert!((roundtripped.ui_scale - 1.25).abs() < 0.001);
         assert_eq!(roundtripped.toolbar_config, cfg.toolbar_config);
     }
 
@@ -2558,5 +2565,37 @@ mod tests {
         pp.recompute_pages(10, 3);
         assert!(pp.resolved_pages.is_empty());
         assert!(pp.range_error.is_some());
+    }
+
+    #[test]
+    fn test_print_preview_collate_booklet_and_annotation_colors() {
+        use super::print_preview::PrintPreviewState;
+        use crate::engine::AnnotationColor;
+
+        let mut pp = PrintPreviewState::new(vec!["Simplex_Printer".to_string()], 0, 5, 0);
+        assert!(pp.render_opts.collate, "Collate should be checked by default");
+        assert!(!pp.render_opts.booklet);
+        assert!(!pp.manual_duplex);
+
+        pp.render_opts.booklet = true;
+        pp.recompute_pages(5, 0);
+        // 5 pages pad to 8 -> 2 physical sheets -> 4 printed sides (front/back pairs)
+        assert_eq!(pp.sheet_count(), 4);
+        let sheets = pp.booklet_sheets();
+        assert_eq!(sheets.len(), 4);
+        assert!(sheets[0].is_front);
+        assert_eq!(sheets[0].left, None);
+        assert_eq!(sheets[0].right, Some(0));
+        assert!(!sheets[1].is_front);
+        assert_eq!(sheets[1].left, Some(1));
+        assert_eq!(sheets[1].right, None);
+
+        // AnnotationColor cycles through all 7 colors cleanly
+        let mut c = AnnotationColor::Yellow;
+        for _ in 0..7 {
+            assert!(!c.label().is_empty());
+            c = c.next();
+        }
+        assert_eq!(c, AnnotationColor::Yellow);
     }
 }

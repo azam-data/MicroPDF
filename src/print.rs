@@ -191,6 +191,10 @@ pub struct PrintRenderOptions {
     /// Print zoom percentage (`100..=200`): values above 100 zoom into the page center/content
     /// to crop outer white margins and enlarge text.
     pub zoom_percent: u16,
+    /// When printing multiple copies, collate (`1,2,3 1,2,3`) if true, else group (`1,1 2,2`).
+    pub collate: bool,
+    /// Saddle-stitch 2-up booklet imposition (landscape short-edge folded booklet).
+    pub booklet: bool,
 }
 
 impl Default for PrintRenderOptions {
@@ -201,7 +205,116 @@ impl Default for PrintRenderOptions {
             grayscale: false,
             auto_trim_margins: false,
             zoom_percent: 100,
+            collate: true,
+            booklet: false,
         }
+    }
+}
+
+/// One physical side of a 2-up saddle-stitch booklet sheet (`None` = blank padding page).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BookletSheet {
+    pub left: Option<u16>,
+    pub right: Option<u16>,
+    pub is_front: bool,
+}
+
+/// Computes saddle-stitch 2-up booklet imposition for `pages` (0-based indices).
+/// Pads up to a multiple of 4 with `None` blank pages, producing `[Front1, Back1, Front2, Back2, ...]`.
+pub fn compute_booklet_sheets(pages: &[u16]) -> Vec<BookletSheet> {
+    if pages.is_empty() {
+        return Vec::new();
+    }
+    let padded_len = ((pages.len() + 3) / 4) * 4;
+    let get = |idx: usize| -> Option<u16> { pages.get(idx).copied() };
+    let mut sheets = Vec::with_capacity(padded_len / 2);
+    let pairs = padded_len / 4;
+    for k in 0..pairs {
+        // Front of sheet k: [N - 1 - 2k | 2k]
+        sheets.push(BookletSheet {
+            left: get(padded_len - 1 - 2 * k),
+            right: get(2 * k),
+            is_front: true,
+        });
+        // Back of sheet k: [2k + 1 | N - 2 - 2k]
+        sheets.push(BookletSheet {
+            left: get(2 * k + 1),
+            right: get(padded_len - 2 - 2 * k),
+            is_front: false,
+        });
+    }
+    sheets
+}
+
+/// Flattens `BookletSheet`s into sequential `[left, right, left, right, ...]` slots for 2-up output.
+pub fn flatten_booklet_sheets(sheets: &[BookletSheet]) -> Vec<Option<u16>> {
+    let mut out = Vec::with_capacity(sheets.len() * 2);
+    for s in sheets {
+        out.push(s.left);
+        out.push(s.right);
+    }
+    out
+}
+
+/// Two-pass plan for printing duplex on a simplex (single-sided) printer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ManualDuplexPasses {
+    /// Pass 1 page slots (front sides). In booklet mode, flattened `[L, R]` pairs.
+    pub pass1_pages: Vec<Option<u16>>,
+    /// Pass 2 page slots (back sides, optionally reversed). In booklet mode, flattened `[L, R]` pairs.
+    pub pass2_pages: Vec<Option<u16>>,
+    /// Number of physical sheets printed per pass.
+    pub sheets_per_pass: usize,
+}
+
+/// Splits `pages` into Pass 1 (Fronts) and Pass 2 (Backs) for guided manual duplex on simplex printers.
+/// For odd page counts in normal mode, pads Pass 2 with a blank page (`None`) before reversing so
+/// the last front page remains blank on the back instead of shifting every subsequent sheet.
+pub fn build_manual_duplex_passes(
+    pages: &[u16],
+    booklet: bool,
+    reverse_backs: bool,
+) -> ManualDuplexPasses {
+    if pages.is_empty() {
+        return ManualDuplexPasses {
+            pass1_pages: Vec::new(),
+            pass2_pages: Vec::new(),
+            sheets_per_pass: 0,
+        };
+    }
+    if booklet {
+        let sheets = compute_booklet_sheets(pages);
+        let fronts: Vec<BookletSheet> = sheets.iter().copied().filter(|s| s.is_front).collect();
+        let mut backs: Vec<BookletSheet> = sheets.iter().copied().filter(|s| !s.is_front).collect();
+        if reverse_backs {
+            backs.reverse();
+        }
+        return ManualDuplexPasses {
+            sheets_per_pass: fronts.len(),
+            pass1_pages: flatten_booklet_sheets(&fronts),
+            pass2_pages: flatten_booklet_sheets(&backs),
+        };
+    }
+
+    let mut fronts: Vec<Option<u16>> = Vec::new();
+    let mut backs: Vec<Option<u16>> = Vec::new();
+    for (i, &p) in pages.iter().enumerate() {
+        if i % 2 == 0 {
+            fronts.push(Some(p));
+        } else {
+            backs.push(Some(p));
+        }
+    }
+    if backs.len() < fronts.len() {
+        backs.push(None);
+    }
+    if reverse_backs {
+        backs.reverse();
+    }
+    ManualDuplexPasses {
+        sheets_per_pass: fronts.len(),
+        pass1_pages: fronts,
+        pass2_pages: backs,
     }
 }
 
@@ -707,6 +820,76 @@ pub fn write_pages_to_temp_pdf(
     Ok(temp)
 }
 
+/// Like `write_pages_to_temp_pdf`, but accepts `Option<u16>` slots where `None` inserts a
+/// matching-size blank white page (used for Booklet multiple-of-4 padding and Odd Manual Duplex).
+pub fn write_optional_pages_to_temp_pdf(
+    engine: &PdfEngine,
+    doc: &PdfDocument,
+    slots: &[Option<u16>],
+    redacted: bool,
+    dir: &Path,
+) -> Result<TempPrintFile> {
+    if slots.is_empty() {
+        anyhow::bail!("No pages selected to print");
+    }
+    // Fast path when there are no blank slots
+    if slots.iter().all(|s| s.is_some()) {
+        let plain: Vec<u16> = slots.iter().flatten().copied().collect();
+        return write_pages_to_temp_pdf(engine, doc, &plain, redacted, dir);
+    }
+
+    let total = doc.pages().len();
+    let default_size = slots
+        .iter()
+        .flatten()
+        .find_map(|&idx| {
+            doc.pages().page_size(idx).ok().map(|r| {
+                PdfPagePaperSize::Custom(r.width(), r.height())
+            })
+        })
+        .unwrap_or_else(PdfPagePaperSize::a4);
+
+    remove_stale_print_temp_files(dir);
+    let mut dest = engine
+        .pdfium
+        .create_new_pdf()
+        .context("Failed to create temporary print PDF")?;
+
+    for slot in slots {
+        match slot {
+            Some(src_idx) => {
+                if *src_idx >= total {
+                    anyhow::bail!("Page {} out of range (1-{total})", src_idx + 1);
+                }
+                let dst_len = dest.pages().len();
+                dest.pages_mut()
+                    .copy_page_from_document(doc, *src_idx, dst_len)
+                    .with_context(|| format!("Failed to copy page {} for printing", src_idx + 1))?;
+            }
+            None => {
+                dest.pages_mut()
+                    .create_page_at_end(default_size)
+                    .context("Failed to insert blank padding page for printing")?;
+            }
+        }
+    }
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let path = dir.join(format!("{TEMP_PRINT_PREFIX}{}_{nanos}.pdf", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("Failed to create temporary print PDF {path:?}"))?;
+    let temp = TempPrintFile { path };
+    write_doc_for_print(&dest, redacted, &mut file)?;
+    drop(file);
+    Ok(temp)
+}
+
 /// Writes `doc` to `file`: streamed by PDFium, or deep-cleaned first after a redaction.
 fn write_doc_for_print(doc: &PdfDocument, redacted: bool, file: &mut std::fs::File) -> Result<()> {
     use std::io::Write;
@@ -857,11 +1040,14 @@ pub fn start_cups_print_with(
 }
 
 /// Extended CUPS print request used by Print Preview (supports duplex, paper size, orientation,
-/// grayscale, and Auto-Trim / Zoom margin cropping).
+/// grayscale, Collate, Booklet 2-up, Manual Duplex passes, and Auto-Trim / Zoom margin cropping).
 #[cfg_attr(windows, allow(dead_code))]
 pub struct CupsPrintExtendedRequest<'a> {
     pub printer: &'a str,
     pub copies: u16,
+    /// Optional explicit page slots (`None` = blank padding page for Booklet or Manual Duplex).
+    /// When `None`, `page_indices` is used directly (or auto-imposed if `render_opts.booklet` is true).
+    pub optional_pages: Option<&'a [Option<u16>]>,
     pub page_indices: &'a [u16],
     pub title: &'a str,
     pub paper: PrintPaperSize,
@@ -909,25 +1095,42 @@ pub fn start_cups_print_extended(
     if printer.is_empty() {
         anyhow::bail!("No printer selected");
     }
-    if req.page_indices.is_empty() {
+    let effective_slots: Vec<Option<u16>> = if let Some(explicit) = req.optional_pages {
+        explicit.to_vec()
+    } else if req.render_opts.booklet {
+        let sheets = compute_booklet_sheets(req.page_indices);
+        flatten_booklet_sheets(&sheets)
+    } else {
+        req.page_indices.iter().copied().map(Some).collect()
+    };
+    if effective_slots.is_empty() {
         anyhow::bail!("No pages selected to print");
     }
+
     let copies = req.copies.clamp(1, 99);
-    let temp = write_pages_to_temp_pdf(engine, doc, req.page_indices, redacted, temp_dir)?;
+    let temp = write_optional_pages_to_temp_pdf(engine, doc, &effective_slots, redacted, temp_dir)?;
 
     if req.render_opts.auto_trim_margins || req.render_opts.zoom_percent > 100 {
-        let mut boxes = Vec::with_capacity(req.page_indices.len());
-        for &p_idx in req.page_indices {
-            if let Ok(page) = doc.pages().get(p_idx) {
-                boxes.push(compute_effective_crop_box(
-                    &page,
-                    req.render_opts.auto_trim_margins,
-                    req.render_opts.zoom_percent,
-                    None,
-                ));
+        let mut boxes = Vec::with_capacity(effective_slots.len());
+        for slot in &effective_slots {
+            match slot {
+                Some(p_idx) => {
+                    if let Ok(page) = doc.pages().get(*p_idx) {
+                        boxes.push(compute_effective_crop_box(
+                            &page,
+                            req.render_opts.auto_trim_margins,
+                            req.render_opts.zoom_percent,
+                            None,
+                        ));
+                    }
+                }
+                None => {
+                    let (w, h) = req.paper.portrait_pts();
+                    boxes.push((0.0, 0.0, w, h));
+                }
             }
         }
-        if boxes.len() == req.page_indices.len() {
+        if boxes.len() == effective_slots.len() {
             let _ = apply_crop_boxes_to_temp_pdf(temp.path(), &boxes);
         }
     }
@@ -943,20 +1146,32 @@ pub fn start_cups_print_extended(
         .arg(format!("media={}", req.paper.cups_media()))
         .arg("-o")
         .arg(req.duplex.cups_sides_arg());
+    if copies > 1 {
+        cmd.arg("-o")
+            .arg(if req.render_opts.collate { "Collate=True" } else { "Collate=False" });
+    }
+    if req.render_opts.booklet {
+        cmd.arg("-o")
+            .arg("number-up=2")
+            .arg("-o")
+            .arg("orientation-requested=4");
+    } else {
+        match req.render_opts.orientation {
+            PrintOrientation::Auto => {}
+            PrintOrientation::Portrait => {
+                cmd.arg("-o").arg("orientation-requested=3");
+            }
+            PrintOrientation::Landscape => {
+                cmd.arg("-o").arg("orientation-requested=4");
+            }
+        }
+    }
     if req.render_opts.fit_to_page
+        || req.render_opts.booklet
         || req.render_opts.auto_trim_margins
         || req.render_opts.zoom_percent > 100
     {
         cmd.arg("-o").arg("fit-to-page");
-    }
-    match req.render_opts.orientation {
-        PrintOrientation::Auto => {}
-        PrintOrientation::Portrait => {
-            cmd.arg("-o").arg("orientation-requested=3");
-        }
-        PrintOrientation::Landscape => {
-            cmd.arg("-o").arg("orientation-requested=4");
-        }
     }
     if req.render_opts.grayscale {
         cmd.arg("-o").arg("ColorModel=Gray");
@@ -967,10 +1182,15 @@ pub fn start_cups_print_extended(
         .stderr(std::process::Stdio::piped());
 
     let child = cmd.spawn().context("Failed to run 'lp'")?;
+    let reported_pages = if req.render_opts.booklet {
+        (effective_slots.len() + 1) / 2
+    } else {
+        effective_slots.len()
+    };
     Ok(PendingLpJob {
         child: Some(child),
         temp: Some(temp),
-        pages: req.page_indices.len(),
+        pages: reported_pages,
         copies,
     })
 }
@@ -1064,9 +1284,40 @@ impl<'e> PagedPrintJob<'e> {
         redacted: bool,
         render_opts: PrintRenderOptions,
         temp_dir: &Path,
+        sink: Box<dyn PrintSink>,
+    ) -> Result<Self> {
+        let slots: Vec<Option<u16>> = if render_opts.booklet {
+            let sheets = compute_booklet_sheets(page_indices);
+            flatten_booklet_sheets(&sheets)
+        } else {
+            page_indices.iter().copied().map(Some).collect()
+        };
+        Self::new_with_optional_pages(
+            engine,
+            source,
+            &slots,
+            loop_copies,
+            reported_copies,
+            redacted,
+            render_opts,
+            temp_dir,
+            sink,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_optional_pages(
+        engine: &'e PdfEngine,
+        source: &PdfDocument,
+        slots: &[Option<u16>],
+        loop_copies: u16,
+        reported_copies: u16,
+        redacted: bool,
+        render_opts: PrintRenderOptions,
+        temp_dir: &Path,
         mut sink: Box<dyn PrintSink>,
     ) -> Result<Self> {
-        let snapshot = write_pages_to_temp_pdf(engine, source, page_indices, redacted, temp_dir)
+        let snapshot = write_optional_pages_to_temp_pdf(engine, source, slots, redacted, temp_dir)
             .and_then(|temp| {
                 let doc = engine
                     .load_pdf_safe(temp.path())
@@ -1080,9 +1331,20 @@ impl<'e> PagedPrintJob<'e> {
                 return Err(e);
             }
         };
-        let per_copy = doc.pages().len();
+        let total_snap_pages = doc.pages().len();
+        let per_copy: u16 = if render_opts.booklet {
+            ((total_snap_pages as usize + 1) / 2) as u16
+        } else {
+            total_snap_pages
+        };
         let loop_copies = loop_copies.max(1);
-        let order = (0..loop_copies).flat_map(|_| 0..per_copy).collect();
+        let order: Vec<u16> = if render_opts.collate {
+            (0..loop_copies).flat_map(|_| 0..per_copy).collect()
+        } else {
+            (0..per_copy)
+                .flat_map(|p| std::iter::repeat(p).take(loop_copies as usize))
+                .collect()
+        };
         Ok(Self {
             doc,
             _temp: temp,
@@ -1121,38 +1383,88 @@ impl<'e> PagedPrintJob<'e> {
         self._temp.path()
     }
 
-    /// Renders and sends the next page. `Ok(true)`: more pages remain; `Ok(false)`: the
-    /// document is complete. On error the printer document is aborted.
+    /// Renders and sends the next page (or 2-up booklet sheet). `Ok(true)`: more remain;
+    /// `Ok(false)`: document complete. On error the printer document is aborted.
     pub fn step(&mut self, engine: &PdfEngine) -> Result<bool> {
         if self.closed {
             return Ok(false);
         }
         let Self { doc, sink, strip_buf, order, next, render_opts, .. } = self;
         let opts = *render_opts;
-        let page_idx = order[*next];
+        let sheet_idx = order[*next];
         let page_res = (|| -> Result<()> {
-            let landscape = doc
-                .pages()
-                .page_size(page_idx)
-                .map(|s| opts.orientation.is_landscape(s.width().value, s.height().value))
-                .unwrap_or(opts.orientation == PrintOrientation::Landscape);
-            let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(landscape)?;
-            let rendered = render_page_in_horizontal_strips_with_options(
-                engine,
-                doc,
-                page_idx,
-                dpi_x,
-                dpi_y,
-                avail_w,
-                avail_h,
-                PRINT_STRIP_ROWS,
-                opts,
-                strip_buf,
-                |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
-            );
-            let ended = sink.end_page();
-            rendered?;
-            ended
+            if opts.booklet {
+                let left_idx = sheet_idx.saturating_mul(2);
+                let right_idx = left_idx + 1;
+                let snap_len = doc.pages().len();
+                let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(true)?;
+                let half_w = (avail_w / 2).max(1);
+                let right_w = avail_w.saturating_sub(half_w).max(1);
+                let half_opts = PrintRenderOptions {
+                    fit_to_page: true,
+                    ..opts
+                };
+                let mut rendered: Result<()> = Ok(());
+                if left_idx < snap_len {
+                    rendered = render_page_in_horizontal_strips_with_options(
+                        engine,
+                        doc,
+                        left_idx,
+                        dpi_x,
+                        dpi_y,
+                        half_w,
+                        avail_h,
+                        PRINT_STRIP_ROWS,
+                        half_opts,
+                        strip_buf,
+                        |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
+                    )
+                    .map(|_| ());
+                }
+                if rendered.is_ok() && right_idx < snap_len {
+                    rendered = render_page_in_horizontal_strips_with_options(
+                        engine,
+                        doc,
+                        right_idx,
+                        dpi_x,
+                        dpi_y,
+                        right_w,
+                        avail_h,
+                        PRINT_STRIP_ROWS,
+                        half_opts,
+                        strip_buf,
+                        |x, y, w, h, px| sink.draw_strip(half_w + x, y, w, h, px),
+                    )
+                    .map(|_| ());
+                }
+                let ended = sink.end_page();
+                rendered?;
+                ended
+            } else {
+                let page_idx = sheet_idx;
+                let landscape = doc
+                    .pages()
+                    .page_size(page_idx)
+                    .map(|s| opts.orientation.is_landscape(s.width().value, s.height().value))
+                    .unwrap_or(opts.orientation == PrintOrientation::Landscape);
+                let (dpi_x, dpi_y, avail_w, avail_h) = sink.start_page(landscape)?;
+                let rendered = render_page_in_horizontal_strips_with_options(
+                    engine,
+                    doc,
+                    page_idx,
+                    dpi_x,
+                    dpi_y,
+                    avail_w,
+                    avail_h,
+                    PRINT_STRIP_ROWS,
+                    opts,
+                    strip_buf,
+                    |x, y, w, h, px| sink.draw_strip(x, y, w, h, px),
+                );
+                let ended = sink.end_page();
+                rendered?;
+                ended
+            }
         })();
         if let Err(e) = page_res {
             self.sink.abort();
@@ -2704,5 +3016,30 @@ mod tests {
         assert_eq!(PrintPaperSize::Legal.cups_media(), "Legal");
         let (a4w, a4h) = PrintPaperSize::A4.portrait_pts();
         assert!(a4h > a4w && (a4w - 595.28).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_booklet_imposition_and_manual_duplex_passes() {
+        // 6 pages -> padded to 8 -> 2 physical sheets (4 sides):
+        // Sheet 1 Front: [blank(7), p1(0)], Sheet 1 Back: [p2(1), blank(6)]
+        // Sheet 2 Front: [p6(5), p3(2)],    Sheet 2 Back: [p4(3), p5(4)]
+        let sheets = compute_booklet_sheets(&[0, 1, 2, 3, 4, 5]);
+        assert_eq!(sheets.len(), 4);
+        assert_eq!((sheets[0].left, sheets[0].right, sheets[0].is_front), (None, Some(0), true));
+        assert_eq!((sheets[1].left, sheets[1].right, sheets[1].is_front), (Some(1), None, false));
+        assert_eq!((sheets[2].left, sheets[2].right, sheets[2].is_front), (Some(5), Some(2), true));
+        assert_eq!((sheets[3].left, sheets[3].right, sheets[3].is_front), (Some(3), Some(4), false));
+
+        // Normal Manual Duplex on 5 pages (odd): Pass 1 = [0, 2, 4], Pass 2 reversed = [None, 3, 1]
+        let md = build_manual_duplex_passes(&[0, 1, 2, 3, 4], false, true);
+        assert_eq!(md.sheets_per_pass, 3);
+        assert_eq!(md.pass1_pages, vec![Some(0), Some(2), Some(4)]);
+        assert_eq!(md.pass2_pages, vec![None, Some(3), Some(1)]);
+
+        // Booklet Manual Duplex on 6 pages: Pass 1 = Fronts [None, 0, 5, 2], Pass 2 reversed = Backs [3, 4, 1, None]
+        let md_bk = build_manual_duplex_passes(&[0, 1, 2, 3, 4, 5], true, true);
+        assert_eq!(md_bk.sheets_per_pass, 2);
+        assert_eq!(md_bk.pass1_pages, vec![None, Some(0), Some(5), Some(2)]);
+        assert_eq!(md_bk.pass2_pages, vec![Some(3), Some(4), Some(1), None]);
     }
 }

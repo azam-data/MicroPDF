@@ -463,6 +463,8 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::SplitRange { input } => ("Split / Extract Pages", "Page range (e.g. '1-3' or '2,4,6')", input.clone(), "Extract"),
             InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add"),
             InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save"),
+            InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach"),
+            InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place"),
             InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open"),
             InputMode::PasswordPrompt { path, password_input, attempts_left, .. } => {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("document.pdf");
@@ -603,7 +605,7 @@ impl<'a> PdfViewerApp<'a> {
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 5", "Fit Page / Width / Text / 2-Page / Scroll"),
+            ("1 - 5 / T", "Fit Page/Width/Text/2-Pg/Scroll & Text View"),
             ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 resets)"),
             ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab tabs)"),
             ("B / L", "Bookmark Sidebar / Import .txt"),
@@ -615,10 +617,10 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+C", "Copy Selected Text"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S", "Open PDF in Tab / Save PDF"),
-            ("Ctrl+P", "Print Preview & Print"),
+            ("O / S", "Open PDF / Save (Ctrl+Shift+S Save As)"),
+            ("Ctrl+P", "Print Preview (Booklet / Simplex Duplex)"),
             ("Z", "Quick Optimize (_optimized.pdf)"),
-            ("Shift+M", "Combine Multiple PDFs"),
+            ("Shift+M", "Combine Multiple PDFs (Interactive)"),
             ("X / U", "Split Pages / Flatten & Unlock"),
             ("P", "Stamp Signature / Image"),
             ("N / H / C", "Page Numbers / Header-Footer / Clear"),

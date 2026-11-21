@@ -1,6 +1,9 @@
 //! Customizable compact icon toolbar rendered inline beside the menus on the unified top bar,
 //! plus the lightweight "Customize Toolbar..." checklist overlay.
+//! Page navigation, page zoom, view modes, reading filter, fullscreen, and presentation live
+//! centered on the Bottom View Bar (`bottom_bar.rs`).
 
+use super::render::{blend_rect_rgba, fill_rect_clipped};
 use super::state::*;
 use super::ui_draw::*;
 
@@ -10,33 +13,31 @@ pub enum ToolbarItem {
     Grid = 1,
     Open = 2,
     Save = 3,
-    Print = 4,
-    PageNav = 5,
-    Zoom = 6,
-    ViewModes = 7,
-    Tools = 8,
-    Rotate = 9,
-    Search = 10,
-    ReadingFilter = 11,
-    ThemeToggle = 12,
+    SaveAs = 4,
+    Print = 5,
+    Annotations = 6,
+    EditTools = 7,
+    Rotate = 8,
+    Search = 9,
+    UiScale = 10,
+    ThemeToggle = 11,
 }
 
 impl ToolbarItem {
-    pub const COUNT: usize = 13;
+    pub const COUNT: usize = 12;
 
     pub const ALL: [ToolbarItem; Self::COUNT] = [
         ToolbarItem::Sidebar,
         ToolbarItem::Grid,
         ToolbarItem::Open,
         ToolbarItem::Save,
+        ToolbarItem::SaveAs,
         ToolbarItem::Print,
-        ToolbarItem::PageNav,
-        ToolbarItem::Zoom,
-        ToolbarItem::ViewModes,
-        ToolbarItem::Tools,
+        ToolbarItem::Annotations,
+        ToolbarItem::EditTools,
         ToolbarItem::Rotate,
         ToolbarItem::Search,
-        ToolbarItem::ReadingFilter,
+        ToolbarItem::UiScale,
         ToolbarItem::ThemeToggle,
     ];
 
@@ -46,14 +47,13 @@ impl ToolbarItem {
             Self::Grid => "grid",
             Self::Open => "open",
             Self::Save => "save",
+            Self::SaveAs => "save_as",
             Self::Print => "print",
-            Self::PageNav => "pages",
-            Self::Zoom => "zoom",
-            Self::ViewModes => "view_modes",
-            Self::Tools => "tools",
+            Self::Annotations => "annotations",
+            Self::EditTools => "edit_tools",
             Self::Rotate => "rotate",
             Self::Search => "search",
-            Self::ReadingFilter => "filter",
+            Self::UiScale => "ui_scale",
             Self::ThemeToggle => "theme",
         }
     }
@@ -64,25 +64,27 @@ impl ToolbarItem {
             Self::Grid => "Thumbnail Grid (Tab)",
             Self::Open => "Open PDF (O)",
             Self::Save => "Save PDF (S)",
+            Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview (Ctrl+P)",
-            Self::PageNav => "Page Navigation & Jump",
-            Self::Zoom => "Zoom Controls (- / % / +)",
-            Self::ViewModes => "View Mode Buttons (1-5)",
-            Self::Tools => "Mouse Tools (Select/Highlight/Redact/Crop/Stamp)",
+            Self::Annotations => "Annotations (Highlight/Underline/Strike/Note/Pen/Text/Shapes)",
+            Self::EditTools => "Edit Tools (Redact / Crop / Stamp)",
             Self::Rotate => "Rotate Page 90° (R)",
             Self::Search => "Find Text (Ctrl+F)",
-            Self::ReadingFilter => "Reading Filter (Normal/Dark/Sepia)",
+            Self::UiScale => "Zoom Interface (UI Scale - / % / +)",
             Self::ThemeToggle => "Light / Dark UI Toggle",
         }
     }
 
     pub fn from_key(s: &str) -> Option<Self> {
         let k = s.trim();
+        if k.eq_ignore_ascii_case("tools") {
+            return Some(Self::Annotations);
+        }
         Self::ALL.into_iter().find(|item| item.key().eq_ignore_ascii_case(k))
     }
 
     pub fn default_enabled(self) -> bool {
-        !matches!(self, Self::ViewModes | Self::ReadingFilter)
+        true
     }
 }
 
@@ -126,85 +128,93 @@ impl ToolbarConfig {
 
     pub fn from_ini_str(s: &str) -> Self {
         let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Self::default();
+        }
         if trimmed.eq_ignore_ascii_case("none") {
             return Self {
                 enabled: [false; ToolbarItem::COUNT],
             };
         }
-        let mut cfg = Self {
-            enabled: [false; ToolbarItem::COUNT],
-        };
-        let mut any = false;
+        let mut enabled = [false; ToolbarItem::COUNT];
+        let mut any_matched = false;
         for part in trimmed.split(',') {
             if let Some(item) = ToolbarItem::from_key(part) {
-                cfg.enabled[item as usize] = true;
-                any = true;
+                enabled[item as usize] = true;
+                any_matched = true;
             }
         }
-        if any { cfg } else { Self::default() }
+        if any_matched {
+            Self { enabled }
+        } else {
+            Self::default()
+        }
     }
 }
 
+/// Every clickable action exposed by the inline top toolbar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ToolbarAction {
     ToggleSidebar,
     ToggleGrid,
-    OpenPdf,
-    SavePdf,
-    PrintPreview,
-    PrevPage,
-    JumpPage,
-    NextPage,
-    ZoomOut,
-    ResetZoom,
-    ZoomIn,
-    ViewFitPage,
-    ViewFitWidth,
-    ViewTwoPage,
-    ViewContinuous,
+    Open,
+    Save,
+    SaveAs,
+    Print,
     ToolSelect,
     ToolHighlight,
+    ToolUnderline,
+    ToolStrikethrough,
+    ToolStickyNote,
+    ToolInkPen,
+    ToolFreeText,
+    ToolRectShape,
+    ToolArrowShape,
+    CycleAnnotationColor,
     ToolRedact,
     ToolCrop,
     ToolStamp,
     RotatePage,
-    Search,
-    CycleFilter,
+    FindText,
+    UiScaleDown,
+    UiScaleReset,
+    UiScaleUp,
     ToggleTheme,
 }
 
 impl ToolbarAction {
     pub fn tooltip(self) -> &'static str {
         match self {
-            Self::ToggleSidebar => "Toggle Bookmarks Sidebar (B)",
-            Self::ToggleGrid => "Toggle Thumbnail Grid (Tab)",
-            Self::OpenPdf => "Open PDF in Tab (O)",
-            Self::SavePdf => "Save PDF (S)",
-            Self::PrintPreview => "Print Preview & Print (Ctrl/Cmd+P)",
-            Self::PrevPage => "Previous Page (Left)",
-            Self::JumpPage => "Jump to Page (G)",
-            Self::NextPage => "Next Page (Right)",
-            Self::ZoomOut => "Zoom Out (-)",
-            Self::ResetZoom => "Reset Zoom to 100% (0)",
-            Self::ZoomIn => "Zoom In (+)",
-            Self::ViewFitPage => "Fit Full Page (1)",
-            Self::ViewFitWidth => "Fit Page Width (2)",
-            Self::ViewTwoPage => "Two-Page Spread (4)",
-            Self::ViewContinuous => "Continuous Scroll (5)",
-            Self::ToolSelect => "Mouse Mode: Select Text",
-            Self::ToolHighlight => "Mouse Mode: Highlight Text",
-            Self::ToolRedact => "Mouse Mode: Black-Box Redact",
-            Self::ToolCrop => "Mouse Mode: Crop Page Area",
+            Self::ToggleSidebar => "Bookmarks Sidebar (B)",
+            Self::ToggleGrid => "Thumbnail Grid (Tab)",
+            Self::Open => "Open PDF (O)",
+            Self::Save => "Save PDF (S)",
+            Self::SaveAs => "Save As... (Ctrl+Shift+S)",
+            Self::Print => "Print Preview (Ctrl+P)",
+            Self::ToolSelect => "Select Text Tool (default)",
+            Self::ToolHighlight => "Highlight Text (drag across text)",
+            Self::ToolUnderline => "Underline Text (drag across text)",
+            Self::ToolStrikethrough => "Strikethrough Text (drag across text)",
+            Self::ToolStickyNote => "Sticky Note / Comment (click on page)",
+            Self::ToolInkPen => "Freehand Pen / Ink (drag to draw)",
+            Self::ToolFreeText => "Text Box / FreeText (click on page)",
+            Self::ToolRectShape => "Rectangle Shape (drag box)",
+            Self::ToolArrowShape => "Arrow Shape (drag start to tip)",
+            Self::CycleAnnotationColor => "Click to Cycle Annotation Color",
+            Self::ToolRedact => "Black-Box Redact (drag area)",
+            Self::ToolCrop => "Crop Page Area (drag area)",
             Self::ToolStamp => "Stamp Signature / Image (P)",
-            Self::RotatePage => "Rotate Current Page 90° (R)",
-            Self::Search => "Find Text in PDF (Ctrl/Cmd+F)",
-            Self::CycleFilter => "Cycle Reading Filter: Normal / Dark / Sepia (V)",
+            Self::RotatePage => "Rotate Page 90° (R)",
+            Self::FindText => "Find Text (Ctrl+F)",
+            Self::UiScaleDown => "Shrink Interface Scale (-10%)",
+            Self::UiScaleReset => "Reset Interface Scale to 100%",
+            Self::UiScaleUp => "Enlarge Interface Scale (+10%)",
             Self::ToggleTheme => "Switch Light / Dark UI Theme",
         }
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(super) struct ToolbarWidgetRect {
     pub(super) x: i32,
     pub(super) y: i32,
@@ -212,91 +222,136 @@ pub(super) struct ToolbarWidgetRect {
     pub(super) h: u32,
     pub(super) action: ToolbarAction,
     pub(super) icon: Option<UiIcon>,
-    pub(super) text: Option<String>,
+    pub(super) label: Option<String>,
+    pub(super) swatch_rgb: Option<u32>,
     pub(super) active: bool,
-    pub(super) accent_kind: ToolAccent,
-    pub(super) pill_outline: bool,
+    pub(super) accent_dot: bool,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub(super) enum ToolAccent {
-    Primary,
-    Warning,
-    Danger,
-    Success,
-    Violet,
-}
-
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Copy)]
 pub(super) struct ToolbarSepX(pub(super) i32);
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum CustomizeHit {
     ToggleItem(ToolbarItem),
     ResetDefaults,
-    Close,
-    InsideCard,
+    Done,
+    InsideModal,
 }
 
 impl<'a> PdfViewerApp<'a> {
-    /// Computes responsive toolbar widget rectangles placed inline beside the menu headers
-    /// on the unified top bar (`x_start .. buf_w - right_pad`).
-    pub(super) fn layout_unified_toolbar(
+    pub(super) fn compute_inline_toolbar_layout(
         &self,
         start_x: i32,
         buf_w: u32,
-        topbar_h: u32,
+        bar_h: u32,
         sf: f64,
     ) -> (Vec<ToolbarWidgetRect>, Vec<ToolbarSepX>) {
-        if !self.show_toolbar || topbar_h == 0 {
+        if !self.show_toolbar || bar_h == 0 || buf_w < 200 {
             return (Vec::new(), Vec::new());
         }
+
         let s = sf as f32;
-        let btn_h = (22.0 * s).round().clamp(18.0, (topbar_h.saturating_sub(6)) as f32) as u32;
-        let btn_y = ((topbar_h.saturating_sub(btn_h)) / 2) as i32;
-        let icon_btn_w = (24.0 * s).round() as u32;
+        let btn_h = (22.0 * s).round().clamp(16.0, (bar_h as f32) - 4.0) as u32;
+        let btn_y = ((bar_h.saturating_sub(btn_h)) / 2) as i32;
+        let sq_w = (23.0 * s).round().max(18.0) as u32;
         let gap = (2.0 * s).round().max(1.0) as i32;
-        let sep_pad = (6.0 * s).round().max(4.0) as i32;
-        let font_sz = (11.5 * s).clamp(10.0, 26.0);
+        let sep_pad = (5.0 * s).round().max(3.0) as i32;
         let right_margin = (8.0 * s).round() as i32;
+        let font_sz = (10.5 * s).clamp(8.5, 20.0);
 
-        // Reserve space on the far right for ThemeToggle (if enabled) so it always pins right cleanly.
-        let pin_theme = self.toolbar_config.is_enabled(ToolbarItem::ThemeToggle);
-        let theme_w = if pin_theme { icon_btn_w } else { 0 };
-        let max_left_x = (buf_w as i32) - right_margin - if pin_theme { theme_w as i32 + sep_pad } else { 0 };
+        let mut widgets = Vec::with_capacity(24);
+        let mut seps = Vec::with_capacity(6);
+        let mut right_edge = (buf_w as i32) - right_margin;
 
-        let mut widgets: Vec<ToolbarWidgetRect> = Vec::new();
-        let mut seps: Vec<ToolbarSepX> = Vec::new();
-        let mut cur_x = start_x;
-
-        if cur_x + (icon_btn_w as i32) >= max_left_x {
-            // Only enough space for pinned theme button
-            if pin_theme && (buf_w as i32) - right_margin - (theme_w as i32) > start_x {
+        // Right-aligned Theme Toggle
+        if self.toolbar_config.is_enabled(ToolbarItem::ThemeToggle) {
+            let x = right_edge - (sq_w as i32);
+            if x > start_x + 20 {
+                let ic = match self.ui_theme_mode {
+                    super::theme::UiThemeMode::Light => UiIcon::Moon,
+                    super::theme::UiThemeMode::Dark => UiIcon::Sun,
+                };
                 widgets.push(ToolbarWidgetRect {
-                    x: (buf_w as i32) - right_margin - (theme_w as i32),
+                    x,
                     y: btn_y,
-                    w: theme_w,
+                    w: sq_w,
                     h: btn_h,
                     action: ToolbarAction::ToggleTheme,
-                    icon: Some(match self.ui_theme_mode {
-                        super::theme::UiThemeMode::Light => UiIcon::Moon,
-                        super::theme::UiThemeMode::Dark => UiIcon::Sun,
-                    }),
-                    text: None,
+                    icon: Some(ic),
+                    label: None,
+                    swatch_rgb: None,
                     active: false,
-                    accent_kind: ToolAccent::Primary,
-                    pill_outline: false,
+                    accent_dot: false,
                 });
+                right_edge = x - gap * 2;
             }
+        }
+
+        // Right-aligned UI Scale (Zoom Interface: A- / 100% / A+)
+        if self.toolbar_config.is_enabled(ToolbarItem::UiScale) {
+            let ui_txt = format!("UI {}%", (self.ui_scale * 100.0).round() as i32);
+            let lbl_w = (measure_text(&ui_txt, font_sz, false).ceil() as u32 + (8.0 * s).round() as u32)
+                .max((46.0 * s).round() as u32);
+            let mini_w = (20.0 * s).round().max(16.0) as u32;
+            let total_ui_w = (mini_w * 2 + lbl_w) as i32 + gap * 2;
+            if right_edge - total_ui_w > start_x + 40 {
+                let x_plus = right_edge - mini_w as i32;
+                let x_mid = x_plus - gap - lbl_w as i32;
+                let x_minus = x_mid - gap - mini_w as i32;
+                widgets.push(ToolbarWidgetRect {
+                    x: x_minus,
+                    y: btn_y,
+                    w: mini_w,
+                    h: btn_h,
+                    action: ToolbarAction::UiScaleDown,
+                    icon: Some(UiIcon::ZoomOut),
+                    label: None,
+                    swatch_rgb: None,
+                    active: false,
+                    accent_dot: false,
+                });
+                widgets.push(ToolbarWidgetRect {
+                    x: x_mid,
+                    y: btn_y,
+                    w: lbl_w,
+                    h: btn_h,
+                    action: ToolbarAction::UiScaleReset,
+                    icon: None,
+                    label: Some(ui_txt),
+                    swatch_rgb: None,
+                    active: (self.ui_scale - 1.0).abs() > 0.01,
+                    accent_dot: false,
+                });
+                widgets.push(ToolbarWidgetRect {
+                    x: x_plus,
+                    y: btn_y,
+                    w: mini_w,
+                    h: btn_h,
+                    action: ToolbarAction::UiScaleUp,
+                    icon: Some(UiIcon::ZoomIn),
+                    label: None,
+                    swatch_rgb: None,
+                    active: false,
+                    accent_dot: false,
+                });
+                right_edge = x_minus - gap * 2;
+            }
+        }
+
+        let max_left_x = right_edge - (6.0 * s).round() as i32;
+        let mut cur_x = start_x + (4.0 * s).round() as i32;
+
+        if cur_x + (sq_w as i32) > max_left_x {
             return (widgets, seps);
         }
 
-        // Initial divider between `Help` and toolbar
+        // Initial separator between `Help` menu and toolbar
         seps.push(ToolbarSepX(cur_x));
         cur_x += sep_pad;
 
-        let push_sep = |cur_x: &mut i32, seps: &mut Vec<ToolbarSepX>, widgets: &[ToolbarWidgetRect]| {
-            if !widgets.is_empty() && *cur_x + sep_pad * 2 < max_left_x {
+        let push_sep = |cur_x: &mut i32, seps: &mut Vec<ToolbarSepX>, count_before: usize| {
+            if count_before > 0 && *cur_x + sep_pad * 2 < max_left_x {
                 *cur_x += sep_pad / 2;
                 seps.push(ToolbarSepX(*cur_x));
                 *cur_x += sep_pad;
@@ -315,352 +370,214 @@ impl<'a> PdfViewerApp<'a> {
             }
         };
 
-        // Group 1: Navigation & File actions
-        let mut g1_added = false;
+        let mk_ic = |action: ToolbarAction, icon: UiIcon, active: bool, accent_dot: bool| ToolbarWidgetRect {
+            x: 0,
+            y: btn_y,
+            w: sq_w,
+            h: btn_h,
+            action,
+            icon: Some(icon),
+            label: None,
+            swatch_rgb: None,
+            active,
+            accent_dot,
+        };
+
+        // Group 1: Panels & File actions (Sidebar, Grid, Open, Save, SaveAs, Print)
+        let mut g1 = 0usize;
         if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) {
-            g1_added |= try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::ToggleSidebar,
-                    icon: Some(UiIcon::Sidebar), text: None,
-                    active: self.show_bookmarks, accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
+            if try_push(mk_ic(ToolbarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks, false), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
         }
         if self.toolbar_config.is_enabled(ToolbarItem::Grid) {
-            g1_added |= try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::ToggleGrid,
-                    icon: Some(UiIcon::Grid), text: None,
-                    active: self.view_mode == ViewMode::ThumbnailGrid,
-                    accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
+            if try_push(mk_ic(ToolbarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid, false), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
         }
         if self.toolbar_config.is_enabled(ToolbarItem::Open) {
-            g1_added |= try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::OpenPdf,
-                    icon: Some(UiIcon::Open), text: None,
-                    active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
+            if try_push(mk_ic(ToolbarAction::Open, UiIcon::Open, false, false), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
         }
         if self.toolbar_config.is_enabled(ToolbarItem::Save) {
-            g1_added |= try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::SavePdf,
-                    icon: Some(UiIcon::Save), text: None,
-                    active: self.has_unsaved_edits, accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
+            if try_push(mk_ic(ToolbarAction::Save, UiIcon::Save, self.has_unsaved_edits, self.has_unsaved_edits), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
+        }
+        if self.toolbar_config.is_enabled(ToolbarItem::SaveAs) {
+            if try_push(mk_ic(ToolbarAction::SaveAs, UiIcon::SaveAs, false, false), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
         }
         if self.toolbar_config.is_enabled(ToolbarItem::Print) {
-            g1_added |= try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::PrintPreview,
-                    icon: Some(UiIcon::Print), text: None,
-                    active: self.print_preview.is_some(), accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
-        }
-
-        // Group 2: Page Navigation
-        if self.toolbar_config.is_enabled(ToolbarItem::PageNav) {
-            let total = self.total_pages();
-            let cur = if total > 0 { self.current_page_index + 1 } else { 0 };
-            let page_str = format!("{cur}/{total}");
-            let pill_w = (measure_text(&page_str, font_sz, false).ceil() as u32 + (14.0 * s).round() as u32)
-                .max((40.0 * s).round() as u32);
-            let nav_btn_w = (20.0 * s).round() as u32;
-            let group_w = nav_btn_w * 2 + pill_w + (gap as u32) * 2;
-            if cur_x + (group_w as i32) + sep_pad <= max_left_x {
-                if g1_added {
-                    push_sep(&mut cur_x, &mut seps, &widgets);
-                }
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: nav_btn_w, h: btn_h,
-                        action: ToolbarAction::PrevPage,
-                        icon: Some(UiIcon::ChevronLeft), text: None,
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: pill_w, h: btn_h,
-                        action: ToolbarAction::JumpPage,
-                        icon: None, text: Some(page_str),
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: true,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: nav_btn_w, h: btn_h,
-                        action: ToolbarAction::NextPage,
-                        icon: Some(UiIcon::ChevronRight), text: None,
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                g1_added = true;
+            if try_push(mk_ic(ToolbarAction::Print, UiIcon::Print, self.print_preview.is_some(), false), &mut cur_x, &mut widgets) {
+                g1 += 1;
             }
         }
 
-        // Group 3: Zoom
-        if self.toolbar_config.is_enabled(ToolbarItem::Zoom) {
-            let zoom_str = format!("{}%", (self.zoom_level * 100.0).round() as u32);
-            let pill_w = (measure_text(&zoom_str, font_sz, false).ceil() as u32 + (12.0 * s).round() as u32)
-                .max((40.0 * s).round() as u32);
-            let z_btn_w = (20.0 * s).round() as u32;
-            let group_w = z_btn_w * 2 + pill_w + (gap as u32) * 2;
-            if cur_x + (group_w as i32) + sep_pad <= max_left_x {
-                if g1_added {
-                    push_sep(&mut cur_x, &mut seps, &widgets);
+        // Group 2: Select + Full Annotations Suite + Color Swatch
+        let mut g2 = 0usize;
+        if self.toolbar_config.is_enabled(ToolbarItem::Annotations) {
+            push_sep(&mut cur_x, &mut seps, g1);
+            let ann_btns = [
+                (ToolbarAction::ToolSelect, UiIcon::Select, self.mouse_mode == MouseMode::Select),
+                (ToolbarAction::ToolHighlight, UiIcon::Highlight, self.mouse_mode == MouseMode::Highlight),
+                (ToolbarAction::ToolUnderline, UiIcon::Underline, self.mouse_mode == MouseMode::Underline),
+                (ToolbarAction::ToolStrikethrough, UiIcon::Strikethrough, self.mouse_mode == MouseMode::Strikethrough),
+                (ToolbarAction::ToolStickyNote, UiIcon::Note, self.mouse_mode == MouseMode::StickyNote),
+                (ToolbarAction::ToolInkPen, UiIcon::Pen, self.mouse_mode == MouseMode::InkPen),
+                (ToolbarAction::ToolFreeText, UiIcon::TextBox, self.mouse_mode == MouseMode::FreeText),
+                (ToolbarAction::ToolRectShape, UiIcon::RectShape, self.mouse_mode == MouseMode::RectShape),
+                (ToolbarAction::ToolArrowShape, UiIcon::ArrowShape, self.mouse_mode == MouseMode::ArrowShape),
+            ];
+            for (act, ic, active) in ann_btns {
+                if try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets) {
+                    g2 += 1;
                 }
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: z_btn_w, h: btn_h,
-                        action: ToolbarAction::ZoomOut,
-                        icon: Some(UiIcon::ZoomOut), text: None,
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: pill_w, h: btn_h,
-                        action: ToolbarAction::ResetZoom,
-                        icon: None, text: Some(zoom_str),
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                try_push(
-                    ToolbarWidgetRect {
-                        x: 0, y: btn_y, w: z_btn_w, h: btn_h,
-                        action: ToolbarAction::ZoomIn,
-                        icon: Some(UiIcon::ZoomIn), text: None,
-                        active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                    },
-                    &mut cur_x, &mut widgets,
-                );
-                g1_added = true;
             }
-        }
-
-        // Group 4: View Modes (optional)
-        if self.toolbar_config.is_enabled(ToolbarItem::ViewModes) {
-            let group_w = icon_btn_w * 4 + (gap as u32) * 3;
-            if cur_x + (group_w as i32) + sep_pad <= max_left_x {
-                if g1_added {
-                    push_sep(&mut cur_x, &mut seps, &widgets);
-                }
-                let modes = [
-                    (ToolbarAction::ViewFitPage, UiIcon::FitPage, ViewMode::FitPage),
-                    (ToolbarAction::ViewFitWidth, UiIcon::FitWidth, ViewMode::FitWidth),
-                    (ToolbarAction::ViewTwoPage, UiIcon::TwoPage, ViewMode::TwoPageSpread),
-                    (ToolbarAction::ViewContinuous, UiIcon::Continuous, ViewMode::ContinuousScroll),
-                ];
-                for (act, ic, vm) in modes {
-                    try_push(
-                        ToolbarWidgetRect {
-                            x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                            action: act, icon: Some(ic), text: None,
-                            active: self.view_mode == vm, accent_kind: ToolAccent::Primary, pill_outline: false,
-                        },
-                        &mut cur_x, &mut widgets,
-                    );
-                }
-                g1_added = true;
-            }
-        }
-
-        // Group 5: Mouse Tools
-        if self.toolbar_config.is_enabled(ToolbarItem::Tools) {
-            let group_w = icon_btn_w * 5 + (gap as u32) * 4;
-            if cur_x + (group_w as i32) + sep_pad <= max_left_x {
-                if g1_added {
-                    push_sep(&mut cur_x, &mut seps, &widgets);
-                }
-                let tools = [
-                    (ToolbarAction::ToolSelect, UiIcon::Select, MouseMode::Select, ToolAccent::Primary),
-                    (ToolbarAction::ToolHighlight, UiIcon::Highlight, MouseMode::Highlight, ToolAccent::Warning),
-                    (ToolbarAction::ToolRedact, UiIcon::Redact, MouseMode::Redact, ToolAccent::Danger),
-                    (ToolbarAction::ToolCrop, UiIcon::Crop, MouseMode::Crop, ToolAccent::Success),
-                    (ToolbarAction::ToolStamp, UiIcon::Stamp, MouseMode::StampImage, ToolAccent::Violet),
-                ];
-                for (act, ic, mm, acc) in tools {
-                    try_push(
-                        ToolbarWidgetRect {
-                            x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                            action: act, icon: Some(ic), text: None,
-                            active: self.mouse_mode == mm, accent_kind: acc, pill_outline: false,
-                        },
-                        &mut cur_x, &mut widgets,
-                    );
-                }
-                g1_added = true;
-            }
-        }
-
-        // Group 6: Quick Utilities (Rotate, Search, ReadingFilter)
-        let want_util = self.toolbar_config.is_enabled(ToolbarItem::Rotate)
-            || self.toolbar_config.is_enabled(ToolbarItem::Search)
-            || self.toolbar_config.is_enabled(ToolbarItem::ReadingFilter);
-        if want_util && g1_added && cur_x + (icon_btn_w as i32) + sep_pad <= max_left_x {
-            push_sep(&mut cur_x, &mut seps, &widgets);
-        }
-        if self.toolbar_config.is_enabled(ToolbarItem::Rotate) {
-            try_push(
+            // Clickable Annotation Color Swatch button
+            if try_push(
                 ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::RotatePage, icon: Some(UiIcon::Rotate), text: None,
-                    active: false, accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
-        }
-        if self.toolbar_config.is_enabled(ToolbarItem::Search) {
-            try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::Search, icon: Some(UiIcon::Search), text: None,
-                    active: matches!(self.input_mode, InputMode::SearchText { .. }) || !self.search_matches.is_empty(),
-                    accent_kind: ToolAccent::Primary, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
-        }
-        if self.toolbar_config.is_enabled(ToolbarItem::ReadingFilter) {
-            try_push(
-                ToolbarWidgetRect {
-                    x: 0, y: btn_y, w: icon_btn_w, h: btn_h,
-                    action: ToolbarAction::CycleFilter, icon: Some(UiIcon::Filter), text: None,
-                    active: self.reading_filter != ReadingFilter::Normal,
-                    accent_kind: ToolAccent::Warning, pill_outline: false,
-                },
-                &mut cur_x, &mut widgets,
-            );
-        }
-
-        // Far-right pinned Light / Dark Theme toggle
-        if pin_theme {
-            let tx = (buf_w as i32) - right_margin - (theme_w as i32);
-            if tx >= cur_x {
-                widgets.push(ToolbarWidgetRect {
-                    x: tx,
+                    x: 0,
                     y: btn_y,
-                    w: theme_w,
+                    w: sq_w,
                     h: btn_h,
-                    action: ToolbarAction::ToggleTheme,
-                    icon: Some(match self.ui_theme_mode {
-                        super::theme::UiThemeMode::Light => UiIcon::Moon,
-                        super::theme::UiThemeMode::Dark => UiIcon::Sun,
-                    }),
-                    text: None,
+                    action: ToolbarAction::CycleAnnotationColor,
+                    icon: None,
+                    label: None,
+                    swatch_rgb: Some(self.annotation_color.u32_rgb()),
                     active: false,
-                    accent_kind: ToolAccent::Primary,
-                    pill_outline: false,
-                });
+                    accent_dot: false,
+                },
+                &mut cur_x,
+                &mut widgets,
+            ) {
+                g2 += 1;
+            }
+        }
+
+        // Group 3: Edit Tools (Redact, Crop, Stamp) + Rotate + Search
+        let want_g3 = self.toolbar_config.is_enabled(ToolbarItem::EditTools)
+            || self.toolbar_config.is_enabled(ToolbarItem::Rotate)
+            || self.toolbar_config.is_enabled(ToolbarItem::Search);
+        if want_g3 {
+            push_sep(&mut cur_x, &mut seps, g1 + g2);
+            if self.toolbar_config.is_enabled(ToolbarItem::EditTools) {
+                for (act, ic, active) in [
+                    (ToolbarAction::ToolRedact, UiIcon::Redact, self.mouse_mode == MouseMode::Redact),
+                    (ToolbarAction::ToolCrop, UiIcon::Crop, self.mouse_mode == MouseMode::Crop),
+                    (ToolbarAction::ToolStamp, UiIcon::Stamp, self.mouse_mode == MouseMode::StampImage),
+                ] {
+                    try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets);
+                }
+            }
+            if self.toolbar_config.is_enabled(ToolbarItem::Rotate) {
+                try_push(mk_ic(ToolbarAction::RotatePage, UiIcon::Rotate, false, false), &mut cur_x, &mut widgets);
+            }
+            if self.toolbar_config.is_enabled(ToolbarItem::Search) {
+                try_push(
+                    mk_ic(ToolbarAction::FindText, UiIcon::Search, matches!(self.input_mode, InputMode::SearchText { .. }), false),
+                    &mut cur_x,
+                    &mut widgets,
+                );
             }
         }
 
         (widgets, seps)
     }
 
-    pub(super) fn draw_unified_toolbar(
+    pub(super) fn draw_inline_toolbar(
         &self,
         buffer: &mut [u32],
         buf_w: u32,
         buf_h: u32,
         start_x: i32,
-        topbar_h: u32,
+        bar_h: u32,
         sf: f64,
     ) {
+        let (widgets, seps) = self.compute_inline_toolbar_layout(start_x, buf_w, bar_h, sf);
+        if widgets.is_empty() && seps.is_empty() {
+            return;
+        }
         let theme = self.ui_theme();
         let s = sf as f32;
-        let (widgets, seps) = self.layout_unified_toolbar(start_x, buf_w, topbar_h, sf);
-        let sep_h = (16.0 * s).round() as u32;
-        let sep_y = ((topbar_h.saturating_sub(sep_h)) / 2) as i32;
-        for ToolbarSepX(sx) in seps {
-            super::render::fill_rect_clipped(buffer, buf_w, buf_h, sx, sep_y, 1, sep_h, theme.divider);
+        let icon_sz = (13.0 * s).round().clamp(10.0, 28.0) as u32;
+        let font_sz = (10.5 * s).clamp(8.5, 20.0);
+        let btn_rad = (4.5 * s).clamp(3.0, 8.0);
+
+        let sep_h = (16.0 * s).round().max(10.0) as u32;
+        let sep_y = ((bar_h.saturating_sub(sep_h)) / 2) as i32;
+        for sep in &seps {
+            fill_rect_clipped(buffer, buf_w, buf_h, sep.0, sep_y, 1, sep_h, theme.divider);
         }
 
-        let font_sz = (11.5 * s).clamp(10.0, 26.0);
-        let rad = (5.0 * s).clamp(3.0, 10.0);
-
         for w in &widgets {
-            let is_hover = self.hovered_widget == Some(UiHit::Toolbar(w.action));
-            let (active_bg, active_fg) = match w.accent_kind {
-                ToolAccent::Primary => (theme.accent_soft_bg, theme.accent_soft_fg),
-                ToolAccent::Warning => (theme.warning_soft_bg, theme.warning),
-                ToolAccent::Danger => (theme.danger_soft_bg, theme.danger),
-                ToolAccent::Success => (theme.success_soft_bg, theme.success),
-                ToolAccent::Violet => (theme.violet_soft_bg, theme.violet),
-            };
-
+            let is_hov = self.hovered_widget == Some(UiHit::Toolbar(w.action));
             if w.active {
-                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, rad, active_bg);
-            } else if is_hover {
-                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, rad, theme.hover_bg);
-            } else if w.pill_outline {
-                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, rad, theme.surface_elevated);
+                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.accent_soft_bg);
+                stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.accent);
+            } else if is_hov {
+                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.hover_bg);
             }
 
-            if w.pill_outline {
-                stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, rad, theme.border_subtle);
+            if let Some(swatch) = w.swatch_rgb {
+                let cx = w.x as f32 + w.w as f32 * 0.5;
+                let cy = w.y as f32 + w.h as f32 * 0.5;
+                let r = (5.5 * s).clamp(4.0, 10.0);
+                fill_circle_aa(buffer, buf_w, buf_h, cx, cy, r + 1.2, theme.input_border);
+                fill_circle_aa(buffer, buf_w, buf_h, cx, cy, r, swatch);
+                continue;
             }
 
             let fg = if w.active {
-                active_fg
-            } else if is_hover {
+                theme.accent_soft_fg
+            } else if is_hov {
                 theme.text_primary
             } else {
                 theme.text_secondary
             };
 
-            if let Some(icon) = w.icon {
-                let isize = (14.0 * s).round().clamp(11.0, (w.h.saturating_sub(4)) as f32) as u32;
-                let ix = w.x + ((w.w.saturating_sub(isize)) / 2) as i32;
-                let iy = w.y + ((w.h.saturating_sub(isize)) / 2) as i32;
-                draw_icon(buffer, buf_w, buf_h, icon, ix, iy, isize, fg);
-            } else if let Some(ref txt) = w.text {
-                let tw = measure_text(txt, font_sz, false);
-                let tx = w.x + (((w.w as f32) - tw) * 0.5).round() as i32;
-                draw_text_vcenter(
-                    buffer, buf_w, buf_h, tx, w.y, w.h, w.x + w.w as i32 - 2, txt, font_sz, fg, false,
+            if let Some(ic) = w.icon {
+                let ix = w.x + ((w.w.saturating_sub(icon_sz)) / 2) as i32;
+                let iy = w.y + ((w.h.saturating_sub(icon_sz)) / 2) as i32;
+                draw_icon(buffer, buf_w, buf_h, ic, ix, iy, icon_sz, fg);
+            } else if let Some(ref lbl) = w.label {
+                let lw = measure_text(lbl, font_sz, w.active);
+                let tx = w.x + ((w.w as f32 - lw) * 0.5).round() as i32;
+                draw_text_vcenter(buffer, buf_w, buf_h, tx, w.y, w.h, w.x + w.w as i32 - 2, lbl, font_sz, fg, w.active);
+            }
+
+            if w.accent_dot {
+                let dr = (2.5 * s).max(2.0);
+                fill_circle_aa(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    (w.x + w.w as i32) as f32 - dr - 2.0,
+                    w.y as f32 + dr + 2.0,
+                    dr,
+                    theme.accent,
                 );
             }
         }
     }
 
-    pub(super) fn hit_test_unified_toolbar(
+    pub(super) fn hit_test_inline_toolbar(
         &self,
         mx: f64,
         my: f64,
         start_x: i32,
         buf_w: u32,
-        topbar_h: u32,
+        bar_h: u32,
         sf: f64,
     ) -> Option<ToolbarAction> {
-        let ix = mx.round() as i32;
-        let iy = my.round() as i32;
-        if iy < 0 || iy >= topbar_h as i32 {
+        if !self.show_toolbar || my < 0.0 || my >= bar_h as f64 {
             return None;
         }
-        let (widgets, _) = self.layout_unified_toolbar(start_x, buf_w, topbar_h, sf);
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        let (widgets, _) = self.compute_inline_toolbar_layout(start_x, buf_w, bar_h, sf);
         for w in widgets {
             if ix >= w.x && ix < w.x + w.w as i32 && iy >= w.y && iy < w.y + w.h as i32 {
                 return Some(w.action);
@@ -671,89 +588,160 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn execute_toolbar_action(&mut self, action: ToolbarAction) {
         self.open_menu = None;
+        self.active_note_popover = None;
         match action {
             ToolbarAction::ToggleSidebar => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
-                self.status_notice = Some(if self.show_bookmarks {
-                    "Bookmarks Sidebar ON".to_string()
-                } else {
-                    "Bookmarks Sidebar OFF".to_string()
-                });
             }
-            ToolbarAction::ToggleGrid => self.toggle_view_mode(),
-            ToolbarAction::OpenPdf => self.pending_dialog = Some(PendingDialog::Open),
-            ToolbarAction::SavePdf => self.pending_dialog = Some(PendingDialog::Save),
-            ToolbarAction::PrintPreview => self.trigger_print(),
-            ToolbarAction::PrevPage => self.step_pages_backward(),
-            ToolbarAction::JumpPage => {
-                self.input_mode = InputMode::JumpToPage { input: String::new() };
+            ToolbarAction::ToggleGrid => {
+                self.toggle_view_mode();
             }
-            ToolbarAction::NextPage => self.step_pages_forward(),
-            ToolbarAction::ZoomOut => self.zoom_by_step(0.8),
-            ToolbarAction::ResetZoom => self.reset_zoom(),
-            ToolbarAction::ZoomIn => self.zoom_by_step(1.25),
-            ToolbarAction::ViewFitPage => self.set_view_mode(ViewMode::FitPage),
-            ToolbarAction::ViewFitWidth => self.set_view_mode(ViewMode::FitWidth),
-            ToolbarAction::ViewTwoPage => self.set_view_mode(ViewMode::TwoPageSpread),
-            ToolbarAction::ViewContinuous => self.set_view_mode(ViewMode::ContinuousScroll),
+            ToolbarAction::Open => {
+                self.pending_dialog = Some(PendingDialog::Open);
+            }
+            ToolbarAction::Save => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::Save);
+                }
+            }
+            ToolbarAction::SaveAs => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::SaveAs);
+                }
+            }
+            ToolbarAction::Print => {
+                self.trigger_print();
+                return;
+            }
             ToolbarAction::ToolSelect => {
                 self.mouse_mode = MouseMode::Select;
-                self.status_notice = Some("Mouse Mode: Select Text".to_string());
+                self.status_notice = Some("Mouse mode: Select Text".to_string());
             }
             ToolbarAction::ToolHighlight => {
                 self.mouse_mode = MouseMode::Highlight;
-                self.status_notice = Some("Mouse Mode: Highlight Text (drag across text)".to_string());
+                self.status_notice = Some(format!(
+                    "Annotate: Highlight ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolUnderline => {
+                self.mouse_mode = MouseMode::Underline;
+                self.status_notice = Some(format!(
+                    "Annotate: Underline ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolStrikethrough => {
+                self.mouse_mode = MouseMode::Strikethrough;
+                self.status_notice = Some(format!(
+                    "Annotate: Strikethrough ({}) — drag across text",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolStickyNote => {
+                self.mouse_mode = MouseMode::StickyNote;
+                self.status_notice = Some(format!(
+                    "Annotate: Sticky Note ({}) — click anywhere on page to place a note",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolInkPen => {
+                self.mouse_mode = MouseMode::InkPen;
+                self.status_notice = Some(format!(
+                    "Annotate: Freehand Pen ({}) — drag to draw",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolFreeText => {
+                self.mouse_mode = MouseMode::FreeText;
+                self.status_notice = Some(format!(
+                    "Annotate: Text Box ({}) — click anywhere on page to add text",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolRectShape => {
+                self.mouse_mode = MouseMode::RectShape;
+                self.status_notice = Some(format!(
+                    "Annotate: Rectangle ({}) — drag to draw box",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::ToolArrowShape => {
+                self.mouse_mode = MouseMode::ArrowShape;
+                self.status_notice = Some(format!(
+                    "Annotate: Arrow ({}) — drag from tail to tip",
+                    self.annotation_color.label()
+                ));
+            }
+            ToolbarAction::CycleAnnotationColor => {
+                self.annotation_color = self.annotation_color.next();
+                self.status_notice = Some(format!(
+                    "Annotation color: {}",
+                    self.annotation_color.label()
+                ));
             }
             ToolbarAction::ToolRedact => {
                 self.mouse_mode = MouseMode::Redact;
-                self.status_notice = Some("Mouse Mode: Redact (drag red box to permanently black out)".to_string());
+                self.status_notice = Some("REDACT mode: drag across sensitive region".to_string());
             }
             ToolbarAction::ToolCrop => {
                 self.mouse_mode = MouseMode::Crop;
-                self.status_notice = Some("Mouse Mode: Crop Page Area (drag green box)".to_string());
+                self.status_notice = Some("CROP mode: drag region to crop page".to_string());
             }
             ToolbarAction::ToolStamp => {
-                self.pending_dialog = Some(PendingDialog::PickStampImage);
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::PickStampImage);
+                }
             }
             ToolbarAction::RotatePage => {
-                let target = if self.view_mode == ViewMode::ThumbnailGrid {
-                    self.hovered_thumb.unwrap_or(self.current_page_index)
-                } else {
-                    self.current_page_index
-                };
-                self.rotate_page_clockwise(target);
+                if self.doc.is_some() {
+                    let p = self.current_page_index;
+                    self.rotate_page_clockwise(p);
+                }
             }
-            ToolbarAction::Search => {
-                self.input_mode = InputMode::SearchText {
-                    query_input: self.search_query.clone(),
-                };
+            ToolbarAction::FindText => {
+                if self.doc.is_some() {
+                    self.input_mode = InputMode::SearchText {
+                        query_input: self.search_query.clone(),
+                    };
+                }
             }
-            ToolbarAction::CycleFilter => {
-                self.reading_filter = self.reading_filter.next();
-                self.status_notice = Some(format!("Reading Filter: {}", self.reading_filter.label()));
+            ToolbarAction::UiScaleDown => {
+                self.adjust_ui_scale(-0.10);
+                return;
+            }
+            ToolbarAction::UiScaleReset => {
+                self.reset_ui_scale();
+                return;
+            }
+            ToolbarAction::UiScaleUp => {
+                self.adjust_ui_scale(0.10);
+                return;
             }
             ToolbarAction::ToggleTheme => {
                 self.ui_theme_mode = self.ui_theme_mode.toggle();
-                self.status_notice = Some(format!("UI Theme: {}", self.ui_theme_mode.label()));
+                self.status_notice = Some(format!("UI theme: {}", self.ui_theme_mode.label()));
+                self.save_session_to_ini();
             }
         }
         self.update_title_bar();
         self.request_redraw();
     }
 
-    /// Computes geometry of the "Customize Toolbar..." modal card.
-    pub(super) fn customize_toolbar_card_rect(&self, buf_w: u32, buf_h: u32, sf: f64) -> (i32, i32, u32, u32) {
+    // -------------------------------------------------------------------------
+    // "Customize Toolbar..." modal checklist card
+    // -------------------------------------------------------------------------
+
+    fn customize_modal_geometry(buf_w: u32, buf_h: u32, sf: f64) -> (i32, i32, u32, u32) {
         let s = sf as f32;
-        let card_w = ((390.0 * s).round() as u32).min(buf_w.saturating_sub(24));
-        let header_h = (44.0 * s).round() as u32;
-        let row_h = (27.0 * s).round() as u32;
-        let footer_h = (48.0 * s).round() as u32;
-        let card_h = (header_h + (ToolbarItem::COUNT as u32) * row_h + footer_h + (12.0 * s).round() as u32)
-            .min(buf_h.saturating_sub(24));
-        let card_x = (buf_w.saturating_sub(card_w) / 2) as i32;
-        let card_y = (buf_h.saturating_sub(card_h) / 2) as i32;
-        (card_x, card_y, card_w, card_h)
+        let mw = ((420.0 * s).round() as u32).min(buf_w.saturating_sub(28));
+        let row_h = (28.0 * s).round() as u32;
+        let mh = ((108.0 * s).round() as u32 + row_h * ToolbarItem::COUNT as u32)
+            .min(buf_h.saturating_sub(28));
+        let mx = (buf_w.saturating_sub(mw) / 2) as i32;
+        let my = (buf_h.saturating_sub(mh) / 2) as i32;
+        (mx, my, mw, mh)
     }
 
     pub(super) fn draw_customize_toolbar_modal(
@@ -763,120 +751,169 @@ impl<'a> PdfViewerApp<'a> {
         buf_h: u32,
         sf: f64,
     ) {
+        if !self.show_customize_toolbar {
+            return;
+        }
         let theme = self.ui_theme();
         let s = sf as f32;
-        super::render::blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
+        blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
 
-        let (cx, cy, cw, ch) = self.customize_toolbar_card_rect(buf_w, buf_h, sf);
+        let (mx, my, mw, mh) = Self::customize_modal_geometry(buf_w, buf_h, sf);
         let rad = (10.0 * s).clamp(6.0, 16.0);
-        draw_soft_shadow(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, (10.0 * s).round() as i32, (4.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
-        fill_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.surface_bg);
-        stroke_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.border_subtle);
+        draw_soft_shadow(
+            buffer, buf_w, buf_h, mx, my, mw, mh, rad,
+            (10.0 * s).round() as i32, (4.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        fill_rounded_rect(buffer, buf_w, buf_h, mx, my, mw, mh, rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, mx, my, mw, mh, rad, theme.border_subtle);
 
         let pad = (16.0 * s).round() as i32;
-        let header_h = (44.0 * s).round() as u32;
-        let title_sz = (14.5 * s).clamp(12.0, 32.0);
-        let body_sz = (12.0 * s).clamp(10.0, 26.0);
+        let title_sz = (14.5 * s).clamp(11.0, 32.0);
+        let row_sz = (12.0 * s).clamp(10.0, 26.0);
+        let row_h = (28.0 * s).round() as i32;
 
-        draw_text_vcenter(buffer, buf_w, buf_h, cx + pad, cy, header_h, cx + cw as i32 - pad, "Customize Toolbar", title_sz, theme.text_primary, true);
-        super::render::fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + header_h as i32, cw.saturating_sub(2), 1, theme.divider);
+        draw_text(
+            buffer, buf_w, buf_h,
+            mx + pad, my + (14.0 * s).round() as i32,
+            "Customize Top Toolbar",
+            title_sz, theme.text_primary, true,
+        );
+        fill_rect_clipped(buffer, buf_w, buf_h, mx + 1, my + (42.0 * s).round() as i32, mw.saturating_sub(2), 1, theme.divider);
 
-        let row_h = (27.0 * s).round() as u32;
-        let list_y = cy + header_h as i32 + (6.0 * s).round() as i32;
-        let cb_sz = (15.0 * s).round() as u32;
+        let list_top = my + (50.0 * s).round() as i32;
+        let cb_sz = (15.0 * s).round().clamp(12.0, 28.0) as u32;
+        let check_ic = (11.0 * s).round().max(8.0) as u32;
 
-        for (idx, item) in ToolbarItem::ALL.iter().enumerate() {
-            let ry = list_y + (idx as i32) * (row_h as i32);
-            if ry + row_h as i32 > cy + ch as i32 - (46.0 * s).round() as i32 {
+        for (i, item) in ToolbarItem::ALL.iter().enumerate() {
+            let ry = list_top + (i as i32) * row_h;
+            if ry + row_h > my + mh as i32 - (44.0 * s).round() as i32 {
                 break;
             }
-            let hovered = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::ToggleItem(*item)));
-            if hovered {
-                fill_rounded_rect(buffer, buf_w, buf_h, cx + pad / 2, ry, cw.saturating_sub(pad as u32), row_h, (5.0 * s).max(3.0), theme.hover_bg);
+            let is_hov = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::ToggleItem(*item)));
+            if is_hov {
+                fill_rounded_rect(
+                    buffer, buf_w, buf_h,
+                    mx + (8.0 * s).round() as i32,
+                    ry + 1,
+                    mw.saturating_sub((16.0 * s).round() as u32),
+                    (row_h - 2).max(1) as u32,
+                    (5.0 * s).max(3.0),
+                    theme.hover_bg,
+                );
             }
-            let cbx = cx + pad;
-            let cby = ry + ((row_h.saturating_sub(cb_sz)) / 2) as i32;
             let checked = self.toolbar_config.is_enabled(*item);
+            let cbx = mx + pad;
+            let cby = ry + (row_h - cb_sz as i32) / 2;
+            let cb_rad = (3.5 * s).clamp(2.5, 6.0);
             if checked {
-                fill_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, (3.5 * s).max(2.0), theme.accent);
-                let ic_pad = (2.0 * s).round() as i32;
-                draw_icon(buffer, buf_w, buf_h, UiIcon::Check, cbx + ic_pad, cby + ic_pad, cb_sz.saturating_sub((ic_pad * 2) as u32), theme.text_on_accent);
+                fill_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, cb_rad, theme.accent);
+                draw_icon(
+                    buffer, buf_w, buf_h, UiIcon::Check,
+                    cbx + ((cb_sz.saturating_sub(check_ic)) / 2) as i32,
+                    cby + ((cb_sz.saturating_sub(check_ic)) / 2) as i32,
+                    check_ic, theme.text_on_accent,
+                );
             } else {
-                fill_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, (3.5 * s).max(2.0), theme.input_bg);
-                stroke_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, (3.5 * s).max(2.0), theme.input_border);
+                fill_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, cb_rad, theme.surface_bg);
+                stroke_rounded_rect(buffer, buf_w, buf_h, cbx, cby, cb_sz, cb_sz, cb_rad, theme.input_border);
             }
             draw_text_vcenter(
-                buffer, buf_w, buf_h, cbx + cb_sz as i32 + (10.0 * s).round() as i32, ry, row_h,
-                cx + cw as i32 - pad, item.label(), body_sz, theme.text_primary, false,
+                buffer, buf_w, buf_h,
+                cbx + cb_sz as i32 + (10.0 * s).round() as i32,
+                ry, row_h as u32,
+                mx + mw as i32 - pad,
+                item.label(), row_sz, theme.text_primary, false,
             );
         }
 
-        // Footer buttons: Reset Defaults (left) & Done (right)
-        let footer_h = (46.0 * s).round() as u32;
-        let fy = cy + ch as i32 - footer_h as i32;
-        super::render::fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, fy, cw.saturating_sub(2), 1, theme.divider);
-
+        // Footer buttons: Reset Defaults | Done
         let btn_h = (28.0 * s).round() as u32;
-        let by = fy + ((footer_h.saturating_sub(btn_h)) / 2) as i32;
+        let btn_y = my + mh as i32 - (40.0 * s).round() as i32;
         let reset_w = (112.0 * s).round() as u32;
-        let done_w = (76.0 * s).round() as u32;
-        let reset_x = cx + pad;
-        let done_x = cx + cw as i32 - pad - done_w as i32;
+        let done_w = (78.0 * s).round() as u32;
+        let reset_x = mx + pad;
+        let done_x = mx + mw as i32 - pad - done_w as i32;
+        let btn_rad = (6.0 * s).clamp(4.0, 10.0);
 
-        let reset_hov = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::ResetDefaults));
-        fill_rounded_rect(buffer, buf_w, buf_h, reset_x, by, reset_w, btn_h, (6.0 * s).max(4.0), if reset_hov { theme.hover_bg } else { theme.surface_elevated });
-        stroke_rounded_rect(buffer, buf_w, buf_h, reset_x, by, reset_w, btn_h, (6.0 * s).max(4.0), theme.border_subtle);
-        let rtw = measure_text("Reset Defaults", body_sz, false);
-        draw_text_vcenter(buffer, buf_w, buf_h, reset_x + ((reset_w as f32 - rtw) * 0.5).round() as i32, by, btn_h, reset_x + reset_w as i32, "Reset Defaults", body_sz, theme.text_primary, false);
+        let r_hov = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::ResetDefaults));
+        fill_rounded_rect(buffer, buf_w, buf_h, reset_x, btn_y, reset_w, btn_h, btn_rad, if r_hov { theme.hover_bg } else { theme.surface_elevated });
+        stroke_rounded_rect(buffer, buf_w, buf_h, reset_x, btn_y, reset_w, btn_h, btn_rad, theme.border_subtle);
+        let r_lbl = "Reset Defaults";
+        let rw = measure_text(r_lbl, row_sz, false);
+        draw_text_vcenter(buffer, buf_w, buf_h, reset_x + ((reset_w as f32 - rw) * 0.5).round() as i32, btn_y, btn_h, reset_x + reset_w as i32, r_lbl, row_sz, theme.text_primary, false);
 
-        let done_hov = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::Close));
-        fill_rounded_rect(buffer, buf_w, buf_h, done_x, by, done_w, btn_h, (6.0 * s).max(4.0), if done_hov { theme.accent_hover } else { theme.accent });
-        let dtw = measure_text("Done", body_sz, true);
-        draw_text_vcenter(buffer, buf_w, buf_h, done_x + ((done_w as f32 - dtw) * 0.5).round() as i32, by, btn_h, done_x + done_w as i32, "Done", body_sz, theme.text_on_accent, true);
+        let d_hov = self.hovered_widget == Some(UiHit::Customize(CustomizeHit::Done));
+        fill_rounded_rect(buffer, buf_w, buf_h, done_x, btn_y, done_w, btn_h, btn_rad, if d_hov { theme.accent_hover } else { theme.accent });
+        let d_lbl = "Done";
+        let dw = measure_text(d_lbl, row_sz, true);
+        draw_text_vcenter(buffer, buf_w, buf_h, done_x + ((done_w as f32 - dw) * 0.5).round() as i32, btn_y, btn_h, done_x + done_w as i32, d_lbl, row_sz, theme.text_on_accent, true);
     }
 
     pub(super) fn hit_test_customize_toolbar_modal(
         &self,
-        mx: f64,
-        my: f64,
+        mx_px: f64,
+        my_px: f64,
         buf_w: u32,
         buf_h: u32,
         sf: f64,
     ) -> Option<CustomizeHit> {
+        if !self.show_customize_toolbar {
+            return None;
+        }
         let s = sf as f32;
-        let (cx, cy, cw, ch) = self.customize_toolbar_card_rect(buf_w, buf_h, sf);
-        let ix = mx.round() as i32;
-        let iy = my.round() as i32;
-        if ix < cx || ix >= cx + cw as i32 || iy < cy || iy >= cy + ch as i32 {
+        let (mx, my, mw, mh) = Self::customize_modal_geometry(buf_w, buf_h, sf);
+        let ix = mx_px.round() as i32;
+        let iy = my_px.round() as i32;
+        if ix < mx || ix >= mx + mw as i32 || iy < my || iy >= my + mh as i32 {
             return None;
         }
         let pad = (16.0 * s).round() as i32;
-        let header_h = (44.0 * s).round() as u32;
-        let row_h = (27.0 * s).round() as u32;
-        let list_y = cy + header_h as i32 + (6.0 * s).round() as i32;
-        let footer_h = (46.0 * s).round() as u32;
-        let fy = cy + ch as i32 - footer_h as i32;
+        let btn_h = (28.0 * s).round() as i32;
+        let btn_y = my + mh as i32 - (40.0 * s).round() as i32;
+        let reset_w = (112.0 * s).round() as i32;
+        let done_w = (78.0 * s).round() as i32;
+        let reset_x = mx + pad;
+        let done_x = mx + mw as i32 - pad - done_w;
 
-        if iy >= list_y && iy < fy {
-            let idx = ((iy - list_y) / row_h as i32) as usize;
-            if idx < ToolbarItem::COUNT {
-                return Some(CustomizeHit::ToggleItem(ToolbarItem::ALL[idx]));
-            }
-        }
-        let btn_h = (28.0 * s).round() as u32;
-        let by = fy + ((footer_h.saturating_sub(btn_h)) / 2) as i32;
-        let reset_w = (112.0 * s).round() as u32;
-        let done_w = (76.0 * s).round() as u32;
-        let reset_x = cx + pad;
-        let done_x = cx + cw as i32 - pad - done_w as i32;
-        if iy >= by && iy < by + btn_h as i32 {
-            if ix >= reset_x && ix < reset_x + reset_w as i32 {
+        if iy >= btn_y && iy < btn_y + btn_h {
+            if ix >= reset_x && ix < reset_x + reset_w {
                 return Some(CustomizeHit::ResetDefaults);
             }
-            if ix >= done_x && ix < done_x + done_w as i32 {
-                return Some(CustomizeHit::Close);
+            if ix >= done_x && ix < done_x + done_w {
+                return Some(CustomizeHit::Done);
             }
         }
-        Some(CustomizeHit::InsideCard)
+
+        let list_top = my + (50.0 * s).round() as i32;
+        let row_h = (28.0 * s).round() as i32;
+        if iy >= list_top && iy < btn_y - 4 {
+            let idx = ((iy - list_top) / row_h.max(1)) as usize;
+            if let Some(&item) = ToolbarItem::ALL.get(idx) {
+                return Some(CustomizeHit::ToggleItem(item));
+            }
+        }
+
+        Some(CustomizeHit::InsideModal)
+    }
+
+    pub(super) fn handle_customize_toolbar_click(&mut self, hit: CustomizeHit) {
+        match hit {
+            CustomizeHit::ToggleItem(item) => {
+                self.toolbar_config.toggle(item);
+                self.show_toolbar = true;
+                self.save_session_to_ini();
+            }
+            CustomizeHit::ResetDefaults => {
+                self.toolbar_config = ToolbarConfig::default();
+                self.show_toolbar = true;
+                self.save_session_to_ini();
+                self.status_notice = Some("Toolbar reset to defaults".to_string());
+            }
+            CustomizeHit::Done => {
+                self.show_customize_toolbar = false;
+            }
+            CustomizeHit::InsideModal => {}
+        }
+        self.request_redraw();
     }
 }
