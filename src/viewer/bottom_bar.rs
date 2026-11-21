@@ -1,6 +1,7 @@
-//! Centered, fanning-out Bottom Page View & Status Bar hosting Page Navigation/Jump,
-//! Zoom Controls, View Modes (`FitPage`, `FitWidth`, `FitTextWidth`, `TwoPage`, `Scroll`, `TextView`),
-//! Reading Filter (`Normal` / `Dark` / `Sepia`), Fullscreen (`F11`), and Presentation (`F5`).
+//! Centered, fanning-out Bottom Page View & Status Bar hosting Bookmarks, Thumbnail Grid,
+//! Page Navigation/Jump, Zoom Controls, View Modes (`FitPage`, `FitWidth`, `FitTextWidth`,
+//! `TwoPage`, `Scroll`, `TextView`), Reading Filter (`Normal` / `Dark` / `Sepia`),
+//! Fullscreen (`F11`), Presentation (`F5`), and the clickable timestamped Session Notification Board.
 
 use super::get_current_rss_mb;
 use super::render::fill_rect_clipped;
@@ -9,6 +10,8 @@ use super::ui_draw::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum BottomBarAction {
+    ToggleSidebar,
+    ToggleGrid,
     PrevPage,
     PageJump,
     NextPage,
@@ -24,11 +27,14 @@ pub(super) enum BottomBarAction {
     ReadingFilter,
     Fullscreen,
     Presentation,
+    NotificationBoard,
 }
 
 impl BottomBarAction {
     pub fn tooltip(self) -> &'static str {
         match self {
+            Self::ToggleSidebar => "Bookmarks Sidebar (B)",
+            Self::ToggleGrid => "Thumbnail Grid View (Tab)",
             Self::PrevPage => "Previous Page (Left / Up)",
             Self::PageJump => "Jump to Page (G)",
             Self::NextPage => "Next Page (Right / Down)",
@@ -44,6 +50,7 @@ impl BottomBarAction {
             Self::ReadingFilter => "Cycle Reading Mode: Normal / Dark / Sepia (V)",
             Self::Fullscreen => "Fullscreen Mode (F11)",
             Self::Presentation => "Presentation Mode (F5)",
+            Self::NotificationBoard => "Click to view Session Notification History",
         }
     }
 }
@@ -80,7 +87,7 @@ impl<'a> PdfViewerApp<'a> {
     ) -> BottomBarLayout {
         let s = sf as f32;
         let top_y = buf_h.saturating_sub(bar_h) as i32;
-        let btn_h = (22.0 * s).round().clamp(16.0, (bar_h as f32) - 4.0) as u32;
+        let btn_h = (22.0 * s).round().clamp(16.0, ((bar_h as f32) - 4.0).max(16.0)) as u32;
         let btn_y = top_y + ((bar_h.saturating_sub(btn_h)) / 2) as i32;
         let sq_w = (24.0 * s).round().max(18.0) as u32;
         let gap = (2.0 * s).round().max(1.0) as i32;
@@ -125,20 +132,24 @@ impl<'a> PdfViewerApp<'a> {
             active,
         };
 
-        // Build logical groups in display order (center-fanned):
-        // Group 0: Page Nav (< | 1/12 | >)
+        // Group 0: Bookmarks Sidebar & Thumbnail Grid (left of Page Selector)
+        let g_panels = vec![
+            mk_icon(sq_w, BottomBarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks),
+            mk_icon(sq_w, BottomBarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid),
+        ];
+        // Group 1: Page Nav (< | 1/12 | >)
         let g_pages = vec![
             mk_icon(sq_w, BottomBarAction::PrevPage, UiIcon::ChevronLeft, false),
             mk_lbl(page_pill_w, BottomBarAction::PageJump, page_txt, None, matches!(self.input_mode, InputMode::JumpToPage { .. })),
             mk_icon(sq_w, BottomBarAction::NextPage, UiIcon::ChevronRight, false),
         ];
-        // Group 1: Zoom (- | 100% | +)
+        // Group 2: Zoom (- | 100% | +)
         let g_zoom = vec![
             mk_icon(sq_w, BottomBarAction::ZoomOut, UiIcon::ZoomOut, false),
             mk_lbl(zoom_pill_w, BottomBarAction::ZoomReset, zoom_txt, None, false),
             mk_icon(sq_w, BottomBarAction::ZoomIn, UiIcon::ZoomIn, false),
         ];
-        // Group 2: View Modes (FitPage, FitWidth, FitTextWidth, 2-Page, Scroll, TextView)
+        // Group 3: View Modes (FitPage, FitWidth, FitTextWidth, 2-Page, Scroll, TextView)
         let g_views = vec![
             mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, self.view_mode == ViewMode::FitPage),
             mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, self.view_mode == ViewMode::FitWidth),
@@ -147,7 +158,7 @@ impl<'a> PdfViewerApp<'a> {
             mk_icon(sq_w, BottomBarAction::Continuous, UiIcon::Continuous, self.view_mode == ViewMode::ContinuousScroll),
             mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
         ];
-        // Group 3: Reading Filter pill
+        // Group 4: Reading Filter pill
         let g_filter = vec![mk_lbl(
             filter_pill_w,
             BottomBarAction::ReadingFilter,
@@ -155,7 +166,7 @@ impl<'a> PdfViewerApp<'a> {
             Some(UiIcon::Filter),
             self.reading_filter != ReadingFilter::Normal,
         )];
-        // Group 4: Fullscreen & Presentation
+        // Group 5: Fullscreen & Presentation
         let g_focus = vec![
             mk_icon(sq_w, BottomBarAction::Fullscreen, UiIcon::Fullscreen, self.is_fullscreen),
             mk_icon(sq_w, BottomBarAction::Presentation, UiIcon::Presentation, self.is_presentation),
@@ -173,8 +184,8 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         // Progressively include groups as width allows (always centered!)
-        let max_center_w = (buf_w as i32).saturating_sub((220.0 * s).round() as i32).max((260.0 * s).round() as i32);
-        let all_groups = [g_pages, g_zoom, g_views, g_filter, g_focus];
+        let max_center_w = (buf_w as i32).saturating_sub((210.0 * s).round() as i32).max((260.0 * s).round() as i32);
+        let all_groups = [g_panels, g_pages, g_zoom, g_views, g_filter, g_focus];
         let mut chosen: Vec<&[BottomWidgetRect]> = Vec::new();
         let mut total_w = 0i32;
         for g in &all_groups {
@@ -215,6 +226,33 @@ impl<'a> PdfViewerApp<'a> {
             cluster_left: start_x,
             cluster_right: cur_x,
         }
+    }
+
+    /// Returns the `(x, y, w, h)` bounding box of a bottom-bar button (for floating tooltip anchoring).
+    pub(super) fn bottom_bar_widget_rect(
+        &self,
+        action: BottomBarAction,
+        buf_w: u32,
+        buf_h: u32,
+        bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let layout = self.compute_bottom_bar_layout(buf_w, buf_h, bar_h, sf);
+        if action == BottomBarAction::NotificationBoard {
+            let s = sf as f32;
+            let pad_x = (8.0 * s).round() as i32;
+            let top_y = buf_h.saturating_sub(bar_h) as i32;
+            let left_max_x = layout.cluster_left - (10.0 * s).round() as i32;
+            if left_max_x > pad_x + 40 {
+                return Some((pad_x, top_y + 2, (left_max_x - pad_x) as u32, bar_h.saturating_sub(4)));
+            }
+            return None;
+        }
+        layout
+            .widgets
+            .into_iter()
+            .find(|w| w.action == action)
+            .map(|w| (w.x, w.y, w.w, w.h))
     }
 
     pub(super) fn draw_bottom_view_bar(
@@ -293,14 +331,38 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
-        // Far-left status / hover tooltip (clipped cleanly before centered cluster)
+        // Far-left clickable Session Notification status area (clipped cleanly before centered cluster)
         let left_max_x = layout.cluster_left - (10.0 * s).round() as i32;
         if left_max_x > pad_x + 40 {
-            let (left_text, left_col, left_bold) = if let Some(UiHit::Toolbar(act)) = self.hovered_widget {
-                (act.tooltip().to_string(), theme.accent_soft_fg, false)
-            } else if let Some(UiHit::BottomBar(act)) = self.hovered_widget {
-                (act.tooltip().to_string(), theme.accent_soft_fg, false)
-            } else if let Some(ref notice) = self.status_notice {
+            let notif_hov = self.hovered_widget == Some(UiHit::BottomBar(BottomBarAction::NotificationBoard));
+            let pill_x = (6.0 * s).round() as i32;
+            let pill_w = (left_max_x - pill_x).max(20) as u32;
+            let pill_h = bar_h.saturating_sub(6).max(16);
+            let pill_y = top_y + ((bar_h.saturating_sub(pill_h)) / 2) as i32;
+            if self.show_notifications {
+                fill_rounded_rect(buffer, buf_w, buf_h, pill_x, pill_y, pill_w, pill_h, btn_rad, theme.accent_soft_bg);
+                stroke_rounded_rect(buffer, buf_w, buf_h, pill_x, pill_y, pill_w, pill_h, btn_rad, theme.accent);
+            } else if notif_hov {
+                fill_rounded_rect(buffer, buf_w, buf_h, pill_x, pill_y, pill_w, pill_h, btn_rad, theme.hover_bg);
+            }
+
+            let mut text_start_x = pad_x;
+            if !self.notifications.is_empty() {
+                let cnt = format!("{}", self.notifications.len());
+                let badge_sz = (9.5 * s).clamp(8.0, 18.0);
+                let bw = (measure_text(&cnt, badge_sz, true).ceil() as u32 + (8.0 * s).round() as u32)
+                    .max((16.0 * s).round() as u32);
+                let bh = (15.0 * s).round().clamp(12.0, (pill_h as f32).max(12.0)) as u32;
+                let by = top_y + ((bar_h.saturating_sub(bh)) / 2) as i32;
+                let bg = if self.show_notifications { theme.accent } else { theme.accent_soft_bg };
+                let fg = if self.show_notifications { theme.text_on_accent } else { theme.accent_soft_fg };
+                fill_rounded_rect(buffer, buf_w, buf_h, pad_x, by, bw, bh, (bh as f32) * 0.5, bg);
+                let tw = measure_text(&cnt, badge_sz, true);
+                draw_text_vcenter(buffer, buf_w, buf_h, pad_x + ((bw as f32 - tw) * 0.5).round() as i32, by, bh, pad_x + bw as i32, &cnt, badge_sz, fg, true);
+                text_start_x = pad_x + bw as i32 + (6.0 * s).round() as i32;
+            }
+
+            let (left_text, left_col, left_bold) = if let Some(ref notice) = self.status_notice {
                 let col = if notice.starts_with("Error") || notice.contains("failed") || notice.contains("Invalid") {
                     theme.danger
                 } else {
@@ -320,9 +382,9 @@ impl<'a> PdfViewerApp<'a> {
                 (fname, theme.text_secondary, false)
             };
 
-            let avail_w = (left_max_x - pad_x).max(20) as f32;
+            let avail_w = (left_max_x - text_start_x - 4).max(16) as f32;
             let clipped = truncate_ellipsis(&left_text, avail_w, small_sz, left_bold);
-            draw_text_vcenter(buffer, buf_w, buf_h, pad_x, top_y, bar_h, left_max_x, &clipped, small_sz, left_col, left_bold);
+            draw_text_vcenter(buffer, buf_w, buf_h, text_start_x, top_y, bar_h, left_max_x - 2, &clipped, small_sz, left_col, left_bold);
         }
 
         // Far-right active tool indicator + RAM (clipped cleanly after centered cluster)
@@ -383,7 +445,7 @@ impl<'a> PdfViewerApp<'a> {
         let top_y = buf_h.saturating_sub(bar_h) as i32;
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
-        if iy < top_y || iy >= buf_h as i32 {
+        if iy < top_y || iy >= buf_h as i32 || ix < 0 || ix >= buf_w as i32 {
             return None;
         }
         let layout = self.compute_bottom_bar_layout(buf_w, buf_h, bar_h, sf);
@@ -392,12 +454,27 @@ impl<'a> PdfViewerApp<'a> {
                 return Some(w.action);
             }
         }
+        let s = sf as f32;
+        let left_max_x = layout.cluster_left - (10.0 * s).round() as i32;
+        if ix >= 4 && ix < left_max_x {
+            return Some(BottomBarAction::NotificationBoard);
+        }
         None
     }
 
     pub(super) fn execute_bottom_bar_action(&mut self, action: BottomBarAction) {
         self.open_menu = None;
+        if action != BottomBarAction::NotificationBoard {
+            self.show_notifications = false;
+        }
         match action {
+            BottomBarAction::ToggleSidebar => {
+                self.show_bookmarks = !self.show_bookmarks;
+                self.invalidate_page_caches();
+            }
+            BottomBarAction::ToggleGrid => {
+                self.toggle_view_mode();
+            }
             BottomBarAction::PrevPage => {
                 self.step_pages_backward();
             }
@@ -444,8 +521,129 @@ impl<'a> PdfViewerApp<'a> {
                     self.enter_presentation_mode();
                 }
             }
+            BottomBarAction::NotificationBoard => {
+                self.show_notifications = !self.show_notifications;
+            }
         }
         self.update_title_bar();
         self.request_redraw();
+    }
+
+    // -------------------------------------------------------------------------
+    // Timestamped Session Notification Board Popover (bottom-left)
+    // -------------------------------------------------------------------------
+
+    pub(super) fn notification_board_geometry(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> (i32, i32, u32, u32, (i32, i32, u32, u32)) {
+        let s = sf as f32;
+        let pw = (440.0 * s).round().min(buf_w.saturating_sub(24) as f32).max(240.0) as u32;
+        let row_h = (22.0 * s).round() as u32;
+        let visible_rows = self.notifications.len().clamp(1, 12) as u32;
+        let header_h = (34.0 * s).round() as u32;
+        let ph = (header_h + visible_rows * row_h + (14.0 * s).round() as u32)
+            .min(buf_h.saturating_sub(status_bar_h + 64).max(96));
+        let px = (10.0 * s).round() as i32;
+        let py = (buf_h.saturating_sub(status_bar_h + ph) as i32 - (8.0 * s).round() as i32).max(40);
+        let clear_w = (54.0 * s).round() as u32;
+        let clear_h = (20.0 * s).round() as u32;
+        let clear_x = px + pw as i32 - clear_w as i32 - (10.0 * s).round() as i32;
+        let clear_y = py + ((header_h.saturating_sub(clear_h)) / 2) as i32;
+        (px, py, pw, ph, (clear_x, clear_y, clear_w, clear_h))
+    }
+
+    pub(super) fn draw_notification_board_popover(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) {
+        if !self.show_notifications {
+            return;
+        }
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let (px, py, pw, ph, (cx, cy, cw, ch)) =
+            self.notification_board_geometry(buf_w, buf_h, status_bar_h, sf);
+        let rad = (8.0 * s).clamp(5.0, 14.0);
+        let header_h = (34.0 * s).round() as u32;
+        let title_sz = (12.0 * s).clamp(10.0, 22.0);
+        let body_sz = (11.0 * s).clamp(9.0, 20.0);
+        let ts_sz = (10.0 * s).clamp(8.5, 18.0);
+
+        draw_soft_shadow(
+            buffer, buf_w, buf_h, px, py, pw, ph, rad,
+            (10.0 * s).round() as i32, (4.0 * s).round() as i32,
+            theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.border_subtle);
+
+        let title = format!("Session Notifications ({})", self.notifications.len());
+        draw_text_vcenter(buffer, buf_w, buf_h, px + (12.0 * s).round() as i32, py, header_h, cx - 6, &title, title_sz, theme.text_primary, true);
+
+        let clr_hov = self.hovered_widget == Some(UiHit::NotificationClear);
+        fill_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, (4.0 * s).max(3.0), if clr_hov { theme.hover_bg } else { theme.surface_elevated });
+        stroke_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, (4.0 * s).max(3.0), theme.border_subtle);
+        let clw = measure_text("Clear", ts_sz, false);
+        draw_text_vcenter(buffer, buf_w, buf_h, cx + ((cw as f32 - clw) * 0.5).round() as i32, cy, ch, cx + cw as i32, "Clear", ts_sz, theme.text_secondary, false);
+
+        fill_rect_clipped(buffer, buf_w, buf_h, px + 1, py + header_h as i32, pw.saturating_sub(2), 1, theme.divider);
+
+        let row_h = (22.0 * s).round() as i32;
+        let list_y = py + header_h as i32 + (6.0 * s).round() as i32;
+        let max_y = py + ph as i32 - (6.0 * s).round() as i32;
+        if self.notifications.is_empty() {
+            draw_text_vcenter(buffer, buf_w, buf_h, px + (12.0 * s).round() as i32, list_y, row_h as u32, px + pw as i32 - 12, "No notifications yet this session.", body_sz, theme.text_muted, false);
+            return;
+        }
+
+        let ts_w = (54.0 * s).round() as i32;
+        // Show newest first
+        for (idx, entry) in self.notifications.iter().rev().enumerate() {
+            let ry = list_y + (idx as i32) * row_h;
+            if ry + row_h > max_y {
+                break;
+            }
+            if idx % 2 == 1 {
+                fill_rect_clipped(buffer, buf_w, buf_h, px + 2, ry, pw.saturating_sub(4), row_h as u32, theme.surface_elevated);
+            }
+            draw_text_vcenter(buffer, buf_w, buf_h, px + (12.0 * s).round() as i32, ry, row_h as u32, px + (12.0 * s).round() as i32 + ts_w, &entry.timestamp, ts_sz, theme.text_muted, false);
+            let msg_x = px + (14.0 * s).round() as i32 + ts_w;
+            let avail_w = (px + pw as i32 - msg_x - (10.0 * s).round() as i32).max(40) as f32;
+            let clipped = truncate_ellipsis(&entry.message, avail_w, body_sz, false);
+            let col = if entry.is_error { theme.danger } else { theme.text_primary };
+            draw_text_vcenter(buffer, buf_w, buf_h, msg_x, ry, row_h as u32, px + pw as i32 - (8.0 * s).round() as i32, &clipped, body_sz, col, false);
+        }
+    }
+
+    /// Returns `Some(true)` if clicking Clear, `Some(false)` if clicking inside the popover, `None` if outside.
+    pub(super) fn hit_test_notification_board(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<bool> {
+        if !self.show_notifications {
+            return None;
+        }
+        let (px, py, pw, ph, (cx, cy, cw, ch)) =
+            self.notification_board_geometry(buf_w, buf_h, status_bar_h, sf);
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < px || ix >= px + pw as i32 || iy < py || iy >= py + ph as i32 {
+            return None;
+        }
+        let on_clear = ix >= cx && ix < cx + cw as i32 && iy >= cy && iy < cy + ch as i32;
+        Some(on_clear)
     }
 }

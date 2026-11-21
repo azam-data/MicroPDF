@@ -77,9 +77,6 @@ jobs:
           $stage = "dist/MicroPDF-windows-x64"
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           Copy-Item "target/release/micro_pdf.exe" -Destination "$stage/micro_pdf.exe"
-          Copy-Item "LICENSE" -Destination "$stage/LICENSE"
-          Copy-Item "THIRD_PARTY_NOTICES.md" -Destination "$stage/THIRD_PARTY_NOTICES.md"
-          Copy-Item "README_SHORTCUTS.txt" -Destination "$stage/README_SHORTCUTS.txt"
           if ($env:INCLUDE_PDFIUM -eq "true" -and (Test-Path "pdfium_dir/pdfium.dll")) {
             Copy-Item "pdfium_dir/pdfium.dll" -Destination "$stage/pdfium.dll"
           }
@@ -136,7 +133,6 @@ jobs:
           mkdir -p "$STAGE"
           cp target/release/micro_pdf "$STAGE/micro_pdf"
           chmod +x "$STAGE/micro_pdf"
-          cp LICENSE THIRD_PARTY_NOTICES.md README_SHORTCUTS.txt "$STAGE/"
           if [ "$INCLUDE_PDFIUM" = "true" ] && [ -f pdfium_dir/libpdfium.dylib ]; then
             cp pdfium_dir/libpdfium.dylib "$STAGE/libpdfium.dylib"
           fi
@@ -184,7 +180,6 @@ jobs:
           mkdir -p "$STAGE"
           cp target/x86_64-apple-darwin/release/micro_pdf "$STAGE/micro_pdf"
           chmod +x "$STAGE/micro_pdf"
-          cp LICENSE THIRD_PARTY_NOTICES.md README_SHORTCUTS.txt "$STAGE/"
           if [ -f pdfium_dir/libpdfium.dylib ]; then
             cp pdfium_dir/libpdfium.dylib "$STAGE/libpdfium.dylib"
           fi

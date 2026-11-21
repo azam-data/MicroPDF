@@ -1296,9 +1296,10 @@ impl<'a> PdfViewerApp<'a> {
             ((self.scroll_y / max_s).clamp(0.0, 1.0), (content_h as f32 / bmp_h as f32).clamp(0.10, 0.9))
         };
 
+        let min_thumb = (28.0 * s).round().min(track_h as f32);
         let thumb_h = ((track_h as f32) * visible_ratio)
             .round()
-            .clamp((28.0 * s).round(), track_h as f32) as u32;
+            .clamp(min_thumb, track_h as f32) as u32;
         let travel = track_h.saturating_sub(thumb_h);
         let thumb_y = track_y + ((travel as f32) * fraction).round() as i32;
         Some((track_x, track_y, track_w, track_h, thumb_y, thumb_h))
@@ -1416,6 +1417,7 @@ impl<'a> PdfViewerApp<'a> {
         height: u32,
         scale_factor: f64,
     ) {
+        self.record_status_notice_if_new();
         let sidebar_w = self
             .sidebar_width_px(scale_factor)
             .min(width.saturating_sub(64));
@@ -1510,8 +1512,27 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
 
-            // Active drag preview (Select / Annotations / Ink / Arrow / Rect / Redact / Crop / Stamp)
-            if self.mouse_mode == MouseMode::InkPen && self.ink_stroke_screen_pts.len() >= 2 {
+            // Active drag preview: Move Annotation / Ink / Arrow / Select / Shapes / Redact / Crop / Stamp
+            if let Some(ref drag) = self.dragging_annotation {
+                let ddx = (self.cursor_pos.0 - drag.start_screen_x).round() as i32;
+                let ddy = (self.cursor_pos.1 - drag.start_screen_y).round() as i32;
+                if ddx.abs() >= 3 || ddy.abs() >= 3 {
+                    if let Some((orig_x, orig_y, orig_w, orig_h)) =
+                        self.pdf_rect_to_screen_rect(drag.page_index, drag.orig_rect)
+                    {
+                        let gx = orig_x + ddx;
+                        let gy = orig_y + ddy;
+                        let gw = orig_w.max(20);
+                        let gh = orig_h.max(18);
+                        super::ui_draw::fill_rounded_rect_alpha(
+                            buffer, width, height, gx, gy, gw, gh, 4.0, theme.accent, 42,
+                        );
+                        super::ui_draw::draw_dashed_rect(
+                            buffer, width, height, gx, gy, gw, gh, 5, 3, theme.accent,
+                        );
+                    }
+                }
+            } else if self.mouse_mode == MouseMode::InkPen && self.ink_stroke_screen_pts.len() >= 2 {
                 let col = self.annotation_color.u32_rgb();
                 let thick = (2.2 * scale_factor as f32).clamp(1.6, 5.0);
                 for win in self.ink_stroke_screen_pts.windows(2) {
@@ -1535,7 +1556,7 @@ impl<'a> PdfViewerApp<'a> {
                         let uy = dy / len;
                         let px = -uy;
                         let py = ux;
-                        let hlen = (thick * 5.0).clamp(10.0, len * 0.45);
+                        let hlen = (thick * 5.0).min(len * 0.45).max(3.0);
                         let hw = hlen * 0.45;
                         let bx = sx2 as f32 - ux * hlen;
                         let by = sy2 as f32 - uy * hlen;
@@ -1580,10 +1601,13 @@ impl<'a> PdfViewerApp<'a> {
             // Floating Sticky Note popover when clicked
             if let Some((ref note_text, nx, ny)) = self.active_note_popover {
                 let s = scale_factor as f32;
-                let pw = (240.0 * s).round().min(width as f32 - 24.0) as u32;
+                let pw = (240.0 * s).round().min((width as f32 - 24.0).max(80.0)) as u32;
                 let ph = (78.0 * s).round() as u32;
-                let px = nx.clamp(8, (width as i32 - pw as i32 - 8).max(8));
-                let py = (ny - ph as i32 - 8).clamp(top_bars_h as i32 + 6, (height as i32 - status_bar_h as i32 - ph as i32 - 6).max(8));
+                let max_px = (width as i32 - pw as i32 - 8).max(8);
+                let px = nx.clamp(8, max_px);
+                let min_py = top_bars_h as i32 + 6;
+                let max_py = (height as i32 - status_bar_h as i32 - ph as i32 - 6).max(min_py);
+                let py = (ny - ph as i32 - 8).clamp(min_py, max_py);
                 let rad = (7.0 * s).clamp(5.0, 12.0);
                 super::ui_draw::draw_soft_shadow(buffer, width, height, px, py, pw, ph, rad, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
                 super::ui_draw::fill_rounded_rect(buffer, width, height, px, py, pw, ph, rad, 0x00FEF9C3);
@@ -1641,6 +1665,23 @@ impl<'a> PdfViewerApp<'a> {
         // Centered Bottom Page View & Status Bar
         self.draw_status_bar(buffer, width, height, status_bar_h, scale_factor);
 
+        // Session Notification Board Popover (bottom-left)
+        if self.show_notifications {
+            self.draw_notification_board_popover(buffer, width, height, status_bar_h, scale_factor);
+        }
+
+        // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu is open)
+        if self.open_menu.is_none()
+            && !self.show_customize_toolbar
+            && !self.show_help_overlay
+            && !self.show_about_overlay
+            && self.combine_modal.is_none()
+            && self.print_preview.is_none()
+            && self.manual_duplex_wait.is_none()
+        {
+            self.draw_floating_hover_tooltip(buffer, width, height, menu_bar_h, status_bar_h, scale_factor);
+        }
+
         // Floating Search Bar / Optimize / Prompt Card
         if self.input_mode != InputMode::Normal {
             self.draw_active_input_overlay(buffer, width, height, top_bars_h, scale_factor);
@@ -1680,6 +1721,106 @@ impl<'a> PdfViewerApp<'a> {
         if self.manual_duplex_wait.is_some() {
             self.draw_manual_duplex_modal(buffer, width, height, scale_factor);
         }
+    }
+
+    /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`
+    /// for rendering live move/selection ghosts over the currently visible page(s).
+    pub(super) fn pdf_rect_to_screen_rect(&self, page_idx: u16, rect: PdfRect) -> Option<(i32, i32, u32, u32)> {
+        let draw_rect = if self.view_mode == ViewMode::ContinuousScroll {
+            let &(_, dr) = self.continuous_draw_rects.iter().find(|&&(p, _)| p == page_idx)?;
+            dr
+        } else if self.cached_page.as_ref().is_some_and(|c| c.page_index == page_idx)
+            || self.current_page_index == page_idx
+        {
+            self.page_draw_rect
+        } else if self.cached_second_page.as_ref().is_some_and(|c| c.page_index == page_idx) {
+            self.second_page_draw_rect?
+        } else {
+            return None;
+        };
+        let page = self.doc.as_ref()?.pages().get(page_idx).ok()?;
+        let pw_pts = page.width().value;
+        let ph_pts = page.height().value;
+        if pw_pts <= 0.0 || ph_pts <= 0.0 || draw_rect.2 == 0 || draw_rect.3 == 0 {
+            return None;
+        }
+        let sx = draw_rect.2 as f32 / pw_pts;
+        let sy = draw_rect.3 as f32 / ph_pts;
+        let x0 = draw_rect.0 + (rect.left().value * sx).round() as i32;
+        let x1 = draw_rect.0 + (rect.right().value * sx).round() as i32;
+        let y0 = draw_rect.1 + ((ph_pts - rect.top().value) * sy).round() as i32;
+        let y1 = draw_rect.1 + ((ph_pts - rect.bottom().value) * sy).round() as i32;
+        let left = x0.min(x1);
+        let top = y0.min(y1);
+        let rw = (x1 - x0).unsigned_abs().max(4);
+        let rh = (y1 - y0).unsigned_abs().max(4);
+        Some((left, top, rw, rh))
+    }
+
+    /// Draws a crisp floating tooltip pill directly below hovered top-toolbar buttons
+    /// or directly above hovered bottom-bar buttons.
+    fn draw_floating_hover_tooltip(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        menu_bar_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) {
+        let (label, anchor_rect, below) = match self.hovered_widget {
+            Some(UiHit::Toolbar(act)) => {
+                let tb_x = self.toolbar_start_x(sf);
+                let Some(rect) = self.toolbar_widget_rect(act, tb_x, buf_w, menu_bar_h, sf) else {
+                    return;
+                };
+                (act.tooltip(), rect, true)
+            }
+            Some(UiHit::BottomBar(act)) => {
+                if self.show_notifications && act == super::bottom_bar::BottomBarAction::NotificationBoard {
+                    return;
+                }
+                let Some(rect) = self.bottom_bar_widget_rect(act, buf_w, buf_h, status_bar_h, sf) else {
+                    return;
+                };
+                (act.tooltip(), rect, false)
+            }
+            _ => return,
+        };
+
+        let s = sf as f32;
+        let font_sz = (11.0 * s).clamp(9.5, 20.0);
+        let pad_x = (9.0 * s).round() as u32;
+        let tip_h = (22.0 * s).round().clamp(18.0, 38.0) as u32;
+        let tw = super::ui_draw::measure_text(label, font_sz, false).ceil() as u32;
+        let tip_w = (tw + pad_x * 2).min(buf_w.saturating_sub(16));
+        let cx = anchor_rect.0 + (anchor_rect.2 as i32) / 2;
+        let max_tx = (buf_w as i32 - tip_w as i32 - 8).max(8);
+        let tx = (cx - (tip_w as i32) / 2).clamp(8, max_tx);
+        let gap = (6.0 * s).round() as i32;
+        let ty = if below {
+            (anchor_rect.1 + anchor_rect.3 as i32 + gap).min(buf_h as i32 - tip_h as i32 - 6)
+        } else {
+            (anchor_rect.1 - tip_h as i32 - gap).max(6)
+        };
+        let rad = (5.0 * s).clamp(4.0, 9.0);
+        // Dark crisp tooltip pill in Light mode, elevated slate in Dark mode (high contrast in both!)
+        let (bg, border, fg) = match self.ui_theme_mode {
+            super::theme::UiThemeMode::Light => (0x001E293B, 0x00334155, 0x00F8FAFC),
+            super::theme::UiThemeMode::Dark => (0x00334155, 0x00475569, 0x00F8FAFC),
+        };
+        super::ui_draw::draw_soft_shadow(
+            buffer, buf_w, buf_h, tx, ty, tip_w, tip_h, rad,
+            (6.0 * s).round() as i32, (2.0 * s).round() as i32,
+            (0, 0, 0), 56,
+        );
+        super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, tx, ty, tip_w, tip_h, rad, bg);
+        super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, tx, ty, tip_w, tip_h, rad, border);
+        super::ui_draw::draw_text_vcenter(
+            buffer, buf_w, buf_h,
+            tx + pad_x as i32, ty, tip_h, tx + tip_w as i32 - 4,
+            label, font_sz, fg, false,
+        );
     }
 
     pub(super) fn render_to_window(&mut self) -> Result<()> {

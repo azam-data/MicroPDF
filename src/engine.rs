@@ -79,6 +79,15 @@ pub struct StampImageBuffer {
 }
 
 /// Color swatch for PDF annotations (Highlight, Underline, Strikethrough, Sticky Note, Ink, Text, Shapes).
+/// A Sticky Note or Text Box annotation on a page that can be clicked to inspect or dragged to reposition.
+#[derive(Clone, Debug)]
+pub struct MovableAnnotation {
+    pub index: usize,
+    pub is_sticky_note: bool,
+    pub bounds: PdfRect,
+    pub text: String,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum AnnotationColor {
     Yellow,
@@ -1450,6 +1459,7 @@ impl PdfEngine {
     }
 
     /// Highlights text in `pdf_rect` on `page_index` (0-based) of `doc` using `color`.
+    /// Stored inside a PDF annotation so `Print Without Annotations` cleanly hides it.
     pub fn highlight_text_in_rect_with_color(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1460,10 +1470,16 @@ impl PdfEngine {
             return Ok(0);
         };
         let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
         let highlight_fill = color.highlight_pdf_color();
-        let (cr, cg, cb) = color.rgb();
 
         let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
         for rect in &target_rects {
             let padded = PdfRect::new_from_values(
                 rect.bottom().value - 1.0,
@@ -1471,29 +1487,27 @@ impl PdfEngine {
                 rect.top().value + 1.0,
                 rect.right().value + 1.0,
             );
+            min_x = min_x.min(padded.left().value);
+            min_y = min_y.min(padded.bottom().value);
+            max_x = max_x.max(padded.right().value);
+            max_y = max_y.max(padded.top().value);
             let mut path_obj =
                 PdfPagePathObject::new_rect(doc, padded, None, None, Some(highlight_fill))?;
             let _ = path_obj.set_blend_mode(PdfPageObjectBlendMode::Multiply);
             path_objects.push(path_obj);
         }
 
+        let bounds = PdfRect::new_from_values(min_y, min_x, max_y, max_x);
         let mut page = doc
             .pages_mut()
             .get(page_index)
             .context("Page index out of bounds for mutable highlight")?;
 
-        if let Ok(mut annot) = page.annotations_mut().create_highlight_annotation() {
-            let _ = annot.set_stroke_color(PdfColor::new(cr, cg, cb, 160));
-            let _ = annot.set_bounds(normalized_sel);
-            for rect in &target_rects {
-                let _ = annot
-                    .attachment_points_mut()
-                    .create_attachment_point_at_end(rect.to_quad_points());
-            }
-        }
-
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Highlight");
         for path_obj in path_objects {
-            page.objects_mut().add_path_object(path_obj)?;
+            annot.objects_mut().add_path_object(path_obj)?;
         }
 
         Ok(target_rects.len())
@@ -1510,11 +1524,22 @@ impl PdfEngine {
             return Ok(0);
         };
         let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
         let stroke = color.stroke_pdf_color();
 
         let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
         for rect in &target_rects {
             let y = (rect.bottom().value - 0.8).max(0.0);
+            min_x = min_x.min(rect.left().value);
+            max_x = max_x.max(rect.right().value);
+            min_y = min_y.min(y - 2.0);
+            max_y = max_y.max(y + 2.0);
             let line = PdfPagePathObject::new_line(
                 doc,
                 rect.left(),
@@ -1527,18 +1552,13 @@ impl PdfEngine {
             path_objects.push(line);
         }
 
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_underline_annotation() {
-            let _ = annot.set_stroke_color(stroke);
-            let _ = annot.set_bounds(normalized_sel);
-            for rect in &target_rects {
-                let _ = annot
-                    .attachment_points_mut()
-                    .create_attachment_point_at_end(rect.to_quad_points());
-            }
-        }
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Underline");
         for obj in path_objects {
-            page.objects_mut().add_path_object(obj)?;
+            annot.objects_mut().add_path_object(obj)?;
         }
         Ok(target_rects.len())
     }
@@ -1554,11 +1574,22 @@ impl PdfEngine {
             return Ok(0);
         };
         let target_rects = Self::collect_line_rects_in_selection(doc, page_index, normalized_sel)?;
+        if target_rects.is_empty() {
+            return Ok(0);
+        }
         let stroke = color.stroke_pdf_color();
 
         let mut path_objects = Vec::with_capacity(target_rects.len());
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
         for rect in &target_rects {
             let mid_y = (rect.bottom().value + rect.top().value) * 0.5;
+            min_x = min_x.min(rect.left().value);
+            max_x = max_x.max(rect.right().value);
+            min_y = min_y.min(mid_y - 2.0);
+            max_y = max_y.max(mid_y + 2.0);
             let line = PdfPagePathObject::new_line(
                 doc,
                 rect.left(),
@@ -1571,23 +1602,18 @@ impl PdfEngine {
             path_objects.push(line);
         }
 
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x, max_y, max_x);
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_strikeout_annotation() {
-            let _ = annot.set_stroke_color(stroke);
-            let _ = annot.set_bounds(normalized_sel);
-            for rect in &target_rects {
-                let _ = annot
-                    .attachment_points_mut()
-                    .create_attachment_point_at_end(rect.to_quad_points());
-            }
-        }
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Strikeout");
         for obj in path_objects {
-            page.objects_mut().add_path_object(obj)?;
+            annot.objects_mut().add_path_object(obj)?;
         }
         Ok(target_rects.len())
     }
 
-    /// Adds a standard PDF Sticky Note (`/Text` annotation + visible note icon badge) at `(pdf_x, pdf_y)`.
+    /// Adds a draggable PDF Sticky Note annotation with visible note icon badge at `(pdf_x, pdf_y)`.
     pub fn add_sticky_note(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1638,34 +1664,105 @@ impl PdfEngine {
         )?;
 
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_text_annotation(trimmed) {
-            let _ = annot.set_bounds(rect);
-            let _ = annot.set_fill_color(fill);
-            let _ = annot.set_stroke_color(border);
-        }
-        page.objects_mut().add_path_object(badge)?;
-        page.objects_mut().add_path_object(l1)?;
-        page.objects_mut().add_path_object(l2)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(rect);
+        let _ = annot.set_creator("MicroPDF:StickyNote");
+        let _ = annot.set_contents(trimmed);
+        annot.objects_mut().add_path_object(badge)?;
+        annot.objects_mut().add_path_object(l1)?;
+        annot.objects_mut().add_path_object(l2)?;
         Ok(())
     }
 
-    /// Reads all Sticky Note (`/Text`) annotations on `page` so clicking/hovering shows a popover.
+    /// Reads all Sticky Note annotations (`/Text` or `MicroPDF:StickyNote` stamps) on `page`.
+    #[allow(dead_code)]
     pub fn read_sticky_notes_on_page(page: &PdfPage) -> Vec<(PdfRect, String)> {
-        let mut notes = Vec::new();
-        for annot in page.annotations().iter() {
-            if annot.annotation_type() == PdfPageAnnotationType::Text {
-                if let (Ok(bounds), Some(text)) = (annot.bounds(), annot.contents()) {
-                    let t = text.trim().to_string();
-                    if !t.is_empty() {
-                        notes.push((bounds, t));
-                    }
-                }
-            }
-        }
-        notes
+        Self::find_movable_annotations_on_page(page)
+            .into_iter()
+            .filter(|m| m.is_sticky_note && !m.text.is_empty())
+            .map(|m| (m.bounds, m.text))
+            .collect()
     }
 
-    /// Adds a smooth vector freehand pen stroke (PDF path + `/Ink` annotation) to `page_index`.
+    /// Finds all Sticky Note and Text Box annotations on `page` so the user can click to read
+    /// or drag to reposition them cleanly.
+    pub fn find_movable_annotations_on_page(page: &PdfPage) -> Vec<MovableAnnotation> {
+        let mut out = Vec::new();
+        for (idx, annot) in page.annotations().iter().enumerate() {
+            let Ok(bounds) = annot.bounds() else {
+                continue;
+            };
+            match annot.annotation_type() {
+                PdfPageAnnotationType::Text => {
+                    out.push(MovableAnnotation {
+                        index: idx,
+                        is_sticky_note: true,
+                        bounds,
+                        text: annot.contents().unwrap_or_default().trim().to_string(),
+                    });
+                }
+                PdfPageAnnotationType::FreeText => {
+                    out.push(MovableAnnotation {
+                        index: idx,
+                        is_sticky_note: false,
+                        bounds,
+                        text: annot.contents().unwrap_or_default().trim().to_string(),
+                    });
+                }
+                PdfPageAnnotationType::Stamp => {
+                    let creator = annot.creator().unwrap_or_default();
+                    if creator == "MicroPDF:StickyNote" {
+                        out.push(MovableAnnotation {
+                            index: idx,
+                            is_sticky_note: true,
+                            bounds,
+                            text: annot.contents().unwrap_or_default().trim().to_string(),
+                        });
+                    } else if creator == "MicroPDF:FreeText" {
+                        out.push(MovableAnnotation {
+                            index: idx,
+                            is_sticky_note: false,
+                            bounds,
+                            text: annot.contents().unwrap_or_default().trim().to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Translates an existing Sticky Note or Text Box annotation (and its inner appearance objects)
+    /// by `(dx_pts, dy_pts)` in PDF point coordinates.
+    pub fn move_annotation_by(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+        dx_pts: f32,
+        dy_pts: f32,
+    ) -> Result<()> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        let old = annot.bounds()?;
+        let new_bounds = PdfRect::new_from_values(
+            (old.bottom().value + dy_pts).max(0.0),
+            (old.left().value + dx_pts).max(0.0),
+            (old.top().value + dy_pts).max(2.0),
+            (old.right().value + dx_pts).max(2.0),
+        );
+        let actual_dx = new_bounds.left().value - old.left().value;
+        let actual_dy = new_bounds.bottom().value - old.bottom().value;
+        annot.set_bounds(new_bounds)?;
+        if let Some(stamp) = annot.as_stamp_annotation_mut() {
+            for mut obj in stamp.objects_mut().iter() {
+                let _ = obj.translate(PdfPoints::new(actual_dx), PdfPoints::new(actual_dy));
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds a smooth vector freehand pen stroke stored inside a PDF annotation on `page_index`.
     pub fn add_freehand_ink(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1677,12 +1774,13 @@ impl PdfEngine {
             return Ok(());
         }
         let stroke = color.stroke_pdf_color();
+        let sw = stroke_width.clamp(0.8, 8.0);
         let mut path = PdfPagePathObject::new(
             doc,
             PdfPoints::new(points[0].0),
             PdfPoints::new(points[0].1),
             Some(stroke),
-            Some(PdfPoints::new(stroke_width.clamp(0.8, 8.0))),
+            Some(PdfPoints::new(sw)),
             None,
         )?;
         let mut min_x = points[0].0;
@@ -1697,21 +1795,21 @@ impl PdfEngine {
             max_y = max_y.max(y);
         }
 
+        let bounds = PdfRect::new_from_values(
+            (min_y - sw - 2.0).max(0.0),
+            (min_x - sw - 2.0).max(0.0),
+            max_y + sw + 2.0,
+            max_x + sw + 2.0,
+        );
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_ink_annotation() {
-            let _ = annot.set_stroke_color(stroke);
-            let _ = annot.set_bounds(PdfRect::new_from_values(
-                (min_y - 2.0).max(0.0),
-                (min_x - 2.0).max(0.0),
-                max_y + 2.0,
-                max_x + 2.0,
-            ));
-        }
-        page.objects_mut().add_path_object(path)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Ink");
+        annot.objects_mut().add_path_object(path)?;
         Ok(())
     }
 
-    /// Adds a FreeText / Text Box annotation at `(pdf_x, pdf_y)` (top-left anchor in PDF points).
+    /// Adds a draggable FreeText / Text Box annotation at `(pdf_x, pdf_y)` (top-left anchor in PDF points).
     pub fn add_freetext_box(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1731,37 +1829,42 @@ impl PdfEngine {
         let lines: Vec<&str> = trimmed.split('\n').collect();
         let line_h = fsz * 1.25;
         let mut text_objs = Vec::with_capacity(lines.len());
-        let mut max_w = 40.0f32;
+        let mut min_x = pdf_x.max(4.0);
+        let mut max_x = min_x + 40.0;
+        let mut min_y = (pdf_y - fsz).max(4.0);
+        let mut max_y = pdf_y + fsz * 0.9;
         for (i, line) in lines.iter().enumerate() {
             let mut tobj = PdfPageTextObject::new(doc, *line, font, PdfPoints::new(fsz))?;
             let _ = tobj.set_fill_color(fill);
             let y = (pdf_y - (i as f32) * line_h).max(8.0);
             tobj.translate(PdfPoints::new(pdf_x.max(4.0)), PdfPoints::new(y))?;
             if let Ok(b) = tobj.bounds() {
-                max_w = max_w.max((b.right().value - b.left().value).abs());
+                min_x = min_x.min(b.left().value);
+                max_x = max_x.max(b.right().value);
+                min_y = min_y.min(b.bottom().value);
+                max_y = max_y.max(b.top().value);
             }
             text_objs.push(tobj);
         }
-        let total_h = (lines.len() as f32 * line_h).max(fsz + 4.0);
         let bounds = PdfRect::new_from_values(
-            (pdf_y - total_h).max(2.0),
-            pdf_x.max(2.0),
-            pdf_y + fsz,
-            pdf_x + max_w + 8.0,
+            (min_y - 3.0).max(2.0),
+            (min_x - 3.0).max(2.0),
+            max_y + 3.0,
+            max_x + 4.0,
         );
 
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_free_text_annotation(trimmed) {
-            let _ = annot.set_bounds(bounds);
-            let _ = annot.set_stroke_color(fill);
-        }
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:FreeText");
+        let _ = annot.set_contents(trimmed);
         for tobj in text_objs {
-            page.objects_mut().add_text_object(tobj)?;
+            annot.objects_mut().add_text_object(tobj)?;
         }
         Ok(())
     }
 
-    /// Adds a crisp stroked Rectangle shape (`PdfPagePathObject` + `/Square` annotation).
+    /// Adds a crisp stroked Rectangle shape stored inside a PDF annotation.
     pub fn add_rectangle_shape(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1772,24 +1875,31 @@ impl PdfEngine {
         let Some(norm) = Self::normalize_sel_rect(pdf_rect) else {
             return Ok(());
         };
+        let sw = stroke_width.clamp(0.8, 8.0);
         let stroke = color.stroke_pdf_color();
         let rect_obj = PdfPagePathObject::new_rect(
             doc,
             norm,
             Some(stroke),
-            Some(PdfPoints::new(stroke_width.clamp(0.8, 8.0))),
+            Some(PdfPoints::new(sw)),
             None,
         )?;
+        let bounds = PdfRect::new_from_values(
+            (norm.bottom().value - sw - 1.0).max(0.0),
+            (norm.left().value - sw - 1.0).max(0.0),
+            norm.top().value + sw + 1.0,
+            norm.right().value + sw + 1.0,
+        );
         let mut page = doc.pages_mut().get(page_index)?;
-        if let Ok(mut annot) = page.annotations_mut().create_square_annotation() {
-            let _ = annot.set_stroke_color(stroke);
-            let _ = annot.set_bounds(norm);
-        }
-        page.objects_mut().add_path_object(rect_obj)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Rect");
+        annot.objects_mut().add_path_object(rect_obj)?;
         Ok(())
     }
 
-    /// Adds a crisp vector Arrow shape from `(x1, y1)` to `(x2, y2)` with a filled arrowhead.
+    /// Adds a crisp vector Arrow shape from `(x1, y1)` to `(x2, y2)` with a filled arrowhead,
+    /// stored inside a PDF annotation.
     pub fn add_arrow_shape(
         doc: &mut PdfDocument,
         page_index: u16,
@@ -1810,7 +1920,7 @@ impl PdfEngine {
         let uy = dy / len;
         let px = -uy;
         let py = ux;
-        let head_len = (stroke_width * 5.2).clamp(8.0, len * 0.45);
+        let head_len = (stroke_width * 5.2).min(len * 0.45).max(3.0);
         let head_half_w = head_len * 0.42;
 
         let base_x = x2 - ux * head_len;
@@ -1820,6 +1930,7 @@ impl PdfEngine {
         let right_x = base_x - px * head_half_w;
         let right_y = base_y - py * head_half_w;
 
+        let sw = stroke_width.clamp(1.0, 8.0);
         let stroke = color.stroke_pdf_color();
         let shaft = PdfPagePathObject::new_line(
             doc,
@@ -1828,7 +1939,7 @@ impl PdfEngine {
             PdfPoints::new(base_x),
             PdfPoints::new(base_y),
             stroke,
-            PdfPoints::new(stroke_width.clamp(1.0, 8.0)),
+            PdfPoints::new(sw),
         )?;
         let mut head = PdfPagePathObject::new(
             doc,
@@ -1842,9 +1953,18 @@ impl PdfEngine {
         head.line_to(PdfPoints::new(right_x), PdfPoints::new(right_y))?;
         head.close_path()?;
 
+        let min_x = x1.min(x2).min(left_x).min(right_x) - sw - 2.0;
+        let max_x = x1.max(x2).max(left_x).max(right_x) + sw + 2.0;
+        let min_y = y1.min(y2).min(left_y).min(right_y) - sw - 2.0;
+        let max_y = y1.max(y2).max(left_y).max(right_y) + sw + 2.0;
+        let bounds = PdfRect::new_from_values(min_y.max(0.0), min_x.max(0.0), max_y, max_x);
+
         let mut page = doc.pages_mut().get(page_index)?;
-        page.objects_mut().add_path_object(shaft)?;
-        page.objects_mut().add_path_object(head)?;
+        let mut annot = page.annotations_mut().create_stamp_annotation()?;
+        let _ = annot.set_bounds(bounds);
+        let _ = annot.set_creator("MicroPDF:Arrow");
+        annot.objects_mut().add_path_object(shaft)?;
+        annot.objects_mut().add_path_object(head)?;
         Ok(())
     }
 

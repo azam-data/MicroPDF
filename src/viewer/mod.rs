@@ -2443,7 +2443,9 @@ mod tests {
     fn test_toolbar_config_defaults_toggle_and_ini_roundtrip() {
         use super::toolbar::{ToolbarConfig, ToolbarItem};
         let mut cfg = ToolbarConfig::default();
-        assert!(cfg.is_enabled(ToolbarItem::Sidebar));
+        // Sidebar & Grid moved to Bottom Bar by default (still toggleable on top toolbar if desired)
+        assert!(!cfg.is_enabled(ToolbarItem::Sidebar));
+        assert!(!cfg.is_enabled(ToolbarItem::Grid));
         assert!(cfg.is_enabled(ToolbarItem::Open));
         assert!(cfg.is_enabled(ToolbarItem::SaveAs));
         assert!(cfg.is_enabled(ToolbarItem::Print));
@@ -2574,6 +2576,7 @@ mod tests {
 
         let mut pp = PrintPreviewState::new(vec!["Simplex_Printer".to_string()], 0, 5, 0);
         assert!(pp.render_opts.collate, "Collate should be checked by default");
+        assert!(pp.render_opts.include_annotations, "Print with annotations should be default");
         assert!(!pp.render_opts.booklet);
         assert!(!pp.manual_duplex);
 
@@ -2597,5 +2600,18 @@ mod tests {
             c = c.next();
         }
         assert_eq!(c, AnnotationColor::Yellow);
+    }
+
+    #[test]
+    fn test_file_menu_no_duplicate_optimize_and_tools_keeps_optimize() {
+        use super::state::MenuCategory;
+        assert!(
+            !MenuCategory::File.items().iter().any(|s| s.contains("Optimize")),
+            "File menu should not contain duplicate Optimize item"
+        );
+        assert!(
+            MenuCategory::Tools.items().iter().any(|s| s.contains("Optimize")),
+            "Tools menu should keep Optimize item"
+        );
     }
 }

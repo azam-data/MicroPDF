@@ -58,7 +58,7 @@ impl<'a> PdfViewerApp<'a> {
             theme.topbar_border,
         );
 
-        let pill_h = (22.0 * s).round().clamp(18.0, (menu_bar_h.saturating_sub(6)) as f32) as u32;
+        let pill_h = (22.0 * s).round().clamp(18.0, (menu_bar_h.saturating_sub(6) as f32).max(18.0)) as u32;
         let pill_y = ((menu_bar_h.saturating_sub(pill_h)) / 2) as i32;
 
         for cat in MenuCategory::ALL {
@@ -388,12 +388,9 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             (MenuCategory::File, 7) => {
-                self.compress_current_pdf();
-            }
-            (MenuCategory::File, 8) => {
                 self.trigger_print();
             }
-            (MenuCategory::File, 9) => {
+            (MenuCategory::File, 8) => {
                 if self.tabs.len() > 1 {
                     let _ = self.close_tab(self.active_tab);
                 } else {

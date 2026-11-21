@@ -227,6 +227,122 @@ impl<'a> PdfViewerApp<'a> {
         let mut total_content_h = 0i32;
 
         for block in &blocks {
+            if let ExportBlock::Table(rows) = block {
+                if !rows.is_empty() {
+                    let num_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+                    let tbl_sz = (base_sz * 0.88).clamp(9.5, 24.0);
+                    let cell_pad_x = (8.0 * s).round() as i32;
+                    let row_h = (tbl_sz * 1.65).round().max(22.0 * s) as i32;
+                    let tbl_x = col_x + pad_x;
+                    let tbl_w = text_w.round().max(120.0) as u32;
+
+                    // Measure natural column widths & detect numeric columns for right-alignment
+                    let mut col_nat = vec![36.0f32; num_cols];
+                    let mut col_num_hits = vec![0usize; num_cols];
+                    let mut col_non_empty = vec![0usize; num_cols];
+                    for (ri, r) in rows.iter().enumerate() {
+                        for (ci, cell) in r.iter().enumerate().take(num_cols) {
+                            let cw = measure_text(cell, tbl_sz, ri == 0) + (cell_pad_x * 2) as f32 + 4.0;
+                            col_nat[ci] = col_nat[ci].max(cw);
+                            if ri > 0 && !cell.trim().is_empty() {
+                                col_non_empty[ci] += 1;
+                                if crate::export::is_numeric_cell(cell) {
+                                    col_num_hits[ci] += 1;
+                                }
+                            }
+                        }
+                    }
+                    let sum_nat: f32 = col_nat.iter().sum::<f32>().max(1.0);
+                    let mut col_w: Vec<i32> = col_nat
+                        .iter()
+                        .map(|&nw| ((nw / sum_nat) * (tbl_w as f32)).floor().max(28.0) as i32)
+                        .collect();
+                    let assigned: i32 = col_w.iter().sum();
+                    if let Some(last) = col_w.last_mut() {
+                        *last = (*last + (tbl_w as i32 - assigned)).max(28);
+                    }
+                    let col_right_align: Vec<bool> = (0..num_cols)
+                        .map(|ci| col_non_empty[ci] > 0 && col_num_hits[ci] * 2 >= col_non_empty[ci])
+                        .collect();
+
+                    let tbl_top = y_cursor;
+                    let tbl_h = (rows.len() as i32) * row_h;
+                    let hdr_bg = match self.reading_filter {
+                        ReadingFilter::DarkInvert => 0x00262626,
+                        ReadingFilter::WarmSepia => 0x00EAE0C8,
+                        ReadingFilter::Normal => theme.surface_elevated,
+                    };
+                    let zebra_bg = match self.reading_filter {
+                        ReadingFilter::DarkInvert => 0x001D1D1D,
+                        ReadingFilter::WarmSepia => 0x00F2EBD9,
+                        ReadingFilter::Normal => 0x00F8FAFC,
+                    };
+                    let grid_col = match self.reading_filter {
+                        ReadingFilter::DarkInvert => 0x00333333,
+                        ReadingFilter::WarmSepia => 0x00DFD3B8,
+                        ReadingFilter::Normal => theme.border_subtle,
+                    };
+
+                    for (ri, r) in rows.iter().enumerate() {
+                        let ry = tbl_top + (ri as i32) * row_h;
+                        if ry + row_h >= body_top && ry <= body_bottom {
+                            let clip_y0 = ry.max(body_top);
+                            let clip_y1 = (ry + row_h).min(body_bottom);
+                            if clip_y1 > clip_y0 {
+                                if ri == 0 {
+                                    fill_rect_clipped(buffer, buf_w, buf_h, tbl_x, clip_y0, tbl_w, (clip_y1 - clip_y0) as u32, hdr_bg);
+                                } else if ri % 2 == 0 {
+                                    fill_rect_clipped(buffer, buf_w, buf_h, tbl_x, clip_y0, tbl_w, (clip_y1 - clip_y0) as u32, zebra_bg);
+                                }
+                                // Row bottom rule
+                                if ry + row_h <= body_bottom {
+                                    fill_rect_clipped(buffer, buf_w, buf_h, tbl_x, ry + row_h - 1, tbl_w, 1, grid_col);
+                                }
+                                let mut cx = tbl_x;
+                                for ci in 0..num_cols {
+                                    let cw = col_w[ci];
+                                    if ci > 0 {
+                                        fill_rect_clipped(buffer, buf_w, buf_h, cx, clip_y0, 1, (clip_y1 - clip_y0) as u32, grid_col);
+                                    }
+                                    if ry >= body_top && ry + row_h <= body_bottom + 2 {
+                                        let cell_txt = r.get(ci).map(String::as_str).unwrap_or("");
+                                        if !cell_txt.is_empty() {
+                                            let is_bold = ri == 0;
+                                            let inner_w = (cw - cell_pad_x * 2).max(12) as f32;
+                                            let clipped = truncate_ellipsis(cell_txt, inner_w, tbl_sz, is_bold);
+                                            let tx = if col_right_align[ci] {
+                                                let tw = measure_text(&clipped, tbl_sz, is_bold).ceil() as i32;
+                                                (cx + cw - cell_pad_x - tw).max(cx + cell_pad_x)
+                                            } else {
+                                                cx + cell_pad_x
+                                            };
+                                            let fg = if is_bold { heading_fg } else { text_fg };
+                                            draw_text_vcenter(buffer, buf_w, buf_h, tx, ry, row_h as u32, cx + cw - 3, &clipped, tbl_sz, fg, is_bold);
+                                        }
+                                    }
+                                    cx += cw;
+                                }
+                            }
+                        }
+                    }
+                    // Outer left/right/top borders clipped to visible body
+                    let vis_y0 = tbl_top.max(body_top);
+                    let vis_y1 = (tbl_top + tbl_h).min(body_bottom);
+                    if vis_y1 > vis_y0 {
+                        if tbl_top >= body_top && tbl_top < body_bottom {
+                            fill_rect_clipped(buffer, buf_w, buf_h, tbl_x, tbl_top, tbl_w, 1, grid_col);
+                        }
+                        fill_rect_clipped(buffer, buf_w, buf_h, tbl_x, vis_y0, 1, (vis_y1 - vis_y0) as u32, grid_col);
+                        fill_rect_clipped(buffer, buf_w, buf_h, tbl_x + tbl_w as i32 - 1, vis_y0, 1, (vis_y1 - vis_y0) as u32, grid_col);
+                    }
+
+                    let para_gap = (base_sz * 0.75).round() as i32;
+                    y_cursor += tbl_h + para_gap;
+                    total_content_h += tbl_h + para_gap;
+                }
+                continue;
+            }
+
             let (fsz, bold, indent, text_col, prefix, text) = match block {
                 ExportBlock::Heading { level, text } => {
                     let mult = match level {
@@ -248,14 +364,7 @@ impl<'a> PdfViewerApp<'a> {
                     let s_all: String = spans.iter().map(|sp| sp.text.as_str()).collect();
                     (base_sz, false, (16.0 * s).round() as i32, text_fg, format!("{num}. "), s_all)
                 }
-                ExportBlock::Table(rows) => {
-                    let mut joined = String::new();
-                    for r in rows {
-                        joined.push_str(&r.join("   |   "));
-                        joined.push('\n');
-                    }
-                    (base_sz * 0.92, false, (8.0 * s).round() as i32, text_fg, String::new(), joined)
-                }
+                ExportBlock::Table(_) => unreachable!(),
             };
 
             let step = (fsz * 1.45).round().max(line_step as f32) as i32;

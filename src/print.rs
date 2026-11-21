@@ -195,6 +195,8 @@ pub struct PrintRenderOptions {
     pub collate: bool,
     /// Saddle-stitch 2-up booklet imposition (landscape short-edge folded booklet).
     pub booklet: bool,
+    /// Whether to include PDF annotations (highlights, notes, shapes, markups) when printing.
+    pub include_annotations: bool,
 }
 
 impl Default for PrintRenderOptions {
@@ -207,6 +209,7 @@ impl Default for PrintRenderOptions {
             zoom_percent: 100,
             collate: true,
             booklet: false,
+            include_annotations: true,
         }
     }
 }
@@ -378,8 +381,8 @@ pub fn compute_effective_crop_box(
         }
         if !trimmed && (ox1 - ox0) >= pw * 0.20 && (oy1 - oy0) >= ph * 0.20 {
             let pad_y = (ph * 0.02).max(8.0);
-            min_x = ox0.clamp(0.0, pw);
-            max_x = ox1.clamp(min_x + 1.0, pw);
+            min_x = ox0.clamp(0.0, (pw - 1.0).max(0.0));
+            max_x = ox1.clamp((min_x + 1.0).min(pw), pw);
             min_y = (oy0 - pad_y).max(0.0);
             max_y = (oy1 + pad_y).min(ph);
         }
@@ -394,10 +397,10 @@ pub fn compute_effective_crop_box(
         let cy = (min_y + max_y) * 0.5;
         let nw = (cw * frac).max(pw * 0.20);
         let nh = (ch * frac).max(ph * 0.20);
-        min_x = (cx - nw * 0.5).clamp(0.0, pw);
-        max_x = (cx + nw * 0.5).clamp(min_x + 1.0, pw);
-        min_y = (cy - nh * 0.5).clamp(0.0, ph);
-        max_y = (cy + nh * 0.5).clamp(min_y + 1.0, ph);
+        min_x = (cx - nw * 0.5).clamp(0.0, (pw - 1.0).max(0.0));
+        max_x = (cx + nw * 0.5).clamp((min_x + 1.0).min(pw), pw);
+        min_y = (cy - nh * 0.5).clamp(0.0, (ph - 1.0).max(0.0));
+        max_y = (cy + nh * 0.5).clamp((min_y + 1.0).min(ph), ph);
     }
 
     (min_x, min_y, max_x, max_y)
@@ -528,7 +531,7 @@ where
             .set_fixed_width(render_w as i32)
             .set_fixed_height(strip_h as i32)
             .render_form_data(false)
-            .render_annotations(true)
+            .render_annotations(opts.include_annotations)
             .use_print_quality(true)
             .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
@@ -1081,6 +1084,24 @@ fn apply_crop_boxes_to_temp_pdf(pdf_path: &Path, crop_boxes: &[(f32, f32, f32, f
     Ok(())
 }
 
+/// Removes all `/Annots` entries from every page of the temporary print PDF so CUPS prints
+/// without any highlights, sticky notes, shapes, or markup annotations (original file untouched).
+#[cfg_attr(windows, allow(dead_code))]
+fn strip_annotations_from_temp_pdf(pdf_path: &Path) -> Result<()> {
+    let raw = std::fs::read(pdf_path).context("Failed to read temp print PDF for annotation strip")?;
+    let mut ldoc = lopdf::Document::load_mem(&raw).context("lopdf could not open temp print PDF")?;
+    let pages = ldoc.get_pages();
+    for (_pnum, page_id) in pages {
+        if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(page_id) {
+            let _ = dict.remove(b"Annots");
+        }
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    ldoc.save_to(&mut out).context("lopdf could not save annotation-free temp print PDF")?;
+    std::fs::write(pdf_path, &out).context("Failed to write annotation-free temp print PDF")?;
+    Ok(())
+}
+
 /// Starts printing with full Print Preview options through CUPS (`lp`).
 #[cfg_attr(windows, allow(dead_code))]
 pub fn start_cups_print_extended(
@@ -1109,6 +1130,10 @@ pub fn start_cups_print_extended(
 
     let copies = req.copies.clamp(1, 99);
     let temp = write_optional_pages_to_temp_pdf(engine, doc, &effective_slots, redacted, temp_dir)?;
+
+    if !req.render_opts.include_annotations {
+        let _ = strip_annotations_from_temp_pdf(temp.path());
+    }
 
     if req.render_opts.auto_trim_margins || req.render_opts.zoom_percent > 100 {
         let mut boxes = Vec::with_capacity(effective_slots.len());

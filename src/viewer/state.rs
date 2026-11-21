@@ -92,7 +92,6 @@ impl MenuCategory {
                 "Save As... (Ctrl+Shift+S)",
                 "Export as Markdown (.md)...",
                 "Export as LaTeX (.tex)...",
-                "Optimize -> _optimized.pdf (Z)",
                 "Print... (Ctrl+P / Cmd+P)",
                 "Close Tab (Ctrl+W)",
             ],
@@ -453,6 +452,29 @@ pub(super) enum UiHit {
     Combine(CombineHit),
     TextView(TextViewHit),
     Overlay(OverlayHit),
+    NotificationClear,
+}
+
+/// One timestamped session notification stored in the bottom-left Notification Board (capped at 50).
+#[derive(Clone, Debug)]
+pub(super) struct NotificationEntry {
+    pub(super) timestamp: String,
+    pub(super) message: String,
+    pub(super) is_error: bool,
+}
+
+/// Active drag-to-move state for repositioning a Sticky Note or Text Box annotation on a page.
+#[derive(Clone, Debug)]
+pub(super) struct DraggingAnnotation {
+    pub(super) page_index: u16,
+    pub(super) annot_index: usize,
+    pub(super) is_sticky_note: bool,
+    pub(super) orig_rect: PdfRect,
+    pub(super) start_pdf_x: f32,
+    pub(super) start_pdf_y: f32,
+    pub(super) start_screen_x: f64,
+    pub(super) start_screen_y: f64,
+    pub(super) note_text: Option<String>,
 }
 
 /// Interactive Command Prompt HUD state machine in the Bottom Command Bar & Window Title Bar.
@@ -799,6 +821,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) ink_stroke_screen_pts: Vec<(f32, f32)>,
     /// Floating sticky-note popover `(note_text, screen_x, screen_y)` when user clicks a sticky note.
     pub(super) active_note_popover: Option<(String, i32, i32)>,
+    /// Active drag-to-move state when repositioning an existing Sticky Note or Text Box.
+    pub(super) dragging_annotation: Option<DraggingAnnotation>,
     /// Active Print Preview modal state (0 bytes when closed).
     pub(super) print_preview: Option<PrintPreviewState>,
     /// Active Manual Duplex Pass 2 wait modal state (0 bytes when closed).
@@ -820,6 +844,12 @@ pub struct PdfViewerApp<'a> {
     /// Saved `(view_mode, zoom_level, pan_x, scroll_y)` restored when exiting `F5` presentation mode.
     pub(super) pre_presentation_state: Option<(ViewMode, f32, f32, f32)>,
     pub(super) status_notice: Option<String>,
+    /// Bounded session log of timestamped status notifications (max 50 entries).
+    pub(super) notifications: VecDeque<NotificationEntry>,
+    /// Last notice message recorded into `notifications` so duplicates are not double-logged.
+    pub(super) last_recorded_notice: Option<String>,
+    /// True when the bottom-left Session Notification Board popover is open.
+    pub(super) show_notifications: bool,
     /// Reusable pixel buffer so page turns never reallocate when `cached_page` is invalidated.
     pub(super) spare_pixel_buf: Vec<u32>,
     /// Declared in strict drop order: `surface` drops first, then `context`, then `window`.
@@ -945,6 +975,7 @@ impl<'a> PdfViewerApp<'a> {
             annotation_color: AnnotationColor::Yellow,
             ink_stroke_screen_pts: Vec::new(),
             active_note_popover: None,
+            dragging_annotation: None,
             print_preview: None,
             manual_duplex_wait: None,
             combine_modal: None,
@@ -960,16 +991,89 @@ impl<'a> PdfViewerApp<'a> {
             } else {
                 None
             },
+            notifications: VecDeque::with_capacity(50),
+            last_recorded_notice: None,
+            show_notifications: false,
             spare_pixel_buf: Vec::new(),
             surface: None,
             context: None,
             window: None,
         };
+        app.record_status_notice_if_new();
         app.load_session_from_ini(initial_path.is_none());
         if let Some(path) = initial_path {
             app.load_document(path)?;
         }
         Ok(app)
+    }
+
+    /// Formats the current local wall-clock time as `HH:MM:SS` using zero extra dependencies.
+    fn local_hms_timestamp() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            #[repr(C)]
+            struct SystemTimeWin {
+                w_year: u16,
+                w_month: u16,
+                w_day_of_week: u16,
+                w_day: u16,
+                w_hour: u16,
+                w_minute: u16,
+                w_second: u16,
+                w_milliseconds: u16,
+            }
+            unsafe extern "system" {
+                fn GetLocalTime(lp_system_time: *mut SystemTimeWin);
+            }
+            let mut st = SystemTimeWin {
+                w_year: 0,
+                w_month: 0,
+                w_day_of_week: 0,
+                w_day: 0,
+                w_hour: 0,
+                w_minute: 0,
+                w_second: 0,
+                w_milliseconds: 0,
+            };
+            unsafe { GetLocalTime(&mut st) };
+            return format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second);
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let day_secs = secs % 86_400;
+            let h = day_secs / 3600;
+            let m = (day_secs % 3600) / 60;
+            let s = day_secs % 60;
+            format!("{h:02}:{m:02}:{s:02}")
+        }
+    }
+
+    /// Captures the current `self.status_notice` into the bounded session Notification Board (max 50).
+    pub(super) fn record_status_notice_if_new(&mut self) {
+        let Some(ref msg) = self.status_notice else {
+            return;
+        };
+        if self.last_recorded_notice.as_deref() == Some(msg.as_str()) {
+            return;
+        }
+        let is_error = msg.starts_with("Error")
+            || msg.starts_with("ERROR")
+            || msg.contains("failed")
+            || msg.contains("Invalid")
+            || msg.contains("error:");
+        if self.notifications.len() >= 50 {
+            self.notifications.pop_front();
+        }
+        self.notifications.push_back(NotificationEntry {
+            timestamp: Self::local_hms_timestamp(),
+            message: msg.clone(),
+            is_error,
+        });
+        self.last_recorded_notice = Some(msg.clone());
     }
 
     /// Returns the portable `micropdf.ini` path next to the executable (or `custom_session_ini_path` in tests).
@@ -1105,21 +1209,47 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Saves open tabs, current page, view mode, recent files, and UI preferences to `micropdf.ini`
     /// next to the executable, falling back to the OS config folder if not writable.
+    ///
+    /// IMPORTANT: Never calls `sync_active_tab_to_slot()` (which moves `self.doc` out into the slot),
+    /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
-        self.sync_active_tab_to_slot();
         let mut saved_tabs = Vec::new();
-        for tab in &self.tabs {
-            if !tab.file_path.as_os_str().is_empty() && tab.file_path.exists() {
+        for (i, tab) in self.tabs.iter().enumerate() {
+            let (path, page_index, vm, last_vm) = if i == self.active_tab {
+                (
+                    &self.file_path,
+                    self.current_page_index,
+                    self.view_mode,
+                    self.last_page_view_mode,
+                )
+            } else {
+                (
+                    &tab.file_path,
+                    tab.current_page_index,
+                    tab.view_mode,
+                    tab.last_page_view_mode,
+                )
+            };
+            if !path.as_os_str().is_empty() && path.exists() {
                 saved_tabs.push(SavedSessionTab {
-                    path: tab.file_path.clone(),
-                    page_index: tab.current_page_index,
-                    view_mode: if tab.view_mode.is_page_view() {
-                        tab.view_mode
-                    } else {
-                        tab.last_page_view_mode
-                    },
+                    path: path.clone(),
+                    page_index,
+                    view_mode: if vm.is_page_view() { vm } else { last_vm },
                 });
             }
+        }
+        // If no tabs slice entry exists yet but a doc is loaded directly on self
+        if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() && self.file_path.exists()
+        {
+            saved_tabs.push(SavedSessionTab {
+                path: self.file_path.clone(),
+                page_index: self.current_page_index,
+                view_mode: if self.view_mode.is_page_view() {
+                    self.view_mode
+                } else {
+                    self.last_page_view_mode
+                },
+            });
         }
         let cfg = SessionConfig {
             active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),

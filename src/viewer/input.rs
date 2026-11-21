@@ -3145,6 +3145,12 @@ impl<'a> PdfViewerApp<'a> {
                 if self.open_menu.is_some() {
                     self.open_menu = None;
                     self.request_redraw();
+                } else if self.show_notifications {
+                    self.show_notifications = false;
+                    self.request_redraw();
+                } else if self.dragging_annotation.is_some() {
+                    self.dragging_annotation = None;
+                    self.request_redraw();
                 } else if self.active_note_popover.is_some() {
                     self.active_note_popover = None;
                     self.request_redraw();
@@ -3407,9 +3413,17 @@ impl<'a> PdfViewerApp<'a> {
 impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
-            let win_attrs = Window::default_attributes()
+            let icon = crate::app_icon::build_window_icon();
+            #[allow(unused_mut)]
+            let mut win_attrs = Window::default_attributes()
                 .with_title("MicroPDF")
-                .with_inner_size(LogicalSize::new(1024.0, 1080.0));
+                .with_inner_size(LogicalSize::new(1024.0, 1080.0))
+                .with_window_icon(icon.clone());
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                win_attrs = win_attrs.with_taskbar_icon(icon);
+            }
 
             let window = Rc::new(
                 event_loop
@@ -3771,7 +3785,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         new_hover = Some(UiHit::MenuItem(idx));
                     }
                 } else {
-                    if self.input_mode != InputMode::Normal {
+                    if self.show_notifications {
+                        if let Some(on_clear) = self.hit_test_notification_board(position.x, position.y, win_w, win_h, status_bar_h, sf) {
+                            if on_clear {
+                                new_hover = Some(UiHit::NotificationClear);
+                            }
+                        }
+                    }
+                    if new_hover.is_none() && self.input_mode != InputMode::Normal {
                         if let Some(h) = self.hit_test_active_input_overlay(position.x, position.y, win_w, top_bars_h, sf) {
                             if h != super::overlays::OverlayHit::InsideModal {
                                 new_hover = Some(UiHit::Overlay(h));
@@ -3848,6 +3869,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     || self.show_customize_toolbar
                     || self.open_menu.is_some()
                 {
+                    return;
+                }
+
+                if self.dragging_annotation.is_some() {
+                    self.request_redraw();
                     return;
                 }
 
@@ -4037,6 +4063,35 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         self.request_redraw();
                     }
                     return;
+                }
+
+                // 0a1. Session Notification Board popover clicks
+                if self.show_notifications && state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(on_clear) = self.hit_test_notification_board(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        if on_clear {
+                            self.notifications.clear();
+                            self.last_recorded_notice = None;
+                            self.status_notice = None;
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    // Clicking outside closes the notification board unless clicking its toggle button itself
+                    let clicking_toggle = status_bar_h > 0
+                        && (self.cursor_pos.1 as i32) >= win_h.saturating_sub(status_bar_h) as i32
+                        && self.hit_test_bottom_bar(self.cursor_pos.0, self.cursor_pos.1, win_w, win_h, status_bar_h, scale_factor)
+                            == Some(super::bottom_bar::BottomBarAction::NotificationBoard);
+                    if !clicking_toggle {
+                        self.show_notifications = false;
+                        self.request_redraw();
+                    }
                 }
 
                 // 0a2. Active input overlay card / Floating Search pill clicks
@@ -4399,13 +4454,50 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
-                // 3. Page View mouse drag interactions: Select, Annotations (8 tools), Redact, Crop, StampImage
+                // 3. Page View mouse drag interactions: Select, Move Note/TextBox, Annotations (8 tools), Redact, Crop, StampImage
                 if button == MouseButton::Left {
                     match state {
                         ElementState::Pressed => {
                             if self.active_note_popover.is_some() {
                                 self.active_note_popover = None;
                                 self.request_redraw();
+                            }
+                            // Check if grabbing an existing Sticky Note or Text Box to drag-reposition it
+                            if matches!(
+                                self.mouse_mode,
+                                MouseMode::Select | MouseMode::StickyNote | MouseMode::FreeText
+                            ) {
+                                if let Some((page_idx, pt_x, pt_y)) =
+                                    self.screen_point_to_pdf_point(self.cursor_pos.0, self.cursor_pos.1)
+                                {
+                                    let hit_movable = self.doc.as_ref().and_then(|doc| {
+                                        let page = doc.pages().get(page_idx).ok()?;
+                                        // Prefer topmost (last-created) matching Sticky Note or Text Box
+                                        PdfEngine::find_movable_annotations_on_page(&page)
+                                            .into_iter()
+                                            .rev()
+                                            .find(|m| {
+                                                pt_x.value >= m.bounds.left().value - 6.0
+                                                    && pt_x.value <= m.bounds.right().value + 6.0
+                                                    && pt_y.value >= m.bounds.bottom().value - 6.0
+                                                    && pt_y.value <= m.bounds.top().value + 6.0
+                                            })
+                                    });
+                                    if let Some(m) = hit_movable {
+                                        self.dragging_annotation = Some(DraggingAnnotation {
+                                            page_index: page_idx,
+                                            annot_index: m.index,
+                                            is_sticky_note: m.is_sticky_note,
+                                            orig_rect: m.bounds,
+                                            start_pdf_x: pt_x.value,
+                                            start_pdf_y: pt_y.value,
+                                            start_screen_x: self.cursor_pos.0,
+                                            start_screen_y: self.cursor_pos.1,
+                                            note_text: if m.text.is_empty() { None } else { Some(m.text) },
+                                        });
+                                        return;
+                                    }
+                                }
                             }
                             self.drag_start = Some(self.cursor_pos);
                             if self.mouse_mode == MouseMode::InkPen {
@@ -4414,6 +4506,58 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                         ElementState::Released => {
+                            if let Some(drag) = self.dragging_annotation.take() {
+                                let (sx2, sy2) = self.cursor_pos;
+                                let moved = (sx2 - drag.start_screen_x).abs() >= 5.0
+                                    || (sy2 - drag.start_screen_y).abs() >= 5.0;
+                                if moved {
+                                    if let Some((end_page, end_x, end_y)) =
+                                        self.screen_point_to_pdf_point(sx2, sy2)
+                                    {
+                                        if end_page == drag.page_index {
+                                            let dx = end_x.value - drag.start_pdf_x;
+                                            let dy = end_y.value - drag.start_pdf_y;
+                                            self.push_undo_snapshot();
+                                            if let Some(doc) = self.doc.as_mut() {
+                                                match PdfEngine::move_annotation_by(
+                                                    doc,
+                                                    drag.page_index,
+                                                    drag.annot_index,
+                                                    dx,
+                                                    dy,
+                                                ) {
+                                                    Ok(()) => {
+                                                        self.has_unsaved_edits = true;
+                                                        self.invalidate_page_caches();
+                                                        self.thumbnail_cache.remove(&drag.page_index);
+                                                        let kind = if drag.is_sticky_note {
+                                                            "Sticky Note"
+                                                        } else {
+                                                            "Text Box"
+                                                        };
+                                                        self.status_notice = Some(format!(
+                                                            "Moved {kind} on Page {} (Ctrl/Cmd+Z to undo)",
+                                                            drag.page_index + 1
+                                                        ));
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = self.undo_stack.pop_back();
+                                                        self.status_notice = Some(format!("Move annotation error: {e}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else if drag.is_sticky_note {
+                                    if let Some(txt) = drag.note_text {
+                                        self.active_note_popover =
+                                            Some((txt, sx2.round() as i32, sy2.round() as i32));
+                                    }
+                                }
+                                self.update_title_bar();
+                                self.request_redraw();
+                                return;
+                            }
                             if let Some((sx1, sy1)) = self.drag_start.take() {
                                 let (sx2, sy2) = self.cursor_pos;
                                 let is_click = (sx2 - sx1).abs() < 5.0 && (sy2 - sy1).abs() < 5.0;

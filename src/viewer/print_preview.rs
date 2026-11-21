@@ -30,6 +30,7 @@ pub(super) struct CachedPreviewSheet {
     pub(super) auto_trim: bool,
     pub(super) zoom_percent: u16,
     pub(super) grayscale: bool,
+    pub(super) include_annotations: bool,
     pub(super) pixels: Vec<u32>,
 }
 
@@ -154,6 +155,8 @@ pub(super) enum PrintPreviewHit {
     CopiesMinus,
     CopiesPlus,
     ToggleCollate,
+    AnnotationsInclude,
+    AnnotationsHide,
     PaperA4,
     PaperLetter,
     PaperLegal,
@@ -352,6 +355,12 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(RectHit { x: cop_x, y: cy, w: c_btn, h: row_h, hit: PrintPreviewHit::CopiesMinus });
         hits.push(RectHit { x: cop_x + cop_step_w - c_btn as i32, y: cy, w: c_btn, h: row_h, hit: PrintPreviewHit::CopiesPlus });
         hits.push(RectHit { x: coll_x, y: cy, w: coll_w, h: row_h, hit: PrintPreviewHit::ToggleCollate });
+        cy += row_h as i32 + sec_gap;
+
+        // 9. Annotations (With Annotations / Without Annotations)
+        cy += lbl_h;
+        hits.push(RectHit { x: ix, y: cy, w: half_row, h: row_h, hit: PrintPreviewHit::AnnotationsInclude });
+        hits.push(RectHit { x: ix + half_row as i32 + gap, y: cy, w: iw.saturating_sub(half_row + gap as u32), h: row_h, hit: PrintPreviewHit::AnnotationsHide });
 
         // Footer buttons
         let foot_h = (46.0 * s).round() as u32;
@@ -439,7 +448,7 @@ impl<'a> PdfViewerApp<'a> {
             .set_fixed_width(rw as i32)
             .set_fixed_height(rh as i32)
             .render_form_data(false)
-            .render_annotations(true)
+            .render_annotations(opts.include_annotations)
             .use_print_quality(true)
             .limit_render_image_cache_size(true)
             .set_reverse_byte_order(false)
@@ -524,6 +533,7 @@ impl<'a> PdfViewerApp<'a> {
                     && c.auto_trim == opts.auto_trim_margins
                     && c.zoom_percent == opts.zoom_percent
                     && c.grayscale == opts.grayscale
+                    && c.include_annotations == opts.include_annotations
                     && ((opts.booklet && c.render_w == print_w && c.render_h == print_h) || !opts.booklet)
             });
         if already_valid {
@@ -572,6 +582,7 @@ impl<'a> PdfViewerApp<'a> {
                     auto_trim: opts.auto_trim_margins,
                     zoom_percent: opts.zoom_percent,
                     grayscale: opts.grayscale,
+                    include_annotations: opts.include_annotations,
                     pixels: canvas,
                 });
             }
@@ -587,6 +598,7 @@ impl<'a> PdfViewerApp<'a> {
                         auto_trim: opts.auto_trim_margins,
                         zoom_percent: opts.zoom_percent,
                         grayscale: opts.grayscale,
+                        include_annotations: opts.include_annotations,
                         pixels,
                     });
                 }
@@ -931,6 +943,15 @@ impl<'a> PdfViewerApp<'a> {
             draw_pill(buffer, r, if pp.render_opts.collate { "✓ Collate" } else { "Collate" }, pp.render_opts.collate);
         }
 
+        // 9. Annotations (With / Without Annotations)
+        if let Some(r) = Self::find_hit(&layout, PrintPreviewHit::AnnotationsInclude) {
+            draw_text(buffer, buf_w, buf_h, ix, r.y - lbl_h, "Annotations", lbl_sz, theme.text_muted, true);
+            draw_pill(buffer, r, if pp.render_opts.include_annotations { "✓ With Annots" } else { "With Annots" }, pp.render_opts.include_annotations);
+        }
+        if let Some(r) = Self::find_hit(&layout, PrintPreviewHit::AnnotationsHide) {
+            draw_pill(buffer, r, if !pp.render_opts.include_annotations { "✓ No Annots" } else { "No Annots" }, !pp.render_opts.include_annotations);
+        }
+
         // Footer divider & buttons
         let foot_h = (46.0 * s).round() as u32;
         let fy = layout.my + layout.mh as i32 - foot_h as i32;
@@ -1094,6 +1115,14 @@ impl<'a> PdfViewerApp<'a> {
                 PrintPreviewHit::ScaleActual => pp.render_opts.fit_to_page = false,
                 PrintPreviewHit::ColorColor => pp.render_opts.grayscale = false,
                 PrintPreviewHit::ColorGray => pp.render_opts.grayscale = true,
+                PrintPreviewHit::AnnotationsInclude => {
+                    pp.render_opts.include_annotations = true;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::AnnotationsHide => {
+                    pp.render_opts.include_annotations = false;
+                    pp.cached_sheet = None;
+                }
                 PrintPreviewHit::ToggleAutoTrim => {
                     pp.render_opts.auto_trim_margins = !pp.render_opts.auto_trim_margins;
                 }

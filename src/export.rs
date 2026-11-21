@@ -228,14 +228,43 @@ fn extract_page_runs(page: &PdfPage) -> (f32, f32, Vec<TextRun>) {
     (page_w, page_h, runs)
 }
 
-/// Groups runs into lines sorted top-to-bottom (descending PDF `y`), respecting 2-column layouts.
+/// Returns true if a trimmed token looks like a numeric/tabular value (numbers, currency,
+/// percentages, dates, dashes, or accounting parentheses like `(1,234.50)`).
+pub(crate) fn is_numeric_cell(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if matches!(t, "-" | "–" | "—" | "N/A" | "n/a") {
+        return true;
+    }
+    let mut digits = 0usize;
+    let mut letters = 0usize;
+    for ch in t.chars() {
+        if ch.is_ascii_digit() {
+            digits += 1;
+        } else if ch.is_alphabetic() {
+            letters += 1;
+        } else if !matches!(ch, '.' | ',' | '%' | '$' | '€' | '£' | '¥' | '₹' | '+' | '-' | '−' | '(' | ')' | '/' | ':' | ' ') {
+            return false;
+        }
+    }
+    digits > 0 && letters <= 2
+}
+
+/// Groups runs into lines sorted top-to-bottom (descending PDF `y`), respecting 2-column prose
+/// layouts WITHOUT accidentally splitting multi-column tables (e.g. Excel/Word tables with
+/// text labels on the left and numbers on the right).
 fn group_runs_into_lines(page_w: f32, mut runs: Vec<TextRun>) -> Vec<TextLine> {
     if runs.is_empty() {
         return Vec::new();
     }
 
-    // Detect clean 2-column split: many runs strictly on left half & strictly on right half,
-    // with very few runs crossing the central gutter.
+    // First group horizontally across the full page width to inspect whether rows are tabular.
+    let full_rows = group_single_column_lines(runs.clone());
+
+    // Detect clean 2-column prose split ONLY when left & right halves are genuinely independent
+    // wrapped prose columns (NOT aligned table rows with numbers or 3+ cells per row!).
     let mid = page_w * 0.5;
     let gutter = page_w * 0.03;
     let mut left_col = Vec::new();
@@ -250,9 +279,72 @@ fn group_runs_into_lines(page_w: f32, mut runs: Vec<TextRun>) -> Vec<TextLine> {
             spanning.push(r.clone());
         }
     }
-    let is_two_col = left_col.len() >= 8
+
+    let candidate_two_col = left_col.len() >= 8
         && right_col.len() >= 8
         && spanning.len() * 5 < runs.len();
+
+    let is_two_col = if candidate_two_col {
+        let mut rows_3plus_cells = 0usize;
+        let mut rows_both_sides = 0usize;
+        let mut right_numeric_runs = 0usize;
+        let mut right_short_rows = 0usize;
+        let mut left_lines_count = 0usize;
+
+        for row in &full_rows {
+            let cells = split_line_into_cell_spans(row);
+            if cells.len() >= 3 {
+                rows_3plus_cells += 1;
+            }
+            let has_left = row.runs.iter().any(|r| r.right <= mid + gutter * 0.5);
+            let has_right = row.runs.iter().any(|r| r.left >= mid - gutter * 0.5);
+            if has_left {
+                left_lines_count += 1;
+            }
+            if has_left && has_right {
+                rows_both_sides += 1;
+                let right_txt: String = row
+                    .runs
+                    .iter()
+                    .filter(|r| r.left >= mid - gutter * 0.5)
+                    .map(|r| r.text.trim())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if right_txt.chars().count() <= 22 {
+                    right_short_rows += 1;
+                }
+            }
+        }
+        for r in &right_col {
+            if is_numeric_cell(&r.text) {
+                right_numeric_runs += 1;
+            }
+        }
+        let right_lines = group_single_column_lines(right_col.clone());
+        let avg_right_chars: f32 = if right_lines.is_empty() {
+            0.0
+        } else {
+            right_lines
+                .iter()
+                .map(|l| l.plain_text().chars().count() as f32)
+                .sum::<f32>()
+                / right_lines.len() as f32
+        };
+
+        // Tabular indicators:
+        // 1. Multiple rows have >= 3 separated cells (Excel/Word multi-column table), OR
+        // 2. Right half is predominantly numeric values (financial/summary tables), OR
+        // 3. Most rows align across left & right AND right-side entries are short labels/values (not wrapped prose).
+        let looks_tabular = rows_3plus_cells >= 2
+            || right_numeric_runs * 3 >= right_col.len()
+            || (left_lines_count >= 3
+                && rows_both_sides * 2 >= left_lines_count
+                && (right_short_rows * 2 >= rows_both_sides || avg_right_chars < 24.0));
+
+        !looks_tabular
+    } else {
+        false
+    };
 
     if is_two_col {
         // Put spanning headers above the 2-column body, then left column, then right column.
@@ -353,25 +445,149 @@ fn group_single_column_lines(mut runs: Vec<TextRun>) -> Vec<TextLine> {
     lines
 }
 
-fn split_line_into_table_cells(line: &TextLine) -> Option<Vec<String>> {
-    if line.runs.len() < 2 {
-        return None;
+fn split_line_into_cell_spans(line: &TextLine) -> Vec<(f32, f32, String)> {
+    if line.runs.is_empty() {
+        return Vec::new();
     }
-    let gap_thresh = (line.avg_font * 1.45).max(16.0);
-    let mut cells: Vec<Vec<TextRun>> = vec![vec![line.runs[0].clone()]];
+    let gap_thresh = (line.avg_font * 1.35).max(12.0);
+    let mut groups: Vec<Vec<TextRun>> = vec![vec![line.runs[0].clone()]];
     for r in line.runs.iter().skip(1) {
-        let prev_r = cells.last().unwrap().last().unwrap().right;
+        let prev_r = groups.last().unwrap().last().unwrap().right;
         if r.left - prev_r >= gap_thresh {
-            cells.push(vec![r.clone()]);
+            groups.push(vec![r.clone()]);
         } else {
-            cells.last_mut().unwrap().push(r.clone());
+            groups.last_mut().unwrap().push(r.clone());
         }
     }
-    if cells.len() >= 2 {
-        Some(cells.into_iter().map(|c| join_runs_plain(&c)).collect())
-    } else {
-        None
+    let mut spans = Vec::with_capacity(groups.len());
+    for g in groups {
+        let left = g.iter().map(|r| r.left).fold(f32::INFINITY, f32::min);
+        let right = g.iter().map(|r| r.right).fold(f32::NEG_INFINITY, f32::max);
+        let txt = join_runs_plain(&g);
+        if !txt.is_empty() {
+            spans.push((left, right, txt));
+        }
     }
+    spans
+}
+
+/// Extracts a multi-row table starting at `start` by clustering cell X-intervals across
+/// consecutive rows into canonical columns. Preserves blank cells and right-aligned numbers.
+fn try_extract_column_table(
+    lines: &[TextLine],
+    start: usize,
+    body_font: f32,
+) -> Option<(Vec<Vec<String>>, usize)> {
+    let first_spans = split_line_into_cell_spans(&lines[start]);
+    if first_spans.len() < 2 {
+        return None;
+    }
+
+    let mut row_spans: Vec<Vec<(f32, f32, String)>> = vec![first_spans];
+    let mut j = start + 1;
+    while j < lines.len() {
+        let vgap = lines[j - 1].bottom - lines[j].top;
+        if vgap > body_font * 2.8 || vgap < -body_font * 2.0 {
+            break;
+        }
+        let ratio = lines[j].avg_font / body_font.max(6.0);
+        if ratio >= 1.38 {
+            break;
+        }
+        let spans = split_line_into_cell_spans(&lines[j]);
+        if spans.len() >= 2 {
+            row_spans.push(spans);
+            j += 1;
+        } else if spans.len() == 1 {
+            // Allow a single-cell section/blank-tail row ONLY if another multi-cell row immediately follows.
+            let next_is_multi = j + 1 < lines.len()
+                && (lines[j].bottom - lines[j + 1].top) <= body_font * 2.8
+                && split_line_into_cell_spans(&lines[j + 1]).len() >= 2;
+            if next_is_multi {
+                row_spans.push(spans);
+                j += 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // Trim any trailing single-span rows.
+    while row_spans.len() > 1 && row_spans.last().is_some_and(|r| r.len() < 2) {
+        row_spans.pop();
+    }
+    let multi_rows = row_spans.iter().filter(|r| r.len() >= 2).count();
+    if row_spans.len() < 2 || multi_rows < 2 {
+        return None;
+    }
+
+    // Seed column X-intervals from multi-cell rows so wide 1-cell subheaders don't fuse columns.
+    let mut seed_intervals: Vec<(f32, f32)> = Vec::new();
+    for spans in &row_spans {
+        if spans.len() >= 2 {
+            for &(l, r, _) in spans {
+                seed_intervals.push((l, r));
+            }
+        }
+    }
+    seed_intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let merge_tol = (body_font * 0.35).max(3.0);
+    let mut cols: Vec<(f32, f32)> = Vec::new();
+    for (l, r) in seed_intervals {
+        if let Some(last) = cols.last_mut() {
+            if l <= last.1 + merge_tol {
+                last.1 = last.1.max(r);
+                continue;
+            }
+        }
+        cols.push((l, r));
+    }
+
+    if cols.len() < 2 || cols.len() > 14 {
+        return None;
+    }
+
+    let mut table_rows: Vec<Vec<String>> = Vec::with_capacity(row_spans.len());
+    for spans in &row_spans {
+        let mut cells = vec![String::new(); cols.len()];
+        for (l, r, txt) in spans {
+            let mut best_col = 0usize;
+            let mut best_overlap = f32::NEG_INFINITY;
+            for (ci, &(cl, cr)) in cols.iter().enumerate() {
+                let overlap = r.min(cr) - l.max(cl);
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best_col = ci;
+                }
+            }
+            if best_overlap <= 0.0 {
+                // Fallback to nearest column center
+                let mid = (l + r) * 0.5;
+                let mut best_dist = f32::INFINITY;
+                for (ci, &(cl, cr)) in cols.iter().enumerate() {
+                    let cmid = (cl + cr) * 0.5;
+                    let d = (mid - cmid).abs();
+                    if d < best_dist {
+                        best_dist = d;
+                        best_col = ci;
+                    }
+                }
+            }
+            if cells[best_col].is_empty() {
+                cells[best_col] = txt.clone();
+            } else {
+                cells[best_col].push(' ');
+                cells[best_col].push_str(txt);
+            }
+        }
+        table_rows.push(cells);
+    }
+
+    let end_idx = start + row_spans.len();
+    Some((table_rows, end_idx))
 }
 
 fn parse_bullet_prefix(text: &str) -> Option<&str> {
@@ -440,30 +656,11 @@ fn classify_lines_into_blocks(lines: &[TextLine], body_font: f32) -> Vec<ExportB
             continue;
         }
 
-        // Check for a multi-row simple table (>= 2 consecutive lines with identical cell count >= 2)
-        if let Some(first_row) = split_line_into_table_cells(line) {
-            let cols = first_row.len();
-            let mut rows = vec![first_row];
-            let mut j = i + 1;
-            while j < lines.len() {
-                let vgap = lines[j - 1].bottom - lines[j].top;
-                if vgap > body_font * 2.5 {
-                    break;
-                }
-                if let Some(next_row) = split_line_into_table_cells(&lines[j]) {
-                    if next_row.len() == cols {
-                        rows.push(next_row);
-                        j += 1;
-                        continue;
-                    }
-                }
-                break;
-            }
-            if rows.len() >= 2 {
-                blocks.push(ExportBlock::Table(rows));
-                i = j;
-                continue;
-            }
+        // Check for a multi-row column-aligned table (handles blank cells & right-aligned numbers)
+        if let Some((rows, next_i)) = try_extract_column_table(lines, i, body_font) {
+            blocks.push(ExportBlock::Table(rows));
+            i = next_i;
+            continue;
         }
 
         // Heading detection by font ratio or short standalone bold line
@@ -522,7 +719,7 @@ fn classify_lines_into_blocks(lines: &[TextLine], body_font: f32) -> Vec<ExportB
                 || next_ratio >= 1.15
                 || parse_bullet_prefix(&next_plain).is_some()
                 || parse_numbered_prefix(&next_plain).is_some()
-                || split_line_into_table_cells(next).is_some()
+                || try_extract_column_table(lines, j, body_font).is_some()
             {
                 break;
             }
@@ -1030,5 +1227,117 @@ mod tests {
     #[test]
     fn test_escape_latex_special_characters() {
         assert_eq!(escape_latex("50% & $10 #1 _a {b}"), "50\\% \\& \\$10 \\#1 \\_a \\{b\\}");
+    }
+
+    fn mk_run(text: &str, left: f32, right: f32, y: f32, bold: bool) -> TextRun {
+        TextRun {
+            text: text.to_string(),
+            left,
+            right,
+            bottom: y,
+            top: y + 10.0,
+            font_size: 10.0,
+            bold,
+            italic: false,
+            link: None,
+        }
+    }
+
+    #[test]
+    fn test_excel_table_not_split_into_text_and_number_flows() {
+        // Simulates a 595pt-wide page exported from Excel: text labels on the left half,
+        // numeric columns on the right half, including a section row and a blank cell.
+        let runs = vec![
+            // Header row
+            mk_run("Line Item", 50.0, 120.0, 720.0, true),
+            mk_run("Q1", 345.0, 365.0, 720.0, true),
+            mk_run("Q2", 425.0, 445.0, 720.0, true),
+            mk_run("Total", 495.0, 530.0, 720.0, true),
+            // Row 1
+            mk_run("Product Revenue", 50.0, 155.0, 702.0, false),
+            mk_run("$12,450", 322.0, 365.0, 702.0, false),
+            mk_run("$14,800", 402.0, 445.0, 702.0, false),
+            mk_run("$27,250", 485.0, 530.0, 702.0, false),
+            // Row 2: blank Q1 cell
+            mk_run("Consulting Fees", 50.0, 150.0, 684.0, false),
+            mk_run("$3,200", 408.0, 445.0, 684.0, false),
+            mk_run("$3,200", 491.0, 530.0, 684.0, false),
+            // Row 3: single-cell subheader
+            mk_run("Operating Costs", 50.0, 150.0, 666.0, true),
+            // Row 4
+            mk_run("Cloud Hosting", 50.0, 140.0, 648.0, false),
+            mk_run("$1,100", 328.0, 365.0, 648.0, false),
+            mk_run("$1,250", 408.0, 445.0, 648.0, false),
+            mk_run("$2,350", 491.0, 530.0, 648.0, false),
+            // Row 5
+            mk_run("Net Income", 50.0, 125.0, 630.0, true),
+            mk_run("$11,350", 322.0, 365.0, 630.0, true),
+            mk_run("$16,750", 402.0, 445.0, 630.0, true),
+            mk_run("$28,100", 485.0, 530.0, 630.0, true),
+            // Row 6
+            mk_run("Margin", 50.0, 95.0, 612.0, false),
+            mk_run("91.2%", 332.0, 365.0, 612.0, false),
+            mk_run("93.1%", 412.0, 445.0, 612.0, false),
+            mk_run("92.3%", 495.0, 530.0, 612.0, false),
+            // Row 7
+            mk_run("Headcount", 50.0, 115.0, 594.0, false),
+            mk_run("14", 352.0, 365.0, 594.0, false),
+            mk_run("16", 432.0, 445.0, 594.0, false),
+            mk_run("16", 517.0, 530.0, 594.0, false),
+            // Row 8
+            mk_run("Notes", 50.0, 90.0, 576.0, false),
+            mk_run("OK", 348.0, 365.0, 576.0, false),
+            mk_run("OK", 428.0, 445.0, 576.0, false),
+            mk_run("Audited", 492.0, 530.0, 576.0, false),
+        ];
+
+        let lines = group_runs_into_lines(595.0, runs);
+        // Must stay 9 horizontal rows (NOT split into 9 left rows + 8 right rows!)
+        assert_eq!(lines.len(), 9);
+        assert!(lines[0].plain_text().contains("Line Item"));
+        assert!(lines[0].plain_text().contains("Total"));
+
+        let blocks = classify_lines_into_blocks(&lines, 10.0);
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
+            ExportBlock::Table(rows) => {
+                assert_eq!(rows.len(), 9);
+                assert_eq!(rows[0], vec!["Line Item", "Q1", "Q2", "Total"]);
+                assert_eq!(rows[1], vec!["Product Revenue", "$12,450", "$14,800", "$27,250"]);
+                // Blank Q1 cell preserved in Consulting Fees row!
+                assert_eq!(rows[2], vec!["Consulting Fees", "", "$3,200", "$3,200"]);
+                // Single-cell subheader preserved!
+                assert_eq!(rows[3], vec!["Operating Costs", "", "", ""]);
+                assert_eq!(rows[5], vec!["Net Income", "$11,350", "$16,750", "$28,100"]);
+            }
+            other => panic!("Expected ExportBlock::Table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_true_two_column_academic_prose_still_reads_left_then_right() {
+        let mut runs = Vec::new();
+        for idx in 0..9 {
+            let y = 700.0 - idx as f32 * 14.0;
+            runs.push(mk_run(
+                &format!("Left column prose line {idx} with enough words to fill a column."),
+                40.0,
+                275.0,
+                y,
+                false,
+            ));
+            runs.push(mk_run(
+                &format!("Right column prose line {idx} continuing the academic paper text."),
+                315.0,
+                555.0,
+                y,
+                false,
+            ));
+        }
+        let lines = group_runs_into_lines(595.0, runs);
+        assert_eq!(lines.len(), 18);
+        assert!(lines[0].plain_text().starts_with("Left column prose line 0"));
+        assert!(lines[8].plain_text().starts_with("Left column prose line 8"));
+        assert!(lines[9].plain_text().starts_with("Right column prose line 0"));
     }
 }

@@ -686,8 +686,8 @@ impl<'a> PdfViewerApp<'a> {
         center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.3.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
-        center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium, winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
-        center_text(buffer, cy + (156.0 * s).round() as i32, "MIT License · See THIRD_PARTY_NOTICES.md", sub_sz, theme.text_muted, false);
+        center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
+        center_text(buffer, cy + (156.0 * s).round() as i32, "MIT License · Fonts: Liberation Sans (SIL OFL) · Press ? for Shortcuts", sub_sz, theme.text_muted, false);
 
         let btn_w = (88.0 * s).round() as u32;
         let btn_h = (28.0 * s).round() as u32;

@@ -84,7 +84,7 @@ impl ToolbarItem {
     }
 
     pub fn default_enabled(self) -> bool {
-        true
+        !matches!(self, Self::Sidebar | Self::Grid)
     }
 }
 
@@ -252,7 +252,7 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         let s = sf as f32;
-        let btn_h = (22.0 * s).round().clamp(16.0, (bar_h as f32) - 4.0) as u32;
+        let btn_h = (22.0 * s).round().clamp(16.0, ((bar_h as f32) - 4.0).max(16.0)) as u32;
         let btn_y = ((bar_h.saturating_sub(btn_h)) / 2) as i32;
         let sq_w = (23.0 * s).round().max(18.0) as u32;
         let gap = (2.0 * s).round().max(1.0) as i32;
@@ -584,6 +584,25 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
         None
+    }
+
+    /// Returns the `(x, y, w, h)` screen rect of a top-toolbar button for anchoring floating tooltips.
+    pub(super) fn toolbar_widget_rect(
+        &self,
+        action: ToolbarAction,
+        start_x: i32,
+        buf_w: u32,
+        bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        if !self.show_toolbar || bar_h == 0 {
+            return None;
+        }
+        let (widgets, _) = self.compute_inline_toolbar_layout(start_x, buf_w, bar_h, sf);
+        widgets
+            .into_iter()
+            .find(|w| w.action == action)
+            .map(|w| (w.x, w.y, w.w, w.h))
     }
 
     pub(super) fn execute_toolbar_action(&mut self, action: ToolbarAction) {
