@@ -9,14 +9,21 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::window::Window;
-use super::get_current_rss_mb;
 
-pub(super) const BG_COLOR_U32: u32 = 0x002B2B2B; // #2B2B2B subtle dark gray margin background
-pub(super) const SIDEBAR_BG_U32: u32 = 0x001E2229;
-pub(super) const SIDEBAR_WIDTH_LOGICAL: u32 = 240;
-pub(super) const MENU_BAR_HEIGHT_LOGICAL: u32 = 24;
+use super::overlays::OverlayHit;
+use super::print_preview::{PrintPreviewHit, PrintPreviewState};
+use super::theme::{UiTheme, UiThemeMode};
+use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
+
+#[allow(dead_code)]
+pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
+#[allow(dead_code)]
+pub(super) const SIDEBAR_BG_U32: u32 = 0x00F8FAFC;
+pub(super) const SIDEBAR_WIDTH_LOGICAL: u32 = 248;
+/// Unified top bar hosting both menus (`File..Help`) and the inline customizable icon toolbar.
+pub(super) const MENU_BAR_HEIGHT_LOGICAL: u32 = 32;
 pub(super) const TAB_BAR_HEIGHT_LOGICAL: u32 = 28;
-pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 22;
+pub(super) const STATUS_BAR_HEIGHT_LOGICAL: u32 = 24;
 pub(super) const PAGE_MARGIN_PX: u32 = 24;
 pub(super) const SPREAD_GAP_PX: u32 = 12;
 pub(super) const THUMB_W: u32 = 140;
@@ -37,7 +44,7 @@ pub(super) const UNDO_BYTES_BUDGET: usize = 64 * 1024 * 1024;
 /// Window in which a second `U` press confirms Flatten & Unlock on a signed document.
 pub(super) const FLATTEN_CONFIRM_WINDOW: Duration = Duration::from_secs(5);
 
-/// Top Menu Bar categories (`#1E1E1E` bar at the very top of the window).
+/// Top Menu Bar categories on the unified top bar.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MenuCategory {
     File,
@@ -60,12 +67,12 @@ impl MenuCategory {
 
     pub fn label(self) -> &'static str {
         match self {
-            MenuCategory::File => "[ File ]",
-            MenuCategory::View => "[ View ]",
-            MenuCategory::Edit => "[ Edit ]",
-            MenuCategory::Page => "[ Page ]",
-            MenuCategory::Tools => "[ Tools ]",
-            MenuCategory::Help => "[ Help ]",
+            MenuCategory::File => "File",
+            MenuCategory::View => "View",
+            MenuCategory::Edit => "Edit",
+            MenuCategory::Page => "Page",
+            MenuCategory::Tools => "Tools",
+            MenuCategory::Help => "Help",
         }
     }
 
@@ -94,6 +101,9 @@ impl MenuCategory {
                 "Cycle Dark / Sepia / Normal Reading Mode (V)",
                 "Toggle Fullscreen (F11)",
                 "Presentation Mode (F5)",
+                "Show Toolbar",
+                "Customize Toolbar...",
+                "Switch Light / Dark UI",
             ],
             MenuCategory::Edit => &[
                 "Undo (Ctrl+Z / Cmd+Z)",
@@ -122,7 +132,10 @@ impl MenuCategory {
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
             ],
-            MenuCategory::Help => &["Toggle Shortcuts Overlay (? / F1)"],
+            MenuCategory::Help => &[
+                "Keyboard & Mouse Shortcuts (? / F1)",
+                "About MicroPDF",
+            ],
         }
     }
 }
@@ -233,12 +246,28 @@ pub(super) struct SavedSessionTab {
     pub(super) view_mode: ViewMode,
 }
 
-/// Parsed contents of `micropdf.ini` (open tabs, active tab, and last 10 recent files).
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, and UI preferences).
+#[derive(Clone, Debug, PartialEq)]
 pub(super) struct SessionConfig {
     pub(super) active_tab: usize,
     pub(super) tabs: Vec<SavedSessionTab>,
     pub(super) recent_files: Vec<PathBuf>,
+    pub(super) ui_theme: UiThemeMode,
+    pub(super) show_toolbar: bool,
+    pub(super) toolbar_config: ToolbarConfig,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            active_tab: 0,
+            tabs: Vec::new(),
+            recent_files: Vec::new(),
+            ui_theme: UiThemeMode::Light,
+            show_toolbar: true,
+            toolbar_config: ToolbarConfig::default(),
+        }
+    }
 }
 
 /// Holds a single visible page's rasterized 0x00RRGGBB pixels.
@@ -275,7 +304,7 @@ pub(super) struct TileKey {
     pub(super) tile_row: u16,
 }
 
-/// Cached 512x512 tile bitmap with LRU access tick (`tile_cache` max 48 MB).
+/// Cached 512x512 tile bitmap with LRU access tick (`tile_cache` max 16 MB).
 pub(super) struct TileEntry {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -340,8 +369,28 @@ pub(super) enum ThumbBadgeHit {
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) enum SidebarHit {
+    AddBookmarkButton,
     ImportTxtButton,
     BookmarkRow { index: usize, on_delete: bool },
+}
+
+/// Unified hovered UI widget identifier so `CursorMoved` only redraws when hover actually changes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum UiHit {
+    MenuHeader(MenuCategory),
+    MenuItem(usize),
+    Toolbar(ToolbarAction),
+    Tab(usize),
+    TabClose(usize),
+    TabNew,
+    SidebarAdd,
+    SidebarImport,
+    SidebarRow(usize),
+    SidebarDelete(usize),
+    Scrollbar,
+    Customize(CustomizeHit),
+    PrintPreview(PrintPreviewHit),
+    Overlay(OverlayHit),
 }
 
 /// Interactive Command Prompt HUD state machine in the Bottom Command Bar & Window Title Bar.
@@ -405,8 +454,8 @@ pub(super) enum InputMode {
         clean_scans: bool,
         previewing: bool,
     },
-    /// Bottom-bar print prompt (macOS/Linux; Windows uses the native dialog).
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Legacy print prompt retained for existing tests; interactive printing uses `print_preview`.
+    #[allow(dead_code)]
     PrintPrompt {
         printers: Vec<String>,
         selected_printer: usize,
@@ -579,7 +628,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) pan_x: f32,
     /// Vertical scroll offset in physical pixels when zoomed or in `FitWidth` / `FitTextWidth` / `ContinuousScroll`.
     pub(super) scroll_y: f32,
-    /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 48 MB).
+    /// LRU 512x512 tile cache used when a page's zoomed size exceeds 2x the viewport size (capped at 16 MB).
     pub(super) tile_cache: HashMap<TileKey, TileEntry>,
     pub(super) tile_lru_tick: u64,
     /// Navigation history of `(page_index, scroll_y)` entries (capped at `MAX_NAV_HISTORY = 50`).
@@ -658,6 +707,20 @@ pub struct PdfViewerApp<'a> {
     pub(super) input_mode: InputMode,
     pub(super) pending_dialog: Option<PendingDialog>,
     pub(super) show_help_overlay: bool,
+    pub(super) show_about_overlay: bool,
+    pub(super) show_customize_toolbar: bool,
+    /// Bright Light default UI theme with Dark Mode toggle.
+    pub(super) ui_theme_mode: UiThemeMode,
+    /// Inline icon toolbar beside the menus on the unified top bar (`View -> Show Toolbar`).
+    pub(super) show_toolbar: bool,
+    /// Per-button customization persisted in `micropdf.ini`.
+    pub(super) toolbar_config: ToolbarConfig,
+    /// Active Print Preview modal state (0 bytes when closed).
+    pub(super) print_preview: Option<PrintPreviewState>,
+    /// Unified hovered UI widget to coalesce redraws and show crisp hover feedback.
+    pub(super) hovered_widget: Option<UiHit>,
+    /// True while dragging the right-edge overlay vertical scrollbar.
+    pub(super) scrollbar_drag: bool,
     /// True when `F11` fullscreen (or `F5` presentation) is active with menu/tab/status bars hidden.
     pub(super) is_fullscreen: bool,
     /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
@@ -675,6 +738,10 @@ pub struct PdfViewerApp<'a> {
 
 
 impl<'a> PdfViewerApp<'a> {
+    pub(super) fn ui_theme(&self) -> UiTheme {
+        self.ui_theme_mode.theme()
+    }
+
     pub fn new(engine: &'a PdfEngine, initial_path: Option<PathBuf>) -> Result<Self> {
         // Print temp files left behind by a previous run that was killed mid-print.
         crate::print::remove_stale_print_temp_files(&std::env::temp_dir());
@@ -755,11 +822,19 @@ impl<'a> PdfViewerApp<'a> {
             input_mode: InputMode::Normal,
             pending_dialog: None,
             show_help_overlay: false,
+            show_about_overlay: false,
+            show_customize_toolbar: false,
+            ui_theme_mode: UiThemeMode::Light,
+            show_toolbar: true,
+            toolbar_config: ToolbarConfig::default(),
+            print_preview: None,
+            hovered_widget: None,
+            scrollbar_drag: false,
             is_fullscreen: false,
             is_presentation: false,
             pre_presentation_state: None,
             status_notice: if initial_path.is_none() {
-                Some("Open PDF (O) or drag and drop a file into this window".to_string())
+                Some("Drop a PDF here or press O to open".to_string())
             } else {
                 None
             },
@@ -816,7 +891,10 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
-        let mut out = String::from("# MicroPDF v1.2 Session & Recent Files\n");
+        let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
+        out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
+        out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
+        out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         out.push_str(&format!("active_tab={}\n", cfg.active_tab));
         for tab in &cfg.tabs {
             let p_str = tab.path.to_string_lossy().replace('\n', "").replace('\r', "");
@@ -845,7 +923,14 @@ impl<'a> PdfViewerApp<'a> {
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            if let Some(val) = line.strip_prefix("active_tab=") {
+            if let Some(val) = line.strip_prefix("ui_theme=") {
+                cfg.ui_theme = UiThemeMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("show_toolbar=") {
+                let v = val.trim();
+                cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("toolbar_items=") {
+                cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("active_tab=") {
                 if let Ok(idx) = val.trim().parse::<usize>() {
                     cfg.active_tab = idx;
                 }
@@ -889,8 +974,8 @@ impl<'a> PdfViewerApp<'a> {
         self.recent_files.truncate(MAX_RECENT_FILES);
     }
 
-    /// Saves open tabs, current page, view mode, and recent files to `micropdf.ini` next to the executable,
-    /// falling back to the OS config folder (and setting a status bar notice) if the exe folder isn't writable.
+    /// Saves open tabs, current page, view mode, recent files, and UI preferences to `micropdf.ini`
+    /// next to the executable, falling back to the OS config folder if not writable.
     pub(super) fn save_session_to_ini(&mut self) {
         self.sync_active_tab_to_slot();
         let mut saved_tabs = Vec::new();
@@ -911,6 +996,9 @@ impl<'a> PdfViewerApp<'a> {
             active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
+            ui_theme: self.ui_theme_mode,
+            show_toolbar: self.show_toolbar,
+            toolbar_config: self.toolbar_config.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
         let primary_path = self.portable_session_ini_path();
@@ -947,6 +1035,9 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         let cfg = Self::parse_session_ini(&content);
+        self.ui_theme_mode = cfg.ui_theme;
+        self.show_toolbar = cfg.show_toolbar;
+        self.toolbar_config = cfg.toolbar_config;
         self.recent_files = cfg
             .recent_files
             .into_iter()
@@ -1378,10 +1469,6 @@ impl<'a> PdfViewerApp<'a> {
         Self::rotation_degrees_of_page(&page)
     }
 
-    pub(super) fn current_page_rotation_degrees(&self) -> i32 {
-        self.page_rotation_degrees(self.current_page_index)
-    }
-
     pub(super) fn filename_display(&self) -> String {
         if self.doc.is_none() && self.file_path.as_os_str().is_empty() {
             return "No PDF Open".to_string();
@@ -1513,42 +1600,14 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
 
-        let title = if let Some(prompt) = self.format_active_prompt_text() {
-            format!("MicroPDF | {prompt}")
+        let title = if self.doc.is_none() {
+            "MicroPDF".to_string()
         } else {
-            let total = self.total_pages();
-            let current_1based = if total > 0 {
-                self.current_page_index + 1
-            } else {
-                0
-            };
-            let page_display = if total > 0 && self.roman_end > 0 {
-                let logical_lbl = PdfEngine::format_logical_page_label(
-                    self.current_page_index as usize,
-                    self.roman_end,
-                );
-                format!("Page {} ({} of {})", logical_lbl, current_1based, total)
-            } else if self.view_mode == ViewMode::TwoPageSpread && current_1based + 1 <= total {
-                format!("Pages {}-{} / {}", current_1based, current_1based + 1, total)
-            } else {
-                format!("Page {} / {}", current_1based, total)
-            };
-            let rotation = self.current_page_rotation_degrees();
-            let ram_mb = get_current_rss_mb().unwrap_or(0.0);
             let filename = self.filename_display();
-            let mode_tag = self.view_mode.short_label();
-            let mouse_tag = self.mouse_mode.short_label();
-            let filter_tag = self.reading_filter.label();
-
-            let suffix = if let Some(notice) = &self.status_notice {
-                notice.clone()
-            } else {
-                "Use Top Menu Bar or press ? for Shortcuts".to_string()
-            };
-
-            format!(
-                "MicroPDF [{mode_tag} | Mouse:{mouse_tag} | Filter:{filter_tag}] | {filename} | {page_display} | Rot:{rotation}° | RAM:{ram_mb:.1} MB | {suffix}"
-            )
+            let dirty = if self.has_unsaved_edits { "• " } else { "" };
+            let total = self.total_pages();
+            let cur = if total > 0 { self.current_page_index + 1 } else { 0 };
+            format!("{dirty}{filename} ({cur}/{total}) — MicroPDF")
         };
 
         window.set_title(&title);

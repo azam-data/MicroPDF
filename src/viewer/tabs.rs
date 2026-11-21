@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use super::state::*;
-use super::render::{draw_bitmap_str_8x8, draw_rect_border, fill_rect_clipped};
+use super::render::fill_rect_clipped;
 
 impl<'a> PdfViewerApp<'a> {
     pub(super) fn sync_active_tab_to_slot(&mut self) {
@@ -460,66 +460,88 @@ impl<'a> PdfViewerApp<'a> {
         if tab_bar_h == 0 {
             return;
         }
-        let scale = (scale_factor.round() as u32).clamp(1, 2);
-        let top_y = menu_bar_h;
-        // Dark slate tab bar backdrop
+        let theme = self.ui_theme();
+        let s = scale_factor as f32;
+        let top_y = menu_bar_h as i32;
+        let font_sz = (11.5 * s).clamp(10.0, 24.0);
+
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, buf_w, tab_bar_h, theme.tabbar_bg);
         fill_rect_clipped(
             buffer,
             buf_w,
             buf_h,
             0,
-            top_y as i32,
-            buf_w,
-            tab_bar_h,
-            0x0015181E,
-        );
-        // Bottom 1px divider
-        fill_rect_clipped(
-            buffer,
-            buf_w,
-            buf_h,
-            0,
-            (top_y + tab_bar_h.saturating_sub(1)) as i32,
+            top_y + tab_bar_h.saturating_sub(1) as i32,
             buf_w,
             1,
-            0x0037474F,
+            theme.divider,
         );
 
         let num_tabs = self.tabs.len().max(1);
-        let plus_btn_w = 34 * scale;
-        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + 12 * scale);
-        let tab_w = (avail_for_tabs / (num_tabs as u32)).clamp(90 * scale, 210 * scale);
-        let text_y = top_y + tab_bar_h.saturating_sub(8 * scale) / 2;
+        let plus_btn_w = (26.0 * s).round() as u32;
+        let tab_gap = (3.0 * s).round() as i32;
+        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + (20.0 * s).round() as u32);
+        let tab_w = (avail_for_tabs / (num_tabs as u32))
+            .clamp((100.0 * s).round() as u32, (215.0 * s).round() as u32);
+        let tab_y = top_y + (3.0 * s).round() as i32;
+        let tab_h = tab_bar_h.saturating_sub((3.0 * s).round() as u32);
+        let rad = (6.0 * s).clamp(4.0, 10.0);
+        let close_sz = (16.0 * s).round() as u32;
+        let close_ic = (10.0 * s).round() as u32;
 
-        let mut cur_x = 4 * scale;
+        let mut cur_x = (8.0 * s).round() as i32;
         for idx in 0..num_tabs {
-            if cur_x + tab_w > buf_w.saturating_sub(plus_btn_w) {
+            if cur_x + tab_w as i32 > buf_w as i32 - plus_btn_w as i32 - (8.0 * s).round() as i32 {
                 break;
             }
             let is_active = idx == self.active_tab;
-            let tab_bg = if is_active { 0x00263238 } else { 0x001C2026 };
-            let border_col = if is_active { 0x0042A5F5 } else { 0x0037474F };
+            let is_tab_hov = matches!(
+                self.hovered_widget,
+                Some(UiHit::Tab(i)) | Some(UiHit::TabClose(i)) if i == idx
+            );
+            let is_close_hov = self.hovered_widget == Some(UiHit::TabClose(idx));
 
-            fill_rect_clipped(
-                buffer,
-                buf_w,
-                buf_h,
-                cur_x as i32,
-                (top_y + 2) as i32,
-                tab_w.saturating_sub(2),
-                tab_bar_h.saturating_sub(3),
-                tab_bg,
-            );
-            draw_rect_border(
-                buffer,
-                buf_w,
-                buf_h,
-                cur_x,
-                top_y + 2,
-                tab_w.saturating_sub(2),
-                tab_bar_h.saturating_sub(3),
-                border_col,
-            );
+            if is_active {
+                super::ui_draw::fill_top_rounded_rect(
+                    buffer, buf_w, buf_h, cur_x, tab_y, tab_w, tab_h, rad, theme.tab_active_bg,
+                );
+                super::ui_draw::stroke_rounded_rect(
+                    buffer, buf_w, buf_h, cur_x, tab_y, tab_w, tab_h.saturating_sub(1), rad, theme.tab_active_border,
+                );
+                // Seamless bottom join with canvas/content area
+                fill_rect_clipped(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    cur_x + 1,
+                    tab_y + tab_h as i32 - 2,
+                    tab_w.saturating_sub(2),
+                    2,
+                    theme.tab_active_bg,
+                );
+                // Clean 2px accent indicator along top of active tab
+                super::ui_draw::fill_rounded_rect(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    cur_x + (6.0 * s).round() as i32,
+                    tab_y,
+                    tab_w.saturating_sub((12.0 * s).round() as u32),
+                    (2.0 * s).round().max(2.0) as u32,
+                    1.0,
+                    theme.accent,
+                );
+            } else if is_tab_hov {
+                super::ui_draw::fill_top_rounded_rect(
+                    buffer, buf_w, buf_h, cur_x, tab_y + 1, tab_w, tab_h.saturating_sub(2), rad, theme.tab_hover_bg,
+                );
+            }
+
+            let is_dirty = if is_active {
+                self.has_unsaved_edits
+            } else {
+                self.tabs.get(idx).map(|t| t.has_unsaved_edits).unwrap_or(false)
+            };
 
             let fname = if is_active {
                 self.filename_display()
@@ -527,79 +549,80 @@ impl<'a> PdfViewerApp<'a> {
                 slot.file_path
                     .file_name()
                     .and_then(|s| s.to_str())
-                    .unwrap_or("doc.pdf")
+                    .unwrap_or("document.pdf")
                     .to_string()
             } else {
-                "doc.pdf".to_string()
+                "No PDF Open".to_string()
             };
 
-            let max_label_chars =
-                ((tab_w.saturating_sub(36 * scale)) / (8 * scale)).max(4) as usize;
-            let mut label = format!("{}: {}", idx + 1, fname);
-            if label.chars().count() > max_label_chars {
-                label = label.chars().take(max_label_chars).collect();
+            let mut text_x = cur_x + (10.0 * s).round() as i32;
+            if is_dirty {
+                let dot_r = (3.0 * s).clamp(2.5, 5.0);
+                super::ui_draw::fill_circle_aa(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    text_x as f32 + dot_r,
+                    tab_y as f32 + (tab_h as f32) * 0.5,
+                    dot_r,
+                    theme.accent,
+                );
+                text_x += (dot_r * 2.0 + 6.0 * s).round() as i32;
             }
 
-            let text_col = if is_active { 0x00FFFFFF } else { 0x00B0BEC5 };
-            draw_bitmap_str_8x8(
-                buffer,
-                buf_w,
-                buf_h,
-                cur_x + 6 * scale,
-                text_y,
-                &label,
-                text_col,
-                scale,
+            let close_x = cur_x + tab_w as i32 - close_sz as i32 - (6.0 * s).round() as i32;
+            let close_y = tab_y + ((tab_h.saturating_sub(close_sz)) / 2) as i32;
+
+            let label_budget = (close_x - text_x - (4.0 * s).round() as i32).max(20) as f32;
+            let label = super::ui_draw::truncate_ellipsis(&fname, label_budget, font_sz, is_active);
+            let text_col = if is_active { theme.text_primary } else { theme.text_secondary };
+            super::ui_draw::draw_text_vcenter(
+                buffer, buf_w, buf_h, text_x, tab_y, tab_h, close_x - 2, &label, font_sz, text_col, is_active,
             );
 
-            // Close `[x]` button on right side of tab
-            let close_x = cur_x + tab_w.saturating_sub(26 * scale);
-            draw_bitmap_str_8x8(
-                buffer,
-                buf_w,
-                buf_h,
-                close_x,
-                text_y,
-                "[x]",
-                0x00EF5350,
-                scale,
-            );
+            // Clean close icon (subtle circular highlight on hover)
+            if is_close_hov {
+                super::ui_draw::fill_rounded_rect(
+                    buffer, buf_w, buf_h, close_x, close_y, close_sz, close_sz, (close_sz as f32) * 0.5, theme.danger_soft_bg,
+                );
+            }
+            if is_active || is_tab_hov || self.tabs.len() > 1 {
+                super::ui_draw::draw_icon(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    super::ui_draw::UiIcon::Close,
+                    close_x + ((close_sz.saturating_sub(close_ic)) / 2) as i32,
+                    close_y + ((close_sz.saturating_sub(close_ic)) / 2) as i32,
+                    close_ic,
+                    if is_close_hov { theme.danger } else { theme.text_muted },
+                );
+            }
 
-            cur_x += tab_w;
+            cur_x += tab_w as i32 + tab_gap;
         }
 
-        // Draw `[ + ]` New Tab button
-        let plus_x = cur_x + 4 * scale;
-        if plus_x + plus_btn_w <= buf_w {
-            fill_rect_clipped(
+        // Clean `+` New Tab icon button
+        let plus_x = cur_x + (2.0 * s).round() as i32;
+        let plus_h = (22.0 * s).round() as u32;
+        let plus_y = top_y + ((tab_bar_h.saturating_sub(plus_h)) / 2) as i32;
+        if plus_x + plus_btn_w as i32 <= buf_w as i32 - 4 {
+            let plus_hov = self.hovered_widget == Some(UiHit::TabNew);
+            if plus_hov {
+                super::ui_draw::fill_rounded_rect(
+                    buffer, buf_w, buf_h, plus_x, plus_y, plus_btn_w, plus_h, (5.0 * s).max(3.0), theme.hover_bg,
+                );
+            }
+            let ic = (12.0 * s).round() as u32;
+            super::ui_draw::draw_icon(
                 buffer,
                 buf_w,
                 buf_h,
-                plus_x as i32,
-                (top_y + 2) as i32,
-                plus_btn_w,
-                tab_bar_h.saturating_sub(3),
-                0x00263238,
-            );
-            draw_rect_border(
-                buffer,
-                buf_w,
-                buf_h,
-                plus_x,
-                top_y + 2,
-                plus_btn_w,
-                tab_bar_h.saturating_sub(3),
-                0x0064B5F6,
-            );
-            draw_bitmap_str_8x8(
-                buffer,
-                buf_w,
-                buf_h,
-                plus_x + 5 * scale,
-                text_y,
-                "[+]",
-                0x0064B5F6,
-                scale,
+                super::ui_draw::UiIcon::Plus,
+                plus_x + ((plus_btn_w.saturating_sub(ic)) / 2) as i32,
+                plus_y + ((plus_h.saturating_sub(ic)) / 2) as i32,
+                ic,
+                if plus_hov { theme.accent } else { theme.text_secondary },
             );
         }
     }
@@ -613,35 +636,38 @@ impl<'a> PdfViewerApp<'a> {
         tab_bar_h: u32,
         scale_factor: f64,
     ) -> Option<TabBarHit> {
-        let ix = mx.round() as u32;
-        let iy = my.round() as u32;
-        if iy < menu_bar_h || iy >= menu_bar_h + tab_bar_h {
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if iy < menu_bar_h as i32 || iy >= (menu_bar_h + tab_bar_h) as i32 {
             return None;
         }
-        let scale = (scale_factor.round() as u32).clamp(1, 2);
+        let s = scale_factor as f32;
         let num_tabs = self.tabs.len().max(1);
-        let plus_btn_w = 34 * scale;
-        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + 12 * scale);
-        let tab_w = (avail_for_tabs / (num_tabs as u32)).clamp(90 * scale, 210 * scale);
+        let plus_btn_w = (26.0 * s).round() as u32;
+        let tab_gap = (3.0 * s).round() as i32;
+        let avail_for_tabs = buf_w.saturating_sub(plus_btn_w + (20.0 * s).round() as u32);
+        let tab_w = (avail_for_tabs / (num_tabs as u32))
+            .clamp((100.0 * s).round() as u32, (215.0 * s).round() as u32);
+        let close_sz = (18.0 * s).round() as i32;
 
-        let mut cur_x = 4 * scale;
+        let mut cur_x = (8.0 * s).round() as i32;
         for idx in 0..num_tabs {
-            if cur_x + tab_w > buf_w.saturating_sub(plus_btn_w) {
+            if cur_x + tab_w as i32 > buf_w as i32 - plus_btn_w as i32 - (8.0 * s).round() as i32 {
                 break;
             }
-            if ix >= cur_x && ix < cur_x + tab_w {
-                let close_x = cur_x + tab_w.saturating_sub(28 * scale);
+            if ix >= cur_x && ix < cur_x + tab_w as i32 {
+                let close_x = cur_x + tab_w as i32 - close_sz - (6.0 * s).round() as i32;
                 if ix >= close_x {
                     return Some(TabBarHit::CloseTab(idx));
                 } else {
                     return Some(TabBarHit::SwitchTab(idx));
                 }
             }
-            cur_x += tab_w;
+            cur_x += tab_w as i32 + tab_gap;
         }
 
-        let plus_x = cur_x + 4 * scale;
-        if ix >= plus_x && ix <= plus_x + plus_btn_w {
+        let plus_x = cur_x + (2.0 * s).round() as i32;
+        if ix >= plus_x && ix <= plus_x + plus_btn_w as i32 {
             return Some(TabBarHit::NewTab);
         }
         None

@@ -1,7 +1,7 @@
 use crate::engine::PdfEngine;
 use anyhow::Result;
 use super::state::*;
-use super::render::{draw_bitmap_str_8x8, draw_rect_border, fill_rect_clipped};
+use super::render::fill_rect_clipped;
 
 impl<'a> PdfViewerApp<'a> {
     /// Renders a single 140x198 thumbnail for `page_idx` into `self.thumbnail_cache` if not already cached.
@@ -241,26 +241,45 @@ impl<'a> PdfViewerApp<'a> {
         sidebar_w: u32,
         top_bars_h: u32,
         status_bar_h: u32,
+        scale_factor: f64,
     ) {
+        let theme = self.ui_theme();
+        let s = scale_factor as f32;
         let bottom_limit = buf_h.saturating_sub(status_bar_h);
         let total = self.total_pages();
+        let label_sz = (11.0 * s).clamp(10.0, 22.0);
+        let badge_sz = (9.5 * s).clamp(8.5, 18.0);
+
         for idx in 0..total {
             let (tx, ty, tw, th) = self.thumbnail_screen_rect(idx, buf_w, sidebar_w, top_bars_h);
-            if ty + (th as i32) + 28 < (top_bars_h as i32) || ty >= (bottom_limit as i32) {
+            if ty + (th as i32) + 32 < (top_bars_h as i32) || ty >= (bottom_limit as i32) {
                 continue;
             }
 
-            // Fill cell card backdrop (white paper background inside THUMB_W x THUMB_H)
-            fill_rect_clipped(
-                buffer,
-                buf_w,
-                bottom_limit,
-                tx,
-                ty,
-                tw,
-                th,
-                0x003A3A3A,
-            );
+            let is_selected = idx == self.current_page_index;
+            let is_hovered = self.hovered_thumb == Some(idx);
+            let is_bw = self.bw_pages.contains(&idx);
+
+            // Soft drop shadow behind page card (clipped to content region)
+            if ty >= top_bars_h as i32 && (ty + th as i32) < bottom_limit as i32 {
+                super::ui_draw::draw_soft_shadow(
+                    buffer,
+                    buf_w,
+                    bottom_limit,
+                    tx,
+                    ty,
+                    tw,
+                    th,
+                    3.0,
+                    6,
+                    2,
+                    theme.shadow_rgb,
+                    theme.shadow_max_alpha,
+                );
+            }
+
+            // Paper card backdrop
+            fill_rect_clipped(buffer, buf_w, bottom_limit, tx, ty, tw, th, theme.surface_bg);
 
             if let Some(entry) = self.thumbnail_cache.get(&idx) {
                 let ox = tx + ((tw.saturating_sub(entry.width)) / 2) as i32;
@@ -271,173 +290,82 @@ impl<'a> PdfViewerApp<'a> {
                     if py < (top_bars_h as i32) || py >= (bottom_limit as i32) {
                         continue;
                     }
+                    let dst_row = (py as u32 * buf_w) as usize;
+                    let src_row = (r * entry.width) as usize;
                     for c in 0..entry.width {
                         let px = ox + (c as i32);
                         if px < (sidebar_w as i32) || px >= (buf_w as i32) {
                             continue;
                         }
-                        buffer[(py as u32 * buf_w + px as u32) as usize] =
-                            entry.pixels[(r * entry.width + c) as usize];
+                        buffer[dst_row + px as usize] = entry.pixels[src_row + c as usize];
                     }
                 }
             }
 
-            // Border highlight for selected page vs hovered page vs normal page
-            let border_color = if idx == self.current_page_index {
-                0x0042A5F5 // Bright blue for selected page
-            } else if self.hovered_thumb == Some(idx) {
-                0x00FFCA28 // Amber for hovered page
+            // Clean accent ring for selected/hovered page, hairline border otherwise
+            let border_color = if is_selected {
+                theme.accent
+            } else if is_hovered {
+                theme.accent_hover
             } else {
-                0x00555555 // Subtle border
+                theme.page_border
             };
 
-            if tx >= 0 && ty >= (top_bars_h as i32) {
-                draw_rect_border(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    tx as u32,
-                    ty as u32,
-                    tw,
-                    th,
-                    border_color,
-                );
-                if idx == self.current_page_index && tw > 2 && th > 2 {
-                    draw_rect_border(
-                        buffer,
-                        buf_w,
-                        bottom_limit,
-                        (tx as u32) + 1,
-                        (ty as u32) + 1,
-                        tw - 2,
-                        th - 2,
-                        border_color,
-                    );
+            if tx >= sidebar_w as i32 && ty >= (top_bars_h as i32) {
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx, ty, tw, th, 2.5, border_color);
+                if is_selected && tw > 4 && th > 4 {
+                    super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx - 1, ty - 1, tw + 2, th + 2, 3.5, theme.accent);
                 }
             }
 
-            // Top-left `[BW]` Grayscale conversion badge on each thumbnail
-            let bw_badge_w = 26u32;
-            let bw_badge_h = 16u32;
-            let bwx = tx;
-            let bwy = ty;
-            let is_bw = self.bw_pages.contains(&idx);
-            if bwx >= (sidebar_w as i32)
-                && bwy >= (top_bars_h as i32)
-                && (bwy as u32 + bw_badge_h) < bottom_limit
+            // Clean corner action pills: show on hover (and keep BW badge visible if page is BW)
+            let show_badges = is_hovered || is_selected;
+            if (show_badges || is_bw)
+                && tx >= (sidebar_w as i32)
+                && ty >= (top_bars_h as i32)
+                && (ty as u32 + 22) < bottom_limit
             {
-                let bg = if is_bw { 0x00455A64 } else { 0x00263238 };
-                let fg = if is_bw { 0x0080DEEA } else { 0x00E0E0E0 };
-                fill_rect_clipped(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    bwx,
-                    bwy,
-                    bw_badge_w,
-                    bw_badge_h,
-                    bg,
-                );
-                draw_rect_border(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    bwx as u32,
-                    bwy as u32,
-                    bw_badge_w,
-                    bw_badge_h,
-                    0x0090A4AE,
-                );
-                draw_bitmap_str_8x8(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    (bwx as u32) + 5,
-                    (bwy as u32) + 4,
-                    "BW",
-                    fg,
-                    1,
-                );
+                let bw_w = 28u32;
+                let bw_h = 18u32;
+                let bg = if is_bw { theme.accent } else { theme.surface_bg };
+                let fg = if is_bw { theme.text_on_accent } else { theme.text_secondary };
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, if is_bw { theme.accent } else { theme.border_subtle });
+                let btw = super::ui_draw::measure_text("BW", badge_sz, true);
+                super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, tx + 3 + ((bw_w as f32 - btw) * 0.5).round() as i32, ty + 3, bw_h, tx + 3 + bw_w as i32, "BW", badge_sz, fg, true);
             }
 
-            // Top-right `[R]` rotate badge on each thumbnail
-            let badge_w = 24u32;
-            let badge_h = 16u32;
-            let bx = tx + (tw as i32) - (badge_w as i32);
-            let by = ty;
-            if bx >= (sidebar_w as i32)
-                && by >= (top_bars_h as i32)
-                && (by as u32 + badge_h) < bottom_limit
+            if show_badges
+                && (tx + tw as i32 - 24) >= (sidebar_w as i32)
+                && ty >= (top_bars_h as i32)
+                && (ty as u32 + 22) < bottom_limit
             {
-                fill_rect_clipped(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    bx,
-                    by,
-                    badge_w,
-                    badge_h,
-                    0x00263238,
-                );
-                draw_rect_border(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    bx as u32,
-                    by as u32,
-                    badge_w,
-                    badge_h,
-                    0x0090A4AE,
-                );
-                draw_bitmap_str_8x8(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    (bx as u32) + 4,
-                    (by as u32) + 4,
-                    "R",
-                    0x00FFEB3B,
-                    1,
-                );
+                let rw = 22u32;
+                let rh = 18u32;
+                let rx = tx + tw as i32 - rw as i32 - 3;
+                let ry = ty + 3;
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.surface_bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.border_subtle);
+                super::ui_draw::draw_icon(buffer, buf_w, bottom_limit, super::ui_draw::UiIcon::Rotate, rx + 4, ry + 2, 13, theme.accent);
             }
 
-            // Page number label centered beneath thumbnail (shows Logical + Physical when roman_end > 0)
+            // Crisp proportional page number centered below card
             let label = if self.roman_end > 0 {
-                let logical =
-                    PdfEngine::format_logical_page_label(idx as usize, self.roman_end);
-                if is_bw {
-                    format!("P.{} ({}) BW", logical, idx + 1)
-                } else {
-                    format!("Page {} ({})", logical, idx + 1)
-                }
-            } else if is_bw {
-                format!("Page {} [BW]", idx + 1)
+                let logical = PdfEngine::format_logical_page_label(idx as usize, self.roman_end);
+                format!("{} ({})", logical, idx + 1)
             } else {
                 format!("Page {}", idx + 1)
             };
-            let label_w = (label.len() as u32) * 8;
-            let lx = (tx + ((tw as i32 - label_w as i32) / 2)).max(sidebar_w as i32);
+            let lw = super::ui_draw::measure_text(&label, label_sz, is_selected);
+            let lx = (tx + ((tw as f32 - lw) * 0.5).round() as i32).max(sidebar_w as i32);
             let ly = ty + (th as i32) + 6;
-            if ly >= (top_bars_h as i32) && (ly as u32 + 10) < bottom_limit {
-                let text_color = if idx == self.current_page_index {
-                    0x0064B5F6
-                } else {
-                    0x00E0E0E0
-                };
-                draw_bitmap_str_8x8(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    lx as u32,
-                    ly as u32,
-                    &label,
-                    text_color,
-                    1,
-                );
+            if ly >= (top_bars_h as i32) && (ly as u32 + 16) < bottom_limit {
+                let text_color = if is_selected { theme.accent } else { theme.text_secondary };
+                super::ui_draw::draw_text_clipped(buffer, buf_w, bottom_limit, lx, ly, buf_w as i32 - 4, &label, label_sz, text_color, is_selected);
             }
         }
 
-        // If user is dragging a page thumbnail to reorder, draw a bright blue vertical insertion bar
+        // Drag-to-reorder insertion indicator bar
         if let Some((src_idx, sx, sy)) = self.grid_drag_page {
             let (cx, cy) = self.cursor_pos;
             let dist = ((cx - sx).powi(2) + (cy - sy).powi(2)).sqrt();
@@ -446,17 +374,8 @@ impl<'a> PdfViewerApp<'a> {
                 if target_idx != src_idx {
                     let (tx, ty, _tw, th) =
                         self.thumbnail_screen_rect(target_idx, buf_w, sidebar_w, top_bars_h);
-                    let bar_x = (tx - 8).max(sidebar_w as i32);
-                    fill_rect_clipped(
-                        buffer,
-                        buf_w,
-                        bottom_limit,
-                        bar_x,
-                        ty - 4,
-                        4,
-                        th + 8,
-                        0x0000E5FF,
-                    );
+                    let bar_x = (tx - 10).max(sidebar_w as i32);
+                    super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, bar_x, ty - 4, 4, th + 8, 2.0, theme.accent);
                 }
             }
         }

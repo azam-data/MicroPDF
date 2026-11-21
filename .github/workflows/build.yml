@@ -1,0 +1,198 @@
+name: Build MicroPDF
+
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Target platform to build"
+        type: choice
+        required: true
+        default: "both"
+        options:
+          - both
+          - windows
+          - mac
+          - mac-intel
+      include_pdfium:
+        description: "Bundle pdfium.dll / libpdfium.dylib into portable zip"
+        type: boolean
+        required: false
+        default: true
+      run_tests:
+        description: "Run cargo test with bundled PDFium"
+        type: boolean
+        required: false
+        default: false
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows (x64)
+    if: >-
+      github.event_name == 'pull_request' ||
+      inputs.platform == 'windows' ||
+      inputs.platform == 'both'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Download PDFium (Windows x64)
+        if: github.event_name == 'pull_request' || inputs.include_pdfium || inputs.run_tests
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pdfium_tmp | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz" -OutFile "pdfium_tmp/pdfium.tgz"
+          tar -xzf pdfium_tmp/pdfium.tgz -C pdfium_tmp
+          $dll = Get-ChildItem -Path pdfium_tmp -Recurse -Filter "pdfium.dll" | Select-Object -First 1
+          if (-not $dll) { throw "pdfium.dll not found in archive" }
+          New-Item -ItemType Directory -Force -Path pdfium_dir | Out-Null
+          Copy-Item $dll.FullName -Destination "pdfium_dir/pdfium.dll"
+
+      - name: Run unit tests
+        if: inputs.run_tests
+        shell: pwsh
+        env:
+          MICROPDF_PDFIUM_DIR: ${{ github.workspace }}\pdfium_dir
+        run: cargo test --locked
+
+      - name: Package portable folder
+        shell: pwsh
+        env:
+          INCLUDE_PDFIUM: ${{ github.event_name == 'pull_request' || inputs.include_pdfium }}
+        run: |
+          $stage = "dist/MicroPDF-windows-x64"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/release/micro_pdf.exe" -Destination "$stage/micro_pdf.exe"
+          Copy-Item "LICENSE" -Destination "$stage/LICENSE"
+          Copy-Item "THIRD_PARTY_NOTICES.md" -Destination "$stage/THIRD_PARTY_NOTICES.md"
+          Copy-Item "README_SHORTCUTS.txt" -Destination "$stage/README_SHORTCUTS.txt"
+          if ($env:INCLUDE_PDFIUM -eq "true" -and (Test-Path "pdfium_dir/pdfium.dll")) {
+            Copy-Item "pdfium_dir/pdfium.dll" -Destination "$stage/pdfium.dll"
+          }
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/MicroPDF-windows-x64.zip" -Force
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicroPDF-windows-x64
+          path: dist/MicroPDF-windows-x64.zip
+          retention-days: 30
+
+  build-macos-arm64:
+    name: Build macOS (Apple Silicon arm64)
+    if: >-
+      github.event_name == 'pull_request' ||
+      inputs.platform == 'mac' ||
+      inputs.platform == 'both'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Download PDFium (macOS arm64)
+        if: github.event_name == 'pull_request' || inputs.include_pdfium || inputs.run_tests
+        run: |
+          mkdir -p pdfium_tmp pdfium_dir
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-arm64.tgz" -o pdfium_tmp/pdfium.tgz
+          tar -xzf pdfium_tmp/pdfium.tgz -C pdfium_tmp
+          DYLIB=$(find pdfium_tmp -name "libpdfium.dylib" | head -n 1)
+          test -n "$DYLIB"
+          cp "$DYLIB" pdfium_dir/libpdfium.dylib
+
+      - name: Run unit tests
+        if: inputs.run_tests
+        env:
+          MICROPDF_PDFIUM_DIR: ${{ github.workspace }}/pdfium_dir
+        run: cargo test --locked
+
+      - name: Package portable folder
+        env:
+          INCLUDE_PDFIUM: ${{ github.event_name == 'pull_request' || inputs.include_pdfium }}
+        run: |
+          STAGE="dist/MicroPDF-macos-arm64"
+          mkdir -p "$STAGE"
+          cp target/release/micro_pdf "$STAGE/micro_pdf"
+          chmod +x "$STAGE/micro_pdf"
+          cp LICENSE THIRD_PARTY_NOTICES.md README_SHORTCUTS.txt "$STAGE/"
+          if [ "$INCLUDE_PDFIUM" = "true" ] && [ -f pdfium_dir/libpdfium.dylib ]; then
+            cp pdfium_dir/libpdfium.dylib "$STAGE/libpdfium.dylib"
+          fi
+          (cd dist && zip -r MicroPDF-macos-arm64.zip MicroPDF-macos-arm64)
+
+      - name: Upload macOS (arm64) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicroPDF-macos-arm64
+          path: dist/MicroPDF-macos-arm64.zip
+          retention-days: 30
+
+  build-macos-x64:
+    name: Build macOS (Intel x64)
+    if: inputs.platform == 'mac-intel'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain (x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary (x64)
+        run: cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: Download PDFium (macOS x64)
+        if: inputs.include_pdfium
+        run: |
+          mkdir -p pdfium_tmp pdfium_dir
+          curl -fsSL "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-mac-x64.tgz" -o pdfium_tmp/pdfium.tgz
+          tar -xzf pdfium_tmp/pdfium.tgz -C pdfium_tmp
+          DYLIB=$(find pdfium_tmp -name "libpdfium.dylib" | head -n 1)
+          test -n "$DYLIB"
+          cp "$DYLIB" pdfium_dir/libpdfium.dylib
+
+      - name: Package portable folder
+        run: |
+          STAGE="dist/MicroPDF-macos-x64"
+          mkdir -p "$STAGE"
+          cp target/x86_64-apple-darwin/release/micro_pdf "$STAGE/micro_pdf"
+          chmod +x "$STAGE/micro_pdf"
+          cp LICENSE THIRD_PARTY_NOTICES.md README_SHORTCUTS.txt "$STAGE/"
+          if [ -f pdfium_dir/libpdfium.dylib ]; then
+            cp pdfium_dir/libpdfium.dylib "$STAGE/libpdfium.dylib"
+          fi
+          (cd dist && zip -r MicroPDF-macos-x64.zip MicroPDF-macos-x64)
+
+      - name: Upload macOS (Intel x64) artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MicroPDF-macos-x64
+          path: dist/MicroPDF-macos-x64.zip
+          retention-days: 30

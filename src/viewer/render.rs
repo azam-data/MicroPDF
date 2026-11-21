@@ -69,7 +69,7 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Returns true if `(virtual_w, virtual_h)` exceeds 2x the viewport size `(content_w, content_h)`.
     /// Above 2x the screen size, MicroPDF never allocates a full-page bitmap and renders only
-    /// visible 512x512 tiles on demand into the 48 MB LRU `tile_cache`.
+    /// visible 512x512 tiles on demand into the 16 MB LRU `tile_cache`.
     pub(super) fn is_tiled_for_viewport(
         virtual_w: u32,
         virtual_h: u32,
@@ -81,7 +81,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Renders a single 512x512 tile `key` into `self.tile_cache`, evicting the least-recently-used
-    /// tile (and reusing its pixel buffer) if `tile_cache` reaches `MAX_TILE_CACHE_ENTRIES` (48 MB).
+    /// tile (and reusing its pixel buffer) if `tile_cache` reaches `MAX_TILE_CACHE_ENTRIES` (16 MB).
     pub(super) fn ensure_tile_rendered(&mut self, key: TileKey) -> Result<()> {
         self.tile_lru_tick = self.tile_lru_tick.wrapping_add(1);
         let tick = self.tile_lru_tick;
@@ -1206,14 +1206,180 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    pub(super) fn render_to_window(&mut self) -> Result<()> {
-        let Some(window) = self.window.as_ref().cloned() else {
-            return Ok(());
+    /// Computes `(track_x, track_y, track_w, track_h, thumb_y, thumb_h)` for the thin right-edge
+    /// overlay vertical scrollbar, or `None` when the current view has nothing to scroll.
+    pub(super) fn vertical_scrollbar_geometry(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        scale_factor: f64,
+    ) -> Option<(i32, i32, u32, u32, i32, u32)> {
+        if self.doc.is_none() || self.is_presentation {
+            return None;
+        }
+        let total = self.total_pages();
+        if total == 0 {
+            return None;
+        }
+        let s = scale_factor as f32;
+        let track_w = (7.0 * s).round().clamp(6.0, 12.0) as u32;
+        let pad_r = (4.0 * s).round() as i32;
+        let pad_v = (6.0 * s).round() as i32;
+        let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
+        if content_h < 40 {
+            return None;
+        }
+        let track_x = buf_w as i32 - track_w as i32 - pad_r;
+        let track_y = top_bars_h as i32 + pad_v;
+        let track_h = content_h.saturating_sub((pad_v * 2) as u32);
+        if track_h < 24 {
+            return None;
+        }
+
+        let (fraction, visible_ratio) = if self.view_mode == ViewMode::ThumbnailGrid {
+            let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
+            let (cols, _cw, cell_h, _sx, _sy) = self.grid_metrics(buf_w, sidebar_w, top_bars_h);
+            let rows = (total as u32).div_ceil(cols.max(1));
+            let total_h = (rows * cell_h + 40) as f32;
+            if total_h <= content_h as f32 {
+                return None;
+            }
+            let max_scroll = (total_h - content_h as f32).max(1.0);
+            ((self.grid_scroll_y / max_scroll).clamp(0.0, 1.0), (content_h as f32 / total_h).clamp(0.08, 1.0))
+        } else if total > 1 {
+            let denom = (total - 1) as f32;
+            ((self.current_page_index as f32 / denom).clamp(0.0, 1.0), (1.0 / total as f32).clamp(0.08, 0.5))
+        } else {
+            let bmp_h = self.page_draw_rect.3;
+            if bmp_h <= content_h {
+                return None;
+            }
+            let max_s = (bmp_h - content_h) as f32;
+            ((self.scroll_y / max_s).clamp(0.0, 1.0), (content_h as f32 / bmp_h as f32).clamp(0.10, 0.9))
         };
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
-        let scale_factor = window.scale_factor();
+
+        let thumb_h = ((track_h as f32) * visible_ratio)
+            .round()
+            .clamp((28.0 * s).round(), track_h as f32) as u32;
+        let travel = track_h.saturating_sub(thumb_h);
+        let thumb_y = track_y + ((travel as f32) * fraction).round() as i32;
+        Some((track_x, track_y, track_w, track_h, thumb_y, thumb_h))
+    }
+
+    pub(super) fn scroll_to_scrollbar_y(
+        &mut self,
+        mouse_y: f64,
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        scale_factor: f64,
+    ) {
+        let Some((_tx, ty, _tw, th, _tby, tbh)) =
+            self.vertical_scrollbar_geometry(buf_w, buf_h, top_bars_h, status_bar_h, scale_factor)
+        else {
+            return;
+        };
+        let travel = th.saturating_sub(tbh).max(1) as f32;
+        let frac = (((mouse_y as f32) - (ty as f32) - (tbh as f32) * 0.5) / travel).clamp(0.0, 1.0);
+        let total = self.total_pages();
+        let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
+
+        if self.view_mode == ViewMode::ThumbnailGrid {
+            let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
+            let (cols, _cw, cell_h, _sx, _sy) = self.grid_metrics(buf_w, sidebar_w, top_bars_h);
+            let rows = (total as u32).div_ceil(cols.max(1));
+            let total_h = (rows * cell_h + 40) as f32;
+            let max_scroll = (total_h - content_h as f32).max(0.0);
+            self.grid_scroll_y = frac * max_scroll;
+        } else if total > 1 {
+            let target = (frac * ((total - 1) as f32)).round() as u16;
+            if target != self.current_page_index {
+                self.current_page_index = target.min(total - 1);
+                self.scroll_y = 0.0;
+                self.invalidate_page_caches();
+            }
+        } else {
+            let bmp_h = self.page_draw_rect.3;
+            let max_s = (bmp_h.saturating_sub(content_h)) as f32;
+            self.scroll_y = frac * max_s;
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    fn draw_page_frame_chrome(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        draw_rect: (i32, i32, u32, u32),
+        sf: f64,
+    ) {
+        if self.is_presentation {
+            return;
+        }
+        let theme = self.ui_theme();
+        let (dx, dy, bw, bh) = draw_rect;
+        if bw == 0 || bh == 0 {
+            return;
+        }
+        let bottom_limit = buf_h.saturating_sub(status_bar_h);
+        let spread = (7.0 * sf as f32).round() as i32;
+        let off_y = (3.0 * sf as f32).round() as i32;
+        if dx >= sidebar_w as i32 && dy >= top_bars_h as i32 {
+            super::ui_draw::draw_soft_shadow(
+                buffer,
+                buf_w,
+                bottom_limit,
+                dx,
+                dy,
+                bw,
+                bh,
+                2.0,
+                spread,
+                off_y,
+                theme.shadow_rgb,
+                theme.shadow_max_alpha,
+            );
+        }
+        // Subtle 1px hairline paper border clipped to viewport
+        let x0 = dx.max(sidebar_w as i32);
+        let x1 = (dx + bw as i32).min(buf_w as i32);
+        let y0 = dy.max(top_bars_h as i32);
+        let y1 = (dy + bh as i32).min(bottom_limit as i32);
+        if x1 > x0 && y1 > y0 {
+            if dy >= top_bars_h as i32 && dy < bottom_limit as i32 {
+                fill_rect_clipped(buffer, buf_w, bottom_limit, x0, dy, (x1 - x0) as u32, 1, theme.page_border);
+            }
+            let by = dy + bh as i32 - 1;
+            if by >= top_bars_h as i32 && by < bottom_limit as i32 {
+                fill_rect_clipped(buffer, buf_w, bottom_limit, x0, by, (x1 - x0) as u32, 1, theme.page_border);
+            }
+            if dx >= sidebar_w as i32 && dx < buf_w as i32 {
+                fill_rect_clipped(buffer, buf_w, bottom_limit, dx, y0, 1, (y1 - y0) as u32, theme.page_border);
+            }
+            let rx = dx + bw as i32 - 1;
+            if rx >= sidebar_w as i32 && rx < buf_w as i32 {
+                fill_rect_clipped(buffer, buf_w, bottom_limit, rx, y0, 1, (y1 - y0) as u32, theme.page_border);
+            }
+        }
+    }
+
+    /// Renders the complete UI and active PDF content into `buffer` (`width * height` `0x00RRGGBB`).
+    /// Shared by `render_to_window` and headless verification tests.
+    pub(super) fn render_frame_into_buffer(
+        &mut self,
+        buffer: &mut [u32],
+        width: u32,
+        height: u32,
+        scale_factor: f64,
+    ) {
         let sidebar_w = self
             .sidebar_width_px(scale_factor)
             .min(width.saturating_sub(64));
@@ -1234,6 +1400,190 @@ impl<'a> PdfViewerApp<'a> {
             self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
         }
 
+        if self.print_preview.is_some() {
+            self.ensure_print_preview_sheet_rendered(width, height, scale_factor);
+        }
+
+        let theme = self.ui_theme();
+        buffer.fill(if self.is_presentation {
+            0x0000_0000
+        } else {
+            theme.canvas_bg
+        });
+
+        if self.doc.is_none() {
+            self.draw_welcome_screen(buffer, width, height, top_bars_h, status_bar_h, scale_factor);
+        } else if self.view_mode.is_page_view() {
+            if self.view_mode == ViewMode::ContinuousScroll {
+                for &(page_idx, draw_rect) in &self.continuous_draw_rects {
+                    if let Some(cache) = self.continuous_page_cache.get(&page_idx) {
+                        self.draw_page_frame_chrome(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, draw_rect, scale_factor,
+                        );
+                        self.blit_page_or_tiles(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, draw_rect, cache,
+                        );
+                        self.draw_search_overlays_on_page(
+                            buffer, width, height, top_bars_h, status_bar_h, page_idx, draw_rect,
+                        );
+                        self.draw_text_selection_overlays_on_page(
+                            buffer, width, height, top_bars_h, status_bar_h, page_idx, draw_rect,
+                        );
+                    }
+                }
+            } else {
+                if let Some(cache) = &self.cached_page {
+                    self.draw_page_frame_chrome(
+                        buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, scale_factor,
+                    );
+                    self.blit_page_or_tiles(
+                        buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, cache,
+                    );
+                    self.draw_search_overlays_on_page(
+                        buffer, width, height, top_bars_h, status_bar_h, cache.page_index, self.page_draw_rect,
+                    );
+                    self.draw_text_selection_overlays_on_page(
+                        buffer, width, height, top_bars_h, status_bar_h, cache.page_index, self.page_draw_rect,
+                    );
+                }
+
+                if self.view_mode == ViewMode::TwoPageSpread {
+                    if let (Some(second_cache), Some(second_rect)) =
+                        (&self.cached_second_page, self.second_page_draw_rect)
+                    {
+                        self.draw_page_frame_chrome(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, second_rect, scale_factor,
+                        );
+                        self.blit_page_or_tiles(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, second_rect, second_cache,
+                        );
+                        self.draw_search_overlays_on_page(
+                            buffer, width, height, top_bars_h, status_bar_h, second_cache.page_index, second_rect,
+                        );
+                        self.draw_text_selection_overlays_on_page(
+                            buffer, width, height, top_bars_h, status_bar_h, second_cache.page_index, second_rect,
+                        );
+                    }
+                }
+            }
+
+            // Active drag box (Select / Highlight / Redact / Crop / Stamp)
+            if let Some((sx1, sy1)) = self.drag_start {
+                let (sx2, sy2) = self.cursor_pos;
+                let (_, target_rect) = self.resolve_target_page_and_draw_rect(sx1, sy1);
+                let (px, py, pw, ph) = target_rect;
+                let page_left = px.max(sidebar_w as i32);
+                let page_right = (px + pw as i32).min(width as i32);
+                let page_top = py.max(top_bars_h as i32);
+                let page_bottom =
+                    (py + ph as i32).min(height.saturating_sub(status_bar_h) as i32);
+
+                if page_right > page_left && page_bottom > page_top {
+                    let min_x = (sx1.min(sx2).round() as i32).clamp(page_left, page_right) as u32;
+                    let max_x = (sx1.max(sx2).round() as i32).clamp(page_left, page_right) as u32;
+                    let min_y = (sy1.min(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
+                    let max_y = (sy1.max(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
+
+                    if max_x > min_x && max_y > min_y {
+                        let (fill_rgba, border_col) = match self.mouse_mode {
+                            MouseMode::Select => ((37, 99, 235, 42), 0x002563EB),
+                            MouseMode::Highlight => ((250, 204, 21, 95), 0x00CA8A04),
+                            MouseMode::Redact => ((220, 38, 38, 105), 0x00DC2626),
+                            MouseMode::Crop => ((5, 150, 105, 85), 0x00059669),
+                            MouseMode::StampImage => ((124, 58, 237, 85), 0x007C3AED),
+                        };
+                        blend_rect_rgba(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, fill_rgba);
+                        draw_rect_border(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, border_col);
+                    }
+                }
+            }
+        } else {
+            self.draw_thumbnail_grid(
+                buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+            );
+        }
+
+        // Thin right-edge overlay vertical scrollbar
+        if let Some((tx, ty, tw, th, tby, tbh)) =
+            self.vertical_scrollbar_geometry(width, height, top_bars_h, status_bar_h, scale_factor)
+        {
+            let tr = theme.scrollbar_track;
+            let tr_col = (tr.0 << 16) | (tr.1 << 8) | tr.2;
+            super::ui_draw::fill_rounded_rect_alpha(
+                buffer, width, height, tx, ty, tw, th, (tw as f32) * 0.5, tr_col, tr.3,
+            );
+            let thm = if self.scrollbar_drag || self.hovered_widget == Some(UiHit::Scrollbar) {
+                theme.scrollbar_thumb_hover
+            } else {
+                theme.scrollbar_thumb
+            };
+            let th_col = (thm.0 << 16) | (thm.1 << 8) | thm.2;
+            super::ui_draw::fill_rounded_rect_alpha(
+                buffer, width, height, tx, tby, tw, tbh, (tw as f32) * 0.5, th_col, thm.3,
+            );
+        }
+
+        // Left Bookmark Sidebar
+        if self.show_bookmarks && sidebar_w > 0 {
+            self.draw_bookmark_sidebar(
+                buffer,
+                width,
+                height.saturating_sub(status_bar_h),
+                sidebar_w,
+                top_bars_h,
+                scale_factor,
+            );
+        }
+
+        // Multi-Document Tab Bar
+        self.draw_tab_bar(buffer, width, height, menu_bar_h, tab_bar_h, scale_factor);
+
+        // Unified Top Menu + Inline Customizable Toolbar Bar
+        self.draw_menu_bar(buffer, width, height, menu_bar_h, scale_factor);
+
+        // Clean Bottom Status Bar
+        self.draw_status_bar(buffer, width, height, status_bar_h, scale_factor);
+
+        // Floating Search Bar / Optimize / Prompt Card
+        if self.input_mode != InputMode::Normal {
+            self.draw_active_input_overlay(buffer, width, height, top_bars_h, scale_factor);
+        }
+
+        // Open Menu Dropdown
+        if let Some(cat) = self.open_menu {
+            self.draw_open_menu_dropdown(buffer, width, height, menu_bar_h, cat, scale_factor);
+        }
+
+        // Customize Toolbar Modal
+        if self.show_customize_toolbar {
+            self.draw_customize_toolbar_modal(buffer, width, height, scale_factor);
+        }
+
+        // Help Overlay (`?` / `F1`)
+        if self.show_help_overlay {
+            self.draw_themed_help_overlay(buffer, width, height, scale_factor);
+        }
+
+        // About MicroPDF Modal (`Help -> About MicroPDF`)
+        if self.show_about_overlay {
+            self.draw_about_overlay(buffer, width, height, scale_factor);
+        }
+
+        // Print Preview Modal (`Ctrl/Cmd+P`)
+        if self.print_preview.is_some() {
+            self.draw_print_preview_modal(buffer, width, height, scale_factor);
+        }
+    }
+
+    pub(super) fn render_to_window(&mut self) -> Result<()> {
+        let Some(window) = self.window.as_ref().cloned() else {
+            return Ok(());
+        };
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        let scale_factor = window.scale_factor();
+
         let Some(mut surface) = self.surface.take() else {
             return Ok(());
         };
@@ -1249,253 +1599,7 @@ impl<'a> PdfViewerApp<'a> {
                 .buffer_mut()
                 .map_err(|e| anyhow::anyhow!("Failed to acquire softbuffer frame: {e}"))?;
 
-            // Fill background with solid black in Presentation Mode (F5), or #2B2B2B otherwise
-            buffer.fill(if self.is_presentation {
-                0x00000000
-            } else {
-                BG_COLOR_U32
-            });
-
-            if self.doc.is_none() {
-                let scale = (scale_factor.round() as u32).clamp(1, 2);
-                let hint1 = "Open PDF (O)";
-                let hint2 = "Press 'O' or File -> Open PDF, or drag and drop a PDF file here";
-                let cy = (top_bars_h + height.saturating_sub(status_bar_h)) / 2;
-                let w1 = (hint1.len() as u32) * 8 * (scale * 2);
-                let w2 = (hint2.len() as u32) * 8 * scale;
-                let x1 = width.saturating_sub(w1) / 2;
-                let x2 = width.saturating_sub(w2) / 2;
-                draw_bitmap_str_8x8(
-                    &mut buffer,
-                    width,
-                    height,
-                    x1,
-                    cy.saturating_sub(20 * scale),
-                    hint1,
-                    0x0064B5F6,
-                    scale * 2,
-                );
-                draw_bitmap_str_8x8(
-                    &mut buffer,
-                    width,
-                    height,
-                    x2,
-                    cy + 8 * scale,
-                    hint2,
-                    0x009E9E9E,
-                    scale,
-                );
-            } else if self.view_mode.is_page_view() {
-                if self.view_mode == ViewMode::ContinuousScroll {
-                    for &(page_idx, draw_rect) in &self.continuous_draw_rects {
-                        if let Some(cache) = self.continuous_page_cache.get(&page_idx) {
-                            self.blit_page_or_tiles(
-                                &mut buffer,
-                                width,
-                                height,
-                                sidebar_w,
-                                top_bars_h,
-                                status_bar_h,
-                                draw_rect,
-                                cache,
-                            );
-                            self.draw_search_overlays_on_page(
-                                &mut buffer,
-                                width,
-                                height,
-                                top_bars_h,
-                                status_bar_h,
-                                page_idx,
-                                draw_rect,
-                            );
-                            self.draw_text_selection_overlays_on_page(
-                                &mut buffer,
-                                width,
-                                height,
-                                top_bars_h,
-                                status_bar_h,
-                                page_idx,
-                                draw_rect,
-                            );
-                        }
-                    }
-                } else {
-                    // 1. Blit primary page bitmap or tiles (with zero-RAM ReadingFilter applied inline)
-                    if let Some(cache) = &self.cached_page {
-                        self.blit_page_or_tiles(
-                            &mut buffer,
-                            width,
-                            height,
-                            sidebar_w,
-                            top_bars_h,
-                            status_bar_h,
-                            self.page_draw_rect,
-                            cache,
-                        );
-                        self.draw_search_overlays_on_page(
-                            &mut buffer,
-                            width,
-                            height,
-                            top_bars_h,
-                            status_bar_h,
-                            cache.page_index,
-                            self.page_draw_rect,
-                        );
-                        self.draw_text_selection_overlays_on_page(
-                            &mut buffer,
-                            width,
-                            height,
-                            top_bars_h,
-                            status_bar_h,
-                            cache.page_index,
-                            self.page_draw_rect,
-                        );
-                    }
-
-                    // 1b. If in TwoPageSpread mode, blit right-hand page bitmap or tiles as well
-                    if self.view_mode == ViewMode::TwoPageSpread {
-                        if let (Some(second_cache), Some(second_rect)) =
-                            (&self.cached_second_page, self.second_page_draw_rect)
-                        {
-                            self.blit_page_or_tiles(
-                                &mut buffer,
-                                width,
-                                height,
-                                sidebar_w,
-                                top_bars_h,
-                                status_bar_h,
-                                second_rect,
-                                second_cache,
-                            );
-                            self.draw_search_overlays_on_page(
-                                &mut buffer,
-                                width,
-                                height,
-                                top_bars_h,
-                                status_bar_h,
-                                second_cache.page_index,
-                                second_rect,
-                            );
-                            self.draw_text_selection_overlays_on_page(
-                                &mut buffer,
-                                width,
-                                height,
-                                top_bars_h,
-                                status_bar_h,
-                                second_cache.page_index,
-                                second_rect,
-                            );
-                        }
-                    }
-                }
-
-                // 2. If user is holding Left-Click and dragging, draw live mode-colored selection box
-                if let Some((sx1, sy1)) = self.drag_start {
-                    let (sx2, sy2) = self.cursor_pos;
-                    let (_, target_rect) = self.resolve_target_page_and_draw_rect(sx1, sy1);
-                    let (px, py, pw, ph) = target_rect;
-                    let page_left = px.max(sidebar_w as i32);
-                    let page_right = (px + pw as i32).min(width as i32);
-                    let page_top = py.max(top_bars_h as i32);
-                    let page_bottom =
-                        (py + ph as i32).min(height.saturating_sub(status_bar_h) as i32);
-
-                    if page_right > page_left && page_bottom > page_top {
-                        let min_x = (sx1.min(sx2).round() as i32)
-                            .clamp(page_left, page_right) as u32;
-                        let max_x = (sx1.max(sx2).round() as i32)
-                            .clamp(page_left, page_right) as u32;
-                        let min_y = (sy1.min(sy2).round() as i32)
-                            .clamp(page_top, page_bottom) as u32;
-                        let max_y = (sy1.max(sy2).round() as i32)
-                            .clamp(page_top, page_bottom) as u32;
-
-                        if max_x > min_x && max_y > min_y {
-                            let (fill_rgba, border_col) = match self.mouse_mode {
-                                MouseMode::Select => ((33, 150, 243, 45), 0x0042A5F5),
-                                MouseMode::Highlight => ((255, 235, 59, 90), 0x00FBC02D),
-                                MouseMode::Redact => ((229, 57, 53, 110), 0x00FF1744),
-                                MouseMode::Crop => ((0, 230, 118, 85), 0x0000E676),
-                                MouseMode::StampImage => ((41, 182, 246, 95), 0x0000B0FF),
-                            };
-                            blend_rect_rgba(
-                                &mut buffer,
-                                width,
-                                height,
-                                min_x,
-                                min_y,
-                                max_x - min_x,
-                                max_y - min_y,
-                                fill_rgba,
-                            );
-                            draw_rect_border(
-                                &mut buffer,
-                                width,
-                                height,
-                                min_x,
-                                min_y,
-                                max_x - min_x,
-                                max_y - min_y,
-                                border_col,
-                            );
-                        }
-                    }
-                }
-            } else {
-                self.draw_thumbnail_grid(
-                    &mut buffer,
-                    width,
-                    height,
-                    sidebar_w,
-                    top_bars_h,
-                    status_bar_h,
-                );
-            }
-
-            // 3. If Left Bookmark Sidebar (`B`) is active, draw the 240px sidebar panel between top_bars_h and status_bar_h
-            if self.show_bookmarks && sidebar_w > 0 {
-                self.draw_bookmark_sidebar(
-                    &mut buffer,
-                    width,
-                    height.saturating_sub(status_bar_h),
-                    sidebar_w,
-                    top_bars_h,
-                    scale_factor,
-                );
-            }
-
-            // 4. Draw the 28px Multi-Document Tab Bar (`y = menu_bar_h .. top_bars_h`)
-            self.draw_tab_bar(
-                &mut buffer,
-                width,
-                height,
-                menu_bar_h,
-                tab_bar_h,
-                scale_factor,
-            );
-
-            // 5. Draw the 24px Top Menu Bar (`y = 0 .. menu_bar_h`)
-            self.draw_menu_bar(&mut buffer, width, height, menu_bar_h, scale_factor);
-
-            // 6. Draw the 22px Bottom Command & Status Bar (`y = height - status_bar_h .. height`)
-            self.draw_status_bar(&mut buffer, width, height, status_bar_h, scale_factor);
-
-            // 7. If a Top Menu dropdown is open, draw it over the viewport
-            if let Some(cat) = self.open_menu {
-                self.draw_open_menu_dropdown(
-                    &mut buffer,
-                    width,
-                    height,
-                    menu_bar_h,
-                    cat,
-                    scale_factor,
-                );
-            }
-
-            // 8. If Help Overlay (`?` or `F1`) is active, draw the modal overlay
-            if self.show_help_overlay {
-                draw_help_overlay(&mut buffer, width, height, scale_factor);
-            }
+            self.render_frame_into_buffer(&mut buffer, width, height, scale_factor);
 
             buffer
                 .present()
@@ -1604,176 +1708,4 @@ pub(super) fn draw_rect_border(
             buffer[(y * buf_w + (x_end - 1)) as usize] = color;
         }
     }
-}
-
-/// Renders a lightweight CPU bitmap Help Overlay (`?` / `F1`) directly into the window buffer.
-pub(super) fn draw_help_overlay(buffer: &mut [u32], buf_w: u32, buf_h: u32, scale_factor: f64) {
-    let scale = (scale_factor.round() as u32).clamp(1, 2);
-    let char_w = 8 * scale;
-    let line_h = 14 * scale;
-
-    let lines = [
-        "=== MICROPDF v1.2: LIGHTWEIGHT PDF VIEWER & POWER TOOLS ===",
-        "",
-        "TOP MENU BAR : Click [File] [View] [Edit] [Page] [Tools] [Help]",
-        "TOP TAB BAR  : Click Tab to Switch, [x] or Cmd/Ctrl+W Close, [+] Open",
-        "VIEW MODES   : '1' Fit | '2' Width | '3' Text | '4' 2-Page | '5' Cont.",
-        "ZOOM & FULL  : Ctrl+Wheel / '+' / '-' / '0' Zoom | F11 Full | F5 Slide",
-        "LINKS & HIST : Click Links to Jump | Alt+Left Back | Alt+Right Forward",
-        "GRID & BKMKS : 'Tab' Thumbnail Grid | 'B' Bookmark Sidebar | 'L' Import",
-        "FIND & COPY  : Cmd/Ctrl+F Incremental Search (Esc Cancel) | Cmd+C Copy",
-        "MOUSE MODES  : Select (default) | Highlight | Redact | Crop (Edit menu)",
-        "STAMP IMAGE  : 'P' Pick PNG/JPG Signature -> Click/Drag on Page to Stamp",
-        "READ FILTER  : 'V' Cycle Normal / Dark Invert / Warm Sepia (0-RAM Blit)",
-        "FLATTEN PDF  : 'U' Flatten Annotations/Forms & Unlock Permissions",
-        "BATCH COMBINE: 'Shift+M' Combine 2+ PDFs in Order into 'Combined.pdf'",
-        "SMART JUMP   : 'G' or 0-9 (Logical '5', Roman 'ii', or Physical '#5')",
-        "MARGINS & #  : 'N' Roman/Arabic # | 'H' Header/Footer | 'C' Clear Zone",
-        "PAGE TOOLS   : 'W' Watermark | 'K' Grayscale [BW] | 'I' Insert | 'R' Rot",
-        "FILE & UNDO  : 'O' Open | 'S' Save | 'Z' Optimize | 'X' Split | Cmd+Z Undo",
-        "? / F1 / ESC : Toggle or Close this Help Overlay",
-    ];
-
-    let max_chars = lines.iter().map(|l| l.len()).max().unwrap_or(40) as u32;
-    let pad_x = 18 * scale;
-    let pad_y = 16 * scale;
-    let box_w = (max_chars * char_w + pad_x * 2).min(buf_w.saturating_sub(16));
-    let box_h = ((lines.len() as u32) * line_h + pad_y * 2).min(buf_h.saturating_sub(16));
-    let box_x = buf_w.saturating_sub(box_w) / 2;
-    let box_y = buf_h.saturating_sub(box_h) / 2;
-
-    blend_rect_rgba(
-        buffer,
-        buf_w,
-        buf_h,
-        box_x,
-        box_y,
-        box_w,
-        box_h,
-        (20, 24, 33, 238),
-    );
-    draw_rect_border(buffer, buf_w, buf_h, box_x, box_y, box_w, box_h, 0x0064B5F6);
-
-    for (idx, line) in lines.iter().enumerate() {
-        let color = if idx == 0 {
-            0x00FFEB3B
-        } else {
-            0x00F5F5F5
-        };
-        let tx = box_x + pad_x;
-        let ty = box_y + pad_y + (idx as u32) * line_h;
-        draw_bitmap_str_8x8(buffer, buf_w, buf_h, tx, ty, line, color, scale);
-    }
-}
-
-/// Built-in 8x8 bitmap font rasterizer for Bookmark Sidebar, Thumbnail Grid labels, and Help Overlay.
-pub(super) fn draw_bitmap_str_8x8(
-    buffer: &mut [u32],
-    buf_w: u32,
-    buf_h: u32,
-    x: u32,
-    y: u32,
-    text: &str,
-    color: u32,
-    scale: u32,
-) {
-    let mut cx = x;
-    for ch in text.chars() {
-        let glyph = glyph_8x8(ch);
-        for (row_idx, &row_bits) in glyph.iter().enumerate() {
-            for col_idx in 0..8u32 {
-                if (row_bits >> (7 - col_idx)) & 1 == 1 {
-                    let px = cx + col_idx * scale;
-                    let py = y + (row_idx as u32) * scale;
-                    for dy in 0..scale {
-                        for dx in 0..scale {
-                            let gx = px + dx;
-                            let gy = py + dy;
-                            if gx < buf_w && gy < buf_h {
-                                buffer[(gy * buf_w + gx) as usize] = color;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        cx += 8 * scale;
-    }
-}
-
-/// Crisp 8x8 ASCII bitmap font glyph generator (embeds standard 5x7 glyphs centered in an 8x8 cell).
-pub(super) fn glyph_8x8(c: char) -> [u8; 8] {
-    let g5x7: [u8; 7] = match c.to_ascii_uppercase() {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-        'D' => [0b11100, 0b10010, 0b10001, 0b10001, 0b10001, 0b10010, 0b11100],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110],
-        '6' => [0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100],
-        ':' => [0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000],
-        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        '+' => [0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000],
-        '/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
-        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
-        '[' => [0b01110, 0b01000, 0b01000, 0b01000, 0b01000, 0b01000, 0b01110],
-        ']' => [0b01110, 0b00010, 0b00010, 0b00010, 0b00010, 0b00010, 0b01110],
-        '&' => [0b01100, 0b10010, 0b10100, 0b01000, 0b10101, 0b10010, 0b01101],
-        '?' => [0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100],
-        '=' => [0b00000, 0b00000, 0b11111, 0b00000, 0b11111, 0b00000, 0b00000],
-        '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
-        '#' => [0b01010, 0b11111, 0b01010, 0b01010, 0b11111, 0b01010, 0b00000],
-        '\'' => [0b00100, 0b00100, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000],
-        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100],
-        ',' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100, 0b01000],
-        '|' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        '!' => [0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00000, 0b00100],
-        '%' => [0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011],
-        '<' => [0b00010, 0b00100, 0b01000, 0b10000, 0b01000, 0b00100, 0b00010],
-        '>' => [0b01000, 0b00100, 0b00010, 0b00001, 0b00010, 0b00100, 0b01000],
-        '*' => [0b00000, 0b00100, 0b10101, 0b01110, 0b10101, 0b00100, 0b00000],
-        '°' => [0b00110, 0b01001, 0b01001, 0b00110, 0b00000, 0b00000, 0b00000],
-        '—' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        _ => [0; 7],
-    };
-    [
-        g5x7[0] << 2,
-        g5x7[1] << 2,
-        g5x7[2] << 2,
-        g5x7[3] << 2,
-        g5x7[4] << 2,
-        g5x7[5] << 2,
-        g5x7[6] << 2,
-        0,
-    ]
 }

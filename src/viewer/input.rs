@@ -1968,80 +1968,9 @@ impl<'a> PdfViewerApp<'a> {
         self.doc = orig_doc;
     }
 
-    /// Triggers printing (`Ctrl/Cmd+P` or `File -> Print...`) of the current in-memory document.
+    /// Triggers Print Preview (`Ctrl/Cmd+P` or `File -> Print...`) of the current in-memory document.
     pub(super) fn trigger_print(&mut self) {
-        if self.doc.is_none() || self.total_pages() == 0 {
-            self.status_notice = Some("No open PDF document to print".to_string());
-            self.update_title_bar();
-            self.request_redraw();
-            return;
-        }
-        if self.print_job.is_some() || self.lp_job.is_some() {
-            self.status_notice = Some(
-                "A print job is still running (Esc cancels printing)".to_string(),
-            );
-            self.update_title_bar();
-            self.request_redraw();
-            return;
-        }
-
-        #[cfg(target_os = "windows")]
-        {
-            let title = self.filename_display();
-            let owner_hwnd = self.window.as_ref().and_then(|w| {
-                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-                match w.window_handle().ok()?.as_raw() {
-                    RawWindowHandle::Win32(h) => Some(h.hwnd.get()),
-                    _ => None,
-                }
-            });
-            let total = self.total_pages();
-            match crate::print::show_windows_print_dialog(&title, total, owner_hwnd) {
-                Ok(None) => {
-                    self.status_notice = Some("Print cancelled".to_string());
-                }
-                Err(e) => {
-                    self.status_notice = Some(format!("Print error: {e:#}"));
-                }
-                Ok(Some(setup)) => {
-                    let Some(doc) = self.doc.as_ref() else {
-                        return;
-                    };
-                    match crate::print::PagedPrintJob::new(
-                        self.engine,
-                        doc,
-                        &setup.page_indices,
-                        setup.loop_copies,
-                        setup.reported_copies,
-                        self.redacted,
-                        &std::env::temp_dir(),
-                        Box::new(setup.sink),
-                    ) {
-                        Ok(job) => self.start_print_job(job, title),
-                        Err(e) => {
-                            self.status_notice = Some(format!("Print error: {e:#}"));
-                        }
-                    }
-                }
-            }
-            self.update_title_bar();
-            self.request_redraw();
-        }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            let (printers, selected_printer) = crate::print::discover_cups_printers();
-            self.input_mode = InputMode::PrintPrompt {
-                printers,
-                selected_printer,
-                copies: 1,
-                range_input: String::new(),
-                fit_to_page: true,
-            };
-            self.status_notice = None;
-            self.update_title_bar();
-            self.request_redraw();
-        }
+        self.open_print_preview();
     }
 
     fn print_progress_notice(job: &crate::print::PagedPrintJob) -> String {
@@ -2540,7 +2469,21 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn handle_key_input(&mut self, logical_key: Key, text: Option<&str>) {
-        // 1. If in an interactive Bottom Command Bar / Title-Bar prompt mode, handle typing, Backspace, Enter, Esc
+        // 0. Print Preview modal takes top keyboard priority
+        if self.print_preview.is_some() {
+            self.handle_print_preview_key(logical_key, text);
+            return;
+        }
+        if self.show_customize_toolbar || self.show_about_overlay {
+            if matches!(logical_key, Key::Named(NamedKey::Escape)) {
+                self.show_customize_toolbar = false;
+                self.show_about_overlay = false;
+                self.request_redraw();
+            }
+            return;
+        }
+
+        // 1. If in an interactive command/dialog prompt mode, handle typing, Backspace, Enter, Esc
         if self.input_mode != InputMode::Normal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
@@ -3457,23 +3400,121 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_pos = (position.x, position.y);
-                if let Some(w) = self.window.as_ref() {
-                    let sf = w.scale_factor();
-                    let menu_bar_h = self.menu_bar_height_px(sf);
-                    if self.open_menu.is_some() {
-                        // Hover-switch between top-level menus when a dropdown is already open
-                        if let Some(hovered_cat) =
-                            self.hit_test_menu_bar_header(position.x, position.y, menu_bar_h, sf)
-                        {
-                            if self.open_menu != Some(hovered_cat) {
-                                self.open_menu = Some(hovered_cat);
+                let (win_w, win_h, sf, sidebar_w, menu_bar_h, tab_bar_h, top_bars_h, status_bar_h) =
+                    if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = w.scale_factor();
+                        let mb_h = self.menu_bar_height_px(sf).min(sz.height.saturating_sub(48));
+                        let tb_h = self.tab_bar_height_px(sf).min(sz.height.saturating_sub(mb_h + 24));
+                        let st_h = self.status_bar_height_px(sf).min(sz.height.saturating_sub(mb_h + tb_h + 16));
+                        (
+                            sz.width.max(1),
+                            sz.height.max(1),
+                            sf,
+                            self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
+                            mb_h,
+                            tb_h,
+                            mb_h + tb_h,
+                            st_h,
+                        )
+                    } else {
+                        (1024, 1080, 1.0, 0, MENU_BAR_HEIGHT_LOGICAL, TAB_BAR_HEIGHT_LOGICAL, MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL, STATUS_BAR_HEIGHT_LOGICAL)
+                    };
+
+                if self.scrollbar_drag {
+                    self.scroll_to_scrollbar_y(position.y, win_w, win_h, top_bars_h, status_bar_h, sf);
+                    return;
+                }
+
+                // Compute unified hover widget and only redraw when hover actually changes
+                let mut new_hover: Option<UiHit> = None;
+                let mut menu_switched = false;
+
+                if self.print_preview.is_some() {
+                    if let Some(h) = self.hit_test_print_preview(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::print_preview::PrintPreviewHit::InsideModal {
+                            new_hover = Some(UiHit::PrintPreview(h));
+                        }
+                    }
+                } else if self.show_customize_toolbar {
+                    if let Some(h) = self.hit_test_customize_toolbar_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::toolbar::CustomizeHit::InsideCard {
+                            new_hover = Some(UiHit::Customize(h));
+                        }
+                    }
+                } else if self.open_menu.is_some() {
+                    if let Some(hovered_cat) = self.hit_test_menu_bar_header(position.x, position.y, menu_bar_h, sf) {
+                        if self.open_menu != Some(hovered_cat) {
+                            self.open_menu = Some(hovered_cat);
+                            menu_switched = true;
+                        }
+                        new_hover = Some(UiHit::MenuHeader(hovered_cat));
+                    } else if let Some((_, idx)) = self.hit_test_open_menu_dropdown(position.x, position.y, win_w, menu_bar_h, sf) {
+                        new_hover = Some(UiHit::MenuItem(idx));
+                    }
+                } else {
+                    if self.input_mode != InputMode::Normal {
+                        if let Some(h) = self.hit_test_active_input_overlay(position.x, position.y, win_w, top_bars_h, sf) {
+                            if h != super::overlays::OverlayHit::InsideModal {
+                                new_hover = Some(UiHit::Overlay(h));
                             }
                         }
-                        self.request_redraw();
-                        return;
-                    } else if (position.y as u32) < menu_bar_h {
-                        self.request_redraw();
                     }
+                    if new_hover.is_none() && (position.y as i32) < menu_bar_h as i32 {
+                        if let Some(cat) = self.hit_test_menu_bar_header(position.x, position.y, menu_bar_h, sf) {
+                            new_hover = Some(UiHit::MenuHeader(cat));
+                        } else {
+                            let tb_x = self.toolbar_start_x(sf);
+                            if let Some(act) = self.hit_test_unified_toolbar(position.x, position.y, tb_x, win_w, menu_bar_h, sf) {
+                                new_hover = Some(UiHit::Toolbar(act));
+                            }
+                        }
+                    } else if new_hover.is_none() && (position.y as i32) < top_bars_h as i32 {
+                        if let Some(th) = self.hit_test_tab_bar(position.x, position.y, win_w, menu_bar_h, tab_bar_h, sf) {
+                            new_hover = Some(match th {
+                                TabBarHit::SwitchTab(i) => UiHit::Tab(i),
+                                TabBarHit::CloseTab(i) => UiHit::TabClose(i),
+                                TabBarHit::NewTab => UiHit::TabNew,
+                            });
+                        }
+                    } else if new_hover.is_none() && self.show_bookmarks && (position.x as u32) < sidebar_w {
+                        if let Some(sh) = self.hit_test_bookmark_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
+                            new_hover = Some(match sh {
+                                SidebarHit::AddBookmarkButton => UiHit::SidebarAdd,
+                                SidebarHit::ImportTxtButton => UiHit::SidebarImport,
+                                SidebarHit::BookmarkRow { index, on_delete: true } => UiHit::SidebarDelete(index),
+                                SidebarHit::BookmarkRow { index, on_delete: false } => UiHit::SidebarRow(index),
+                            });
+                        }
+                    } else if new_hover.is_none() && self.doc.is_none() {
+                        if let Some(oh) = self.hit_test_welcome(position.x, position.y, win_w, win_h, top_bars_h, status_bar_h, sf) {
+                            new_hover = Some(UiHit::Overlay(oh));
+                        }
+                    } else if new_hover.is_none() {
+                        if let Some((tx, ty, tw, th, _, _)) = self.vertical_scrollbar_geometry(win_w, win_h, top_bars_h, status_bar_h, sf) {
+                            let ix = position.x.round() as i32;
+                            let iy = position.y.round() as i32;
+                            if ix >= tx - 4 && ix <= tx + tw as i32 + 4 && iy >= ty && iy < ty + th as i32 {
+                                new_hover = Some(UiHit::Scrollbar);
+                            }
+                        }
+                    }
+                }
+
+                let hover_changed = new_hover != self.hovered_widget;
+                if hover_changed {
+                    self.hovered_widget = new_hover;
+                }
+                if hover_changed || menu_switched {
+                    if let Some(w) = self.window.as_ref() {
+                        let pointer = new_hover.is_some() || self.hovered_link.is_some();
+                        w.set_cursor(if pointer { CursorIcon::Pointer } else { CursorIcon::Default });
+                    }
+                    self.request_redraw();
+                }
+
+                if self.print_preview.is_some() || self.show_customize_toolbar || self.open_menu.is_some() {
+                    return;
                 }
 
                 if self.drag_start.is_some() || self.grid_drag_page.is_some() {
@@ -3491,7 +3532,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                     }
                     self.request_redraw();
-                } else if self.view_mode.is_page_view() {
+                } else if self.view_mode.is_page_view() && new_hover.is_none() {
                     let new_link = self.resolve_link_at_screen_pos(position.x, position.y);
                     if new_link != self.hovered_link {
                         let is_over_link = new_link.is_some();
@@ -3505,36 +3546,23 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                     }
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
-                    if let Some(w) = self.window.as_ref() {
-                        let sz = w.inner_size();
-                        let sf = w.scale_factor();
-                        let sidebar_w = self.sidebar_width_px(sf);
-                        let top_bars_h = self.top_bars_height_px(sf);
-                        let new_hover = self
-                            .hit_test_thumbnail(
-                                position.x,
-                                position.y,
-                                sz.width.max(1),
-                                sidebar_w,
-                                top_bars_h,
-                            )
-                            .map(|(idx, _)| idx);
-                        if new_hover != self.hovered_thumb {
-                            self.hovered_thumb = new_hover;
-                            self.request_redraw();
-                        }
+                    let new_hover_thumb = self
+                        .hit_test_thumbnail(position.x, position.y, win_w, sidebar_w, top_bars_h)
+                        .map(|(idx, _)| idx);
+                    if new_hover_thumb != self.hovered_thumb {
+                        self.hovered_thumb = new_hover_thumb;
+                        self.request_redraw();
                     }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if self.show_help_overlay {
-                    if state == ElementState::Pressed {
-                        self.show_help_overlay = false;
-                        self.request_redraw();
-                    }
+                if state == ElementState::Released && self.scrollbar_drag {
+                    self.scrollbar_drag = false;
+                    self.request_redraw();
                     return;
                 }
-                let (win_w, scale_factor, sidebar_w, menu_bar_h, tab_bar_h, top_bars_h) =
+
+                let (win_w, win_h, scale_factor, sidebar_w, menu_bar_h, tab_bar_h, top_bars_h, status_bar_h) =
                     if let Some(w) = self.window.as_ref() {
                         let sz = w.inner_size();
                         let sf = w.scale_factor();
@@ -3542,24 +3570,76 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let tb_h = self
                             .tab_bar_height_px(sf)
                             .min(sz.height.saturating_sub(mb_h + 24));
+                        let st_h = self
+                            .status_bar_height_px(sf)
+                            .min(sz.height.saturating_sub(mb_h + tb_h + 16));
                         (
                             sz.width.max(1),
+                            sz.height.max(1),
                             sf,
                             self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)),
                             mb_h,
                             tb_h,
                             mb_h + tb_h,
+                            st_h,
                         )
                     } else {
                         (
                             1024,
+                            1080,
                             1.0,
                             0,
                             MENU_BAR_HEIGHT_LOGICAL,
                             TAB_BAR_HEIGHT_LOGICAL,
                             MENU_BAR_HEIGHT_LOGICAL + TAB_BAR_HEIGHT_LOGICAL,
+                            STATUS_BAR_HEIGHT_LOGICAL,
                         )
                     };
+
+                // Top-priority modal: Print Preview
+                if self.print_preview.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_print_preview(self.cursor_pos.0, self.cursor_pos.1, win_w, win_h, scale_factor) {
+                            Some(hit) => self.handle_print_preview_click(hit),
+                            None => self.close_print_preview(),
+                        }
+                    }
+                    return;
+                }
+
+                // Help & About modals
+                if self.show_help_overlay || self.show_about_overlay {
+                    if state == ElementState::Pressed {
+                        self.show_help_overlay = false;
+                        self.show_about_overlay = false;
+                        self.request_redraw();
+                    }
+                    return;
+                }
+
+                // Customize Toolbar modal
+                if self.show_customize_toolbar {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_customize_toolbar_modal(self.cursor_pos.0, self.cursor_pos.1, win_w, win_h, scale_factor) {
+                            Some(super::toolbar::CustomizeHit::ToggleItem(item)) => {
+                                self.toolbar_config.toggle(item);
+                                self.show_toolbar = true;
+                                self.request_redraw();
+                            }
+                            Some(super::toolbar::CustomizeHit::ResetDefaults) => {
+                                self.toolbar_config = super::toolbar::ToolbarConfig::default();
+                                self.show_toolbar = true;
+                                self.request_redraw();
+                            }
+                            Some(super::toolbar::CustomizeHit::Close) | None => {
+                                self.show_customize_toolbar = false;
+                                self.request_redraw();
+                            }
+                            Some(super::toolbar::CustomizeHit::InsideCard) => {}
+                        }
+                    }
+                    return;
+                }
 
                 // 0a. If a Top Menu dropdown is open, check if the user clicked an item or header
                 if self.open_menu.is_some() {
@@ -3588,15 +3668,30 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             self.request_redraw();
                             return;
                         }
-                        // Clicked outside menu dropdown -> close dropdown
                         self.open_menu = None;
                         self.request_redraw();
                     }
                     return;
                 }
 
-                // 0b. Check Top 24px Menu Bar header clicks
-                if (self.cursor_pos.1 as u32) < menu_bar_h {
+                // 0a2. Active input overlay card / Floating Search pill clicks
+                if self.input_mode != InputMode::Normal {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(oh) = self.hit_test_active_input_overlay(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.handle_overlay_click(oh);
+                            return;
+                        }
+                    }
+                }
+
+                // 0b. Unified Top Bar clicks (Menus on left + Inline Customizable Toolbar beside Help)
+                if (self.cursor_pos.1 as i32) < menu_bar_h as i32 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(cat) = self.hit_test_menu_bar_header(
                             self.cursor_pos.0,
@@ -3606,13 +3701,25 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         ) {
                             self.open_menu = Some(cat);
                             self.request_redraw();
+                            return;
+                        }
+                        let tb_x = self.toolbar_start_x(scale_factor);
+                        if let Some(action) = self.hit_test_unified_toolbar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            tb_x,
+                            win_w,
+                            menu_bar_h,
+                            scale_factor,
+                        ) {
+                            self.execute_toolbar_action(action);
                         }
                     }
                     return;
                 }
 
-                // 0c. Check 28px Multi-Tab Bar interactions (`menu_bar_h .. top_bars_h`)
-                if (self.cursor_pos.1 as u32) < top_bars_h {
+                // 0c. Multi-Tab Bar interactions (`menu_bar_h .. top_bars_h`)
+                if (self.cursor_pos.1 as i32) < top_bars_h as i32 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(hit) = self.hit_test_tab_bar(
                             self.cursor_pos.0,
@@ -3646,6 +3753,50 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                // 0d. Welcome Screen clicks when no document is open
+                if self.doc.is_none() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(oh) = self.hit_test_welcome(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            top_bars_h,
+                            status_bar_h,
+                            scale_factor,
+                        ) {
+                            self.handle_overlay_click(oh);
+                        }
+                    }
+                    return;
+                }
+
+                // 0e. Thin right-edge overlay vertical scrollbar click/drag
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some((tx, ty, tw, th, _, _)) = self.vertical_scrollbar_geometry(
+                        win_w,
+                        win_h,
+                        top_bars_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        let ix = self.cursor_pos.0.round() as i32;
+                        let iy = self.cursor_pos.1.round() as i32;
+                        if ix >= tx - 4 && ix <= tx + tw as i32 + 4 && iy >= ty && iy < ty + th as i32 {
+                            self.scrollbar_drag = true;
+                            self.scroll_to_scrollbar_y(
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                top_bars_h,
+                                status_bar_h,
+                                scale_factor,
+                            );
+                            return;
+                        }
+                    }
+                }
+
                 // 1. Check Left Bookmark Sidebar interactions
                 if self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w {
                     if state == ElementState::Pressed {
@@ -3657,6 +3808,15 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             scale_factor,
                         ) {
                             match hit {
+                                SidebarHit::AddBookmarkButton => {
+                                    if button == MouseButton::Left {
+                                        self.input_mode = InputMode::AddBookmark {
+                                            title_input: String::new(),
+                                        };
+                                        self.update_title_bar();
+                                        self.request_redraw();
+                                    }
+                                }
                                 SidebarHit::ImportTxtButton => {
                                     if button == MouseButton::Left {
                                         self.pending_dialog =

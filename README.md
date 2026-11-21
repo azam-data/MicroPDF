@@ -15,26 +15,26 @@
 | Scan: peak at 400% zoom, panning | 274 MB | 134.4 MB |
 | Scan: peak in thumbnail grid | 301 MB | 187.8 MB |
 
-All scan figures are within the target of file size + 120 MB (236 MB). Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 48 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries. Printing a 20-page scan at 600 dpi adds about 25 MB at peak (one decoded scan image plus one 5 MB strip).
+All scan figures are within the target of file size + 120 MB (236 MB). Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 16 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries. Printing a 20-page scan at 600 dpi adds about 25 MB at peak (one decoded scan image plus one 5 MB strip).
 
 ---
 
 ## Key Features
 
-- **CPU-Rendered Menu Bar & Command/Status Bar**:
-  - **24px Top Menu Bar (`#1E1E1E`)**: 6 clickable dropdown menus (`[ File ]  [ View ]  [ Edit ]  [ Page ]  [ Tools ]  [ Help ]`) rendered directly over the CPU frame buffer (`#252526` dropdown, `#007ACC` hover highlight), including `File -> Recent` (last 10 files).
-  - **22px Bottom Command & Status Bar**: Displays interactive typing prompts with a live cursor inside the window (including masked `*` password prompts for encrypted PDFs, incremental search progress, external URL confirmation, and session restore prompts), plus live page, mode, zoom, mouse-tool, filter, and RAM telemetry.
+- **Bright, Modern CPU-Rendered UI (Light Default + Dark Toggle, Zero GPU)**:
+  - **Unified Top Menu & Customizable Icon Toolbar (32px)**: 6 crisp dropdown menus (`File`, `View`, `Edit`, `Page`, `Tools`, `Help` including `Help -> About MicroPDF` and `File -> Recent`) paired with a customizable icon toolbar directly beside `Help` (`View -> Show Toolbar` and `View -> Customize Toolbar...`), rendered with antialiased proportional typography (`ab_glyph` + bounded 256 KB glyph cache), rounded buttons, soft shadows, and instant **Light / Dark UI** switching persisted in `micropdf.ini`.
+  - **Clean Tabs, Welcome Screen, Floating Search, & Thin Scrollbar**: Folder-style tabs with unsaved-edit indicators (`•`), a welcoming drag-and-drop empty screen with clickable recent files, a top-right floating `Ctrl/Cmd+F` search pill, clickable dialog cards (Optimize, Password, Jump, Watermark, etc.), and a thin draggable vertical scrollbar.
 - **Five View Modes (`1`, `2`, `3`, `4`, `5` Keys & `View` Menu), Zoom (`25%–800%`), & Fullscreen/Presentation (`F11` / `F5`)**:
   1. **`FitPage` (`1`)**: Fits the full page cleanly inside the available viewport.
   2. **`FitWidth` (`2`)**: Scales the page so its full width fills the viewport (minus 24px padding), with smooth vertical scrolling (`scroll_y`) and automatic page-to-page transitions.
   3. **`FitTextWidth` (`3`)**: Computes the union bounding box of page content objects (`page.objects().iter()`) to auto-trim left/right margins so the text column fills the viewport width.
   4. **`TwoPageSpread` (`4`)**: Renders `current_page` and `current_page + 1` side-by-side with a 12px gap, advancing 2 pages at a time.
   5. **`ContinuousScroll` (`5`)**: Vertical page stack with 12px gaps where the page number tracks the viewport centre and only visible pages ± 1 are cached in RAM.
-  - **Cursor-Anchored Zoom (`Ctrl/Cmd + Wheel`, `+`, `-`, `0`)**: Zooms 25%–800% around the cursor; above 2× viewport size, renders only visible `512 × 512` tiles in a 48 MB LRU tile cache.
+  - **Cursor-Anchored Zoom (`Ctrl/Cmd + Wheel`, `+`, `-`, `0`)**: Zooms 25%–800% around the cursor; above 2× viewport size, renders only visible `512 × 512` tiles in a 16 MB LRU tile cache.
   - **Fullscreen (`F11`) & Presentation Mode (`F5`)**: `F11` hides all bars; `F5` fits one page to a solid black screen with arrow/mouse-click page turns (`Esc` exits).
 - **Links, History (`Alt+Left` / `Alt+Right`), Session Restore (`micropdf.ini`), Single Instance, & Auto-Reload**:
-  - Click internal PDF links to jump or external URLs (with status-bar `Enter` confirmation) to open in the browser; navigate back/forward up to 50 steps with `Alt+Left` / `Alt+Right`.
-  - Automatically saves and offers to restore your previous tabs and recent files from `micropdf.ini`, forwards second-instance CLI opens to the running window in `< 200 ms`, and auto-reloads modified PDFs every 1 s while focused (ideal for LaTeX/Typst).
+  - Click internal PDF links to jump or external URLs (with confirmation) to open in the browser; navigate back/forward up to 50 steps with `Alt+Left` / `Alt+Right`.
+  - Automatically saves and offers to restore your previous tabs, recent files, UI theme, and toolbar customization in `micropdf.ini`, forwards second-instance CLI opens to the running window in `< 200 ms`, and auto-reloads modified PDFs every 1 s while focused (ideal for LaTeX/Typst).
 - **Text Selection (`Ctrl/Cmd+C`) & 6 Power Editor Tools**:
   - **Select & Copy Text (`Mouse Mode: Select Text`, default)**: Drag across text or double-click a word to highlight and press `Ctrl/Cmd+C` to copy to the clipboard (character boxes are cached for the current page only).
   1. **Time-Sliced Incremental Text Search (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`, `Esc` to cancel)**: Searches ~8 ms of pages per frame on the main thread with live status-bar progress so 1,000+ page PDFs never freeze the UI.
@@ -43,14 +43,15 @@ All scan figures are within the target of file size + 120 MB (236 MB). Continuou
   4. **Signature / Image Stamp (`P` Key or `Tools -> Stamp Signature / Image...`)**: Pick any `.png` (preserving alpha transparency) or `.jpg`/`.jpeg` file (auto-capped at 2,000 px) and click or drag on the page to stamp it via `PdfPageImageObject`.
   5. **Dark Mode / Sepia Reading Filter (`V` Key or `View` Menu)**: Cycles `Normal`, `DarkInvert`, and `WarmSepia` directly in the final `softbuffer` blit loop with zero extra RAM and zero modifications to the PDF file.
   6. **Flatten & Unlock PDF (`U` Key or `Tools -> Flatten & Unlock PDF`)**: Flattens annotations and form fields on all pages into page content streams and strips `/Encrypt`, `/AcroForm`, and `/Perms` restrictions.
-- **Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Prints the document as it is in the app, including unsaved edits, redactions and filled-in form fields.
-  - **Windows**: native print dialog (page range, copies); pages are sent one per frame with `Printing page N / M` in the status bar and `Esc` to cancel. Each page is rendered at the printer's resolution in 256-row strips, fitted to the printable area, paper orientation following the page.
-  - **macOS**: bottom-bar prompt (printer from `lpstat`, copies, page range like `1-3,5,8-`, `F` fit-to-page) that sends a temporary PDF to `lp` in the background and deletes it once `lp` has it.
+- **Print Preview & Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Split-view live sheet preview on Windows, macOS, and Linux showing unsaved edits, redactions, and filled-in form fields before printing:
+  - **Printer selection**: Direct printer picker on macOS/Linux (`lpstat`) and Windows (`EnumPrintersW` + optional native system dialog).
+  - **Pages & Duplex**: `All`, `Current`, or `Custom` range (`1-3, 5, 8-`), `Odd` / `Even` filters, `Reverse Order`, copies (`1–99`), paper size (`A4` / `Letter` / `Legal`), orientation (`Auto` / `Portrait` / `Landscape`), `Fit` / `100%`, `Color` / `Grayscale`, and **Both-Side (Duplex)** (`1-Sided` / `Long Edge` / `Short Edge`).
+  - **Crop White Space (`Auto-Trim` & `100%–200%` Print Zoom)**: Automatically detects and trims wide white margins (or lets you zoom in manually) to make small text larger and easier to read on paper, printed at full vector sharpness.
 - **Optimize (`Z` or `Tools -> Optimize...`)**: Smaller / Balanced / Print presets, colour, gray or black-and-white, scan cleaning on or off, a preview of the current page, progress in the status bar and `Esc` to cancel. Writes `<name>_optimized.pdf`.
 - **Batch Combine Multiple PDFs (`Shift+M` or `File -> Combine Multiple PDFs...`)**:
   - Select 2 or more PDF files in the native multi-file dialog to append all their pages in order and open the combined document in a new `"Combined.pdf"` tab.
-- **Multi-Document Tab Bar, Thumbnail Grid (`Tab`), Grayscale (`[BW]` / `K`), Bookmarks (`B` / `L`), & Multi-Step Undo (`Cmd/Ctrl+Z`)**:
-  - Inactive tabs hold no rendered bitmaps, `140 x 198` Thumbnail Grid (evicting outside visible rows ± 1 screen, capped at 300 entries) with drag-and-drop page reordering and `[BW]` / `[R]` badges, Roman/Arabic `/PageLabels` (`N`), aligned Headers/Footers (`H`), Margin Zone purge (`C`), hierarchical `.txt` bookmarks (`L`) embedded into `/Outlines`, and 8-step Undo (`Cmd/Ctrl+Z`).
+- **Multi-Document Tab Bar, Thumbnail Grid (`Tab`), Grayscale (`BW` / `K`), Bookmarks (`B` / `L`), & Multi-Step Undo (`Cmd/Ctrl+Z`)**:
+  - Inactive tabs hold no rendered bitmaps, `140 x 198` Thumbnail Grid (evicting outside visible rows ± 1 screen, capped at 300 entries) with drag-and-drop page reordering and hover `BW` / Rotate badges, Roman/Arabic `/PageLabels` (`N`), aligned Headers/Footers (`H`), Margin Zone purge (`C`), hierarchical `.txt` bookmarks (`L`) embedded into `/Outlines`, and 8-step Undo (`Cmd/Ctrl+Z`).
 
 ---
 

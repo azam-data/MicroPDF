@@ -2,10 +2,15 @@ mod bookmarks;
 mod grid;
 mod input;
 mod menu;
+mod overlays;
+mod print_preview;
 mod render;
 mod state;
 mod statusbar;
 mod tabs;
+mod theme;
+mod toolbar;
+mod ui_draw;
 
 use crate::engine::PdfEngine;
 use anyhow::{Context, Result};
@@ -2412,5 +2417,146 @@ mod tests {
         assert!(zoom <= cap, "scan zoom {zoom:.1} > {cap:.1}");
         assert!(grid <= cap, "scan grid {grid:.1} > {cap:.1}");
         Ok(())
+    }
+
+    #[test]
+    fn test_ui_theme_default_is_light_and_ini_roundtrip() {
+        use super::theme::UiThemeMode;
+        assert_eq!(UiThemeMode::default(), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::Light.toggle(), UiThemeMode::Dark);
+        assert_eq!(UiThemeMode::Dark.toggle(), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::from_ini_str("light"), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::from_ini_str("dark"), UiThemeMode::Dark);
+        assert_eq!(UiThemeMode::from_ini_str("unknown"), UiThemeMode::Light);
+        assert_eq!(UiThemeMode::Light.to_ini_str(), "light");
+        assert_eq!(UiThemeMode::Dark.to_ini_str(), "dark");
+        let light = UiThemeMode::Light.theme();
+        let dark = UiThemeMode::Dark.theme();
+        assert_ne!(light.canvas_bg, dark.canvas_bg);
+        assert_ne!(light.topbar_bg, dark.topbar_bg);
+    }
+
+    #[test]
+    fn test_toolbar_config_defaults_toggle_and_ini_roundtrip() {
+        use super::toolbar::{ToolbarConfig, ToolbarItem};
+        let mut cfg = ToolbarConfig::default();
+        assert!(cfg.is_enabled(ToolbarItem::Sidebar));
+        assert!(cfg.is_enabled(ToolbarItem::Open));
+        assert!(cfg.is_enabled(ToolbarItem::Print));
+        assert!(cfg.is_enabled(ToolbarItem::ThemeToggle));
+        assert!(!cfg.is_enabled(ToolbarItem::ViewModes));
+        assert!(!cfg.is_enabled(ToolbarItem::ReadingFilter));
+
+        cfg.toggle(ToolbarItem::ViewModes);
+        cfg.toggle(ToolbarItem::Print);
+        assert!(cfg.is_enabled(ToolbarItem::ViewModes));
+        assert!(!cfg.is_enabled(ToolbarItem::Print));
+
+        let serialized = cfg.to_ini_str();
+        let parsed = ToolbarConfig::from_ini_str(&serialized);
+        assert_eq!(cfg, parsed);
+
+        let none_cfg = ToolbarConfig::from_ini_str("none");
+        for item in ToolbarItem::ALL {
+            assert!(!none_cfg.is_enabled(item));
+        }
+        assert_eq!(none_cfg.to_ini_str(), "none");
+    }
+
+    #[test]
+    fn test_session_config_persists_ui_preferences_and_loads_legacy_ini() {
+        use super::state::{PdfViewerApp, SessionConfig};
+        use super::theme::UiThemeMode;
+        use super::toolbar::{ToolbarConfig, ToolbarItem};
+
+        // Legacy v1.2 ini without ui_theme / show_toolbar / toolbar_items should default cleanly
+        let legacy = "recent=foo.pdf\ntab=bar.pdf|2\nactive_tab=0\n";
+        let loaded_legacy = PdfViewerApp::parse_session_ini(legacy);
+        assert_eq!(loaded_legacy.ui_theme, UiThemeMode::Light);
+        assert!(loaded_legacy.show_toolbar);
+        assert_eq!(loaded_legacy.toolbar_config, ToolbarConfig::default());
+
+        // Roundtrip with custom UI preferences
+        let mut cfg = SessionConfig::default();
+        cfg.ui_theme = UiThemeMode::Dark;
+        cfg.show_toolbar = false;
+        cfg.toolbar_config.toggle(ToolbarItem::Open);
+        cfg.toolbar_config.toggle(ToolbarItem::Tools);
+        let serialized = PdfViewerApp::serialize_session_ini(&cfg);
+        let roundtripped = PdfViewerApp::parse_session_ini(&serialized);
+        assert_eq!(roundtripped.ui_theme, UiThemeMode::Dark);
+        assert!(!roundtripped.show_toolbar);
+        assert_eq!(roundtripped.toolbar_config, cfg.toolbar_config);
+    }
+
+    #[test]
+    fn test_ui_draw_fonts_metrics_truncation_and_cache_cap() {
+        use super::ui_draw::*;
+        let w = measure_text("MicroPDF Print Preview", 13.0, false);
+        assert!(w > 40.0, "expected positive measured text width, got {w}");
+        let wb = measure_text("MicroPDF Print Preview", 13.0, true);
+        assert!(wb > 40.0, "expected positive bold text width, got {wb}");
+
+        let trunc = truncate_ellipsis("VeryLongDocumentFileNameThatShouldTruncate.pdf", 80.0, 12.0, false);
+        assert!(trunc.ends_with('…') || trunc.ends_with("..."), "expected ellipsis truncation, got '{trunc}'");
+        assert!(measure_text(&trunc, 12.0, false) <= 82.0);
+
+        // Render text and icons into a scratch buffer and verify glyph cache stays bounded
+        let mut buf = vec![0x00FF_FFFFu32; 320 * 120];
+        draw_text(&mut buf, 320, 120, 10, 10, "Bright Professional UI 1234567890", 14.0, 0x001E_293B, false);
+        draw_text(&mut buf, 320, 120, 10, 34, "Bold Heading — Print & Zoom", 15.0, 0x0025_63EB, true);
+        draw_icon(&mut buf, 320, 120, UiIcon::Print, 10, 64, 18, 0x001E_293B);
+        draw_icon(&mut buf, 320, 120, UiIcon::Sun, 36, 64, 18, 0x001E_293B);
+        draw_icon(&mut buf, 320, 120, UiIcon::Moon, 62, 64, 18, 0x001E_293B);
+        assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
+
+        // Stress-test many sizes to verify the 256 KB glyph cache cap holds
+        for sz in [10.0f32, 12.0, 14.0, 16.0, 18.0, 22.0, 28.0] {
+            let _ = measure_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", sz, false);
+        }
+        assert!(
+            glyph_cache_bytes() <= 256 * 1024,
+            "glyph cache exceeded 256 KB cap: {} bytes",
+            glyph_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn test_print_preview_state_page_options_and_stepping() {
+        use super::print_preview::{PrintPageScope, PrintPreviewState};
+        use crate::print::PageParity;
+
+        let mut pp = PrintPreviewState::new(
+            vec!["HP_LaserJet".to_string(), "Save_as_PDF".to_string()],
+            0,
+            10,
+            3, // 0-based page 4
+        );
+        assert_eq!(pp.resolved_pages, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(pp.active_page_index(), Some(0));
+
+        // Current page scope
+        pp.page_scope = PrintPageScope::Current;
+        pp.recompute_pages(10, 3);
+        assert_eq!(pp.resolved_pages, vec![3]);
+        assert_eq!(pp.active_page_index(), Some(3));
+
+        // Custom range + Even + Reverse
+        pp.page_scope = PrintPageScope::Custom;
+        pp.custom_range = "1-6, 9-10".to_string();
+        pp.parity = PageParity::Even;
+        pp.reverse = true;
+        pp.recompute_pages(10, 3);
+        assert_eq!(pp.resolved_pages, vec![9, 5, 3, 1]);
+        assert_eq!(pp.sheet_pos, 0);
+        assert_eq!(pp.active_page_index(), Some(9));
+        pp.sheet_pos = 2;
+        assert_eq!(pp.active_page_index(), Some(3));
+
+        // Invalid range sets error and clears resolved_pages
+        pp.custom_range = "99".to_string();
+        pp.recompute_pages(10, 3);
+        assert!(pp.resolved_pages.is_empty());
+        assert!(pp.range_error.is_some());
     }
 }
