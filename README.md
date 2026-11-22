@@ -1,47 +1,83 @@
 # MicroPDF
 
-**MicroPDF** is a lightweight, portable PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), and [`image`](https://crates.io/crates/image). No GPU, no GUI toolkit, no installer: the menu bar, tab bar and status bar are drawn by the CPU straight into the window frame buffer.
+**MicroPDF** is a fast, ultra-lightweight, portable PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), and [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter).
 
-**Footprint (v1.3.0, raw process memory measured by `ram_realistic_measurement`, release build on macOS, 1920×1080, without the window frame buffer of about 8 MB):**
+**Zero GPU. Zero GUI toolkit. Zero installer.** Every menu, tab, toolbar, modal dialog, and live preview is CPU-rendered directly into the window frame buffer with minimal RAM and zero OS breadcrumbs.
 
-- `micro_pdf.exe` is about 1.6 MB (`micro_pdf` on macOS about 1.4 MB). It needs `pdfium.dll` (about 7.8 MB, from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries)) in the **same folder**, so a portable install is about 9.5 MB.
-- PDFium reads the file on demand, so a large file is not held in memory.
+---
 
-| Raw RSS | v1.2.1 | v1.3.0 |
-|---|---|---|
-| Small text PDF: idle after open | | 16.9 MB |
-| 116 MB, 100-page 300-dpi scan: idle after open | 129 MB | 50.6 MB |
-| Scan: peak while scrolling 50 pages | 228 MB | 118.2 MB |
-| Scan: peak at 400% zoom, panning | 274 MB | 134.4 MB |
-| Scan: peak in thumbnail grid | 301 MB | 187.8 MB |
+## Download & Portable Install (`v1.4.0`)
 
-All scan figures are within the target of file size + 120 MB (236 MB). Continuous scroll caches only visible pages ± 1, zoom above 2× uses a 16 MB LRU cache of 512×512 tiles, and the thumbnail grid is capped at 300 entries. Printing a 20-page scan at 600 dpi adds about 25 MB at peak (one decoded scan image plus one 5 MB strip).
+Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
+
+1. Download **`MicroPDF-windows-x64.zip`** (and optional **`SHA256SUMS.txt`**).
+2. Extract to any folder (or USB drive) — no installation or admin rights needed:
+   ```text
+   MicroPDF/
+   ├── micro_pdf.exe          # Signed-metadata Windows executable (~2 MB)
+   ├── pdfium.dll             # Bundled PDFium engine (~7.8 MB)
+   ├── micropdf.ini           # Auto-created portable settings & history
+   └── micropdf_assets/       # Auto-created portable signatures & stamps
+       ├── signatures/
+       └── stamps/
+   ```
+3. *(Optional)* Verify integrity on Windows PowerShell:
+   ```powershell
+   Get-FileHash MicroPDF-windows-x64.zip -Algorithm SHA256
+   ```
+
+> **macOS / Linux:** Build natively from source with `cargo build --release` and place `libpdfium.dylib` / `libpdfium.so` from [pdfium-binaries](https://github.com/bblanchon/pdfium-binaries) next to the `micro_pdf` binary.
+
+---
+
+## What's New in v1.4.0
+
+- **Hand Tool & Horizontal/Vertical Scrollbars (Normal & Compare Windows):** Click the **Hand** toolbar button (or **Hand** toggle in Compare Mode) to grab-and-pan zoomed pages in 2D, or drag the bottom horizontal and right vertical overlay scrollbars.
+- **Full Compare Mode Viewing Modes:** Compare Two PDFs now supports **Fit Page**, **Fit Width**, **100% Actual Size**, and custom zoom (`25%–400%`) with lockstep 2D scrolling, panning, page offset, pane swap, and CPU **Visual Diff** overlay.
+- **Split PDF to Single-Page PDFs:** Lossless folder export (`Tools -> Split to Single-Page PDFs...`) with All / Current / Custom Range and zero-padded `<prefix>_page_001.pdf` filenames.
+- **Shared System Font Picker:** Scans OS `.ttf`/`.otf` fonts via `ttf-parser` with clean human-readable names across **Watermark**, **Header & Footer**, and **Page Numbering** dialogs (plus built-in PDF font fallbacks).
+- **Detailed Watermark Dialog with Live Preview (`W`):** Real-time rotated & alpha-blended preview with System Font Picker, size, 6 colors, `-180°..+180°` rotation (`-45°/0°/+45°` presets), opacity (`5%–100%`), Centered / Custom Position / Tiled Grid coverage, and page range.
+- **Portable Stamp & Signature Manager (`P`):** Embedded freehand **Signature Pad** (Black/Blue ink, Clear, Save PNG), 5 customizable preset stamps (`APPROVED`, `CONFIDENTIAL`, `DRAFT`, `REVIEWED`, `COPY`), custom text & PNG stamps, Rename/Delete, and click-and-drag placement — stored portably in `./micropdf_assets/`.
+- **Lightweight Matrix Page Deskew (`Page -> Deskew Page(s)...`):** Straighten tilted scans (`-15.0°..+15.0°`, `0.1°` step) with Draw Guideline auto-snap, alignment grid, and live preview using lossless 2D affine transforms (zero rasterization).
+- **Hybrid Lattice + Stream PDF-to-Excel Engine (`Export -> Export to Excel (.xlsx)...`):** Vector gridline & thin-rectangle extraction with connected-component isolation for side-by-side tables, merged-cell detection, Stream gutter fallback, `/Rotate 90/180/270` landscape page normalization, financial comma-decimal parsing, and native desktop Microsoft Excel output via `rust_xlsxwriter`.
+
+---
+
+## Footprint & Memory Efficiency
+
+PDFium reads documents on demand, inactive tabs hold zero rendered bitmaps, modals allocate nothing when closed, zoom above 2× uses a bounded 16 MB 512×512 tile LRU cache, and the thumbnail grid is capped at 300 entries.
+
+| Raw Process RSS *(macOS release, 1920×1080, excluding ~8 MB window buffer)* | v1.2.1 | v1.3.0+ |
+| :--- | :---: | :---: |
+| Small text PDF: idle after open | — | **16.9 MB** |
+| 116 MB, 100-page 300-dpi scan: idle after open | 129 MB | **50.6 MB** |
+| Scan: peak while scrolling 50 pages | 228 MB | **118.2 MB** |
+| Scan: peak at 400% zoom, panning | 274 MB | **134.4 MB** |
+| Scan: peak in thumbnail grid | 301 MB | **187.8 MB** |
+
+Printing a 20-page 600-dpi scan adds ~25 MB at peak (one decoded scan image plus one 5 MB strip).
 
 ---
 
 ## Key Features
 
-- **Bright, Modern CPU-Rendered UI (Light Default + Dark Toggle, Zero GPU)**:
-  - **Unified Top Menu & Customizable Icon Toolbar (32px)**: 7 crisp dropdown menus (`File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Help` including `Help -> User Guide (How to Use)`, `Help -> Keyboard & Mouse Shortcuts`, `Help -> Bookmark Import Format (.txt)`, `Help -> About MicroPDF`, and `File -> Recent`) paired with a customizable icon toolbar directly beside `Help` (`View -> Show Toolbar`, `View -> Customize Toolbar...`, and `View -> UI Scale`), rendered with antialiased proportional typography (`ab_glyph` + bounded 256 KB glyph cache), rounded buttons, soft shadows, and instant **Light / Dark UI** switching persisted in `micropdf.ini`.
-  - **Built-in Step-by-Step Offline User Guide (`Help -> User Guide (How to Use)`)**: 10 plain-English beginner chapters covering every tool with numbered steps, friendly tips, and one-click `.txt` export for printing.
-  - **Scalable Tabs, Unsaved-Changes Guard, Welcome Screen & Floating Search**: Folder-style tabs with unsaved-edit indicators (`•`), overflow scroll arrows + `▾` All-Tabs dropdown + tab right-click menu (`Close Other Tabs` / `Close Tabs to Right` / `Close All Tabs`), `Save / Discard / Cancel` unsaved-changes guard on tab/app close, drag-and-drop Welcome Screen, top-right floating `Ctrl/Cmd+F` search pill (`Aa` Match Case, `W` Whole Word, `▲`/`▼` prev/next), and a thin draggable vertical scrollbar.
-- **View Modes (`1`–`4`, `T`), Independent Scroll Flow (`5`), Eye-Care Modes (`V`), Zoom (`25%–800%`), & Fullscreen/Presentation (`F11` / `F5`)**:
-  1. **`FitPage` (`1`)**, **`FitWidth` (`2`)**, **`FitTextWidth` (`3`)**, **`TwoPageSpread` (`4`)**, and **Reflowable `TextView` (`T`)**.
-  2. **Independent Scroll Modes**: Combine any page layout with **Single Page**, **Continuous Vertical (`5`)**, or **Continuous Horizontal Book** scroll.
-  3. **6 Eye-Care Reading Modes (`V` or Bottom Bar Picker, persisted in `micropdf.ini`)**: `Normal`, **`Paper E-Ink` (Best for day)**, `Warm Sepia`, `Sage Eye-Care`, `Dark Invert`, and **`Night Amber` (Best for night)**.
-  4. **Reading Continuity**: Automatically remembers your last page & zoom for up to 50 files in `micropdf.ini`, restores previous sessions on request, forwards second-instance opens in `< 200 ms`, and auto-reloads modified PDFs every 1 s while focused.
-- **Annotations, Interactive Form Filling, & Power Editor Tools**:
-  - **Select, Copy, Annotate & Inspect**: Drag or double-click text (`Ctrl/Cmd+C`), place Highlights, Underlines, Strikethroughs, Sticky Notes (multi-line reader popover with Edit/Delete), Freehand Pen, Text Boxes, Rectangles, and Arrows in 7 colors; **right-click any annotation** to edit text, recolor, or delete. Full 8-step **Undo (`Ctrl+Z`) & Redo (`Ctrl+Y` / `Ctrl+Shift+Z`)** across edits and metadata.
-  - **Native Interactive Form Filling**: Click PDF Checkboxes, Radio Buttons, and Text Fields directly in Select mode with Undo, Save, and Print support.
-  - **Side-by-Side PDF Compare (`Tools -> Compare with Another PDF...`)**: Synchronized dual-pane comparison supporting **Fit Page**, **Fit Width**, **100% Actual Size**, and custom zoom with lockstep 2D scrolling/panning, page offset, pane swap, and CPU **Visual Diff** overlay.
-  - **Quick Measure / Ruler Tool (`Edit -> Measure Distance & Area (Ruler)`)**: Measure exact Length, ΔX × ΔY, Area, and Angle directly from PDF points in `mm`, `cm`, `in`, or `pt`.
-  - **Black-Box Redaction & One-Click Privacy Scrubber (`File -> Document Properties & Privacy...`)**: True content/pixel redaction that strips underlying text, images, form fields, `/Info`, and `/StructTreeRoot` on save, plus one-click personal metadata & XMP scrubbing without altering page content.
-  - **Create PDF from Images (`File -> Create PDF from Images...`), Lossless Single-Page Split (`Tools -> Split to Single-Page PDFs...`) & Export Menu**: Split any PDF losslessly into numbered single-page PDFs, or convert offline to **Word (`.docx`)**, **Excel (`.xlsx`)** (Hybrid Lattice + Stream engine with merged cells, multi-table isolation, and financial comma-decimal normalization), **Markdown (`.md`)**, **LaTeX (`.tex`)**, or **PNG/JPEG Images** (150/200/300 DPI).
-  - **Shared System Font Picker, Detailed Watermark (`W`) & Portable Stamp/Signature Manager (`P`)**: Use installed OS `.ttf`/`.otf` fonts across Watermark, Header/Footer, and Page Numbers; preview rotated/tiled/transparent watermarks live; draw freehand signatures (Black/Blue ink) or customize `APPROVED`/`CONFIDENTIAL`/`DRAFT`/`REVIEWED`/`COPY` stamps stored portably in `./micropdf_assets/`.
-  - **Lightweight Matrix Page Deskew (`Page -> Deskew Page(s)...`)**: Straighten tilted/scanned pages (`-15.0°` to `+15.0°`, `0.1°` steps) with Draw Guideline auto-snap, alignment grid, and live preview using lossless 2D affine transforms (zero rasterization).
-- **Print Preview & Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Live sheet preview on Windows, macOS, and Linux with **10 Paper Sizes**, `With Annots` / `No Annots`, **Auto-Trim** white space + `100%–200%` Print Zoom, automatic **2-Sided (Duplex)**, guided **Manual 2-Sided on any 1-sided printer**, and foldable **Booklet** printing.
-- **Thumbnail Grid Multi-Select (`Tab`), Combine / Insert PDFs, Header/Footer Profiles, Page Numbers, Bookmarks & Optimize**:
-  - Multi-select pages (`Ctrl+Click` / `Shift+Click`) for single-step batch Rotate, B/W, Extract, or Delete; right-click thumbnails to insert blanks or external PDFs before/after; visual **Header & Footer** dialog with live preview & reusable style profiles; visual **Page Numbering** dialog with Roman/Arabic & skip cover pages; **Bookmark Sidebar** with Add, Edit, Reorder, Indent/Outdent, Auto-Detect Headings, Import `.txt`, and Export `.txt`; and **Optimize (`Z`)** with scan cleanup and live preview.
+### Reading, Navigation & UI
+- **Compact 720p-Ready CPU UI (Light Default + Dark Mode):** Unified 32px menu bar (`File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Help`) + customizable icon toolbar (`View -> Customize Toolbar...`, `View -> UI Scale`), antialiased proportional text (`ab_glyph`), and instant Light/Dark switching.
+- **Scalable Tabs & Unsaved-Changes Guard:** Multi-tab bar with overflow arrows, `▾` All-Tabs popover, tab right-click menu (`Close Other Tabs` / `Close Tabs to Right` / `Close All Tabs`), `Save / Discard / Cancel` guard on close, drag-and-drop Welcome Screen, and auto-reload on external file changes.
+- **Flexible Layouts & Pan/Scroll:** `FitPage` (`1`), `FitWidth` (`2`), `FitTextWidth` (`3`), `TwoPageSpread` (`4`), reflowable `TextView` (`T`), plus independent **Single Page**, **Continuous Vertical (`5`)**, and **Continuous Horizontal Book** flows, `25%–800%` cursor-centered zoom, **Hand Tool**, and draggable **Horizontal & Vertical Scrollbars**.
+- **6 Eye-Care Reading Modes (`V`):** `Normal`, `Paper E-Ink` (day), `Warm Sepia`, `Sage Eye-Care`, `Dark Invert`, and `Night Amber` (night), persisted in `micropdf.ini` alongside reading positions for up to 50 recent files.
+- **Fast Search & Built-In Beginner Manual:** Floating `Ctrl/Cmd+F` search (`Aa` Case, `W` Whole Word, `F3`/`Shift+F3`), `Alt+Left`/`Alt+Right` navigation history, Smart Jump (`G` — logical `5`, Roman `iii`, or physical `#5`), and a 10-chapter offline **Step-by-Step User Guide** (`Help -> User Guide (How to Use)`) with `.txt` export.
+
+### Editing, Annotations, Forms & Security
+- **Annotations & 8-Step Undo/Redo:** Text select & copy (`Ctrl+C`), Highlight, Underline, Strikethrough, Sticky Notes (with reader popover), Freehand Pen, Text Boxes, Rectangles, and Arrows in 7 colors; **right-click any annotation** to edit, recolor, or delete; `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) Undo/Redo.
+- **Interactive PDF Forms:** Click Checkboxes, Radio Buttons, and Text Fields directly in Select mode with Undo, Save, and Print support.
+- **True Black-Box Redaction & Privacy Scrubber:** Strips underlying text, images, form fields, `/Info`, and `/StructTreeRoot` on save, plus one-click metadata & XMP scrubbing (`File -> Document Properties & Privacy...`).
+- **Page & Document Tools:** Thumbnail Grid (`Tab`) with `Ctrl/Shift+Click` multi-select batch Rotate / B&W / Extract / Delete, right-click insert blanks or external PDFs before/after, **Combine PDFs (`Shift+M`)**, **Split/Extract (`X`)**, **Split to Single-Page PDFs**, **Matrix Deskew**, **Quick Measure / Ruler**, **Header & Footer Profiles (`H`)**, **Page Numbering (`N`)**, **Detailed Watermark (`W`)**, **Stamps & Signatures (`P`)**, **Bookmark Sidebar (`B`)** with Auto-Detect & `.txt` Import/Export, and **Flatten & Unlock (`U`)**.
+
+### Export, Conversion, Printing & Optimize
+- **Offline Export Menu (`Export`):** Convert to **Word (`.docx`)**, **Excel (`.xlsx`)** (Hybrid Lattice + Stream engine via `rust_xlsxwriter`), **Markdown (`.md`)**, **LaTeX (`.tex`)**, or **PNG/JPEG Images** (150/200/300 DPI), plus **Create PDF from Images (`File -> Create PDF from Images...`)**.
+- **Live Print Preview (`Ctrl/Cmd+P`):** 10 Paper Sizes, `With Annots` / `No Annots`, Auto-Trim + `100%–200%` Print Zoom, automatic Duplex, guided **Manual 2-Sided** for any 1-sided printer, and foldable **Booklet** printing.
+- **Local PDF Optimizer (`Z` / `Tools -> Optimize...`):** Writes `<name>_optimized.pdf` without touching the original. Supports Smaller (150 dpi), Balanced (200 dpi), Print (300 dpi), grayscale/1-bit B&W, ink-preserving scan whitening, and live page preview (no Ghostscript or OCR required).
 
 ---
 
@@ -49,68 +85,52 @@ All scan figures are within the target of file size + 120 MB (236 MB). Continuou
 
 | Shortcut / Action | Mode | Description |
 | :--- | :--- | :--- |
-| **Top Menu Bar Click** | Any | Open `[ File ]`, `[ View ]`, `[ Edit ]`, `[ Page ]`, `[ Tools ]`, `[ Export ]`, or `[ Help ]` |
+| **Top Menu Bar Click** | Any | Open `File`, `View`, `Edit`, `Page`, `Tools`, `Export`, or `Help` |
 | `1` / `2` / `3` / `4` / `5` / `T` | Page View | `1` Fit Page, `2` Fit Width, `3` Fit Text, `4` Two-Page, `5` Continuous Scroll, `T` Text View |
 | `Ctrl/Cmd+Wheel` / `+` / `-` / `0` | Page View | Zoom (`25%–800%`) around cursor or reset zoom to `100%` (`0` / `Ctrl+0`) |
-| `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+1..9` | Any | Switch next tab, previous tab, or jump directly to tab 1–9 (`Ctrl+W` closes tab) |
-| `F11` / `F5` / `Esc` | Any | Fullscreen (`F11`), Presentation Mode (`F5`), or exit tool/compare/modal (`Esc`) |
+| **Hand Tool** / **Scrollbars** | Normal / Compare | Click the **Hand** icon to drag-pan in 2D, or drag bottom Horizontal / right Vertical scrollbars |
+| `Ctrl+Tab` / `Ctrl+1..9` / `Ctrl+W` | Any | Switch tabs, jump to tab 1–9, or close tab (with unsaved-changes guard) |
+| `F11` / `F5` / `Esc` | Any | Fullscreen (`F11`), Presentation Mode (`F5`), or return to Select / close modal (`Esc`) |
 | `Alt+Left` / `Alt+Right` | Page View | Navigate Back / Forward in link & page jump history (up to 50 entries) |
-| **Left-Click / Drag / Right-Click** | Page View | Select text (`Ctrl+C`), click Form Fields to fill, right-click any annotation to Edit/Recolor/Delete |
-| `Tab` / `Ctrl+Click` / `Shift+Click` | Any / Grid | Toggle Thumbnail Grid (`Tab`); multi-select thumbnails for batch Rotate / B&W / Extract / Delete |
-| `Cmd/Ctrl+F` & `F3` / `Shift+F3` | Any | Incremental search (`Aa` Case, `W` Whole Word) & Next (`F3` / `Ctrl+G`) / Prev (`Shift+F3` / `Ctrl+Shift+G`) |
-| `V` | Page View | Cycle 6 Eye-Care Reading Modes (`Paper E-Ink` day, `Night Amber` night, Sepia, Sage, Dark, Normal) |
-| `P` / `U` / `Z` | Any | Stamp Signature/Image (`P`), Flatten & Unlock (`U`), Optimize PDF (`Z`) |
-| `Shift+M` / `X` | Any | **Combine Multiple PDFs** (`Shift+M`), Split / Extract range (`X`) |
-| `B` / `A` / `L` | Any | Toggle Bookmark Sidebar (`B`), Add Bookmark (`A`), Import `.txt` bookmarks (`L`) |
-| `G` | Normal | Smart Jump to Logical (`5`), Roman (`iii`), or Physical (`#5`) page |
-| `N` / `H` / `W` | Normal | Page Numbering Dialog (`N`), Header/Footer & Profiles (`H`), Watermark (`W`) |
-| `K` / `I` / `R` / `D` | Normal / Grid | Convert page to B&W (`K`), Insert Blank (`I`), Rotate 90° (`R`), Delete page (`D`) |
-| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Normal | Undo (`Ctrl+Z`) and Redo (`Ctrl+Y` / `Ctrl+Shift+Z`) up to 8 steps per tab |
-| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Live Print Preview (`Ctrl+P`), Open (`O`), Save (`S`), Save As (`Ctrl+Shift+S`) |
-| `?` / `F1` / `Help -> User Guide` | Any | Quick Shortcut Sheet (`?` / `F1`) or 10-chapter Step-by-Step Beginner User Guide |
+| **Left-Click / Drag / Right-Click** | Page View | Select text (`Ctrl+C`), fill Form Fields, or right-click annotations to Edit/Recolor/Delete |
+| `Tab` / `Ctrl+Click` / `Shift+Click` | Any / Grid | Toggle Thumbnail Grid (`Tab`); multi-select thumbnails for batch actions |
+| `Ctrl/Cmd+F` & `F3` / `Shift+F3` | Any | Incremental search (`Aa` Case, `W` Whole Word) & Next / Previous match |
+| `V` | Page View | Cycle 6 Eye-Care Reading Modes (`Paper E-Ink`, `Night Amber`, Sepia, Sage, Dark, Normal) |
+| `W` / `P` / `N` / `H` | Normal | Detailed Watermark (`W`), Stamps & Signatures (`P`), Page Numbers (`N`), Header/Footer (`H`) |
+| `Shift+M` / `X` / `Z` / `U` | Any | Combine PDFs (`Shift+M`), Split/Extract (`X`), Optimize (`Z`), Flatten & Unlock (`U`) |
+| `B` / `A` / `L` / `G` | Any / Normal | Bookmarks Sidebar (`B`), Add Bookmark (`A`), Import `.txt` (`L`), Smart Jump (`G`) |
+| `K` / `I` / `R` / `D` | Normal / Grid | Page B&W (`K`), Insert Blank (`I`), Rotate 90° (`R`), Delete Page (`D`) |
+| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Normal | Undo / Redo up to 8 steps per tab |
+| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Print Preview (`Ctrl+P`), Open (`O`), Save (`S`), Save As (`Ctrl+Shift+S`) |
+| `?` / `F1` / `Help -> User Guide` | Any | Shortcut Sheet (`?` / `F1`) or 10-chapter Step-by-Step User Guide |
 
 ---
 
-## Requirements
+## Building & Testing from Source
 
-Keep `micro_pdf.exe` and `pdfium.dll` (Windows) or `micro_pdf` and `libpdfium.dylib` / `libpdfium.so` together in one folder. Since v1.1, PDFium is loaded **only** from the executable's folder, never from the current working directory or system paths. For development you can point to another folder with the `MICROPDF_PDFIUM_DIR` environment variable.
-
-## Building from Source
+Keep `micro_pdf.exe` and `pdfium.dll` (Windows) or `micro_pdf` and `libpdfium.dylib` / `libpdfium.so` (macOS / Linux) in the same folder. PDFium is loaded **only** from the executable directory (or `MICROPDF_PDFIUM_DIR` during development).
 
 ```bash
-# Native macOS / Linux Release Build
-cargo build --release
+# Release build (macOS / Linux / Windows)
+cargo build --release --locked
 
-# Portable Windows x86_64 Cross-Compile
-cargo xwin build --release --target x86_64-pc-windows-msvc
-```
+# Cross-compile Windows x64 from macOS / Linux
+cargo xwin build --release --locked --target x86_64-pc-windows-msvc
 
-## Optimize (`Z` and `Tools -> Optimize...`)
+# Run unit tests (set MICROPDF_PDFIUM_DIR if PDFium is not beside target/debug)
+cargo test --locked
 
-Writes `<name>_optimized.pdf` next to the original; the original and the open document are never changed, and nothing is written if the result would not be smaller. `Z` runs the Balanced preset: images are downsampled to 200 dpi and re-encoded as JPEG (quality 70). On scanned pages (an image covering most of the page) off-white paper is pushed to pure white and text is sharpened, while ink colour is kept, so blue signatures stay blue. `Tools -> Optimize...` also offers Smaller (150 dpi) and Print (300 dpi), gray and black-and-white (1-bit) output, scan cleaning on or off, and a preview of the current page. Everything runs locally; no Ghostscript or OCR.
-
-On a 10-page, 24 MB scan: 6.0 MB in about 1 s per page; 0.54 MB in black-and-white mode.
-
-## Testing
-
-```bash
-# PDFium must be reachable: copy it next to the test binary or set MICROPDF_PDFIUM_DIR
-cargo test
-```
-
-Real memory figures (run on its own, takes a minute):
-
-```bash
+# Realistic memory & print RSS benchmarks
 cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
 cargo test --release ram_print -- --ignored --nocapture --test-threads=1
 ```
 
-`test_redaction_leaves_no_trace` builds a PDF with secret text over an image, redacts it, saves it, and fails if the secret survives in extracted text, in any decompressed stream, or in the image pixels under the box.
+---
 
 ## Contributing & Updating the Built-In User Guide
 
-Before contributing code or opening a pull request, please read **[`AGENTS.md`](AGENTS.md)** and **[`docs/USER_GUIDE_FRAMEWORK.md`](docs/USER_GUIDE_FRAMEWORK.md)**. Any change that adds, renames, or alters user-facing features, menus, dialogs, or shortcuts **must** update the built-in beginner manual in [`src/viewer/user_guide.rs`](src/viewer/user_guide.rs) and the shortcut sheet in [`src/viewer/overlays.rs`](src/viewer/overlays.rs).
+Before contributing or opening a pull request, please read **[`AGENTS.md`](AGENTS.md)** and **[`docs/USER_GUIDE_FRAMEWORK.md`](docs/USER_GUIDE_FRAMEWORK.md)**. Any change that adds, renames, or alters user-facing features, menus, dialogs, or shortcuts **must** update the built-in beginner manual in [`src/viewer/user_guide.rs`](src/viewer/user_guide.rs) and the shortcut sheet in [`src/viewer/overlays.rs`](src/viewer/overlays.rs).
 
 ## License
 
-MicroPDF is released under the MIT License (see `LICENSE`). Third-party components, including PDFium, keep their own licenses; see `THIRD_PARTY_NOTICES.md`.
+MicroPDF is released under the MIT License (see [`LICENSE`](LICENSE)). Third-party components, including PDFium, retain their own licenses (see [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)).
