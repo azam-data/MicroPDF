@@ -2081,6 +2081,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_excel_export_modal(buffer, width, height, scale_factor);
         }
 
+        // Split to Single-Page PDFs Modal
+        if self.split_pages_modal.is_some() {
+            self.draw_split_pages_modal(buffer, width, height, scale_factor);
+        }
+
         // Document Properties & Privacy Metadata Scrubber Modal
         if self.doc_props_modal.is_some() {
             self.draw_doc_props_modal(buffer, width, height, scale_factor);

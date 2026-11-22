@@ -29,6 +29,7 @@ use super::image_tools_modal::{
 use super::measure::{MeasureBarHit, MeasureUnit, MeasurementResult};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
+use super::split_pages_modal::{SplitPagesHit, SplitPagesModalState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
@@ -177,6 +178,7 @@ impl MenuCategory {
                 "Add Watermark... (W)",
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
+                "Split to Single-Page PDFs...",
                 "Compare with Another PDF...",
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
@@ -738,6 +740,7 @@ pub(super) enum UiHit {
     CreatePdfImages(CreatePdfImagesHit),
     ExportImages(ExportImagesHit),
     ExcelExport(ExcelExportHit),
+    SplitPages(SplitPagesHit),
     DocProps(DocPropsHit),
     UnsavedChanges(UnsavedChangesHit),
     AnnotContext(AnnotContextHit),
@@ -996,6 +999,7 @@ pub(super) enum PendingDialog {
     PickImagesForPdf,
     PickComparePdf,
     ExportPagesAsImagesDir,
+    SplitSinglePagesDir,
     ExportMarkdown,
     ExportLatex,
     ExportDocx,
@@ -1219,6 +1223,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) excel_export_modal: Option<ExcelExportModalState>,
     /// Remembers last chosen Hybrid Lattice/Stream Excel export options for the session.
     pub(super) excel_export_opts: crate::export::ExcelExportOptions,
+    /// Active `Split to Single-Page PDFs` modal state (0 bytes when closed).
+    pub(super) split_pages_modal: Option<SplitPagesModalState>,
     /// Active `Document Properties & Privacy` modal state (0 bytes when closed).
     pub(super) doc_props_modal: Option<DocPropsModalState>,
     /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
@@ -1466,6 +1472,7 @@ impl<'a> PdfViewerApp<'a> {
             export_images_modal: None,
             excel_export_modal: None,
             excel_export_opts: crate::export::ExcelExportOptions::default(),
+            split_pages_modal: None,
             doc_props_modal: None,
             unsaved_changes_modal: None,
             user_guide_modal: None,
@@ -1510,6 +1517,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.create_pdf_images_modal.is_some()
             || self.export_images_modal.is_some()
             || self.excel_export_modal.is_some()
+            || self.split_pages_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
             || self.show_customize_toolbar

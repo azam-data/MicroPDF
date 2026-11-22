@@ -8,6 +8,49 @@ use super::render::fill_rect_clipped;
 use super::state::*;
 use super::ui_draw::*;
 
+/// Viewing / scaling mode inside Side-by-Side Compare Mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum CompareFitMode {
+    /// Fit full page height & width into each half-pane (multiplied by `zoom_level`).
+    FitPage,
+    /// Fit page width to each half-pane (multiplied by `zoom_level`), enabling synced vertical scroll.
+    FitWidth,
+    /// True 100% actual size (`96 DPI / 72 pt * sf * zoom_level`), enabling synced 2D scroll & pan.
+    ActualSize,
+}
+
+/// Computes `(target_w, target_h)` in physical pixels for a compare pane given page dimensions in
+/// PDF points, available pane area, viewing mode, custom `zoom_level`, and display `scale_factor`.
+pub(super) fn compute_compare_render_dimensions(
+    pw_pts: f32,
+    ph_pts: f32,
+    pane_w: u32,
+    pane_h: u32,
+    fit_mode: CompareFitMode,
+    zoom_level: f32,
+    sf: f64,
+) -> (u32, u32) {
+    let pw = pw_pts.max(1.0);
+    let ph = ph_pts.max(1.0);
+    let avail_w = pane_w.saturating_sub(24).max(32) as f32;
+    let avail_h = pane_h.saturating_sub(36).max(32) as f32;
+    let base_scale = match fit_mode {
+        CompareFitMode::FitPage => (avail_w / pw).min(avail_h / ph),
+        CompareFitMode::FitWidth => avail_w / pw,
+        CompareFitMode::ActualSize => (96.0 / 72.0) * (sf.max(0.5) as f32),
+    };
+    let z = zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+    let scale = (base_scale * z).max(0.05);
+    // Keep peak bitmap RAM bounded even at 400%+ zoom
+    let max_dim = 4096.0f32;
+    let raw_w = (pw * scale).max(16.0);
+    let raw_h = (ph * scale).max(16.0);
+    let clamp_factor = (max_dim / raw_w.max(raw_h)).min(1.0);
+    let bw = (raw_w * clamp_factor).round().max(16.0) as u32;
+    let bh = (raw_h * clamp_factor).round().max(16.0) as u32;
+    (bw, bh)
+}
+
 pub(super) struct CompareCachedBitmap {
     pub(super) page_idx: u16,
     pub(super) width: u32,
@@ -20,9 +63,13 @@ pub(super) struct CompareModeState<'a> {
     #[allow(dead_code)]
     pub(super) other_path: PathBuf,
     pub(super) other_name: String,
+    pub(super) fit_mode: CompareFitMode,
     pub(super) visual_diff: bool,
     pub(super) page_offset: i16,
     pub(super) swapped: bool,
+    pub(super) max_scroll_y: f32,
+    pub(super) max_pan_x: f32,
+    pub(super) pan_drag_last: Option<(f64, f64)>,
     pub(super) cached_left: Option<CompareCachedBitmap>,
     pub(super) cached_right: Option<CompareCachedBitmap>,
     pub(super) cached_diff: Option<(u16, u16, u32, u32, Vec<u32>, f32)>,
@@ -39,9 +86,13 @@ impl<'a> CompareModeState<'a> {
             other_doc,
             other_path,
             other_name,
+            fit_mode: CompareFitMode::FitPage,
             visual_diff: false,
             page_offset: 0,
             swapped: false,
+            max_scroll_y: 0.0,
+            max_pan_x: 0.0,
+            pan_drag_last: None,
             cached_left: None,
             cached_right: None,
             cached_diff: None,
@@ -57,6 +108,9 @@ impl<'a> CompareModeState<'a> {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum CompareHit {
+    FitPage,
+    FitWidth,
+    ActualSize,
     ToggleDiff,
     OffsetMinus,
     OffsetPlus,
@@ -189,12 +243,15 @@ impl<'a> PdfViewerApp<'a> {
         let btn_h = (24.0 * s).round() as u32;
         let by = y + ((bar_h.saturating_sub(btn_h)) / 2) as i32;
 
-        let close_w = (68.0 * s).round() as u32;
-        let open_w = (92.0 * s).round() as u32;
-        let swap_w = (58.0 * s).round() as u32;
-        let sm_w = (24.0 * s).round() as u32;
-        let off_lbl_w = (68.0 * s).round() as u32;
-        let diff_w = (128.0 * s).round() as u32;
+        let close_w = (58.0 * s).round() as u32;
+        let open_w = (82.0 * s).round() as u32;
+        let swap_w = (50.0 * s).round() as u32;
+        let sm_w = (22.0 * s).round() as u32;
+        let off_lbl_w = (56.0 * s).round() as u32;
+        let diff_w = (106.0 * s).round() as u32;
+        let fit_w = (40.0 * s).round() as u32;
+        let wid_w = (50.0 * s).round() as u32;
+        let act_w = (46.0 * s).round() as u32;
 
         let close_x = x + w as i32 - pad - close_w as i32;
         let open_x = close_x - gap - open_w as i32;
@@ -202,9 +259,15 @@ impl<'a> PdfViewerApp<'a> {
         let plus_x = swap_x - gap - sm_w as i32;
         let minus_x = plus_x - off_lbl_w as i32 - sm_w as i32;
         let diff_x = minus_x - gap - diff_w as i32;
+        let act_x = diff_x - gap - act_w as i32;
+        let wid_x = act_x - 3 - wid_w as i32;
+        let fit_x = wid_x - 3 - fit_w as i32;
         let _ = cmp;
 
         let hits = vec![
+            (fit_x, by, fit_w, btn_h, CompareHit::FitPage),
+            (wid_x, by, wid_w, btn_h, CompareHit::FitWidth),
+            (act_x, by, act_w, btn_h, CompareHit::ActualSize),
             (diff_x, by, diff_w, btn_h, CompareHit::ToggleDiff),
             (minus_x, by, sm_w, btn_h, CompareHit::OffsetMinus),
             (plus_x, by, sm_w, btn_h, CompareHit::OffsetPlus),
@@ -238,8 +301,38 @@ impl<'a> PdfViewerApp<'a> {
         Some(CompareHit::InsideBar)
     }
 
+    pub(super) fn set_compare_fit_mode(&mut self, mode: CompareFitMode) {
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.fit_mode = mode;
+            cmp.invalidate_caches();
+        }
+        match mode {
+            CompareFitMode::FitPage => self.view_mode = ViewMode::FitPage,
+            CompareFitMode::FitWidth => self.view_mode = ViewMode::FitWidth,
+            CompareFitMode::ActualSize => {
+                self.view_mode = ViewMode::FitPage;
+                self.zoom_level = 1.0;
+            }
+        }
+        self.scroll_y = 0.0;
+        self.pan_x = 0.0;
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
     pub(super) fn handle_compare_bar_click(&mut self, hit: CompareHit) {
         match hit {
+            CompareHit::FitPage => {
+                self.zoom_level = 1.0;
+                self.set_compare_fit_mode(CompareFitMode::FitPage);
+            }
+            CompareHit::FitWidth => {
+                self.zoom_level = 1.0;
+                self.set_compare_fit_mode(CompareFitMode::FitWidth);
+            }
+            CompareHit::ActualSize => {
+                self.set_compare_fit_mode(CompareFitMode::ActualSize);
+            }
             CompareHit::ToggleDiff => {
                 if let Some(ref mut cmp) = self.compare_mode {
                     cmp.visual_diff = !cmp.visual_diff;
@@ -282,8 +375,8 @@ impl<'a> PdfViewerApp<'a> {
     fn render_compare_doc_page(
         doc: &PdfDocument,
         page_idx: u16,
-        pane_w: u32,
-        pane_h: u32,
+        bw: u32,
+        bh: u32,
         reading_filter: ReadingFilter,
     ) -> Option<CompareCachedBitmap> {
         let total = doc.pages().len();
@@ -291,17 +384,9 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
         let page = doc.pages().get(page_idx).ok()?;
-        let pw = page.width().value.max(1.0);
-        let ph = page.height().value.max(1.0);
-        let avail_w = pane_w.saturating_sub(24).max(32) as f32;
-        let avail_h = pane_h.saturating_sub(36).max(32) as f32;
-        let scale = (avail_w / pw).min(avail_h / ph);
-        let bw = (pw * scale).round().clamp(16.0, avail_w) as i32;
-        let bh = (ph * scale).round().clamp(16.0, avail_h) as i32;
-
         let cfg = PdfRenderConfig::new()
-            .set_target_width(bw)
-            .set_target_height(bh)
+            .set_fixed_width(bw.max(16) as i32)
+            .set_fixed_height(bh.max(16) as i32)
             .render_form_data(true)
             .render_annotations(true);
         let bmp = page.render_with_config(&cfg).ok()?;
@@ -320,6 +405,34 @@ impl<'a> PdfViewerApp<'a> {
             height: h,
             pixels,
         })
+    }
+
+    /// Synchronized scrolling inside Compare Mode; returns `true` if scroll consumed the delta.
+    pub(super) fn scroll_compare_synced(&mut self, dx: f32, dy: f32) -> bool {
+        let Some(cmp) = self.compare_mode.as_ref() else {
+            return false;
+        };
+        let max_y = cmp.max_scroll_y;
+        let max_x = cmp.max_pan_x;
+        let mut consumed = false;
+        if dx.abs() > 0.1 && max_x > 0.5 {
+            let prev = self.pan_x;
+            self.pan_x = (self.pan_x + dx).clamp(0.0, max_x);
+            if (self.pan_x - prev).abs() > 0.1 {
+                consumed = true;
+            }
+        }
+        if dy.abs() > 0.1 && max_y > 0.5 {
+            let prev = self.scroll_y;
+            self.scroll_y = (self.scroll_y + dy).clamp(0.0, max_y);
+            if (self.scroll_y - prev).abs() > 0.1 {
+                consumed = true;
+            }
+        }
+        if consumed {
+            self.request_redraw();
+        }
+        consumed
     }
 
     /// Ensures left/right bitmaps (and optional Visual Diff buffer) are rendered for the current
@@ -345,8 +458,12 @@ impl<'a> PdfViewerApp<'a> {
         let active_name = self.filename_display();
         let active_total = self.total_pages();
         let reading_filter = self.reading_filter;
+        let zoom_level = self.zoom_level;
+        let lbl_h = (22.0 * sf as f32).round() as u32;
+        let area_y = content_y + lbl_h + 4;
+        let area_h = content_h.saturating_sub(lbl_h + 8).max(16);
 
-        // Render left & right bitmaps (cached until page, offset, or pane size changes)
+        // Render left & right bitmaps (cached until page, offset, mode, zoom, or pane size changes)
         if let (Some(main_doc), Some(cmp)) = (self.doc.as_ref(), self.compare_mode.as_mut()) {
             let other_total = cmp.other_doc.pages().len();
             let right_signed = (left_idx as i32) + (cmp.page_offset as i32);
@@ -359,32 +476,84 @@ impl<'a> PdfViewerApp<'a> {
                 (main_doc, left_idx, left_idx < active_total, &cmp.other_doc, right_idx, right_valid)
             };
 
-            let target_w = half_w.saturating_sub(8).max(32);
-            let target_h = content_h.saturating_sub(24).max(32);
+            let pane_w_eff = half_w.saturating_sub(8).max(32);
+            let pane_h_eff = content_h.saturating_sub(24).max(32);
+            let fit_mode = cmp.fit_mode;
 
-            let left_stale = cmp.cached_left.as_ref().map_or(true, |c| {
-                c.page_idx != idx_a || c.width > target_w || c.height > target_h
-            });
-            if left_stale {
-                cmp.cached_left = if valid_a {
-                    Self::render_compare_doc_page(doc_a, idx_a, target_w, target_h, reading_filter)
-                } else {
-                    None
-                };
+            let target_a = if valid_a {
+                doc_a.pages().get(idx_a).ok().map(|p| {
+                    compute_compare_render_dimensions(
+                        p.width().value,
+                        p.height().value,
+                        pane_w_eff,
+                        pane_h_eff,
+                        fit_mode,
+                        zoom_level,
+                        sf,
+                    )
+                })
+            } else {
+                None
+            };
+            let target_b = if valid_b {
+                doc_b.pages().get(idx_b).ok().map(|p| {
+                    compute_compare_render_dimensions(
+                        p.width().value,
+                        p.height().value,
+                        pane_w_eff,
+                        pane_h_eff,
+                        fit_mode,
+                        zoom_level,
+                        sf,
+                    )
+                })
+            } else {
+                None
+            };
+
+            if let Some((tw, th)) = target_a {
+                let left_stale = cmp.cached_left.as_ref().map_or(true, |c| {
+                    c.page_idx != idx_a || c.width != tw || c.height != th
+                });
+                if left_stale {
+                    cmp.cached_left =
+                        Self::render_compare_doc_page(doc_a, idx_a, tw, th, reading_filter);
+                    cmp.cached_diff = None;
+                }
+            } else {
+                cmp.cached_left = None;
                 cmp.cached_diff = None;
             }
 
-            let right_stale = cmp.cached_right.as_ref().map_or(true, |c| {
-                c.page_idx != idx_b || c.width > target_w || c.height > target_h
-            });
-            if right_stale {
-                cmp.cached_right = if valid_b {
-                    Self::render_compare_doc_page(doc_b, idx_b, target_w, target_h, reading_filter)
-                } else {
-                    None
-                };
+            if let Some((tw, th)) = target_b {
+                let right_stale = cmp.cached_right.as_ref().map_or(true, |c| {
+                    c.page_idx != idx_b || c.width != tw || c.height != th
+                });
+                if right_stale {
+                    cmp.cached_right =
+                        Self::render_compare_doc_page(doc_b, idx_b, tw, th, reading_filter);
+                    cmp.cached_diff = None;
+                }
+            } else {
+                cmp.cached_right = None;
                 cmp.cached_diff = None;
             }
+
+            // Compute synchronized scroll & pan bounds across both panes
+            let max_bw = cmp
+                .cached_left
+                .as_ref()
+                .map_or(0, |c| c.width)
+                .max(cmp.cached_right.as_ref().map_or(0, |c| c.width));
+            let max_bh = cmp
+                .cached_left
+                .as_ref()
+                .map_or(0, |c| c.height)
+                .max(cmp.cached_right.as_ref().map_or(0, |c| c.height));
+            cmp.max_pan_x = (max_bw as f32 + 24.0 - half_w as f32).max(0.0);
+            cmp.max_scroll_y = (max_bh as f32 + 16.0 - area_h as f32).max(0.0);
+            self.pan_x = self.pan_x.clamp(0.0, cmp.max_pan_x);
+            self.scroll_y = self.scroll_y.clamp(0.0, cmp.max_scroll_y);
 
             if cmp.visual_diff {
                 if let (Some(lb), Some(rb)) = (cmp.cached_left.as_ref(), cmp.cached_right.as_ref()) {
@@ -393,7 +562,6 @@ impl<'a> PdfViewerApp<'a> {
                         .as_ref()
                         .map_or(true, |d| d.0 != idx_a || d.1 != idx_b || d.2 != lb.width || d.3 != lb.height);
                     if diff_stale {
-                        // Resample right onto left's exact dimensions if page sizes differ slightly
                         let right_aligned: Vec<u32> = if rb.width == lb.width && rb.height == lb.height {
                             rb.pixels.clone()
                         } else {
@@ -422,6 +590,8 @@ impl<'a> PdfViewerApp<'a> {
         let sub_sz = (10.5 * s).clamp(9.0, 20.0);
         let body_sz = (11.5 * s).clamp(10.0, 22.0);
         let bottom_limit = buf_h.saturating_sub(status_bar_h);
+        let pan_x_px = self.pan_x.round() as i32;
+        let scroll_y_px = self.scroll_y.round() as i32;
 
         // Draw center pane splitter
         fill_rect_clipped(
@@ -462,13 +632,12 @@ impl<'a> PdfViewerApp<'a> {
             )
         };
 
-        // Blit helper for a pane
+        // Blit helper for a pane with synchronized 2D pan/scroll clipped cleanly below pane header
         let blit_pane = |buffer: &mut [u32],
                          pane_x: u32,
                          pane_w: u32,
                          title: &str,
                          bmp: Option<(&[u32], u32, u32)>| {
-            let lbl_h = (22.0 * s).round() as u32;
             let clipped = truncate_ellipsis(title, (pane_w.saturating_sub(24)) as f32, sub_sz, true);
             draw_text_vcenter(
                 buffer,
@@ -484,40 +653,51 @@ impl<'a> PdfViewerApp<'a> {
                 true,
             );
             if let Some((pixels, bw, bh)) = bmp {
-                let area_y = content_y + lbl_h + 4;
-                let area_h = content_h.saturating_sub(lbl_h + 8);
-                let ox = pane_x as i32 + ((pane_w.saturating_sub(bw)) / 2) as i32;
-                let oy = area_y as i32 + ((area_h.saturating_sub(bh)) / 2) as i32;
-                draw_soft_shadow(
-                    buffer,
-                    buf_w,
-                    bottom_limit,
-                    ox,
-                    oy,
-                    bw,
-                    bh,
-                    2.0,
-                    8,
-                    3,
-                    theme.shadow_rgb,
-                    theme.shadow_max_alpha,
-                );
-                for r in 0..bh {
-                    let py = oy + r as i32;
-                    if py < content_y as i32 || py >= bottom_limit as i32 {
-                        continue;
-                    }
-                    let dst_row = (py as u32 * buf_w) as usize;
-                    let src_row = (r * bw) as usize;
-                    for c in 0..bw {
-                        let px = ox + c as i32;
-                        if px < pane_x as i32 || px >= (pane_x + pane_w) as i32 {
-                            continue;
-                        }
-                        buffer[dst_row + px as usize] = pixels[src_row + c as usize];
+                let ox = if bw + 24 <= pane_w {
+                    pane_x as i32 + ((pane_w.saturating_sub(bw)) / 2) as i32
+                } else {
+                    pane_x as i32 + 12 - pan_x_px
+                };
+                let oy = if bh + 16 <= area_h {
+                    area_y as i32 + ((area_h.saturating_sub(bh)) / 2) as i32
+                } else {
+                    area_y as i32 + 8 - scroll_y_px
+                };
+                let clip_top = area_y as i32;
+                let clip_bot = bottom_limit as i32;
+                let clip_left = pane_x as i32;
+                let clip_right = (pane_x + pane_w) as i32;
+
+                let r_start = (clip_top - oy).max(0) as u32;
+                let r_end = (clip_bot - oy).max(0).min(bh as i32) as u32;
+                let c_start = (clip_left - ox).max(0) as u32;
+                let c_end = (clip_right - ox).max(0).min(bw as i32) as u32;
+                if r_start < r_end && c_start < c_end {
+                    let copy_w = (c_end - c_start) as usize;
+                    for r in r_start..r_end {
+                        let py = (oy + r as i32) as u32;
+                        let dst_off = (py * buf_w) as usize + (ox + c_start as i32) as usize;
+                        let src_off = (r * bw + c_start) as usize;
+                        buffer[dst_off..dst_off + copy_w]
+                            .copy_from_slice(&pixels[src_off..src_off + copy_w]);
                     }
                 }
-                stroke_rounded_rect(buffer, buf_w, bottom_limit, ox, oy, bw, bh, 2.0, theme.page_border);
+                // Crisp border clipped inside pane bounds
+                if oy >= clip_top && oy < clip_bot {
+                    let bx0 = ox.max(clip_left);
+                    let bx1 = (ox + bw as i32).min(clip_right);
+                    if bx1 > bx0 {
+                        fill_rect_clipped(buffer, buf_w, bottom_limit, bx0, oy, (bx1 - bx0) as u32, 1, theme.page_border);
+                    }
+                }
+                let bot_y = oy + bh as i32 - 1;
+                if bot_y >= clip_top && bot_y < clip_bot {
+                    let bx0 = ox.max(clip_left);
+                    let bx1 = (ox + bw as i32).min(clip_right);
+                    if bx1 > bx0 {
+                        fill_rect_clipped(buffer, buf_w, bottom_limit, bx0, bot_y, (bx1 - bx0) as u32, 1, theme.page_border);
+                    }
+                }
             } else {
                 let msg = "No matching page at this offset";
                 let mw = measure_text(msg, body_sz, false);
@@ -579,8 +759,13 @@ impl<'a> PdfViewerApp<'a> {
             fill_rect_clipped(buffer, buf_w, buf_h, bx, by + bh as i32 - 1, bw, 1, theme.divider);
 
             let first_btn_x = hits.first().map(|h| h.0).unwrap_or(bx + bw as i32);
-            let title_lbl = format!("Compare Mode: {}  vs  {}", active_name, cmp.other_name);
-            let clipped_title = truncate_ellipsis(&title_lbl, (first_btn_x - bx - 20).max(40) as f32, body_sz, true);
+            let title_lbl = format!(
+                "Compare ({:.0}%): {} vs {}",
+                self.zoom_level * 100.0,
+                active_name,
+                cmp.other_name
+            );
+            let clipped_title = truncate_ellipsis(&title_lbl, (first_btn_x - bx - 16).max(40) as f32, body_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, bx + (12.0 * s).round() as i32, by, bh, first_btn_x - 8, &clipped_title, body_sz, theme.text_primary, true);
 
             let rad = (5.0 * s).max(3.0);
@@ -589,6 +774,20 @@ impl<'a> PdfViewerApp<'a> {
             for &(rx, ry, rw, rh, hit) in &hits {
                 let hov = self.hovered_widget == Some(UiHit::Compare(hit));
                 match hit {
+                    CompareHit::FitPage | CompareHit::FitWidth | CompareHit::ActualSize => {
+                        let (lbl, active) = match hit {
+                            CompareHit::FitPage => ("Fit", cmp.fit_mode == CompareFitMode::FitPage),
+                            CompareHit::FitWidth => ("Width", cmp.fit_mode == CompareFitMode::FitWidth),
+                            _ => ("100%", cmp.fit_mode == CompareFitMode::ActualSize),
+                        };
+                        let bg = if active { theme.accent } else if hov { theme.hover_bg } else { theme.surface_elevated };
+                        let fg = if active { theme.text_on_accent } else { theme.text_primary };
+                        let bdr = if active { theme.accent } else { theme.border_subtle };
+                        fill_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bg);
+                        stroke_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bdr);
+                        let tw = measure_text(lbl, sub_sz, active);
+                        draw_text_vcenter(buffer, buf_w, buf_h, rx + ((rw as f32 - tw) * 0.5).round() as i32, ry, rh, rx + rw as i32, lbl, sub_sz, fg, active);
+                    }
                     CompareHit::ToggleDiff => {
                         let on = cmp.visual_diff;
                         let bg = if on { theme.accent } else if hov { theme.hover_bg } else { theme.surface_elevated };
@@ -596,7 +795,7 @@ impl<'a> PdfViewerApp<'a> {
                         let bdr = if on { theme.accent } else { theme.border_subtle };
                         fill_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bg);
                         stroke_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bdr);
-                        let lbl = if on { "Visual Diff: ON" } else { "Visual Diff: OFF" };
+                        let lbl = if on { "Diff: ON" } else { "Diff: OFF" };
                         let tw = measure_text(lbl, sub_sz, true);
                         draw_text_vcenter(buffer, buf_w, buf_h, rx + ((rw as f32 - tw) * 0.5).round() as i32, ry, rh, rx + rw as i32, lbl, sub_sz, fg, true);
                     }

@@ -686,14 +686,18 @@ impl<'a> PdfViewerApp<'a> {
                 };
             }
             (MenuCategory::Tools, 5) => {
+                self.open_split_pages_modal();
+                return;
+            }
+            (MenuCategory::Tools, 6) => {
                 if self.doc.is_some() {
                     self.pending_dialog = Some(PendingDialog::PickComparePdf);
                 } else {
                     self.status_notice = Some("Open a PDF first before starting Compare Mode".to_string());
                 }
             }
-            (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
-            (MenuCategory::Tools, 7) => self.open_optimize_prompt(),
+            (MenuCategory::Tools, 7) => self.flatten_and_unlock_current_pdf(),
+            (MenuCategory::Tools, 8) => self.open_optimize_prompt(),
 
             // Export menu
             (MenuCategory::Export, 0) => {

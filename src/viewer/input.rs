@@ -15,6 +15,19 @@ use super::state::*;
 
 impl<'a> PdfViewerApp<'a> {
     pub(super) fn set_view_mode(&mut self, mode: ViewMode) {
+        if self.compare_mode.is_some() {
+            match mode {
+                ViewMode::FitPage => {
+                    self.set_compare_fit_mode(super::compare_mode::CompareFitMode::FitPage);
+                    return;
+                }
+                ViewMode::FitWidth | ViewMode::FitTextWidth => {
+                    self.set_compare_fit_mode(super::compare_mode::CompareFitMode::FitWidth);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if self.view_mode == mode {
             return;
         }
@@ -803,6 +816,20 @@ impl<'a> PdfViewerApp<'a> {
     /// Sets `self.zoom_level` (clamped to `25%..=800%`) while adjusting `self.pan_x` and `self.scroll_y`
     /// so the document point under `(anchor_x, anchor_y)` stays fixed on screen.
     pub(super) fn set_zoom_around_cursor(&mut self, new_zoom: f32, anchor_x: f64, anchor_y: f64) {
+        if self.compare_mode.is_some() {
+            let clamped = new_zoom.clamp(MIN_ZOOM_LEVEL, 4.0);
+            if (clamped - self.zoom_level).abs() < 0.001 {
+                return;
+            }
+            self.zoom_level = clamped;
+            if let Some(ref mut cmp) = self.compare_mode {
+                cmp.invalidate_caches();
+            }
+            self.status_notice = Some(format!("Compare Zoom: {:.0}%", self.zoom_level * 100.0));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         let clamped = new_zoom.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
         let old_zoom = self.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
         if (clamped - old_zoom).abs() < 0.001 {
@@ -925,6 +952,10 @@ impl<'a> PdfViewerApp<'a> {
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.fit_mode = super::compare_mode::CompareFitMode::ActualSize;
+            cmp.invalidate_caches();
+        }
         for (_, old_tile) in self.tile_cache.drain() {
             if old_tile.pixels.capacity() > self.spare_pixel_buf.capacity() {
                 self.spare_pixel_buf = old_tile.pixels;
@@ -3365,6 +3396,11 @@ impl<'a> PdfViewerApp<'a> {
             }
             return;
         }
+        // 0a6. Split to Single-Page PDFs modal
+        if self.split_pages_modal.is_some() {
+            self.handle_split_pages_key(&logical_key, text);
+            return;
+        }
         // 0b. Print Preview modal takes top keyboard priority
         if self.print_preview.is_some() {
             self.handle_print_preview_key(logical_key, text);
@@ -4748,6 +4784,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::PickImagesForPdf => self.pick_images_for_pdf_dialog(),
                 PendingDialog::PickComparePdf => self.pick_compare_pdf_dialog(),
                 PendingDialog::ExportPagesAsImagesDir => self.export_pages_as_images_dir_dialog(),
+                PendingDialog::SplitSinglePagesDir => self.execute_split_single_pages_dialog(),
                 PendingDialog::ExportMarkdown => self.export_markdown_dialog(),
                 PendingDialog::ExportLatex => self.export_latex_dialog(),
                 PendingDialog::ExportDocx => self.export_docx_dialog(),
@@ -5016,14 +5053,35 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // Ctrl/Cmd + MouseWheel zooms around the cursor position (25%..=800%)
-                if self.cmd_or_ctrl_pressed && self.view_mode.is_page_view() {
+                if self.cmd_or_ctrl_pressed && (self.view_mode.is_page_view() || self.compare_mode.is_some()) {
                     if dy.abs() > 0.1 {
                         let factor = if dy > 0.0 { 1.15 } else { 1.0 / 1.15 };
-                        let target = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
-                        let (cx, cy) = self.cursor_pos;
-                        self.set_zoom_around_cursor(target, cx, cy);
+                        if self.compare_mode.is_some() {
+                            self.zoom_level = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, 4.0);
+                            if let Some(ref mut cmp) = self.compare_mode {
+                                cmp.invalidate_caches();
+                            }
+                            self.update_title_bar();
+                            self.request_redraw();
+                        } else {
+                            let target = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+                            let (cx, cy) = self.cursor_pos;
+                            self.set_zoom_around_cursor(target, cx, cy);
+                        }
                     }
                     return;
+                }
+
+                // Synchronized vertical/horizontal scrolling in Compare Mode
+                if self.compare_mode.is_some() {
+                    let (pan_dx, scroll_dy) = if self.shift_pressed && dx.abs() < 0.5 {
+                        ((-dy) as f32, 0.0)
+                    } else {
+                        ((-dx) as f32, (-dy) as f32)
+                    };
+                    if self.scroll_compare_synced(pan_dx, scroll_dy) {
+                        return;
+                    }
                 }
 
                 // If cursor is over the Bookmark Sidebar, scroll bookmarks
@@ -5110,6 +5168,15 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.update_deskew_slider_from_x(position.x, win_w, sidebar_w, top_bars_h, sf);
                     return;
                 }
+                if let Some(last) = self.compare_mode.as_ref().and_then(|c| c.pan_drag_last) {
+                    let dx = (last.0 - position.x) as f32;
+                    let dy = (last.1 - position.y) as f32;
+                    if let Some(ref mut cmp) = self.compare_mode {
+                        cmp.pan_drag_last = Some((position.x, position.y));
+                    }
+                    self.scroll_compare_synced(dx, dy);
+                    return;
+                }
 
                 // Compute unified hover widget and only redraw when hover actually changes
                 let mut new_hover: Option<UiHit> = None;
@@ -5155,6 +5222,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     if let Some(h) = self.hit_test_excel_export_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::excel_export_modal::ExcelExportHit::InsideModal {
                             new_hover = Some(UiHit::ExcelExport(h));
+                        }
+                    }
+                } else if self.split_pages_modal.is_some() {
+                    if let Some(h) = self.hit_test_split_pages_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::split_pages_modal::SplitPagesHit::InsideModal {
+                            new_hover = Some(UiHit::SplitPages(h));
                         }
                     }
                 } else if self.combine_modal.is_some() {
@@ -5600,6 +5673,26 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             Some(hit) => self.handle_excel_export_click(hit),
                             None => {
                                 self.excel_export_modal = None;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Split to Single-Page PDFs modal
+                if self.split_pages_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_split_pages_modal(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(hit) => self.handle_split_pages_click(hit),
+                            None => {
+                                self.split_pages_modal = None;
                                 self.request_redraw();
                             }
                         }
@@ -6107,8 +6200,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
-                // 0d1. Side-by-Side Compare Mode top control bar + canvas click guard
+                // 0d1. Side-by-Side Compare Mode top control bar + synced drag-to-pan
                 if self.compare_mode.is_some() {
+                    if state == ElementState::Released && button == MouseButton::Left {
+                        if let Some(ref mut cmp) = self.compare_mode {
+                            cmp.pan_drag_last = None;
+                        }
+                        return;
+                    }
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(hit) = self.hit_test_compare_bar(
                             self.cursor_pos.0,
@@ -6119,6 +6218,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             scale_factor,
                         ) {
                             self.handle_compare_bar_click(hit);
+                            return;
+                        }
+                        if !(self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w) {
+                            if let Some(ref mut cmp) = self.compare_mode {
+                                cmp.pan_drag_last = Some(self.cursor_pos);
+                            }
                             return;
                         }
                     }

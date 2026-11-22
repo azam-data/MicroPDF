@@ -14,6 +14,7 @@ mod menu;
 mod overlays;
 mod print_preview;
 mod render;
+mod split_pages_modal;
 mod state;
 mod statusbar;
 mod tabs;
@@ -2949,6 +2950,51 @@ mod tests {
         assert!(txt.contains("Strip Personal Metadata & XMP"));
         assert!(txt.contains("Deskew Page(s)"));
         assert!(txt.contains("Auto (Hybrid)"));
+    }
+
+    #[test]
+    fn test_milestone1_compare_viewing_modes_dimensions() {
+        use super::compare_mode::{compute_compare_render_dimensions, CompareFitMode};
+        // Letter page (612 x 792 pt) inside a 600x600 half-pane at 1.0x scale
+        let (fw, fh) = compute_compare_render_dimensions(612.0, 792.0, 600, 600, CompareFitMode::FitPage, 1.0, 1.0);
+        assert!(fw < 600 && fh <= 564, "FitPage must fit height & width: {fw}x{fh}");
+
+        let (ww, wh) = compute_compare_render_dimensions(612.0, 792.0, 600, 600, CompareFitMode::FitWidth, 1.0, 1.0);
+        assert_eq!(ww, 576, "FitWidth must match available pane width (600 - 24)");
+        assert!(wh > fh, "FitWidth on portrait Letter should be taller than FitPage: {ww}x{wh}");
+
+        let (aw, ah) = compute_compare_render_dimensions(612.0, 792.0, 600, 600, CompareFitMode::ActualSize, 1.0, 1.0);
+        assert_eq!(aw, 816, "ActualSize 100% of 612pt at 96dpi = 816px");
+        assert_eq!(ah, 1056, "ActualSize 100% of 792pt at 96dpi = 1056px");
+
+        let (zw, zh) = compute_compare_render_dimensions(612.0, 792.0, 600, 600, CompareFitMode::FitPage, 2.0, 1.0);
+        assert!((zw as i32 - (fw * 2) as i32).abs() <= 2 && (zh as i32 - (fh * 2) as i32).abs() <= 2,
+            "200% zoom must double FitPage dimensions: {zw}x{zh} vs {fw}x{fh}");
+    }
+
+    #[test]
+    fn test_milestone1_single_page_pdf_filename_and_range() {
+        use super::split_pages_modal::{SplitPagesModalState, SplitPdfScope};
+        assert_eq!(
+            crate::engine::PdfEngine::format_single_page_pdf_name("Q4 Report", 1, 25),
+            "Q4 Report_page_001.pdf"
+        );
+        assert_eq!(
+            crate::engine::PdfEngine::format_single_page_pdf_name("bad/name:here", 12, 1200),
+            "bad_name_here_page_0012.pdf"
+        );
+        assert_eq!(
+            crate::engine::PdfEngine::format_single_page_pdf_name("   ", 5, 10),
+            "page_page_005.pdf"
+        );
+
+        let mut st = SplitPagesModalState::new("demo".to_string());
+        assert_eq!(st.resolved_pages(2, 5).unwrap(), vec![0, 1, 2, 3, 4]);
+        st.scope = SplitPdfScope::Current;
+        assert_eq!(st.resolved_pages(2, 5).unwrap(), vec![2]);
+        st.scope = SplitPdfScope::Custom;
+        st.custom_range = "1-2, 5".to_string();
+        assert_eq!(st.resolved_pages(2, 5).unwrap(), vec![0, 1, 4]);
     }
 }
 

@@ -3384,6 +3384,72 @@ impl PdfEngine {
         Self::write_atomic(output_path.as_ref(), &bytes).context("Failed to save extracted PDF")
     }
 
+    /// Formats a zero-padded single-page PDF filename (e.g., `report_page_001.pdf`).
+    pub fn format_single_page_pdf_name(prefix: &str, page_num_1based: u16, total_pages: u16) -> String {
+        let clean: String = prefix
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let clean = clean.trim();
+        let stem = if clean.is_empty() { "page" } else { clean };
+        let width = total_pages.max(1).to_string().len().max(3);
+        format!("{stem}_page_{page_num_1based:0width$}.pdf")
+    }
+
+    /// Losslessly splits selected 0-based `page_indices` of `doc` into individual single-page
+    /// `.pdf` files inside `out_dir` via PDFium page-import/export APIs (zero rasterization).
+    pub fn split_doc_to_single_page_pdfs<P: AsRef<Path>>(
+        &self,
+        doc: &PdfDocument,
+        page_indices: &[u16],
+        out_dir: P,
+        prefix: &str,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
+        let total_doc_pages = doc.pages().len();
+        if total_doc_pages == 0 || page_indices.is_empty() {
+            anyhow::bail!("No pages selected to split");
+        }
+        let dir = out_dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create output folder {}", dir.display()))?;
+
+        let total_to_export = page_indices.len();
+        let mut written = 0usize;
+        for (step, &page_idx) in page_indices.iter().enumerate() {
+            if page_idx >= total_doc_pages {
+                continue;
+            }
+            let mut single = self
+                .pdfium
+                .create_new_pdf()
+                .context("Failed to create single-page destination PDF")?;
+            single
+                .pages_mut()
+                .copy_page_from_document(doc, page_idx, 0)
+                .with_context(|| format!("Failed to copy page {} losslessly", page_idx + 1))?;
+            let bytes = single
+                .save_to_bytes()
+                .with_context(|| format!("Failed to serialize page {}", page_idx + 1))?;
+            drop(single);
+
+            let fname = Self::format_single_page_pdf_name(prefix, page_idx + 1, total_doc_pages);
+            let out_path = dir.join(fname);
+            Self::write_atomic(&out_path, &bytes)
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+            written += 1;
+            on_progress(step + 1, total_to_export);
+        }
+        Ok(written)
+    }
+
     /// Stamp Page Numbers (`add_page_numbers`) supporting Roman numerals (e.g., i, ii, iii, iv, v)
     /// for pages `1..=roman_end` and standard Arabic numerals (1, 2, 3...) after that,
     /// positioned at bottom-center.
