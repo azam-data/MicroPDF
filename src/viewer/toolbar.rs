@@ -710,7 +710,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             ToolbarAction::ToolStamp => {
                 if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::PickStampImage);
+                    self.open_stamp_manager_modal();
                 }
             }
             ToolbarAction::RotatePage => {

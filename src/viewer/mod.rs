@@ -15,6 +15,7 @@ mod overlays;
 mod print_preview;
 mod render;
 mod split_pages_modal;
+mod stamp_manager_modal;
 mod state;
 mod statusbar;
 mod tabs;
@@ -23,6 +24,7 @@ mod theme;
 mod toolbar;
 mod ui_draw;
 mod user_guide;
+mod watermark_modal;
 
 use crate::engine::PdfEngine;
 use anyhow::{Context, Result};
@@ -2995,6 +2997,32 @@ mod tests {
         st.scope = SplitPdfScope::Custom;
         st.custom_range = "1-2, 5".to_string();
         assert_eq!(st.resolved_pages(2, 5).unwrap(), vec![0, 1, 4]);
+    }
+
+    #[test]
+    fn test_milestone2_stamp_and_signature_rasterization_and_storage() {
+        use super::stamp_manager_modal::{
+            ensure_asset_subdirs, rasterize_signature_pad_rgba, rasterize_text_stamp_rgba,
+            SignatureInkColor, StampBorderStyle,
+        };
+        let stamp = rasterize_text_stamp_rgba("APPROVED", (22, 138, 68), StampBorderStyle::Double);
+        assert!(stamp.width >= 140 && stamp.height >= 64);
+        let stamp_rgba = stamp.image.to_rgba8();
+        assert_eq!(stamp_rgba.as_raw().len(), (stamp.width * stamp.height * 4) as usize);
+        assert!(stamp_rgba.as_raw().chunks_exact(4).any(|px| px[3] > 200 && px[1] == 138));
+        assert!(stamp_rgba.as_raw().chunks_exact(4).any(|px| px[3] == 0), "stamp background must stay transparent");
+
+        assert!(rasterize_signature_pad_rgba(&[], SignatureInkColor::Black).is_none());
+        let strokes = vec![vec![(0.1, 0.5), (0.4, 0.3), (0.8, 0.6)]];
+        let sig = rasterize_signature_pad_rgba(&strokes, SignatureInkColor::Blue).unwrap();
+        assert_eq!((sig.width, sig.height), (480, 180));
+        let sig_rgba = sig.image.to_rgba8();
+        assert!(sig_rgba.as_raw().chunks_exact(4).any(|px| px[3] > 200 && px[2] == 178));
+
+        let tmp = std::env::temp_dir().join("micropdf_m2_assets_test");
+        let (sigs, stamps) = ensure_asset_subdirs(&tmp);
+        assert!(sigs.is_dir() && stamps.is_dir());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 

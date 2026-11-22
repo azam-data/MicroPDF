@@ -673,12 +673,12 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
             (MenuCategory::Tools, 2) => {
-                self.input_mode = InputMode::Watermark {
-                    input: String::new(),
-                };
+                self.open_watermark_modal();
+                return;
             }
             (MenuCategory::Tools, 3) => {
-                self.pending_dialog = Some(PendingDialog::PickStampImage);
+                self.open_stamp_manager_modal();
+                return;
             }
             (MenuCategory::Tools, 4) => {
                 self.input_mode = InputMode::SplitRange {

@@ -3401,6 +3401,16 @@ impl<'a> PdfViewerApp<'a> {
             self.handle_split_pages_key(&logical_key, text);
             return;
         }
+        // 0a7. Detailed Watermark modal
+        if self.watermark_modal.is_some() {
+            self.handle_watermark_key(&logical_key, text);
+            return;
+        }
+        // 0a8. Portable Stamp & Signature Manager modal
+        if self.stamp_manager_modal.is_some() {
+            self.handle_stamp_manager_key(&logical_key, text);
+            return;
+        }
         // 0b. Print Preview modal takes top keyboard priority
         if self.print_preview.is_some() {
             self.handle_print_preview_key(logical_key, text);
@@ -4584,7 +4594,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if s.eq_ignore_ascii_case("v") {
                     self.set_reading_filter(self.reading_filter.next());
                 } else if s.eq_ignore_ascii_case("p") {
-                    self.pending_dialog = Some(PendingDialog::PickStampImage);
+                    self.open_stamp_manager_modal();
                 } else if s.eq_ignore_ascii_case("u") {
                     self.flatten_and_unlock_current_pdf();
                 } else if s.eq_ignore_ascii_case("b") {
@@ -4644,9 +4654,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if s.eq_ignore_ascii_case("h") || s.eq_ignore_ascii_case("c") {
                     self.open_header_footer_modal();
                 } else if s.eq_ignore_ascii_case("w") {
-                    self.input_mode = InputMode::Watermark {
-                        input: String::new(),
-                    };
+                    self.open_watermark_modal();
                     self.status_notice = None;
                     self.update_title_bar();
                     self.request_redraw();
@@ -4790,6 +4798,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ExportDocx => self.export_docx_dialog(),
                 PendingDialog::ExportXlsx => self.export_xlsx_dialog(),
                 PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
+                PendingDialog::ImportStampAssetPng => self.import_stamp_asset_png_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
                 PendingDialog::ExtractSelectedPages(pages) => {
                     self.extract_selected_pages_dialog(&pages)
@@ -5168,6 +5177,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.update_deskew_slider_from_x(position.x, win_w, sidebar_w, top_bars_h, sf);
                     return;
                 }
+                if self.stamp_manager_modal.as_ref().is_some_and(|s| s.pad_drawing) {
+                    self.append_signature_pad_point(position.x, position.y, win_w, win_h, sf, false);
+                    return;
+                }
                 if let Some(last) = self.compare_mode.as_ref().and_then(|c| c.pan_drag_last) {
                     let dx = (last.0 - position.x) as f32;
                     let dy = (last.1 - position.y) as f32;
@@ -5228,6 +5241,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     if let Some(h) = self.hit_test_split_pages_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::split_pages_modal::SplitPagesHit::InsideModal {
                             new_hover = Some(UiHit::SplitPages(h));
+                        }
+                    }
+                } else if self.watermark_modal.is_some() {
+                    if let Some(h) = self.hit_test_watermark_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::watermark_modal::WatermarkHit::InsideModal {
+                            new_hover = Some(UiHit::Watermark(h));
+                        }
+                    }
+                } else if self.stamp_manager_modal.is_some() {
+                    if let Some(h) = self.hit_test_stamp_manager_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::stamp_manager_modal::StampManagerHit::InsideModal {
+                            new_hover = Some(UiHit::StampManager(h));
                         }
                     }
                 } else if self.combine_modal.is_some() {
@@ -5693,6 +5718,62 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             Some(hit) => self.handle_split_pages_click(hit),
                             None => {
                                 self.split_pages_modal = None;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Detailed Watermark modal
+                if self.watermark_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_watermark_modal(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(hit) => self.handle_watermark_click(hit),
+                            None => {
+                                self.watermark_modal = None;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Portable Stamp & Signature Manager modal (with Freehand Signature Pad drawing)
+                if self.stamp_manager_modal.is_some() {
+                    if state == ElementState::Released && button == MouseButton::Left {
+                        if let Some(ref mut st) = self.stamp_manager_modal {
+                            st.pad_drawing = false;
+                        }
+                        return;
+                    }
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_stamp_manager_modal(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(super::stamp_manager_modal::StampManagerHit::DrawPad) => {
+                                self.append_signature_pad_point(
+                                    self.cursor_pos.0,
+                                    self.cursor_pos.1,
+                                    win_w,
+                                    win_h,
+                                    scale_factor,
+                                    true,
+                                );
+                            }
+                            Some(hit) => self.handle_stamp_manager_click(hit),
+                            None => {
+                                self.stamp_manager_modal = None;
                                 self.request_redraw();
                             }
                         }

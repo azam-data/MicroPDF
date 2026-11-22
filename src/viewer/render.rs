@@ -1712,6 +1712,9 @@ impl<'a> PdfViewerApp<'a> {
         if self.combine_modal.is_some() {
             self.ensure_combine_preview_rendered(width, height, scale_factor);
         }
+        if self.watermark_modal.is_some() {
+            self.ensure_watermark_preview_rendered(width, height, scale_factor);
+        }
 
         let theme = self.ui_theme();
         buffer.fill(if self.is_presentation {
@@ -2084,6 +2087,16 @@ impl<'a> PdfViewerApp<'a> {
         // Split to Single-Page PDFs Modal
         if self.split_pages_modal.is_some() {
             self.draw_split_pages_modal(buffer, width, height, scale_factor);
+        }
+
+        // Detailed Watermark Modal with Live Preview
+        if self.watermark_modal.is_some() {
+            self.draw_watermark_modal(buffer, width, height, scale_factor);
+        }
+
+        // Portable Stamp & Signature Manager Modal
+        if self.stamp_manager_modal.is_some() {
+            self.draw_stamp_manager_modal(buffer, width, height, scale_factor);
         }
 
         // Document Properties & Privacy Metadata Scrubber Modal

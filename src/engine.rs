@@ -125,6 +125,7 @@ pub struct HeaderFooterProfile {
     pub footer_left: String,
     pub footer_center: String,
     pub footer_right: String,
+    pub font_name: String,
     pub font_size: f32,
     pub margin_pt: f32,
     pub color: HeaderFooterColor,
@@ -140,6 +141,7 @@ impl Default for HeaderFooterProfile {
             footer_left: String::new(),
             footer_center: String::new(),
             footer_right: String::new(),
+            font_name: "Helvetica (Built-in)".to_string(),
             font_size: 10.0,
             margin_pt: 28.0,
             color: HeaderFooterColor::Gray,
@@ -187,7 +189,7 @@ impl HeaderFooterProfile {
 
     pub fn to_ini_str(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}|{}",
             Self::esc(&self.name),
             Self::esc(&self.header_left),
             Self::esc(&self.header_center),
@@ -198,6 +200,7 @@ impl HeaderFooterProfile {
             self.font_size.clamp(6.0, 24.0),
             self.margin_pt.clamp(12.0, 72.0),
             self.color.to_ini_str(),
+            Self::esc(&self.font_name),
         )
     }
 
@@ -210,6 +213,12 @@ impl HeaderFooterProfile {
         if name.is_empty() {
             return None;
         }
+        let font_name = if parts.len() >= 11 {
+            let parsed = Self::unesc(parts[10]).trim().to_string();
+            if parsed.is_empty() { "Helvetica".to_string() } else { parsed }
+        } else {
+            "Helvetica".to_string()
+        };
         Some(Self {
             name,
             header_left: Self::unesc(parts[1]),
@@ -221,6 +230,7 @@ impl HeaderFooterProfile {
             font_size: parts[7].trim().parse::<f32>().unwrap_or(10.0).clamp(6.0, 24.0),
             margin_pt: parts[8].trim().parse::<f32>().unwrap_or(28.0).clamp(12.0, 72.0),
             color: HeaderFooterColor::from_ini_str(parts[9]),
+            font_name,
         })
     }
 }
@@ -263,6 +273,7 @@ pub struct PageNumberConfig {
     pub roman_end: u16,
     /// Number of leading cover/picture pages to leave completely unnumbered (0 = none).
     pub skip_pages: u16,
+    pub font_name: String,
     pub font_size: f32,
     pub margin_pt: f32,
     pub color: HeaderFooterColor,
@@ -275,9 +286,48 @@ impl Default for PageNumberConfig {
             format: PageNumberFormat::Plain,
             roman_end: 0,
             skip_pages: 0,
+            font_name: "Helvetica (Built-in)".to_string(),
             font_size: 10.0,
             margin_pt: 28.0,
             color: HeaderFooterColor::Gray,
+        }
+    }
+}
+
+/// Coverage / placement mode for the Milestone 2.2 Detailed Watermark dialog.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum WatermarkPlacement {
+    Centered,
+    /// Custom relative position `(x_pct, y_pct)` in `0.0..=1.0` (`0.5, 0.5` = center).
+    Custom { x_pct: f32, y_pct: f32 },
+    /// Repeating grid across the entire page with `(gap_x_pt, gap_y_pt)` spacing.
+    Tiled { gap_x_pt: f32, gap_y_pt: f32 },
+}
+
+/// Full configuration for Milestone 2.2 Detailed Watermark stamping.
+#[derive(Clone, Debug)]
+pub struct WatermarkConfig {
+    pub text: String,
+    pub font_name: String,
+    pub font_size: f32,
+    pub color_rgb: (u8, u8, u8),
+    /// Rotation angle in degrees (`-180.0..=180.0`; positive = CCW in PDF space, e.g. 45° diagonal).
+    pub rotation_deg: f32,
+    /// Opacity percentage (`5..=100`, default `28`).
+    pub opacity_pct: u8,
+    pub placement: WatermarkPlacement,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            text: "CONFIDENTIAL".to_string(),
+            font_name: "Helvetica Bold (Built-in)".to_string(),
+            font_size: 54.0,
+            color_rgb: (120, 125, 135),
+            rotation_deg: 45.0,
+            opacity_pct: 28,
+            placement: WatermarkPlacement::Centered,
         }
     }
 }
@@ -2775,7 +2825,7 @@ impl PdfEngine {
         if total_pages == 0 || page_indices.is_empty() {
             return Ok(());
         }
-        let font = doc.fonts_mut().helvetica();
+        let font = crate::fonts::load_pdf_font_by_name(doc, &profile.font_name);
         let font_sz = profile.font_size.clamp(6.0, 24.0);
         let edge_y = profile.margin_pt.clamp(12.0, 72.0);
         let side_x = 36.0_f32;
@@ -2860,7 +2910,7 @@ impl PdfEngine {
         if total_pages == 0 {
             return Ok(());
         }
-        let font = doc.fonts_mut().helvetica();
+        let font = crate::fonts::load_pdf_font_by_name(doc, &cfg.font_name);
         let font_sz = cfg.font_size.clamp(6.0, 24.0);
         let edge_y = cfg.margin_pt.clamp(12.0, 72.0);
         let side_x = 36.0_f32;
@@ -2906,6 +2956,91 @@ impl PdfEngine {
             obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
             let mut page = doc.pages_mut().get(idx)?;
             page.objects_mut().add_text_object(obj)?;
+        }
+        Ok(())
+    }
+
+    /// Stamps a detailed customizable watermark (`WatermarkConfig`: system font, size, color,
+    /// rotation `-180°..+180°`, opacity `5%..100%`, Centered / Custom / Tiled) onto selected 0-based `page_indices`.
+    pub fn apply_watermark_full(
+        doc: &mut PdfDocument,
+        cfg: &WatermarkConfig,
+        page_indices: &[u16],
+    ) -> Result<()> {
+        let txt = cfg.text.trim();
+        let total_pages = doc.pages().len();
+        if txt.is_empty() || total_pages == 0 || page_indices.is_empty() {
+            return Ok(());
+        }
+        let font = crate::fonts::load_pdf_font_by_name(doc, &cfg.font_name);
+        let font_sz = cfg.font_size.clamp(10.0, 160.0);
+        let alpha = ((cfg.opacity_pct.clamp(5, 100) as f32 / 100.0) * 255.0).round() as u8;
+        let (r, g, b) = cfg.color_rgb;
+        let color = PdfColor::new(r, g, b, alpha);
+        let rot_deg = cfg.rotation_deg.clamp(-180.0, 180.0);
+
+        for &idx in page_indices {
+            if idx >= total_pages {
+                continue;
+            }
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value.max(1.0), page.height().value.max(1.0))
+            };
+
+            // Measure single watermark box once per page
+            let probe = PdfPageTextObject::new(doc, txt, font, PdfPoints::new(font_sz))?;
+            let tw = probe.width().unwrap_or(PdfPoints::new(font_sz * txt.len() as f32 * 0.55)).value.max(10.0);
+            let th = probe.height().unwrap_or(PdfPoints::new(font_sz)).value.max(8.0);
+            drop(probe);
+
+            let centers: Vec<(f32, f32)> = match cfg.placement {
+                WatermarkPlacement::Centered => vec![(pw * 0.5, ph * 0.5)],
+                WatermarkPlacement::Custom { x_pct, y_pct } => {
+                    let cx = (pw * x_pct.clamp(0.05, 0.95)).clamp(20.0, (pw - 20.0).max(20.0));
+                    // y_pct: 0.0 = top, 1.0 = bottom -> PDF Y is bottom-up
+                    let cy = (ph * (1.0 - y_pct.clamp(0.05, 0.95))).clamp(20.0, (ph - 20.0).max(20.0));
+                    vec![(cx, cy)]
+                }
+                WatermarkPlacement::Tiled { gap_x_pt, gap_y_pt } => {
+                    let step_x = (tw * 0.85 + gap_x_pt.clamp(24.0, 320.0)).max(60.0);
+                    let step_y = (th * 1.4 + gap_y_pt.clamp(24.0, 320.0)).max(50.0);
+                    let mut pts = Vec::new();
+                    let mut row_i = 0usize;
+                    let mut y = step_y * 0.5;
+                    while y < ph + step_y * 0.5 {
+                        let stagger = if row_i % 2 == 1 { step_x * 0.5 } else { 0.0 };
+                        let mut x = step_x * 0.5 - stagger;
+                        while x < pw + step_x * 0.5 {
+                            if x > -tw * 0.25 && x < pw + tw * 0.25 {
+                                pts.push((x, y));
+                            }
+                            x += step_x;
+                        }
+                        y += step_y;
+                        row_i += 1;
+                    }
+                    pts
+                }
+            };
+
+            let mut objs = Vec::with_capacity(centers.len());
+            for (cx, cy) in centers {
+                let mut obj = PdfPageTextObject::new(doc, txt, font, PdfPoints::new(font_sz))?;
+                obj.set_fill_color(color)?;
+                // Center text around origin, rotate by -rot_deg (CW = negative CCW), then translate to (cx, cy)
+                obj.translate(PdfPoints::new(-tw * 0.5), PdfPoints::new(-th * 0.35))?;
+                if rot_deg.abs() > 0.05 {
+                    let _ = obj.rotate_counter_clockwise_degrees(rot_deg);
+                }
+                obj.translate(PdfPoints::new(cx), PdfPoints::new(cy))?;
+                objs.push(obj);
+            }
+
+            let mut page = doc.pages_mut().get(idx)?;
+            for obj in objs {
+                page.objects_mut().add_text_object(obj)?;
+            }
         }
         Ok(())
     }

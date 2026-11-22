@@ -30,10 +30,12 @@ use super::measure::{MeasureBarHit, MeasureUnit, MeasurementResult};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
 use super::split_pages_modal::{SplitPagesHit, SplitPagesModalState};
+use super::stamp_manager_modal::{StampManagerHit, StampManagerModalState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
 use super::user_guide::{UserGuideHit, UserGuideState};
+use super::watermark_modal::{WatermarkHit, WatermarkModalState};
 
 #[allow(dead_code)]
 pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
@@ -176,7 +178,7 @@ impl MenuCategory {
                 "Page Numbering... (N)",
                 "Header & Footer / Clear Existing... (H)",
                 "Add Watermark... (W)",
-                "Stamp Signature / Image... (P)",
+                "Stamps & Signatures... (P)",
                 "Split / Extract Pages... (X)",
                 "Split to Single-Page PDFs...",
                 "Compare with Another PDF...",
@@ -741,6 +743,8 @@ pub(super) enum UiHit {
     ExportImages(ExportImagesHit),
     ExcelExport(ExcelExportHit),
     SplitPages(SplitPagesHit),
+    Watermark(WatermarkHit),
+    StampManager(StampManagerHit),
     DocProps(DocPropsHit),
     UnsavedChanges(UnsavedChangesHit),
     AnnotContext(AnnotContextHit),
@@ -814,6 +818,7 @@ pub(super) enum InputMode {
     ClearMargins {
         input: String,
     },
+    #[allow(dead_code)]
     Watermark {
         input: String,
     },
@@ -1004,7 +1009,9 @@ pub(super) enum PendingDialog {
     ExportLatex,
     ExportDocx,
     ExportXlsx,
+    #[allow(dead_code)]
     PickStampImage,
+    ImportStampAssetPng,
     Split(String),
     ExtractSelectedPages(Vec<u16>),
     ImportBookmarksTxt,
@@ -1225,6 +1232,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) excel_export_opts: crate::export::ExcelExportOptions,
     /// Active `Split to Single-Page PDFs` modal state (0 bytes when closed).
     pub(super) split_pages_modal: Option<SplitPagesModalState>,
+    /// Active Detailed Watermark modal with live preview (0 bytes when closed).
+    pub(super) watermark_modal: Option<WatermarkModalState>,
+    /// Active Portable Stamp & Signature Manager modal (0 bytes when closed).
+    pub(super) stamp_manager_modal: Option<StampManagerModalState>,
     /// Active `Document Properties & Privacy` modal state (0 bytes when closed).
     pub(super) doc_props_modal: Option<DocPropsModalState>,
     /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
@@ -1473,6 +1484,8 @@ impl<'a> PdfViewerApp<'a> {
             excel_export_modal: None,
             excel_export_opts: crate::export::ExcelExportOptions::default(),
             split_pages_modal: None,
+            watermark_modal: None,
+            stamp_manager_modal: None,
             doc_props_modal: None,
             unsaved_changes_modal: None,
             user_guide_modal: None,
@@ -1518,6 +1531,8 @@ impl<'a> PdfViewerApp<'a> {
             || self.export_images_modal.is_some()
             || self.excel_export_modal.is_some()
             || self.split_pages_modal.is_some()
+            || self.watermark_modal.is_some()
+            || self.stamp_manager_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
             || self.show_customize_toolbar

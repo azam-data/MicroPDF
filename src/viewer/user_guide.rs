@@ -280,7 +280,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 3,
-                text: "To extract a few pages into a separate PDF: click Tools -> Split / Extract Pages... (X), type a range like '1-3' or '2, 5, 8-10', and press Enter.",
+                text: "To extract a few pages into one PDF: click Tools -> Split / Extract Pages... (X), type a range like '1-3' or '2, 5, 8-10', and press Enter. Or click Tools -> Split to Single-Page PDFs... to export each page losslessly as its own numbered PDF file into a folder!",
             },
             GuideBlock::Heading("Straightening Tilted or Scanned Pages (Page Deskew)"),
             GuideBlock::Step {
@@ -437,9 +437,9 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "Click 'Choose Folder & Export' to save numbered images straight into your chosen folder.",
             },
-            GuideBlock::Heading("Markdown (.md), LaTeX (.tex), Signatures & Watermarks"),
+            GuideBlock::Heading("Markdown (.md), LaTeX (.tex), Stamps, Signatures & Watermarks"),
             GuideBlock::Paragraph(
-                "• Writers & students can export clean Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• To stamp a handwritten signature or company logo: click Tools -> Stamp Signature / Image... (P), pick a PNG/JPG image, and click or drag where you want it on the page.\n• To place a diagonal background label (like DRAFT or CONFIDENTIAL): click Tools -> Add Watermark... (W), type your text, and press Enter.",
+                "• Writers & students can export clean Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with System Font Picker, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
             ),
             GuideBlock::Tip(
                 "For the cleanest handwritten signature stamp, use a PNG image with a transparent background — MicroPDF preserves transparency automatically!",
@@ -524,7 +524,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Both PDFs appear side-by-side and turn pages together! If one version has an extra page, use Offset '-' / '+' in the top Compare bar to line matching pages up.",
+                text: "Both PDFs appear side-by-side and turn, zoom, and scroll together! Switch freely between Fit, Width, 100%, or custom zoom (Ctrl+Wheel / + / -) and drag or scroll to pan both panes in sync. If one version has an extra page, use Offset '-' / '+' in the top Compare bar.",
             },
             GuideBlock::Step {
                 number: 3,

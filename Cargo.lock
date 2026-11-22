@@ -1362,6 +1362,7 @@ dependencies = [
  "pdfium-render",
  "rfd",
  "softbuffer",
+ "ttf-parser",
  "winit",
  "winresource",
 ]
