@@ -30,9 +30,16 @@ impl<'a> PdfViewerApp<'a> {
             slot.bw_pages = self.bw_pages.clone();
             // v1.1: move, don't deep-clone, up to 8 full-document snapshots on every tab switch.
             slot.undo_stack = std::mem::take(&mut self.undo_stack);
+            slot.redo_stack = std::mem::take(&mut self.redo_stack);
+            slot.undo_generation = self.undo_generation;
+            slot.saved_undo_generation = self.saved_undo_generation;
             slot.redacted = self.redacted;
             slot.has_unsaved_edits = self.has_unsaved_edits;
             slot.last_file_mtime = self.last_file_mtime;
+        }
+        if !self.file_path.as_os_str().is_empty() {
+            let path = self.file_path.clone();
+            self.record_last_position(&path, self.current_page_index, self.zoom_level);
         }
     }
 
@@ -53,6 +60,8 @@ impl<'a> PdfViewerApp<'a> {
             self.nav_back_stack = std::mem::take(&mut slot.nav_back_stack);
             self.nav_forward_stack = std::mem::take(&mut slot.nav_forward_stack);
             self.hovered_link = None;
+            self.hovered_form_field = None;
+            self.last_measurement = None;
             self.roman_end = slot.roman_end;
             self.skip_pages = slot.skip_pages;
             self.bookmarks = slot.bookmarks.clone();
@@ -61,10 +70,15 @@ impl<'a> PdfViewerApp<'a> {
             self.grid_scroll_y = slot.grid_scroll_y;
             self.bw_pages = slot.bw_pages.clone();
             self.undo_stack = std::mem::take(&mut slot.undo_stack);
+            self.redo_stack = std::mem::take(&mut slot.redo_stack);
+            self.undo_generation = slot.undo_generation;
+            self.saved_undo_generation = slot.saved_undo_generation;
             self.redacted = slot.redacted;
             self.has_unsaved_edits = slot.has_unsaved_edits;
             self.last_file_mtime = slot.last_file_mtime;
             self.flatten_confirm_at = None;
+            self.selected_thumbs.clear();
+            self.last_thumb_anchor = None;
             self.search_query.clear();
             self.search_matches.clear();
             self.current_search_match = 0;
@@ -107,8 +121,9 @@ impl<'a> PdfViewerApp<'a> {
         password: Option<&str>,
     ) -> Result<()> {
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&loaded, &path, skip_pages, roman_end);
 
         // Strictly drop previous cached page bitmaps, thumbnail cache, and previous document
         self.invalidate_page_caches();
@@ -117,18 +132,35 @@ impl<'a> PdfViewerApp<'a> {
         self.doc = None;
 
         let file_mtime = Self::read_file_mtime(&path);
+        let page_count = loaded.pages().len();
+        let (restored_page, restored_zoom) = self
+            .lookup_last_position(&path)
+            .map(|(p, z)| {
+                (
+                    if page_count > 0 { p.min(page_count - 1) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
         self.file_path = path.clone();
-        self.current_page_index = 0;
-        self.zoom_level = 1.0;
+        self.current_page_index = restored_page;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = roman_end;
-        self.skip_pages = 0;
+        self.skip_pages = skip_pages;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = file_mtime;
@@ -136,6 +168,8 @@ impl<'a> PdfViewerApp<'a> {
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.grid_scroll_y = 0.0;
         self.search_query.clear();
         self.search_matches.clear();
@@ -156,24 +190,27 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs.push(DocumentTab {
                 doc: None,
                 file_path: path,
-                current_page_index: 0,
+                current_page_index: restored_page,
                 view_mode: self.view_mode,
                 last_page_view_mode: self.last_page_view_mode,
                 scroll_mode: self.scroll_mode,
-                zoom_level: 1.0,
+                zoom_level: restored_zoom,
                 pan_x: 0.0,
                 scroll_y: 0.0,
                 scroll_x: 0.0,
                 nav_back_stack: VecDeque::new(),
                 nav_forward_stack: Vec::new(),
                 roman_end,
-                skip_pages: 0,
+                skip_pages,
                 bookmarks: self.bookmarks.clone(),
                 selected_bookmark: self.selected_bookmark,
                 bookmark_scroll_y: 0,
                 grid_scroll_y: 0.0,
                 bw_pages: HashSet::new(),
                 undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+                redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+                undo_generation: 0,
+                saved_undo_generation: 0,
                 redacted: false,
                 has_unsaved_edits: false,
                 last_file_mtime: file_mtime,
@@ -182,21 +219,24 @@ impl<'a> PdfViewerApp<'a> {
             self.tab_scroll_offset = 0;
         } else if self.active_tab < self.tabs.len() {
             self.tabs[self.active_tab].file_path = path;
-            self.tabs[self.active_tab].current_page_index = 0;
-            self.tabs[self.active_tab].zoom_level = 1.0;
+            self.tabs[self.active_tab].current_page_index = restored_page;
+            self.tabs[self.active_tab].zoom_level = restored_zoom;
             self.tabs[self.active_tab].pan_x = 0.0;
             self.tabs[self.active_tab].scroll_y = 0.0;
             self.tabs[self.active_tab].scroll_x = 0.0;
             self.tabs[self.active_tab].nav_back_stack.clear();
             self.tabs[self.active_tab].nav_forward_stack.clear();
             self.tabs[self.active_tab].roman_end = roman_end;
-            self.tabs[self.active_tab].skip_pages = 0;
+            self.tabs[self.active_tab].skip_pages = skip_pages;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].selected_bookmark = self.selected_bookmark;
             self.tabs[self.active_tab].bookmark_scroll_y = 0;
             self.tabs[self.active_tab].grid_scroll_y = 0.0;
             self.tabs[self.active_tab].bw_pages.clear();
             self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redo_stack.clear();
+            self.tabs[self.active_tab].undo_generation = 0;
+            self.tabs[self.active_tab].saved_undo_generation = 0;
             self.tabs[self.active_tab].redacted = false;
             self.tabs[self.active_tab].has_unsaved_edits = false;
             self.tabs[self.active_tab].last_file_mtime = file_mtime;
@@ -247,8 +287,9 @@ impl<'a> PdfViewerApp<'a> {
             return self.load_document_with_password(path, password);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&loaded, &path, skip_pages, roman_end);
         let selected_bookmark = if loaded_bookmarks.is_empty() {
             None
         } else {
@@ -264,28 +305,41 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
 
         let file_mtime = Self::read_file_mtime(&path);
+        let page_count = loaded.pages().len();
+        let (restored_page, restored_zoom) = self
+            .lookup_last_position(&path)
+            .map(|(p, z)| {
+                (
+                    if page_count > 0 { p.min(page_count - 1) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
         let new_idx = self.tabs.len();
         self.tabs.push(DocumentTab {
             doc: None,
             file_path: path.clone(),
-            current_page_index: 0,
+            current_page_index: restored_page,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
             scroll_mode: self.scroll_mode,
-            zoom_level: 1.0,
+            zoom_level: restored_zoom,
             pan_x: 0.0,
             scroll_y: 0.0,
             scroll_x: 0.0,
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             roman_end,
-            skip_pages: 0,
+            skip_pages,
             bookmarks: loaded_bookmarks.clone(),
             selected_bookmark,
             bookmark_scroll_y: 0,
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
             redacted: false,
             has_unsaved_edits: false,
             last_file_mtime: file_mtime,
@@ -294,28 +348,36 @@ impl<'a> PdfViewerApp<'a> {
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.file_path = path;
-        self.current_page_index = 0;
+        self.current_page_index = restored_page;
         self.view_mode = ViewMode::FitPage;
         self.last_page_view_mode = ViewMode::FitPage;
-        self.zoom_level = 1.0;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = roman_end;
-        self.skip_pages = 0;
+        self.skip_pages = skip_pages;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = selected_bookmark;
         self.bookmark_scroll_y = 0;
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = file_mtime;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -330,7 +392,7 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
-    /// Opens an in-memory PDF byte vector in a brand-new tab named `virtual_path` (used by Combine Multiple PDFs).
+    /// Opens an in-memory PDF byte vector in a brand-new tab named `virtual_path` (used by Combine Multiple PDFs & Create PDF from Images).
     pub fn open_bytes_in_new_tab(&mut self, bytes: Vec<u8>, virtual_path: PathBuf) -> Result<()> {
         let loaded = self.engine.load_pdf_from_bytes_safe(bytes)?;
         self.sync_active_tab_to_slot();
@@ -360,6 +422,9 @@ impl<'a> PdfViewerApp<'a> {
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 1,
+            saved_undo_generation: 0,
             redacted: false,
             has_unsaved_edits: true,
             last_file_mtime: None,
@@ -378,6 +443,9 @@ impl<'a> PdfViewerApp<'a> {
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = 0;
         self.skip_pages = 0;
         self.bookmarks.clear();
@@ -386,10 +454,15 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 1;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = true;
         self.last_file_mtime = None;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -418,7 +491,10 @@ impl<'a> PdfViewerApp<'a> {
         self.drag_start = None;
         self.grid_drag_page = None;
         self.hovered_thumb = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.thumb_context_menu = None;
+        self.annot_context_menu = None;
         self.show_tab_list_popover = false;
         self.tab_context_menu = None;
         self.input_mode = InputMode::Normal;
@@ -453,6 +529,10 @@ impl<'a> PdfViewerApp<'a> {
         self.tab_list_scroll = 0;
         self.tab_context_menu = None;
         self.thumb_context_menu = None;
+        self.annot_context_menu = None;
+        self.compare_mode = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
         self.file_path = PathBuf::new();
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;
@@ -472,10 +552,15 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = None;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -498,6 +583,12 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         }
         self.sync_active_tab_to_slot();
+        let closed_path = self.tabs[close_idx].file_path.clone();
+        let closed_page = self.tabs[close_idx].current_page_index;
+        let closed_zoom = self.tabs[close_idx].zoom_level;
+        if !closed_path.as_os_str().is_empty() {
+            self.record_last_position(&closed_path, closed_page, closed_zoom);
+        }
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
@@ -1114,8 +1205,14 @@ impl<'a> PdfViewerApp<'a> {
                         .unwrap_or("document.pdf")
                         .to_string()
                 };
+                let is_dirty = if is_active {
+                    self.has_unsaved_edits
+                } else {
+                    self.tabs[idx].has_unsaved_edits
+                };
                 let prefix = if is_active { "✓ " } else { "" };
-                let full_lbl = format!("{prefix}{}. {fname}", idx + 1);
+                let dirty = if is_dirty { "• " } else { "" };
+                let full_lbl = format!("{prefix}{dirty}{}. {fname}", idx + 1);
                 let cx = px + pw as i32 - close_sz as i32 - (10.0 * s).round() as i32;
                 let cy = ry + ((row_h.saturating_sub(close_sz)) / 2) as i32;
                 let tx = px + (12.0 * s).round() as i32;
@@ -1325,16 +1422,16 @@ impl<'a> PdfViewerApp<'a> {
         };
         match hit {
             TabContextHit::CloseThis => {
-                let _ = self.close_tab(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseTab(tab_idx));
             }
             TabContextHit::CloseOthers => {
-                self.close_other_tabs(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseOtherTabs(tab_idx));
             }
             TabContextHit::CloseRight => {
-                self.close_tabs_to_right(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseTabsToRight(tab_idx));
             }
             TabContextHit::CloseAll => {
-                self.close_all_tabs();
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseAllTabs);
             }
         }
     }

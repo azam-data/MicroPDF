@@ -1,9 +1,13 @@
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
+mod compare_mode;
+mod doc_props_modal;
 mod doc_tools_modal;
 mod grid;
+mod image_tools_modal;
 mod input;
+mod measure;
 mod menu;
 mod overlays;
 mod print_preview;
@@ -15,6 +19,7 @@ mod text_view;
 mod theme;
 mod toolbar;
 mod ui_draw;
+mod user_guide;
 
 use crate::engine::PdfEngine;
 use anyhow::{Context, Result};
@@ -865,7 +870,15 @@ mod tests {
 
         // 2. When focused and no unsaved edits, reloads and preserves page & scroll_y
         //    v1.2.1: a stale pre-reload snapshot must not survive (Ctrl+Z would revert the change)
-        app.undo_stack.push_back(b"stale snapshot".to_vec());
+        app.undo_stack.push_back(state::UndoSnapshot {
+            pdf_bytes: Some(b"stale snapshot".to_vec()),
+            bookmarks: Vec::new(),
+            bw_pages: std::collections::HashSet::new(),
+            roman_end: 0,
+            skip_pages: 0,
+            redacted: false,
+            generation: 0,
+        });
         app.window_focused = true;
         app.poll_auto_reload_if_due();
         assert!(app.undo_stack.is_empty(), "undo history must be cleared on auto-reload");
@@ -1016,6 +1029,8 @@ mod tests {
         app.incremental_search = Some(state::IncrementalSearchState {
             query: query.to_string(),
             q_chars: q_chars.clone(),
+            case_sensitive: false,
+            whole_word: false,
             next_page: 0,
             total_pages: 12,
             origin_page: 0,
@@ -2801,7 +2816,139 @@ mod tests {
         }
         assert_eq!(sm, ScrollMode::SinglePage);
     }
+
+    #[test]
+    fn test_tier2_search_case_sensitive_and_whole_word() {
+        let text = "Cat catalog CAT cat_dog cat.";
+        let lower_hay: Vec<char> = text.chars().flat_map(|c| c.to_lowercase()).collect();
+        let exact_hay: Vec<char> = text.chars().collect();
+        let q_lower: Vec<char> = "cat".chars().collect();
+        let q_cap: Vec<char> = "Cat".chars().collect();
+
+        // Case-insensitive substring: "Cat", "cat" (in catalog), "CAT", "cat" (in cat_dog), "cat"
+        let all_sub = PdfEngine::find_text_match_ranges(&lower_hay, &q_lower, false);
+        assert_eq!(all_sub.len(), 5, "Expected 5 substring matches, got {all_sub:?}");
+
+        // Case-insensitive whole word: "Cat", "CAT", "cat" (excludes catalog & cat_dog)
+        let all_word = PdfEngine::find_text_match_ranges(&lower_hay, &q_lower, true);
+        assert_eq!(all_word.len(), 3, "Expected 3 whole-word matches, got {all_word:?}");
+
+        // Case-sensitive exact "Cat" whole word: only first token at 0..3
+        let exact_word = PdfEngine::find_text_match_ranges(&exact_hay, &q_cap, true);
+        assert_eq!(exact_word, vec![(0, 3)]);
+    }
+
+    #[test]
+    fn test_tier2_measure_stats_and_units() {
+        use super::measure::{compute_measurement_stats, MeasureUnit};
+
+        // 72 pt horizontal segment = 1.00 in = 2.54 cm = 25.40 mm
+        let s_in = compute_measurement_stats(10.0, 20.0, 82.0, 20.0, MeasureUnit::In);
+        assert!((s_in.length - 1.0).abs() < 1e-4);
+        assert!((s_in.dx - 1.0).abs() < 1e-4);
+        assert!(s_in.dy.abs() < 1e-4);
+        assert!(s_in.angle_deg.abs() < 1e-3);
+
+        let s_mm = compute_measurement_stats(10.0, 20.0, 82.0, 20.0, MeasureUnit::Mm);
+        assert!((s_mm.length - 25.4).abs() < 1e-3);
+
+        let s_cm = compute_measurement_stats(10.0, 20.0, 82.0, 20.0, MeasureUnit::Cm);
+        assert!((s_cm.length - 2.54).abs() < 1e-3);
+
+        // 3-4-5 right triangle in PDF points: dx=216pt (3in), dy=288pt (4in) -> len=5in, area=12in²
+        let tri = compute_measurement_stats(0.0, 0.0, 216.0, 288.0, MeasureUnit::In);
+        assert!((tri.length - 5.0).abs() < 1e-3);
+        assert!((tri.area - 12.0).abs() < 1e-3);
+        assert!((tri.angle_deg - 53.1301).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_tier2_visual_diff_buffer() {
+        use super::compare_mode::compute_visual_diff_buffer;
+
+        // Identical white/black pixels -> 0.0% diff
+        let a = vec![0x00FF_FFFF, 0x0010_1010, 0x00FF_FFFF, 0x00FF_FFFF];
+        let (diff_same, pct_same) = compute_visual_diff_buffer(&a, &a);
+        assert_eq!(diff_same.len(), 4);
+        assert!(pct_same < 1e-5);
+
+        // Pixel 0 darker on left -> Red (0x00DC_2626)
+        // Pixel 1 darker on right -> Blue (0x0025_63EB)
+        // Pixels 2 & 3 identical -> 50% diff
+        let left = vec![0x0000_0000, 0x00FF_FFFF, 0x00FF_FFFF, 0x00FF_FFFF];
+        let right = vec![0x00FF_FFFF, 0x0000_0000, 0x00FF_FFFF, 0x00FF_FFFF];
+        let (diff, pct) = compute_visual_diff_buffer(&left, &right);
+        assert_eq!(diff[0], 0x00DC_2626);
+        assert_eq!(diff[1], 0x0025_63EB);
+        assert!((pct - 50.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_tier2_reading_continuity_and_lru_positions_ini() {
+        use super::state::{LastPositionEntry, ReadingFilter, SessionConfig, MAX_LAST_POSITIONS};
+        use std::path::PathBuf;
+
+        let mut cfg = SessionConfig::default();
+        cfg.reading_filter = ReadingFilter::NightAmber;
+        for i in 0..(MAX_LAST_POSITIONS + 10) {
+            cfg.last_positions.push(LastPositionEntry {
+                path: PathBuf::from(format!("/tmp/doc_{i}.pdf")),
+                page_index: i as u16,
+                zoom_level: 1.25,
+            });
+        }
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        assert!(ini.contains("reading_filter=NightAmber"));
+        assert!(ini.contains("last_pos=0|1.25|/tmp/doc_0.pdf"));
+
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(parsed.reading_filter, ReadingFilter::NightAmber);
+        assert_eq!(parsed.last_positions.len(), MAX_LAST_POSITIONS);
+        assert_eq!(parsed.last_positions[0].path, PathBuf::from("/tmp/doc_0.pdf"));
+        assert_eq!(parsed.last_positions[0].page_index, 0);
+        assert!((parsed.last_positions[0].zoom_level - 1.25).abs() < 1e-3);
+        assert_eq!(parsed.last_positions[5].page_index, 5);
+    }
+
+    #[test]
+    fn test_tier3_user_guide_chapters_and_export() {
+        use super::user_guide::{format_full_user_guide_txt, GuideBlock, USER_GUIDE_CHAPTERS};
+
+        assert_eq!(USER_GUIDE_CHAPTERS.len(), 10, "User Guide must have 10 chapters");
+        for (idx, ch) in USER_GUIDE_CHAPTERS.iter().enumerate() {
+            assert_eq!(ch.number as usize, idx + 1, "Chapter numbering must be sequential 1..=10");
+            assert!(!ch.short_title.trim().is_empty());
+            assert!(!ch.title.trim().is_empty());
+            assert!(!ch.summary.trim().is_empty());
+            let step_count = ch
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, GuideBlock::Step { .. }))
+                .count();
+            assert!(
+                step_count >= 3,
+                "Chapter {} ({}) should have at least 3 numbered steps, found {step_count}",
+                ch.number,
+                ch.title
+            );
+            let has_tip = ch.blocks.iter().any(|b| matches!(b, GuideBlock::Tip(_)));
+            assert!(has_tip, "Chapter {} ({}) should include a beginner Tip callout", ch.number, ch.title);
+        }
+
+        let txt = format_full_user_guide_txt();
+        assert!(txt.contains("MicroPDF v1.4 — Step-by-Step User Guide"));
+        assert!(txt.contains("CHAPTER 1:"));
+        assert!(txt.contains("CHAPTER 10:"));
+        assert!(txt.contains("Step 1:"));
+        assert!(txt.contains("[TIP]"));
+        assert!(txt.contains("Create PDF from Images"));
+        assert!(txt.contains("Compare with Another PDF"));
+        assert!(txt.contains("Measure Distance & Area"));
+        assert!(txt.contains("Strip Personal Metadata & XMP"));
+    }
 }
+
+
 
 
 

@@ -184,20 +184,33 @@ impl<'a> PdfViewerApp<'a> {
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
 
+        let s = self
+            .window
+            .as_ref()
+            .map(|w| self.effective_scale_factor(w.scale_factor()))
+            .unwrap_or(1.0) as f32;
+        let bw_w = (28.0 * s).round().clamp(24.0, 52.0) as i32;
+        let bw_h = (18.0 * s).round().clamp(16.0, 34.0) as i32;
+        let rot_w = (22.0 * s).round().clamp(20.0, 44.0) as i32;
+        let pad = (3.0 * s).round() as i32;
+
         for idx in 0..total {
             let (tx, ty, tw, th) =
                 self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, top_bars_h);
             if ix >= tx && ix < tx + (tw as i32) && iy >= ty && iy < ty + (th as i32) + 22 {
-                // Top-left `[BW]` badge is 28x18 at `(tx, ty)`
-                let on_bw_badge = ix >= tx && ix <= tx + 28 && iy >= ty && iy <= ty + 18;
+                // Top-left `[BW]` badge
+                let on_bw_badge =
+                    ix >= tx + pad && ix <= tx + pad + bw_w && iy >= ty + pad && iy <= ty + pad + bw_h;
                 if on_bw_badge {
                     return Some((idx, ThumbBadgeHit::BwConvert));
                 }
-                // Top-right `[R]` badge is 24x18 at `(tx + tw - 24, ty)`
-                let badge_x = tx + (tw as i32) - 24;
-                let badge_y = ty;
-                let on_rotate_badge =
-                    ix >= badge_x && ix <= tx + (tw as i32) && iy >= badge_y && iy <= badge_y + 18;
+                // Top-right `[R]` badge
+                let badge_x = tx + (tw as i32) - rot_w - pad;
+                let badge_y = ty + pad;
+                let on_rotate_badge = ix >= badge_x
+                    && ix <= badge_x + rot_w
+                    && iy >= badge_y
+                    && iy <= badge_y + bw_h;
                 if on_rotate_badge {
                     return Some((idx, ThumbBadgeHit::Rotate));
                 }
@@ -256,7 +269,9 @@ impl<'a> PdfViewerApp<'a> {
                 continue;
             }
 
-            let is_selected = idx == self.current_page_index;
+            let is_current = idx == self.current_page_index;
+            let is_multi_selected = self.selected_thumbs.contains(&idx);
+            let is_selected = is_current || is_multi_selected;
             let is_hovered = self.hovered_thumb == Some(idx);
             let is_bw = self.bw_pages.contains(&idx);
 
@@ -302,6 +317,29 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
 
+            // Subtle blue tint overlay when page is part of a multi-selection
+            if is_multi_selected && ty < bottom_limit as i32 && (ty + th as i32) > top_bars_h as i32 {
+                let clip_top = ty.max(top_bars_h as i32);
+                let clip_bot = (ty + th as i32).min(bottom_limit as i32);
+                let clip_left = tx.max(sidebar_w as i32);
+                let clip_right = (tx + tw as i32).min(buf_w as i32);
+                if clip_bot > clip_top && clip_right > clip_left {
+                    let ar = (theme.accent >> 16) & 0xFF;
+                    let ag = (theme.accent >> 8) & 0xFF;
+                    let ab = theme.accent & 0xFF;
+                    super::render::blend_rect_rgba(
+                        buffer,
+                        buf_w,
+                        bottom_limit,
+                        clip_left as u32,
+                        clip_top as u32,
+                        (clip_right - clip_left) as u32,
+                        (clip_bot - clip_top) as u32,
+                        (ar, ag, ab, 28),
+                    );
+                }
+            }
+
             // Clean accent ring for selected/hovered page, hairline border otherwise
             let border_color = if is_selected {
                 theme.accent
@@ -316,37 +354,54 @@ impl<'a> PdfViewerApp<'a> {
                 if is_selected && tw > 4 && th > 4 {
                     super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx - 1, ty - 1, tw + 2, th + 2, 3.5, theme.accent);
                 }
+                if is_multi_selected && tw > 6 && th > 6 {
+                    super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx - 2, ty - 2, tw + 4, th + 4, 4.0, theme.accent);
+                }
             }
 
             // Clean corner action pills: show on hover (and keep BW badge visible if page is BW)
-            let show_badges = is_hovered || is_selected;
+            let show_badges = is_hovered || is_current;
+            let bw_w = (28.0 * s).round().clamp(24.0, 52.0) as u32;
+            let bw_h = (18.0 * s).round().clamp(16.0, 34.0) as u32;
+            let rot_w = (22.0 * s).round().clamp(20.0, 44.0) as u32;
+            let b_pad = (3.0 * s).round() as i32;
+            let b_rad = (4.0 * s).clamp(3.0, 7.0);
             if (show_badges || is_bw)
                 && tx >= (sidebar_w as i32)
                 && ty >= (top_bars_h as i32)
-                && (ty as u32 + 22) < bottom_limit
+                && (ty + b_pad + bw_h as i32) < (bottom_limit as i32)
             {
-                let bw_w = 28u32;
-                let bw_h = 18u32;
                 let bg = if is_bw { theme.accent } else { theme.surface_bg };
                 let fg = if is_bw { theme.text_on_accent } else { theme.text_secondary };
-                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, bg);
-                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, if is_bw { theme.accent } else { theme.border_subtle });
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, tx + b_pad, ty + b_pad, bw_w, bw_h, b_rad, bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx + b_pad, ty + b_pad, bw_w, bw_h, b_rad, if is_bw { theme.accent } else { theme.border_subtle });
                 let btw = super::ui_draw::measure_text("BW", badge_sz, true);
-                super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, tx + 3 + ((bw_w as f32 - btw) * 0.5).round() as i32, ty + 3, bw_h, tx + 3 + bw_w as i32, "BW", badge_sz, fg, true);
+                super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, tx + b_pad + ((bw_w as f32 - btw) * 0.5).round() as i32, ty + b_pad, bw_h, tx + b_pad + bw_w as i32, "BW", badge_sz, fg, true);
             }
 
             if show_badges
-                && (tx + tw as i32 - 24) >= (sidebar_w as i32)
+                && (tx + tw as i32 - rot_w as i32 - b_pad) >= (sidebar_w as i32)
                 && ty >= (top_bars_h as i32)
-                && (ty as u32 + 22) < bottom_limit
+                && (ty + b_pad + bw_h as i32) < (bottom_limit as i32)
             {
-                let rw = 22u32;
-                let rh = 18u32;
-                let rx = tx + tw as i32 - rw as i32 - 3;
-                let ry = ty + 3;
-                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.surface_bg);
-                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.border_subtle);
-                super::ui_draw::draw_icon(buffer, buf_w, bottom_limit, super::ui_draw::UiIcon::Rotate, rx + 4, ry + 2, 13, theme.accent);
+                let rx = tx + tw as i32 - rot_w as i32 - b_pad;
+                let ry = ty + b_pad;
+                let ic_sz = (12.0 * s).round().clamp(10.0, 22.0) as u32;
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rot_w, bw_h, b_rad, theme.surface_bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rot_w, bw_h, b_rad, theme.border_subtle);
+                super::ui_draw::draw_icon(buffer, buf_w, bottom_limit, super::ui_draw::UiIcon::Rotate, rx + ((rot_w.saturating_sub(ic_sz)) / 2) as i32, ry + ((bw_h.saturating_sub(ic_sz)) / 2) as i32, ic_sz, theme.accent);
+            }
+
+            // Bottom-right checkmark badge when multi-selected
+            if is_multi_selected {
+                let chk_sz = (18.0 * s).round().clamp(16.0, 28.0) as u32;
+                let cx = tx + tw as i32 - chk_sz as i32 - b_pad;
+                let cy = ty + th as i32 - chk_sz as i32 - b_pad;
+                if cx >= sidebar_w as i32 && cy >= top_bars_h as i32 && (cy + chk_sz as i32) < bottom_limit as i32 {
+                    super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, cx, cy, chk_sz, chk_sz, (chk_sz as f32) * 0.5, theme.accent);
+                    let cw = super::ui_draw::measure_text("✓", badge_sz, true);
+                    super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, cx + ((chk_sz as f32 - cw) * 0.5).round() as i32, cy, chk_sz, cx + chk_sz as i32, "✓", badge_sz, theme.text_on_accent, true);
+                }
             }
 
             // Crisp proportional page number centered below card
@@ -383,6 +438,9 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
         }
+
+        // Floating multi-select batch toolbar when 2+ pages are selected
+        self.draw_thumb_batch_bar(buffer, buf_w, buf_h, sidebar_w, status_bar_h, scale_factor);
     }
 
     // =========================================================================
@@ -397,18 +455,18 @@ impl<'a> PdfViewerApp<'a> {
     ) -> Option<(ThumbContextMenuState, i32, i32, u32, u32, Vec<(i32, i32, u32, u32, ThumbContextHit)>)> {
         let st = self.thumb_context_menu?;
         let s = sf as f32;
-        let mw = (242.0 * s).round() as u32;
+        let mw = (252.0 * s).round() as u32;
         let pad = (8.0 * s).round() as i32;
         let hdr_h = (26.0 * s).round() as u32;
         let row_h = (28.0 * s).round() as u32;
         let gap = (4.0 * s).round() as i32;
         let iw = mw.saturating_sub((pad * 2) as u32);
-        // Header + blank count row + Before/After blank pills + divider + 5 actions + padding
-        let mh = hdr_h + row_h * 7 + (gap as u32) * 3 + (14.0 * s).round() as u32;
+        // Header + blank count row + Before/After blank pills + divider + 6 actions + padding
+        let mh = hdr_h + row_h * 8 + (gap as u32) * 3 + (14.0 * s).round() as u32;
         let mx = st.x.clamp(8, (buf_w as i32 - mw as i32 - 8).max(8));
         let my = st.y.clamp(8, (buf_h as i32 - mh as i32 - 8).max(8));
 
-        let mut boxes = Vec::with_capacity(10);
+        let mut boxes = Vec::with_capacity(11);
         let ix = mx + pad;
         let mut cy = my + hdr_h as i32 + (5.0 * s).round() as i32;
 
@@ -429,12 +487,13 @@ impl<'a> PdfViewerApp<'a> {
         boxes.push((ix + half_w as i32 + gap, cy, iw.saturating_sub(half_w + gap as u32), bh + 2, ThumbContextHit::InsertBlankAfter));
         cy += row_h as i32 + gap * 2;
 
-        // Rows 3..7: Standard page operations
+        // Rows 3..8: Standard / Batch page operations
         for hit in [
             ThumbContextHit::InsertPdfBefore,
             ThumbContextHit::InsertPdfAfter,
             ThumbContextHit::RotateCw,
             ThumbContextHit::ConvertBw,
+            ThumbContextHit::ExtractSelected,
             ThumbContextHit::DeletePage,
         ] {
             boxes.push((ix, cy, iw, row_h, hit));
@@ -442,6 +501,16 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         Some((st, mx, my, mw, mh, boxes))
+    }
+
+    fn thumb_context_target_pages(&self, clicked_page: u16) -> Vec<u16> {
+        if self.selected_thumbs.len() > 1 && self.selected_thumbs.contains(&clicked_page) {
+            let mut v: Vec<u16> = self.selected_thumbs.iter().copied().collect();
+            v.sort_unstable();
+            v
+        } else {
+            vec![clicked_page]
+        }
     }
 
     pub(super) fn draw_thumb_context_menu(
@@ -472,8 +541,14 @@ impl<'a> PdfViewerApp<'a> {
         super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, mx, my, mw, mh, rad, theme.surface_bg);
         super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, mx, my, mw, mh, rad, theme.border_subtle);
 
+        let targets = self.thumb_context_target_pages(st.page_idx);
+        let batch_n = targets.len();
         let pnum = st.page_idx + 1;
-        let hdr = format!("Page {pnum} Actions");
+        let hdr = if batch_n > 1 {
+            format!("{batch_n} Selected Pages")
+        } else {
+            format!("Page {pnum} Actions")
+        };
         super::ui_draw::draw_text_vcenter(
             buffer, buf_w, buf_h, mx + pad + 2, my, hdr_h, mx + mw as i32 - pad,
             &hdr, lbl_sz, theme.text_muted, true,
@@ -527,13 +602,34 @@ impl<'a> PdfViewerApp<'a> {
             fill_rect_clipped(buffer, buf_w, buf_h, mx + 6, first_y - (4.0 * s).round() as i32, mw.saturating_sub(12), 1, theme.divider);
         }
 
-        let can_delete = self.total_pages() > 1;
-        let rows: [(ThumbContextHit, String, bool, bool); 5] = [
+        let can_delete = (self.total_pages() as usize) > batch_n;
+        let rows: [(ThumbContextHit, String, bool, bool); 6] = [
             (ThumbContextHit::InsertPdfBefore, format!("Insert PDF(s) Before Page {pnum}..."), true, false),
             (ThumbContextHit::InsertPdfAfter, format!("Insert PDF(s) After Page {pnum}..."), true, false),
-            (ThumbContextHit::RotateCw, "Rotate 90° Clockwise".to_string(), true, false),
-            (ThumbContextHit::ConvertBw, "Convert Page to Black & White".to_string(), true, false),
-            (ThumbContextHit::DeletePage, format!("Delete Page {pnum}"), can_delete, true),
+            (
+                ThumbContextHit::RotateCw,
+                if batch_n > 1 { format!("Rotate {batch_n} Pages 90°") } else { "Rotate 90° Clockwise".to_string() },
+                true,
+                false,
+            ),
+            (
+                ThumbContextHit::ConvertBw,
+                if batch_n > 1 { format!("Convert {batch_n} Pages to B/W") } else { "Convert Page to Black & White".to_string() },
+                true,
+                false,
+            ),
+            (
+                ThumbContextHit::ExtractSelected,
+                if batch_n > 1 { format!("Extract {batch_n} Pages to PDF...") } else { format!("Extract Page {pnum} to PDF...") },
+                true,
+                false,
+            ),
+            (
+                ThumbContextHit::DeletePage,
+                if batch_n > 1 { format!("Delete {batch_n} Selected Pages") } else { format!("Delete Page {pnum}") },
+                can_delete,
+                true,
+            ),
         ];
 
         for (hit, label, enabled, danger) in rows {
@@ -579,6 +675,7 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn handle_thumb_context_click(&mut self, hit: ThumbContextHit) {
         let Some(st) = self.thumb_context_menu else { return };
+        let targets = self.thumb_context_target_pages(st.page_idx);
         match hit {
             ThumbContextHit::InsideMenu => return,
             ThumbContextHit::BlankCountMinus => {
@@ -613,17 +710,411 @@ impl<'a> PdfViewerApp<'a> {
             }
             ThumbContextHit::RotateCw => {
                 self.thumb_context_menu = None;
-                self.rotate_page_clockwise(st.page_idx);
+                if targets.len() > 1 {
+                    self.batch_rotate_pages(&targets);
+                } else {
+                    self.rotate_page_clockwise(st.page_idx);
+                }
             }
             ThumbContextHit::ConvertBw => {
                 self.thumb_context_menu = None;
-                self.convert_page_to_bw_in_place(st.page_idx);
+                if targets.len() > 1 {
+                    self.batch_convert_pages_bw(&targets);
+                } else {
+                    self.convert_page_to_bw_in_place(st.page_idx);
+                }
+            }
+            ThumbContextHit::ExtractSelected => {
+                self.thumb_context_menu = None;
+                self.pending_dialog = Some(PendingDialog::ExtractSelectedPages(targets));
+                self.request_redraw();
             }
             ThumbContextHit::DeletePage => {
                 self.thumb_context_menu = None;
-                self.current_page_index = st.page_idx;
-                self.delete_current_page();
+                if targets.len() > 1 {
+                    self.batch_delete_pages(&targets);
+                } else {
+                    self.current_page_index = st.page_idx;
+                    self.delete_current_page();
+                }
             }
         }
+    }
+
+    // =========================================================================
+    // Tier 1.5: Multi-Select Helpers, Floating Batch Bar & Batch Operations
+    // =========================================================================
+
+    /// Applies `Ctrl+Click` (toggle) or `Shift+Click` (contiguous range) multi-selection logic
+    /// in Thumbnail Grid View.
+    pub(super) fn select_thumbnail_with_modifiers(
+        &mut self,
+        page_idx: u16,
+        ctrl_or_cmd: bool,
+        shift: bool,
+    ) {
+        let total = self.total_pages();
+        if total == 0 || page_idx >= total {
+            return;
+        }
+        if shift {
+            let anchor = self
+                .last_thumb_anchor
+                .unwrap_or(self.current_page_index)
+                .min(total - 1);
+            let lo = anchor.min(page_idx);
+            let hi = anchor.max(page_idx);
+            if !ctrl_or_cmd {
+                self.selected_thumbs.clear();
+            }
+            for p in lo..=hi {
+                self.selected_thumbs.insert(p);
+            }
+        } else if ctrl_or_cmd {
+            if self.selected_thumbs.is_empty() && self.current_page_index != page_idx {
+                self.selected_thumbs.insert(self.current_page_index);
+            }
+            if !self.selected_thumbs.remove(&page_idx) {
+                self.selected_thumbs.insert(page_idx);
+            }
+            self.last_thumb_anchor = Some(page_idx);
+        } else {
+            self.selected_thumbs.clear();
+            self.last_thumb_anchor = Some(page_idx);
+        }
+        self.current_page_index = page_idx;
+    }
+
+    fn thumb_batch_bar_layout(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32, Vec<(i32, i32, u32, u32, ThumbBatchHit)>)> {
+        if self.view_mode != ViewMode::ThumbnailGrid || self.selected_thumbs.len() < 2 {
+            return None;
+        }
+        let s = sf as f32;
+        let pad = (10.0 * s).round() as i32;
+        let gap = (6.0 * s).round() as i32;
+        let btn_h = (26.0 * s).round() as u32;
+        let bar_h = (40.0 * s).round() as u32;
+        let lbl_sz = (11.0 * s).clamp(9.5, 20.0);
+
+        let count_lbl = format!("{} pages selected", self.selected_thumbs.len());
+        let count_w = (super::ui_draw::measure_text(&count_lbl, lbl_sz, true).ceil() as u32)
+            + (12.0 * s).round() as u32;
+
+        let btns: [(&str, ThumbBatchHit); 5] = [
+            ("Rotate 90°", ThumbBatchHit::RotateSelected),
+            ("B/W", ThumbBatchHit::BwSelected),
+            ("Extract...", ThumbBatchHit::ExtractSelected),
+            ("Delete", ThumbBatchHit::DeleteSelected),
+            ("Clear", ThumbBatchHit::ClearSelection),
+        ];
+        let mut widths = Vec::with_capacity(btns.len());
+        let mut btns_total_w = 0u32;
+        for &(txt, _) in &btns {
+            let bw = (super::ui_draw::measure_text(txt, lbl_sz, true).ceil() as u32)
+                + (18.0 * s).round() as u32;
+            widths.push(bw);
+            btns_total_w += bw;
+        }
+        let bar_w = (pad as u32) * 2
+            + count_w
+            + btns_total_w
+            + (gap as u32) * (btns.len() as u32);
+        let content_w = buf_w.saturating_sub(sidebar_w);
+        let bar_x = sidebar_w as i32 + ((content_w.saturating_sub(bar_w)) / 2) as i32;
+        let bar_y = buf_h.saturating_sub(status_bar_h + bar_h + (14.0 * s).round() as u32) as i32;
+
+        let mut hits = Vec::with_capacity(btns.len());
+        let mut cx = bar_x + pad + count_w as i32 + gap;
+        let by = bar_y + ((bar_h.saturating_sub(btn_h)) / 2) as i32;
+        for ((_, hit), bw) in btns.iter().zip(widths.into_iter()) {
+            hits.push((cx, by, bw, btn_h, *hit));
+            cx += bw as i32 + gap;
+        }
+        Some((bar_x, bar_y, bar_w, bar_h, hits))
+    }
+
+    pub(super) fn draw_thumb_batch_bar(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) {
+        let Some((bx, by, bw, bh, hits)) =
+            self.thumb_batch_bar_layout(buf_w, buf_h, sidebar_w, status_bar_h, sf)
+        else {
+            return;
+        };
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let rad = (10.0 * s).max(6.0);
+        let btn_rad = (6.0 * s).max(4.0);
+        let lbl_sz = (11.0 * s).clamp(9.5, 20.0);
+
+        super::ui_draw::draw_soft_shadow(
+            buffer, buf_w, buf_h, bx, by, bw, bh, rad,
+            14, 4, theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, theme.surface_bg);
+        super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, theme.accent);
+
+        let count_lbl = format!("{} pages selected", self.selected_thumbs.len());
+        super::ui_draw::draw_text_vcenter(
+            buffer,
+            buf_w,
+            buf_h,
+            bx + (12.0 * s).round() as i32,
+            by,
+            bh,
+            bx + bw as i32,
+            &count_lbl,
+            lbl_sz,
+            theme.accent,
+            true,
+        );
+
+        let can_delete = (self.total_pages() as usize) > self.selected_thumbs.len();
+        for &(rx, ry, rw, rh, hit) in &hits {
+            let hov = self.hovered_widget == Some(UiHit::ThumbBatch(hit));
+            let (lbl, bg, fg, bdr) = match hit {
+                ThumbBatchHit::RotateSelected => (
+                    "Rotate 90°",
+                    if hov { theme.hover_bg } else { theme.surface_elevated },
+                    theme.text_primary,
+                    theme.border_subtle,
+                ),
+                ThumbBatchHit::BwSelected => (
+                    "B/W",
+                    if hov { theme.hover_bg } else { theme.surface_elevated },
+                    theme.text_primary,
+                    theme.border_subtle,
+                ),
+                ThumbBatchHit::ExtractSelected => (
+                    "Extract...",
+                    if hov { theme.accent_hover } else { theme.accent },
+                    theme.text_on_accent,
+                    theme.accent,
+                ),
+                ThumbBatchHit::DeleteSelected => {
+                    if !can_delete {
+                        ("Delete", theme.surface_elevated, theme.text_muted, theme.border_subtle)
+                    } else if hov {
+                        ("Delete", theme.danger, theme.text_on_accent, theme.danger)
+                    } else {
+                        ("Delete", theme.danger_soft_bg, theme.danger, theme.danger)
+                    }
+                }
+                ThumbBatchHit::ClearSelection => (
+                    "Clear",
+                    if hov { theme.hover_bg } else { theme.surface_elevated },
+                    theme.text_secondary,
+                    theme.border_subtle,
+                ),
+                ThumbBatchHit::InsideBar => continue,
+            };
+            super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, btn_rad, bg);
+            super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, btn_rad, bdr);
+            let tw = super::ui_draw::measure_text(lbl, lbl_sz, true);
+            super::ui_draw::draw_text_vcenter(
+                buffer,
+                buf_w,
+                buf_h,
+                rx + ((rw as f32 - tw) * 0.5).round() as i32,
+                ry,
+                rh,
+                rx + rw as i32,
+                lbl,
+                lbl_sz,
+                fg,
+                true,
+            );
+        }
+    }
+
+    pub(super) fn hit_test_thumb_batch_bar(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<ThumbBatchHit> {
+        let (bx, by, bw, bh, hits) =
+            self.thumb_batch_bar_layout(buf_w, buf_h, sidebar_w, status_bar_h, sf)?;
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < bx || ix >= bx + bw as i32 || iy < by || iy >= by + bh as i32 {
+            return None;
+        }
+        for (rx, ry, rw, rh, hit) in hits {
+            if ix >= rx && ix < rx + rw as i32 && iy >= ry && iy < ry + rh as i32 {
+                return Some(hit);
+            }
+        }
+        Some(ThumbBatchHit::InsideBar)
+    }
+
+    pub(super) fn handle_thumb_batch_click(&mut self, hit: ThumbBatchHit) {
+        let mut pages: Vec<u16> = self.selected_thumbs.iter().copied().collect();
+        pages.sort_unstable();
+        if pages.is_empty() {
+            return;
+        }
+        match hit {
+            ThumbBatchHit::RotateSelected => self.batch_rotate_pages(&pages),
+            ThumbBatchHit::BwSelected => self.batch_convert_pages_bw(&pages),
+            ThumbBatchHit::ExtractSelected => {
+                self.pending_dialog = Some(PendingDialog::ExtractSelectedPages(pages));
+                self.request_redraw();
+            }
+            ThumbBatchHit::DeleteSelected => self.batch_delete_pages(&pages),
+            ThumbBatchHit::ClearSelection => {
+                self.selected_thumbs.clear();
+                self.request_redraw();
+            }
+            ThumbBatchHit::InsideBar => {}
+        }
+    }
+
+    pub(super) fn batch_rotate_pages(&mut self, pages: &[u16]) {
+        if pages.is_empty() || self.doc.is_none() {
+            return;
+        }
+        self.push_undo_snapshot();
+        let mut rotated = 0usize;
+        if let Some(doc) = self.doc.as_mut() {
+            for &p_idx in pages {
+                if let Ok(mut page) = doc.pages_mut().get(p_idx) {
+                    let next_rot = match page.rotation().unwrap_or(pdfium_render::prelude::PdfPageRenderRotation::None) {
+                        pdfium_render::prelude::PdfPageRenderRotation::None => pdfium_render::prelude::PdfPageRenderRotation::Degrees90,
+                        pdfium_render::prelude::PdfPageRenderRotation::Degrees90 => pdfium_render::prelude::PdfPageRenderRotation::Degrees180,
+                        pdfium_render::prelude::PdfPageRenderRotation::Degrees180 => pdfium_render::prelude::PdfPageRenderRotation::Degrees270,
+                        pdfium_render::prelude::PdfPageRenderRotation::Degrees270 => pdfium_render::prelude::PdfPageRenderRotation::None,
+                    };
+                    page.set_rotation(next_rot);
+                    rotated += 1;
+                }
+            }
+        }
+        self.invalidate_page_caches();
+        for &p_idx in pages {
+            self.thumbnail_cache.remove(&p_idx);
+        }
+        self.status_notice = Some(format!(
+            "Rotated {rotated} selected page(s) by 90° (Ctrl+Z to undo)"
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn batch_convert_pages_bw(&mut self, pages: &[u16]) {
+        if pages.is_empty() || self.doc.is_none() {
+            return;
+        }
+        let Ok(mut bytes) = self.doc.as_ref().unwrap().save_to_bytes() else {
+            self.status_notice = Some("Failed to serialize PDF for batch B/W".to_string());
+            self.request_redraw();
+            return;
+        };
+        self.push_undo_snapshot();
+        let mut converted = 0usize;
+        for &p_idx in pages {
+            match self.engine.convert_page_to_bw(&bytes, p_idx) {
+                Ok(next) => {
+                    bytes = next;
+                    self.bw_pages.insert(p_idx);
+                    converted += 1;
+                }
+                Err(e) => {
+                    self.status_notice = Some(format!("Batch B/W failed on page {}: {e}", p_idx + 1));
+                    self.request_redraw();
+                    return;
+                }
+            }
+        }
+        match self.engine.load_pdf_from_bytes_safe(bytes) {
+            Ok(new_doc) => {
+                self.doc = Some(new_doc);
+                self.invalidate_page_caches();
+                for &p_idx in pages {
+                    self.thumbnail_cache.remove(&p_idx);
+                }
+                self.status_notice = Some(format!(
+                    "Converted {converted} selected page(s) to Black & White (Ctrl+Z to undo)"
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Batch B/W reload failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn batch_delete_pages(&mut self, pages: &[u16]) {
+        let total = self.total_pages();
+        if pages.is_empty() || total <= 1 {
+            return;
+        }
+        let mut unique: Vec<u16> = pages.iter().copied().filter(|&p| p < total).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        if unique.len() >= total as usize {
+            self.status_notice = Some("Cannot delete all pages — at least 1 page must remain".to_string());
+            self.request_redraw();
+            return;
+        }
+        self.push_undo_snapshot();
+        let deleted_count = unique.len();
+        if let Some(doc) = self.doc.as_mut() {
+            for &p_idx in unique.iter().rev() {
+                if let Ok(page) = doc.pages_mut().get(p_idx) {
+                    let _ = page.delete();
+                }
+            }
+        }
+        let new_total = self.total_pages();
+        // Remap bookmarks & bw_pages in descending order so each shift stays exact
+        for &p_idx in unique.iter().rev() {
+            let cur_total = self.total_pages() as usize;
+            PdfEngine::remap_bookmarks_after_delete(
+                &mut self.bookmarks,
+                p_idx as usize,
+                self.skip_pages,
+                self.roman_end,
+                cur_total,
+            );
+            let old_bw = std::mem::take(&mut self.bw_pages);
+            for b in old_bw {
+                if b < p_idx {
+                    self.bw_pages.insert(b);
+                } else if b > p_idx {
+                    self.bw_pages.insert(b - 1);
+                }
+            }
+        }
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
+        if self.current_page_index >= new_total && new_total > 0 {
+            self.current_page_index = new_total - 1;
+        }
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.status_notice = Some(format!(
+            "Deleted {deleted_count} selected page(s) — {new_total} page(s) remaining (Ctrl+Z to undo)"
+        ));
+        self.update_title_bar();
+        self.request_redraw();
     }
 }

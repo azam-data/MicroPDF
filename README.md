@@ -22,36 +22,24 @@ All scan figures are within the target of file size + 120 MB (236 MB). Continuou
 ## Key Features
 
 - **Bright, Modern CPU-Rendered UI (Light Default + Dark Toggle, Zero GPU)**:
-  - **Unified Top Menu & Customizable Icon Toolbar (32px)**: 6 crisp dropdown menus (`File`, `View`, `Edit`, `Page`, `Tools`, `Help` including `Help -> About MicroPDF` and `File -> Recent`) paired with a customizable icon toolbar directly beside `Help` (`View -> Show Toolbar` and `View -> Customize Toolbar...`), rendered with antialiased proportional typography (`ab_glyph` + bounded 256 KB glyph cache), rounded buttons, soft shadows, and instant **Light / Dark UI** switching persisted in `micropdf.ini`.
-  - **Clean Tabs, Welcome Screen, Floating Search, & Thin Scrollbar**: Folder-style tabs with unsaved-edit indicators (`•`), a welcoming drag-and-drop empty screen with clickable recent files, a top-right floating `Ctrl/Cmd+F` search pill, clickable dialog cards (Optimize, Password, Jump, Watermark, etc.), and a thin draggable vertical scrollbar.
-- **Five View Modes (`1`, `2`, `3`, `4`, `5` Keys & `View` Menu), Zoom (`25%–800%`), & Fullscreen/Presentation (`F11` / `F5`)**:
-  1. **`FitPage` (`1`)**: Fits the full page cleanly inside the available viewport.
-  2. **`FitWidth` (`2`)**: Scales the page so its full width fills the viewport (minus 24px padding), with smooth vertical scrolling (`scroll_y`) and automatic page-to-page transitions.
-  3. **`FitTextWidth` (`3`)**: Computes the union bounding box of page content objects (`page.objects().iter()`) to auto-trim left/right margins so the text column fills the viewport width.
-  4. **`TwoPageSpread` (`4`)**: Renders `current_page` and `current_page + 1` side-by-side with a 12px gap, advancing 2 pages at a time.
-  5. **`ContinuousScroll` (`5`)**: Vertical page stack with 12px gaps where the page number tracks the viewport centre and only visible pages ± 1 are cached in RAM.
-  - **Cursor-Anchored Zoom (`Ctrl/Cmd + Wheel`, `+`, `-`, `0`)**: Zooms 25%–800% around the cursor; above 2× viewport size, renders only visible `512 × 512` tiles in a 16 MB LRU tile cache.
-  - **Fullscreen (`F11`) & Presentation Mode (`F5`)**: `F11` hides all bars; `F5` fits one page to a solid black screen with arrow/mouse-click page turns (`Esc` exits).
-- **Links, History (`Alt+Left` / `Alt+Right`), Session Restore (`micropdf.ini`), Single Instance, & Auto-Reload**:
-  - Click internal PDF links to jump or external URLs (with confirmation) to open in the browser; navigate back/forward up to 50 steps with `Alt+Left` / `Alt+Right`.
-  - Automatically saves and offers to restore your previous tabs, recent files, UI theme, and toolbar customization in `micropdf.ini`, forwards second-instance CLI opens to the running window in `< 200 ms`, and auto-reloads modified PDFs every 1 s while focused (ideal for LaTeX/Typst).
-- **Text Selection (`Ctrl/Cmd+C`) & 6 Power Editor Tools**:
-  - **Select & Copy Text (`Mouse Mode: Select Text`, default)**: Drag across text or double-click a word to highlight and press `Ctrl/Cmd+C` to copy to the clipboard (character boxes are cached for the current page only).
-  1. **Time-Sliced Incremental Text Search (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`, `Esc` to cancel)**: Searches ~8 ms of pages per frame on the main thread with live status-bar progress so 1,000+ page PDFs never freeze the UI.
-  2. **Black-Box Redaction & Metadata Sanitizer (`Mouse Mode: Redact`)**: Drag a red box across any page region. Text, vector paths, form XObjects and annotations under the box are deleted; image pixels under the box are painted black inside the image itself (rotated or undecodable images are removed whole). On save, a redacted document also loses its `/Info` dictionary, embedded page thumbnails and every orphaned object, and the save is refused if that cleanup fails. Redaction does not touch bookmark titles or file names, so check those yourself.
-  3. **Visual Page Cropping (`Mouse Mode: Crop Page Area`)**: Drag a green box to crop the page's `/CropBox` in-place, with one-click restore via `Page -> Reset Page Crop` or `Cmd/Ctrl+Z`.
-  4. **Signature / Image Stamp (`P` Key or `Tools -> Stamp Signature / Image...`)**: Pick any `.png` (preserving alpha transparency) or `.jpg`/`.jpeg` file (auto-capped at 2,000 px) and click or drag on the page to stamp it via `PdfPageImageObject`.
-  5. **Dark Mode / Sepia Reading Filter (`V` Key or `View` Menu)**: Cycles `Normal`, `DarkInvert`, and `WarmSepia` directly in the final `softbuffer` blit loop with zero extra RAM and zero modifications to the PDF file.
-  6. **Flatten & Unlock PDF (`U` Key or `Tools -> Flatten & Unlock PDF`)**: Flattens annotations and form fields on all pages into page content streams and strips `/Encrypt`, `/AcroForm`, and `/Perms` restrictions.
-- **Print Preview & Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Split-view live sheet preview on Windows, macOS, and Linux showing unsaved edits, redactions, and filled-in form fields before printing:
-  - **Printer selection**: Direct printer picker on macOS/Linux (`lpstat`) and Windows (`EnumPrintersW` + optional native system dialog).
-  - **Pages & Duplex**: `All`, `Current`, or `Custom` range (`1-3, 5, 8-`), `Odd` / `Even` filters, `Reverse Order`, copies (`1–99`), paper size (`A4` / `Letter` / `Legal`), orientation (`Auto` / `Portrait` / `Landscape`), `Fit` / `100%`, `Color` / `Grayscale`, and **Both-Side (Duplex)** (`1-Sided` / `Long Edge` / `Short Edge`).
-  - **Crop White Space (`Auto-Trim` & `100%–200%` Print Zoom)**: Automatically detects and trims wide white margins (or lets you zoom in manually) to make small text larger and easier to read on paper, printed at full vector sharpness.
-- **Optimize (`Z` or `Tools -> Optimize...`)**: Smaller / Balanced / Print presets, colour, gray or black-and-white, scan cleaning on or off, a preview of the current page, progress in the status bar and `Esc` to cancel. Writes `<name>_optimized.pdf`.
-- **Batch Combine Multiple PDFs (`Shift+M` or `File -> Combine Multiple PDFs...`)**:
-  - Select 2 or more PDF files in the native multi-file dialog to append all their pages in order and open the combined document in a new `"Combined.pdf"` tab.
-- **Multi-Document Tab Bar, Thumbnail Grid (`Tab`), Grayscale (`BW` / `K`), Bookmarks (`B` / `L`), & Multi-Step Undo (`Cmd/Ctrl+Z`)**:
-  - Inactive tabs hold no rendered bitmaps, `140 x 198` Thumbnail Grid (evicting outside visible rows ± 1 screen, capped at 300 entries) with drag-and-drop page reordering and hover `BW` / Rotate badges, Roman/Arabic `/PageLabels` (`N`), aligned Headers/Footers (`H`), Margin Zone purge (`C`), hierarchical `.txt` bookmarks (`L`) embedded into `/Outlines`, and 8-step Undo (`Cmd/Ctrl+Z`).
+  - **Unified Top Menu & Customizable Icon Toolbar (32px)**: 7 crisp dropdown menus (`File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Help` including `Help -> User Guide (How to Use)`, `Help -> Keyboard & Mouse Shortcuts`, `Help -> Bookmark Import Format (.txt)`, `Help -> About MicroPDF`, and `File -> Recent`) paired with a customizable icon toolbar directly beside `Help` (`View -> Show Toolbar`, `View -> Customize Toolbar...`, and `View -> UI Scale`), rendered with antialiased proportional typography (`ab_glyph` + bounded 256 KB glyph cache), rounded buttons, soft shadows, and instant **Light / Dark UI** switching persisted in `micropdf.ini`.
+  - **Built-in Step-by-Step Offline User Guide (`Help -> User Guide (How to Use)`)**: 10 plain-English beginner chapters covering every tool with numbered steps, friendly tips, and one-click `.txt` export for printing.
+  - **Scalable Tabs, Unsaved-Changes Guard, Welcome Screen & Floating Search**: Folder-style tabs with unsaved-edit indicators (`•`), overflow scroll arrows + `▾` All-Tabs dropdown + tab right-click menu (`Close Other Tabs` / `Close Tabs to Right` / `Close All Tabs`), `Save / Discard / Cancel` unsaved-changes guard on tab/app close, drag-and-drop Welcome Screen, top-right floating `Ctrl/Cmd+F` search pill (`Aa` Match Case, `W` Whole Word, `▲`/`▼` prev/next), and a thin draggable vertical scrollbar.
+- **View Modes (`1`–`4`, `T`), Independent Scroll Flow (`5`), Eye-Care Modes (`V`), Zoom (`25%–800%`), & Fullscreen/Presentation (`F11` / `F5`)**:
+  1. **`FitPage` (`1`)**, **`FitWidth` (`2`)**, **`FitTextWidth` (`3`)**, **`TwoPageSpread` (`4`)**, and **Reflowable `TextView` (`T`)**.
+  2. **Independent Scroll Modes**: Combine any page layout with **Single Page**, **Continuous Vertical (`5`)**, or **Continuous Horizontal Book** scroll.
+  3. **6 Eye-Care Reading Modes (`V` or Bottom Bar Picker, persisted in `micropdf.ini`)**: `Normal`, **`Paper E-Ink` (Best for day)**, `Warm Sepia`, `Sage Eye-Care`, `Dark Invert`, and **`Night Amber` (Best for night)**.
+  4. **Reading Continuity**: Automatically remembers your last page & zoom for up to 50 files in `micropdf.ini`, restores previous sessions on request, forwards second-instance opens in `< 200 ms`, and auto-reloads modified PDFs every 1 s while focused.
+- **Annotations, Interactive Form Filling, & Power Editor Tools**:
+  - **Select, Copy, Annotate & Inspect**: Drag or double-click text (`Ctrl/Cmd+C`), place Highlights, Underlines, Strikethroughs, Sticky Notes (multi-line reader popover with Edit/Delete), Freehand Pen, Text Boxes, Rectangles, and Arrows in 7 colors; **right-click any annotation** to edit text, recolor, or delete. Full 8-step **Undo (`Ctrl+Z`) & Redo (`Ctrl+Y` / `Ctrl+Shift+Z`)** across edits and metadata.
+  - **Native Interactive Form Filling**: Click PDF Checkboxes, Radio Buttons, and Text Fields directly in Select mode with Undo, Save, and Print support.
+  - **Side-by-Side PDF Compare (`Tools -> Compare with Another PDF...`)**: Synchronized dual-pane comparison with page offset, pane swap, and CPU **Visual Diff** overlay (red/blue pixel diff).
+  - **Quick Measure / Ruler Tool (`Edit -> Measure Distance & Area (Ruler)`)**: Measure exact Length, ΔX × ΔY, Area, and Angle directly from PDF points in `mm`, `cm`, `in`, or `pt`.
+  - **Black-Box Redaction & One-Click Privacy Scrubber (`File -> Document Properties & Privacy...`)**: True content/pixel redaction that strips underlying text, images, form fields, `/Info`, and `/StructTreeRoot` on save, plus one-click personal metadata & XMP scrubbing without altering page content.
+  - **Create PDF from Images (`File -> Create PDF from Images...`) & Export Menu**: Convert PDFs offline to **Word (`.docx`)**, **Excel (`.xlsx`)**, **Markdown (`.md`)**, **LaTeX (`.tex`)**, or **PNG/JPEG Images** (150/200/300 DPI).
+- **Print Preview & Printing (`Ctrl/Cmd+P` or `File -> Print...`)**: Live sheet preview on Windows, macOS, and Linux with **10 Paper Sizes**, `With Annots` / `No Annots`, **Auto-Trim** white space + `100%–200%` Print Zoom, automatic **2-Sided (Duplex)**, guided **Manual 2-Sided on any 1-sided printer**, and foldable **Booklet** printing.
+- **Thumbnail Grid Multi-Select (`Tab`), Combine / Insert PDFs, Header/Footer Profiles, Page Numbers, Bookmarks & Optimize**:
+  - Multi-select pages (`Ctrl+Click` / `Shift+Click`) for single-step batch Rotate, B/W, Extract, or Delete; right-click thumbnails to insert blanks or external PDFs before/after; visual **Header & Footer** dialog with live preview & reusable style profiles; visual **Page Numbering** dialog with Roman/Arabic & skip cover pages; **Bookmark Sidebar** with Add, Edit, Reorder, Indent/Outdent, Auto-Detect Headings, Import `.txt`, and Export `.txt`; and **Optimize (`Z`)** with scan cleanup and live preview.
 
 ---
 
@@ -59,27 +47,25 @@ All scan figures are within the target of file size + 120 MB (236 MB). Continuou
 
 | Shortcut / Action | Mode | Description |
 | :--- | :--- | :--- |
-| **Top Menu Bar Click** | Any | Open `[ File ]`, `[ View ]`, `[ Edit ]`, `[ Page ]`, `[ Tools ]`, or `[ Help ]` dropdown menu |
-| `1` / `2` / `3` / `4` / `5` | Page View | Switch View Mode: `1` Fit Page, `2` Fit Width, `3` Fit Text, `4` Two-Page, `5` Continuous Scroll |
-| `Ctrl/Cmd+Wheel` / `+` / `-` / `0` | Page View | Zoom in/out (`25%–800%`) around cursor or reset zoom to `100%` (`0`) |
-| `F11` / `F5` / `Esc` | Any | Toggle Fullscreen (`F11`), Presentation Mode (`F5`), or exit/cancel (`Esc`) |
+| **Top Menu Bar Click** | Any | Open `[ File ]`, `[ View ]`, `[ Edit ]`, `[ Page ]`, `[ Tools ]`, `[ Export ]`, or `[ Help ]` |
+| `1` / `2` / `3` / `4` / `5` / `T` | Page View | `1` Fit Page, `2` Fit Width, `3` Fit Text, `4` Two-Page, `5` Continuous Scroll, `T` Text View |
+| `Ctrl/Cmd+Wheel` / `+` / `-` / `0` | Page View | Zoom (`25%–800%`) around cursor or reset zoom to `100%` (`0` / `Ctrl+0`) |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` / `Ctrl+1..9` | Any | Switch next tab, previous tab, or jump directly to tab 1–9 (`Ctrl+W` closes tab) |
+| `F11` / `F5` / `Esc` | Any | Fullscreen (`F11`), Presentation Mode (`F5`), or exit tool/compare/modal (`Esc`) |
 | `Alt+Left` / `Alt+Right` | Page View | Navigate Back / Forward in link & page jump history (up to 50 entries) |
-| **Left-Click & Drag / Double-Click** | Page View | Select text / word (`Ctrl/Cmd+C` to copy), or Highlight, Redact, Crop, Stamp Image |
-| `Tab` | Any | Toggle between **Page View** and **All-Pages Thumbnail Grid** (`Ctrl+Tab` cycles open tabs) |
-| `Cmd/Ctrl+F` & `F3` / `Cmd/Ctrl+G` | Any | Time-sliced incremental text search (`Esc` cancels) & jump to next match |
-| `V` | Page View | Cycle **Normal** / **Dark Invert** / **Warm Sepia** reading filter (in-place CPU blit) |
-| `P` | Page View | Pick PNG/JPG signature or image -> Click or drag on page to stamp |
-| `U` | Any | Flatten annotations/form fields on all pages & unlock PDF permissions |
-| `Shift+M` / `M` | Any | **Combine Multiple PDFs** into `"Combined.pdf"` tab (`Shift+M`) / Merge 1 PDF (`M`) |
-| `B` / `L` | Any | Toggle **Left Bookmark Sidebar** / Import `.txt` bookmarks (`Serial -- Title -- Page`) |
-| `G` or `0`–`9` | Normal | Smart Jump to Logical page (`5`), Roman page (`ii`), or Physical page (`#5`) |
-| `N` / `H` / `C` / `W` | Normal | Roman/Arabic Page Numbers (`N`), Aligned Header/Footer (`H`), Clear Margins (`C`), Watermark (`W`) |
-| `K` / `I` / `R` / `D` | Normal / Grid | Convert page to Grayscale `[BW]` (`K`), Insert A4 (`I`), Rotate 90° (`R`), Delete page (`D`) |
-| `Cmd+Z` / `Ctrl+Z` | Normal | Undo last structural or page edit (up to 8 steps per tab) |
-| `Ctrl/Cmd+P` / `File -> Print...` | Any | Print the current document (Windows: print dialog, `Esc` cancels while printing; macOS: print bar, `Tab` printer, `+`/`-` copies, `F` fit-to-page) |
-| `Tools -> Optimize...` | Any | Optimize menu in the bottom bar: `1`/`2`/`3` preset, `C`/`G`/`B` colour mode, `S` clean scans, `P` preview, `Enter` run, `Esc` cancel |
-| `O` / `S` / `Z` / `X` | Normal | Open PDF in tab (`O`), Save PDF (`S`), Optimize PDF to `<name>_optimized.pdf` (`Z`), Split/Extract range (`X`) |
-| `?` / `F1` / `Esc` | Any | Toggle Help Overlay / Close menu / Cancel prompt / Reset mouse mode |
+| **Left-Click / Drag / Right-Click** | Page View | Select text (`Ctrl+C`), click Form Fields to fill, right-click any annotation to Edit/Recolor/Delete |
+| `Tab` / `Ctrl+Click` / `Shift+Click` | Any / Grid | Toggle Thumbnail Grid (`Tab`); multi-select thumbnails for batch Rotate / B&W / Extract / Delete |
+| `Cmd/Ctrl+F` & `F3` / `Shift+F3` | Any | Incremental search (`Aa` Case, `W` Whole Word) & Next (`F3` / `Ctrl+G`) / Prev (`Shift+F3` / `Ctrl+Shift+G`) |
+| `V` | Page View | Cycle 6 Eye-Care Reading Modes (`Paper E-Ink` day, `Night Amber` night, Sepia, Sage, Dark, Normal) |
+| `P` / `U` / `Z` | Any | Stamp Signature/Image (`P`), Flatten & Unlock (`U`), Optimize PDF (`Z`) |
+| `Shift+M` / `X` | Any | **Combine Multiple PDFs** (`Shift+M`), Split / Extract range (`X`) |
+| `B` / `A` / `L` | Any | Toggle Bookmark Sidebar (`B`), Add Bookmark (`A`), Import `.txt` bookmarks (`L`) |
+| `G` | Normal | Smart Jump to Logical (`5`), Roman (`iii`), or Physical (`#5`) page |
+| `N` / `H` / `W` | Normal | Page Numbering Dialog (`N`), Header/Footer & Profiles (`H`), Watermark (`W`) |
+| `K` / `I` / `R` / `D` | Normal / Grid | Convert page to B&W (`K`), Insert Blank (`I`), Rotate 90° (`R`), Delete page (`D`) |
+| `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Normal | Undo (`Ctrl+Z`) and Redo (`Ctrl+Y` / `Ctrl+Shift+Z`) up to 8 steps per tab |
+| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Live Print Preview (`Ctrl+P`), Open (`O`), Save (`S`), Save As (`Ctrl+Shift+S`) |
+| `?` / `F1` / `Help -> User Guide` | Any | Quick Shortcut Sheet (`?` / `F1`) or 10-chapter Step-by-Step Beginner User Guide |
 
 ---
 
@@ -105,19 +91,23 @@ On a 10-page, 24 MB scan: 6.0 MB in about 1 s per page; 0.54 MB in black-and-whi
 
 ## Testing
 
-```
+```bash
 # PDFium must be reachable: copy it next to the test binary or set MICROPDF_PDFIUM_DIR
 cargo test
 ```
 
 Real memory figures (run on its own, takes a minute):
 
-```
+```bash
 cargo test --release ram_realistic -- --ignored --nocapture --test-threads=1
 cargo test --release ram_print -- --ignored --nocapture --test-threads=1
 ```
 
 `test_redaction_leaves_no_trace` builds a PDF with secret text over an image, redacts it, saves it, and fails if the secret survives in extracted text, in any decompressed stream, or in the image pixels under the box.
+
+## Contributing & Updating the Built-In User Guide
+
+Before contributing code or opening a pull request, please read **[`AGENTS.md`](AGENTS.md)** and **[`docs/USER_GUIDE_FRAMEWORK.md`](docs/USER_GUIDE_FRAMEWORK.md)**. Any change that adds, renames, or alters user-facing features, menus, dialogs, or shortcuts **must** update the built-in beginner manual in [`src/viewer/user_guide.rs`](src/viewer/user_guide.rs) and the shortcut sheet in [`src/viewer/overlays.rs`](src/viewer/overlays.rs).
 
 ## License
 

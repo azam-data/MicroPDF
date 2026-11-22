@@ -170,14 +170,18 @@ fn extract_page_runs(page: &PdfPage) -> (f32, f32, Vec<TextRun>) {
         }
     }
 
-    let mut runs = Vec::new();
-    for obj in page.objects().iter() {
+    fn collect_object_runs(
+        obj: &PdfPageObject,
+        links: &[(PdfRect, String)],
+        runs: &mut Vec<TextRun>,
+        depth: u8,
+    ) {
         if let Some(text_obj) = obj.as_text_object() {
             let txt = text_obj.text();
             if txt.trim().is_empty() {
-                continue;
+                return;
             }
-            let Ok(b) = obj.bounds() else { continue };
+            let Ok(b) = obj.bounds() else { return };
             let left = b.left().value.min(b.right().value);
             let right = b.left().value.max(b.right().value);
             let bottom = b.bottom().value.min(b.top().value);
@@ -188,7 +192,15 @@ fn extract_page_runs(page: &PdfPage) -> (f32, f32, Vec<TextRun>) {
             let bold = font.is_bold_reenforced()
                 || font
                     .weight()
-                    .map(|w| matches!(w, PdfFontWeight::Weight600 | PdfFontWeight::Weight700Bold | PdfFontWeight::Weight800 | PdfFontWeight::Weight900))
+                    .map(|w| {
+                        matches!(
+                            w,
+                            PdfFontWeight::Weight600
+                                | PdfFontWeight::Weight700Bold
+                                | PdfFontWeight::Weight800
+                                | PdfFontWeight::Weight900
+                        )
+                    })
                     .unwrap_or(false)
                 || fname.contains("bold")
                 || fname.contains("black")
@@ -222,7 +234,18 @@ fn extract_page_runs(page: &PdfPage) -> (f32, f32, Vec<TextRun>) {
                 italic,
                 link,
             });
+        } else if depth < 4 {
+            if let Some(form) = obj.as_x_object_form_object() {
+                for child in form.iter() {
+                    collect_object_runs(&child, links, runs, depth + 1);
+                }
+            }
         }
+    }
+
+    let mut runs = Vec::new();
+    for obj in page.objects().iter() {
+        collect_object_runs(&obj, &links, &mut runs, 0);
     }
 
     (page_w, page_h, runs)
@@ -794,37 +817,93 @@ fn detect_repeating_margin_text(all_pages: &[Vec<TextLine>]) -> std::collections
 fn extract_document_blocks(doc: &PdfDocument) -> Vec<Vec<ExportBlock>> {
     let total = doc.pages().len();
     let mut page_lines: Vec<Vec<TextLine>> = Vec::with_capacity(total as usize);
+    let mut fallback_text: Vec<Option<String>> = Vec::with_capacity(total as usize);
     for idx in 0..total {
         if let Ok(page) = doc.pages().get(idx) {
             let (pw, _ph, runs) = extract_page_runs(&page);
-            page_lines.push(group_runs_into_lines(pw, runs));
+            if runs.is_empty() {
+                let raw = page
+                    .text()
+                    .ok()
+                    .map(|t| t.all())
+                    .filter(|s| !s.trim().is_empty());
+                page_lines.push(Vec::new());
+                fallback_text.push(raw);
+            } else {
+                page_lines.push(group_runs_into_lines(pw, runs));
+                fallback_text.push(None);
+            }
         } else {
             page_lines.push(Vec::new());
+            fallback_text.push(None);
         }
     }
 
     let body_font = estimate_body_font_size(&page_lines);
     let repeated = detect_repeating_margin_text(&page_lines);
+    let strip_page_nums = total > 1;
 
     page_lines
         .into_iter()
-        .map(|mut lines| {
-            // Strip repeating running headers/footers and lone page-number lines
+        .zip(fallback_text)
+        .map(|(mut lines, fb)| {
+            if lines.is_empty() {
+                if let Some(raw) = fb {
+                    return raw
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(|l| {
+                            ExportBlock::Paragraph(vec![StyledSpan {
+                                text: l.to_string(),
+                                bold: false,
+                                italic: false,
+                                link: None,
+                            }])
+                        })
+                        .collect();
+                }
+                return Vec::new();
+            }
+            // Strip repeating running headers/footers and multi-page lone page-number lines
             if let Some(first) = lines.first() {
                 let t = first.plain_text();
-                if repeated.contains(&t) || (t.len() <= 5 && t.chars().all(|c| c.is_ascii_digit())) {
+                if repeated.contains(&t)
+                    || (strip_page_nums && t.len() <= 5 && t.chars().all(|c| c.is_ascii_digit()))
+                {
                     lines.remove(0);
                 }
             }
             if let Some(last) = lines.last() {
                 let t = last.plain_text();
-                if repeated.contains(&t) || (t.len() <= 5 && t.chars().all(|c| c.is_ascii_digit())) {
+                if repeated.contains(&t)
+                    || (strip_page_nums && t.len() <= 5 && t.chars().all(|c| c.is_ascii_digit()))
+                {
                     lines.pop();
                 }
             }
             classify_lines_into_blocks(&lines, body_font)
         })
         .collect()
+}
+
+/// Detects likely document headings `(0-based page_index, heading_level 0|1, title)` across `doc`
+/// for one-click Bookmark generation on PDFs that lack an outline tree.
+pub fn detect_document_headings(doc: &PdfDocument) -> Vec<(usize, u8, String)> {
+    let pages = extract_document_blocks(doc);
+    let mut out = Vec::new();
+    for (p_idx, blocks) in pages.into_iter().enumerate() {
+        for block in blocks {
+            if let ExportBlock::Heading { level, text } = block {
+                let clean = text.trim().to_string();
+                if clean.len() >= 2 && clean.len() <= 140 {
+                    let bm_lvl = if level <= 1 { 0 } else { 1 };
+                    out.push((p_idx, bm_lvl, clean));
+                }
+            }
+        }
+    }
+    out
 }
 
 fn format_spans_markdown(spans: &[StyledSpan]) -> String {
@@ -851,7 +930,11 @@ fn format_spans_markdown(spans: &[StyledSpan]) -> String {
             core = format!("*{core}*");
         }
         if let Some(ref url) = s.link {
-            core = format!("[{core}]({url})");
+            let safe_url = url
+                .replace(' ', "%20")
+                .replace('(', "%28")
+                .replace(')', "%29");
+            core = format!("[{core}]({safe_url})");
         }
         out.push_str(&core);
         if trail_sp {
@@ -1015,7 +1098,13 @@ fn format_spans_latex(spans: &[StyledSpan]) -> String {
             core = format!("\\textit{{{core}}}");
         }
         if let Some(ref url) = s.link {
-            let safe_url = url.replace('%', "\\%").replace('#', "\\#");
+            let safe_url = url
+                .replace('\\', "\\textbackslash{}")
+                .replace('{', "\\{")
+                .replace('}', "\\}")
+                .replace('%', "\\%")
+                .replace('#', "\\#")
+                .replace('~', "\\~{}");
             core = format!("\\href{{{safe_url}}}{{{core}}}");
         }
         out.push_str(&core);
@@ -1081,24 +1170,24 @@ pub fn render_blocks_to_latex(doc_title: &str, pages: &[Vec<ExportBlock>]) -> St
                     }
                 }
                 ExportBlock::BulletItem(spans) => {
-                    if list != ListKind::Itemize {
-                        close_list(&mut out, &mut list);
-                        out.push_str("\\begin{itemize}\n");
-                        list = ListKind::Itemize;
-                    }
                     let line = format_spans_latex(spans);
                     if !line.is_empty() {
+                        if list != ListKind::Itemize {
+                            close_list(&mut out, &mut list);
+                            out.push_str("\\begin{itemize}\n");
+                            list = ListKind::Itemize;
+                        }
                         out.push_str(&format!("  \\item {line}\n"));
                     }
                 }
                 ExportBlock::NumberedItem { spans, .. } => {
-                    if list != ListKind::Enumerate {
-                        close_list(&mut out, &mut list);
-                        out.push_str("\\begin{enumerate}\n");
-                        list = ListKind::Enumerate;
-                    }
                     let line = format_spans_latex(spans);
                     if !line.is_empty() {
+                        if list != ListKind::Enumerate {
+                            close_list(&mut out, &mut list);
+                            out.push_str("\\begin{enumerate}\n");
+                            list = ListKind::Enumerate;
+                        }
                         out.push_str(&format!("  \\item {line}\n"));
                     }
                 }
@@ -1110,7 +1199,11 @@ pub fn render_blocks_to_latex(doc_title: &str, pages: &[Vec<ExportBlock>]) -> St
                         out.push_str(&format!("\\begin{{tabular}}{{{spec}}}\n\\hline\n"));
                         for (r_idx, r) in rows.iter().enumerate() {
                             let cells: Vec<String> = r.iter().map(|c| escape_latex(c)).collect();
-                            out.push_str(&cells.join(" & "));
+                            let mut row_line = cells.join(" & ");
+                            if row_line.starts_with('[') {
+                                row_line.insert_str(0, "{}");
+                            }
+                            out.push_str(&row_line);
                             out.push_str(" \\\\\n");
                             if r_idx == 0 {
                                 out.push_str("\\hline\n");
@@ -1274,8 +1367,10 @@ fn xml_escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            // Strip illegal XML 1.0 control characters
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r' => {}
+            // Strip illegal XML 1.0 control characters and non-characters (U+FFFE, U+FFFF)
+            c if ((c as u32) < 0x20 && c != '\t' && c != '\n' && c != '\r')
+                || c == '\u{FFFE}'
+                || c == '\u{FFFF}' => {}
             c => out.push(c),
         }
     }
@@ -1360,7 +1455,12 @@ pub fn render_blocks_to_docx(doc_title: &str, pages: &[Vec<ExportBlock>]) -> Vec
                 }
                 ExportBlock::NumberedItem { num, spans } => {
                     body.push_str("<w:p><w:pPr><w:ind w:left=\"360\" w:hanging=\"220\"/></w:pPr>");
-                    push_run(&mut body, &format!("{num} "), true, false, false);
+                    let prefix = if num.ends_with('.') || num.ends_with(')') {
+                        format!("{num} ")
+                    } else {
+                        format!("{num}. ")
+                    };
+                    push_run(&mut body, &prefix, true, false, false);
                     push_spans(&mut body, spans);
                     body.push_str("</w:p>");
                 }
@@ -1383,8 +1483,12 @@ pub fn render_blocks_to_docx(doc_title: &str, pages: &[Vec<ExportBlock>]) -> Vec
                          <w:tblCellMar>\
                          <w:top w:w=\"60\" w:type=\"dxa\"/><w:bottom w:w=\"60\" w:type=\"dxa\"/>\
                          <w:left w:w=\"100\" w:type=\"dxa\"/><w:right w:w=\"100\" w:type=\"dxa\"/>\
-                         </w:tblCellMar></w:tblPr>",
+                         </w:tblCellMar></w:tblPr><w:tblGrid>",
                     );
+                    for _ in 0..cols {
+                        body.push_str(&format!("<w:gridCol w:w=\"{col_w}\"/>"));
+                    }
+                    body.push_str("</w:tblGrid>");
                     for (r_idx, row) in rows.iter().enumerate() {
                         let is_hdr = r_idx == 0;
                         body.push_str("<w:tr>");
@@ -1501,14 +1605,72 @@ fn xlsx_col_letter(mut col_zero_based: usize) -> String {
     chars.into_iter().rev().collect()
 }
 
+/// Validates strict English thousands grouping (e.g. `1,234` or `12,345,678.90`) or plain
+/// dot-decimal numbers (`1234.56`), rejecting European comma-decimals (`12,50`), comma lists
+/// (`1,2,3`), leading-zero IDs (`00412`), and >15-digit account/card numbers so Excel never
+/// corrupts or truncates them.
+fn is_valid_grouped_number(num_part: &str) -> bool {
+    let unsigned = num_part
+        .strip_prefix('-')
+        .or_else(|| num_part.strip_prefix('+'))
+        .unwrap_or(num_part);
+    if unsigned.is_empty() {
+        return false;
+    }
+    let (int_part, frac_part) = match unsigned.split_once('.') {
+        Some((i, f)) => {
+            if f.is_empty() || !f.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+            (i, Some(f))
+        }
+        None => (unsigned, None),
+    };
+    if int_part.is_empty() {
+        return false;
+    }
+    // Preserve leading-zero identifiers (ZIP codes, account codes like "00123") as text
+    if int_part.len() > 1 && int_part.starts_with('0') && !int_part.contains(',') {
+        return false;
+    }
+    let digit_count = if int_part.contains(',') {
+        let groups: Vec<&str> = int_part.split(',').collect();
+        if groups.len() < 2
+            || groups[0].is_empty()
+            || groups[0].len() > 3
+            || !groups[0].chars().all(|c| c.is_ascii_digit())
+            || groups[0].starts_with('0')
+        {
+            return false;
+        }
+        for g in &groups[1..] {
+            if g.len() != 3 || !g.chars().all(|c| c.is_ascii_digit()) {
+                return false;
+            }
+        }
+        groups.iter().map(|g| g.len()).sum::<usize>()
+    } else {
+        if !int_part.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        int_part.len()
+    };
+    let total_digits = digit_count + frac_part.map_or(0, str::len);
+    total_digits >= 1 && total_digits <= 15
+}
+
 fn parse_excel_numeric(cell: &str) -> Option<(f64, u8)> {
     let s = cell.trim();
     if s.is_empty() || s.len() > 24 {
         return None;
     }
-    // Style 3 = plain/comma number, Style 4 = percentage
+    // Style 3 = decimal/comma float (#,##0.00), Style 4 = percentage (0.00%), Style 5 = plain integer (General)
     if let Some(pct) = s.strip_suffix('%') {
-        let cleaned = pct.trim().replace(',', "");
+        let pt = pct.trim();
+        if !is_valid_grouped_number(pt) {
+            return None;
+        }
+        let cleaned = pt.replace(',', "");
         if let Ok(v) = cleaned.parse::<f64>() {
             if v.is_finite() {
                 return Some((v / 100.0, 4));
@@ -1516,11 +1678,15 @@ fn parse_excel_numeric(cell: &str) -> Option<(f64, u8)> {
         }
         return None;
     }
-    // Allow optional leading currency or accounting parens only for plain numbers without alpha
+    if !is_valid_grouped_number(s) {
+        return None;
+    }
+    let has_decimal_or_comma = s.contains('.') || s.contains(',');
     let cleaned = s.replace(',', "");
     if let Ok(v) = cleaned.parse::<f64>() {
         if v.is_finite() {
-            return Some((v, 3));
+            let style = if has_decimal_or_comma { 3 } else { 5 };
+            return Some((v, style));
         }
     }
     None
@@ -1715,12 +1881,13 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
           </border>\
         </borders>\
         <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
-        <cellXfs count=\"5\">\
+        <cellXfs count=\"6\">\
           <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
           <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\
           <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
           <xf numFmtId=\"4\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
           <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
         </cellXfs>\
         </styleSheet>";
 
@@ -2017,6 +2184,42 @@ mod tests {
         assert!(wb.contains("Document Text"));
         assert!(sheet1.contains("<v>12450</v>"), "numeric cell should store raw number: {sheet1}");
         assert!(sheet1.contains("<v>0.255</v>"), "percentage cell should store numeric ratio: {sheet1}");
+    }
+
+    #[test]
+    fn test_tier0_xlsx_numbers_xml_sanitization_and_md_latex_escaping() {
+        // Years / integers must NOT be formatted as 2-decimal floats; European comma decimals,
+        // leading-zero codes, and >15-digit IDs must stay strings.
+        assert_eq!(parse_excel_numeric("2026"), Some((2026.0, 5)));
+        assert_eq!(parse_excel_numeric("12,450"), Some((12450.0, 3)));
+        assert_eq!(parse_excel_numeric("12.50"), Some((12.5, 3)));
+        assert_eq!(parse_excel_numeric("25.5%"), Some((0.255, 4)));
+        assert_eq!(parse_excel_numeric("12,50"), None);
+        assert_eq!(parse_excel_numeric("00123"), None);
+        assert_eq!(parse_excel_numeric("12345678901234567"), None);
+
+        // XML 1.0 forbids U+FFFE and U+FFFF
+        let sanitized = xml_escape("A\u{FFFE}B\u{FFFF}C & <D>");
+        assert_eq!(sanitized, "ABC &amp; &lt;D&gt;");
+
+        // Markdown URL spaces/parentheses escaping
+        let md = render_blocks_to_markdown(&[vec![ExportBlock::Paragraph(vec![StyledSpan {
+            text: "Docs".to_string(),
+            bold: false,
+            italic: false,
+            link: Some("https://example.com/a (b).pdf".to_string()),
+        }])]]);
+        assert!(md.contains("(https://example.com/a%20%28b%29.pdf)"), "md: {md}");
+
+        // LaTeX tabular row starting with '[' must be prefixed with '{}' so LaTeX doesn't parse as \\[len]
+        let tex = render_blocks_to_latex(
+            "Test",
+            &[vec![ExportBlock::Table(vec![
+                vec!["Col1".to_string(), "Col2".to_string()],
+                vec!["[Note]".to_string(), "Val".to_string()],
+            ])]],
+        );
+        assert!(tex.contains("{}[Note] & Val \\\\"), "tex: {tex}");
     }
 }
 

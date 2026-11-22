@@ -13,14 +13,24 @@ use winit::window::Window;
 
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
+use super::compare_mode::{CompareHit, CompareModeState};
+use super::doc_props_modal::{
+    ActiveNotePopover, AnnotContextHit, AnnotationContextMenuState, DocPropsHit,
+    DocPropsModalState, NotePopoverHit, UnsavedChangesHit, UnsavedChangesModalState,
+};
 use super::doc_tools_modal::{
     HeaderFooterHit, HeaderFooterModalState, PageNumberHit, PageNumberModalState,
 };
+use super::image_tools_modal::{
+    CreatePdfImagesHit, CreatePdfImagesModalState, ExportImagesHit, ExportImagesModalState,
+};
+use super::measure::{MeasureBarHit, MeasureUnit, MeasurementResult};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
+use super::user_guide::{UserGuideHit, UserGuideState};
 
 #[allow(dead_code)]
 pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
@@ -47,6 +57,7 @@ pub(super) const MIN_UI_SCALE: f32 = 0.80;
 pub(super) const MAX_UI_SCALE: f32 = 1.60;
 pub(super) const MAX_NAV_HISTORY: usize = 50;
 pub(super) const MAX_RECENT_FILES: usize = 10;
+pub(super) const MAX_LAST_POSITIONS: usize = 50;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.
@@ -93,8 +104,10 @@ impl MenuCategory {
         match self {
             MenuCategory::File => &[
                 "Open PDF in Tab (O)",
+                "Create PDF from Images...",
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
+                "Document Properties & Privacy...",
                 "Save PDF (S)",
                 "Save As... (Ctrl+Shift+S)",
                 "Print... (Ctrl+P / Cmd+P)",
@@ -128,9 +141,10 @@ impl MenuCategory {
             ],
             MenuCategory::Edit => &[
                 "Undo (Ctrl+Z / Cmd+Z)",
+                "Redo (Ctrl+Y / Ctrl+Shift+Z)",
                 "Copy Selected Text (Ctrl+C / Cmd+C)",
                 "Find Text in PDF... (Ctrl+F / Cmd+F)",
-                "Mouse Mode: Select Text (default)",
+                "Mouse Mode: Select Text / Fill Forms",
                 "Annotate: Highlight Text",
                 "Annotate: Underline Text",
                 "Annotate: Strikethrough Text",
@@ -140,6 +154,7 @@ impl MenuCategory {
                 "Annotate: Rectangle Shape",
                 "Annotate: Arrow Shape",
                 "Cycle Annotation Color",
+                "Measure Distance & Area (Ruler)",
                 "Mouse Mode: Black-Box Redact",
                 "Mouse Mode: Crop Page Area",
             ],
@@ -159,6 +174,7 @@ impl MenuCategory {
                 "Add Watermark... (W)",
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
+                "Compare with Another PDF...",
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
             ],
@@ -167,8 +183,10 @@ impl MenuCategory {
                 "Export as Excel (.xlsx)...",
                 "Export as Markdown (.md)...",
                 "Export as LaTeX (.tex)...",
+                "Export Pages as Images (PNG/JPG)...",
             ],
             MenuCategory::Help => &[
+                "User Guide (How to Use)",
                 "Keyboard & Mouse Shortcuts (? / F1)",
                 "Bookmark Import Format (.txt)",
                 "About MicroPDF",
@@ -189,6 +207,7 @@ pub enum MouseMode {
     FreeText,
     RectShape,
     ArrowShape,
+    Measure,
     Redact,
     Crop,
     StampImage,
@@ -206,6 +225,7 @@ impl MouseMode {
             MouseMode::FreeText => "TextBox",
             MouseMode::RectShape => "Rect",
             MouseMode::ArrowShape => "Arrow",
+            MouseMode::Measure => "Ruler",
             MouseMode::Redact => "REDACT",
             MouseMode::Crop => "CROP",
             MouseMode::StampImage => "STAMP",
@@ -304,6 +324,28 @@ impl ReadingFilter {
             Self::SageEyeCare => (0x00E9_F2EA, 0x001D_271F),
             Self::DarkInvert => (0x001E_2024, 0x00D8_DCE2),
             Self::NightAmber => (0x001A_1713, 0x00E5_CFA8),
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::PaperEInk => "PaperEInk",
+            Self::WarmSepia => "WarmSepia",
+            Self::SageEyeCare => "SageEyeCare",
+            Self::DarkInvert => "DarkInvert",
+            Self::NightAmber => "NightAmber",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "PaperEInk" => Self::PaperEInk,
+            "WarmSepia" => Self::WarmSepia,
+            "SageEyeCare" => Self::SageEyeCare,
+            "DarkInvert" => Self::DarkInvert,
+            "NightAmber" => Self::NightAmber,
+            _ => Self::Normal,
         }
     }
 }
@@ -424,15 +466,25 @@ pub(super) struct SavedSessionTab {
     pub(super) view_mode: ViewMode,
 }
 
+/// Remembered reading position `(page_index, zoom_level)` for a file in the 50-entry LRU table.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LastPositionEntry {
+    pub(super) path: PathBuf,
+    pub(super) page_index: u16,
+    pub(super) zoom_level: f32,
+}
+
 /// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, UI preferences & saved profiles).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SessionConfig {
     pub(super) active_tab: usize,
     pub(super) tabs: Vec<SavedSessionTab>,
     pub(super) recent_files: Vec<PathBuf>,
+    pub(super) last_positions: Vec<LastPositionEntry>,
     pub(super) ui_theme: UiThemeMode,
     pub(super) ui_scale: f32,
     pub(super) scroll_mode: ScrollMode,
+    pub(super) reading_filter: ReadingFilter,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
@@ -444,9 +496,11 @@ impl Default for SessionConfig {
             active_tab: 0,
             tabs: Vec::new(),
             recent_files: Vec::new(),
+            last_positions: Vec::new(),
             ui_theme: UiThemeMode::Light,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
+            reading_filter: ReadingFilter::Normal,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
@@ -512,6 +566,25 @@ pub(super) struct PageCharBox {
     pub(super) rect: Option<PdfRect>,
 }
 
+/// Metadata-aware Undo / Redo snapshot.
+/// When `pdf_bytes` is `None`, the edit only mutated metadata (e.g. bookmarks), costing 0 bytes of PDF RAM.
+#[derive(Clone, Debug)]
+pub(super) struct UndoSnapshot {
+    pub(super) pdf_bytes: Option<Vec<u8>>,
+    pub(super) bookmarks: Vec<Bookmark>,
+    pub(super) bw_pages: HashSet<u16>,
+    pub(super) roman_end: usize,
+    pub(super) skip_pages: usize,
+    pub(super) redacted: bool,
+    pub(super) generation: u64,
+}
+
+impl UndoSnapshot {
+    pub(super) fn byte_len(&self) -> usize {
+        self.pdf_bytes.as_ref().map_or(0, Vec::len)
+    }
+}
+
 /// Zero-RAM inactive document tab slot (never stores cached bitmaps or thumbnails).
 pub(super) struct DocumentTab<'a> {
     pub(super) doc: Option<PdfDocument<'a>>,
@@ -533,7 +606,10 @@ pub(super) struct DocumentTab<'a> {
     pub(super) bookmark_scroll_y: usize,
     pub(super) grid_scroll_y: f32,
     pub(super) bw_pages: HashSet<u16>,
-    pub(super) undo_stack: VecDeque<Vec<u8>>,
+    pub(super) undo_stack: VecDeque<UndoSnapshot>,
+    pub(super) redo_stack: VecDeque<UndoSnapshot>,
+    pub(super) undo_generation: u64,
+    pub(super) saved_undo_generation: u64,
     /// True once any redaction has been applied; forces the strict save path.
     pub(super) redacted: bool,
     /// True once any unsaved edit has been made to this tab since load/save.
@@ -579,8 +655,19 @@ pub(super) enum ThumbContextHit {
     InsertPdfAfter,
     RotateCw,
     ConvertBw,
+    ExtractSelected,
     DeletePage,
     InsideMenu,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ThumbBatchHit {
+    RotateSelected,
+    BwSelected,
+    ExtractSelected,
+    DeleteSelected,
+    ClearSelection,
+    InsideBar,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -602,6 +689,12 @@ pub(super) enum ThumbBadgeHit {
 pub(super) enum SidebarHit {
     AddBookmarkButton,
     ImportTxtButton,
+    ExportTxtButton,
+    AutoDetectButton,
+    MoveUpButton,
+    MoveDownButton,
+    OutdentButton,
+    IndentButton,
     BookmarkRow { index: usize, on_delete: bool },
 }
 
@@ -621,8 +714,15 @@ pub(super) enum UiHit {
     TabList(TabListHit),
     TabContext(TabContextHit),
     ThumbContext(ThumbContextHit),
+    ThumbBatch(ThumbBatchHit),
     SidebarAdd,
     SidebarImport,
+    SidebarExport,
+    SidebarAuto,
+    SidebarMoveUp,
+    SidebarMoveDown,
+    SidebarOutdent,
+    SidebarIndent,
     SidebarRow(usize),
     SidebarDelete(usize),
     Scrollbar,
@@ -632,6 +732,15 @@ pub(super) enum UiHit {
     Combine(CombineHit),
     HeaderFooter(HeaderFooterHit),
     PageNumber(PageNumberHit),
+    CreatePdfImages(CreatePdfImagesHit),
+    ExportImages(ExportImagesHit),
+    DocProps(DocPropsHit),
+    UnsavedChanges(UnsavedChangesHit),
+    AnnotContext(AnnotContextHit),
+    NotePopover(NotePopoverHit),
+    Compare(CompareHit),
+    MeasureBar(MeasureBarHit),
+    UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
     Overlay(OverlayHit),
@@ -711,14 +820,28 @@ pub(super) enum InputMode {
         title_input: String,
     },
     StickyNotePrompt {
+        page_idx: u16,
         pdf_x: f32,
         pdf_y: f32,
         text_input: String,
     },
     FreeTextPrompt {
+        page_idx: u16,
         pdf_x: f32,
         pdf_y: f32,
         text_input: String,
+    },
+    EditAnnotationText {
+        page_idx: u16,
+        annot_idx: usize,
+        label: &'static str,
+        text_input: String,
+    },
+    EditFormField {
+        page_idx: u16,
+        annot_idx: usize,
+        field_name: String,
+        value_input: String,
     },
     ConfirmExternalUrl {
         url: String,
@@ -838,6 +961,7 @@ pub(super) struct ActiveOptimizeJob {
     pub(super) out_path: PathBuf,
     pub(super) out_name: String,
     pub(super) disk_size: usize,
+    pub(super) skip_pages: usize,
     pub(super) roman_end: usize,
     pub(super) bookmarks: Vec<Bookmark>,
     pub(super) redacted: bool,
@@ -846,7 +970,10 @@ pub(super) struct ActiveOptimizeJob {
 #[derive(Clone, Debug)]
 pub(super) struct IncrementalSearchState {
     pub(super) query: String,
+    #[allow(dead_code)]
     pub(super) q_chars: Vec<char>,
+    pub(super) case_sensitive: bool,
+    pub(super) whole_word: bool,
     pub(super) next_page: u16,
     pub(super) total_pages: u16,
     pub(super) origin_page: u16,
@@ -861,14 +988,20 @@ pub(super) enum PendingDialog {
     Merge,
     CombineMultiple,
     CombineAddFiles,
+    PickImagesForPdf,
+    PickComparePdf,
+    ExportPagesAsImagesDir,
     ExportMarkdown,
     ExportLatex,
     ExportDocx,
     ExportXlsx,
     PickStampImage,
     Split(String),
+    ExtractSelectedPages(Vec<u16>),
     ImportBookmarksTxt,
+    ExportBookmarksTxt,
     SaveBookmarkSampleTxt,
+    SaveUserGuideTxt,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -892,7 +1025,10 @@ pub struct PdfViewerApp<'a> {
     /// Number of leading unnumbered cover/picture pages set via Page Numbering.
     pub(super) skip_pages: usize,
     pub(super) bw_pages: HashSet<u16>,
-    pub(super) undo_stack: VecDeque<Vec<u8>>,
+    pub(super) undo_stack: VecDeque<UndoSnapshot>,
+    pub(super) redo_stack: VecDeque<UndoSnapshot>,
+    pub(super) undo_generation: u64,
+    pub(super) saved_undo_generation: u64,
     /// True once any redaction has been applied to the active document.
     pub(super) redacted: bool,
     /// True once any unsaved edit has been made to the active document since load/save.
@@ -941,6 +1077,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     /// Currently hovered link target on the page (triggers `CursorIcon::Pointer` hand cursor).
     pub(super) hovered_link: Option<ResolvedLinkTarget>,
+    /// Currently hovered fillable form widget `(page_idx, pdf_bounds)` in `MouseMode::Select`.
+    pub(super) hovered_form_field: Option<(u16, PdfRect)>,
     /// Cached character boxes `(page_index, chars)` for the current page only (freed on page change).
     pub(super) cached_char_boxes: Option<(u16, Vec<PageCharBox>)>,
     /// Currently selected text string and its page/line highlight rectangles in `MouseMode::Select`.
@@ -951,6 +1089,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) last_select_click: Option<(u16, f64, f64, Instant)>,
     /// Last 10 recently opened/saved PDF file paths (shown in `File -> Recent` and persisted in `micropdf.ini`).
     pub(super) recent_files: Vec<PathBuf>,
+    /// Compact 50-entry LRU remembering `(page_index, zoom_level)` per previously read PDF path.
+    pub(super) last_positions: Vec<LastPositionEntry>,
     /// Saved session tabs loaded from `micropdf.ini` when starting with no file argument.
     pub(super) pending_restore_tabs: Vec<SavedSessionTab>,
     pub(super) pending_restore_active_tab: usize,
@@ -960,6 +1100,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Accepted single-instance connections whose request line has not fully arrived yet.
     pub(super) pending_ipc: Vec<PendingIpcConnection>,
+    /// Verified forwarded PDF paths waiting until any blocking modal closes before switching tabs.
+    pub(super) queued_ipc_paths: VecDeque<PathBuf>,
     /// Flattened one-page copy of the form page being tiled (see `ensure_tile_rendered`).
     pub(super) tile_form_copy: Option<(u16, PdfDocument<'a>)>,
     /// Paged print job sent one page per frame (Windows GDI; a fake printer in tests).
@@ -973,20 +1115,27 @@ pub struct PdfViewerApp<'a> {
     pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
-    /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
+    /// Active Mouse Mode (`Select`, `Highlight`, `Measure`, `Redact`, `Crop`, `StampImage`).
     pub(super) mouse_mode: MouseMode,
+    /// Active unit & last completed measurement for `MouseMode::Measure`.
+    pub(super) measure_unit: MeasureUnit,
+    pub(super) last_measurement: Option<MeasurementResult>,
     /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
     pub(super) pending_stamp_image: Option<StampImageBuffer>,
     /// Zero-RAM CPU-rendered Reading Filter (6 eye-care palettes).
     pub(super) reading_filter: ReadingFilter,
     /// True when the bottom-bar Reading Mode picker popover is open.
     pub(super) show_reading_mode_popover: bool,
-    /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`).
+    /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Shift+F3` / `Ctrl+G`).
     pub(super) search_query: String,
+    pub(super) search_case_sensitive: bool,
+    pub(super) search_whole_word: bool,
     pub(super) search_matches: Vec<SearchMatch>,
     pub(super) current_search_match: usize,
     /// Time-sliced (~8 ms/frame) incremental search state on the main thread (`Esc` cancels).
     pub(super) incremental_search: Option<IncrementalSearchState>,
+    /// Active Side-by-Side Compare Mode state (0 bytes when closed).
+    pub(super) compare_mode: Option<CompareModeState<'a>>,
     /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
     pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
@@ -999,6 +1148,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) grid_drag_page: Option<(u16, f64, f64)>,
     /// Last double-click tracking in Grid View: `(page_idx, timestamp)`.
     pub(super) last_thumb_click: Option<(u16, Instant)>,
+    /// Multi-selected thumbnail page indices (`Ctrl+Click` / `Shift+Click`) for batch operations.
+    pub(super) selected_thumbs: HashSet<u16>,
+    /// Anchor page index for `Shift+Click` range selection in Thumbnail Grid.
+    pub(super) last_thumb_anchor: Option<u16>,
     /// Right-click context menu on a thumbnail card in Grid View.
     pub(super) thumb_context_menu: Option<ThumbContextMenuState>,
     /// Left Bookmark Sidebar (`B` to toggle).
@@ -1035,8 +1188,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) annotation_color: AnnotationColor,
     /// Live freehand pen stroke points in window physical pixels while dragging `MouseMode::InkPen`.
     pub(super) ink_stroke_screen_pts: Vec<(f32, f32)>,
-    /// Floating sticky-note popover `(note_text, screen_x, screen_y)` when user clicks a sticky note.
-    pub(super) active_note_popover: Option<(String, i32, i32)>,
+    /// Floating multi-line sticky-note reader popover with Edit & Delete controls.
+    pub(super) active_note_popover: Option<ActiveNotePopover>,
+    /// Floating right-click annotation inspector menu (Edit Text / Color / Delete).
+    pub(super) annot_context_menu: Option<AnnotationContextMenuState>,
     /// Active drag-to-move state when repositioning an existing Sticky Note or Text Box.
     pub(super) dragging_annotation: Option<DraggingAnnotation>,
     /// Active Print Preview modal state (0 bytes when closed).
@@ -1049,10 +1204,24 @@ pub struct PdfViewerApp<'a> {
     pub(super) header_footer_modal: Option<HeaderFooterModalState>,
     /// Active visual Page Numbering modal state (0 bytes when closed).
     pub(super) page_number_modal: Option<PageNumberModalState>,
+    /// Active `Create PDF from Images` modal state (0 bytes when closed).
+    pub(super) create_pdf_images_modal: Option<CreatePdfImagesModalState>,
+    /// Active `Export Pages as Images` modal state (0 bytes when closed).
+    pub(super) export_images_modal: Option<ExportImagesModalState>,
+    /// Active `Document Properties & Privacy` modal state (0 bytes when closed).
+    pub(super) doc_props_modal: Option<DocPropsModalState>,
+    /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
+    pub(super) unsaved_changes_modal: Option<UnsavedChangesModalState>,
+    /// Active built-in Step-by-Step User Guide modal (`Help -> User Guide (How to Use)`).
+    pub(super) user_guide_modal: Option<UserGuideState>,
+    /// Set true once exit has been confirmed through the unsaved-changes guard.
+    pub(super) pending_app_exit: bool,
     /// Cached extracted blocks for `ViewMode::TextView` (0 bytes when not in Text View).
     pub(super) cached_text_view: Option<CachedTextViewPage>,
     /// Reading font size in logical pixels for `ViewMode::TextView`.
     pub(super) text_view_font_size: f32,
+    /// Last computed vertical max scroll in pixels for `ViewMode::TextView` (used by scrollbar & wheel).
+    pub(super) text_view_max_scroll: f32,
     /// Unified hovered UI widget to coalesce redraws and show crisp hover feedback.
     pub(super) hovered_widget: Option<UiHit>,
     /// True while dragging the right-edge overlay vertical scrollbar.
@@ -1152,7 +1321,11 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
         self.reading_filter = filter;
         self.show_reading_mode_popover = false;
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.invalidate_caches();
+        }
         self.status_notice = Some(format!("Reading Mode: {}", filter.picker_title()));
+        self.save_session_to_ini();
         self.request_redraw();
     }
 
@@ -1174,6 +1347,9 @@ impl<'a> PdfViewerApp<'a> {
             skip_pages: 0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
             redacted: false,
             has_unsaved_edits: false,
             last_file_mtime: None,
@@ -1200,17 +1376,20 @@ impl<'a> PdfViewerApp<'a> {
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             hovered_link: None,
+            hovered_form_field: None,
             cached_char_boxes: None,
             selected_text: String::new(),
             selected_text_page: None,
             selected_text_rects: Vec::new(),
             last_select_click: None,
             recent_files: Vec::new(),
+            last_positions: Vec::new(),
             pending_restore_tabs: Vec::new(),
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
             single_instance_listener: None,
             pending_ipc: Vec::new(),
+            queued_ipc_paths: VecDeque::new(),
             tile_form_copy: None,
             print_job: None,
             lp_job: None,
@@ -1218,19 +1397,26 @@ impl<'a> PdfViewerApp<'a> {
             rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
+            measure_unit: MeasureUnit::Mm,
+            last_measurement: None,
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
             show_reading_mode_popover: false,
             search_query: String::new(),
+            search_case_sensitive: false,
+            search_whole_word: false,
             search_matches: Vec::new(),
             current_search_match: 0,
             incremental_search: None,
+            compare_mode: None,
             optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
             hovered_thumb: None,
             grid_drag_page: None,
             last_thumb_click: None,
+            selected_thumbs: HashSet::new(),
+            last_thumb_anchor: None,
             thumb_context_menu: None,
             show_bookmarks: false,
             bookmarks: Vec::new(),
@@ -1257,14 +1443,22 @@ impl<'a> PdfViewerApp<'a> {
             annotation_color: AnnotationColor::Yellow,
             ink_stroke_screen_pts: Vec::new(),
             active_note_popover: None,
+            annot_context_menu: None,
             dragging_annotation: None,
             print_preview: None,
             manual_duplex_wait: None,
             combine_modal: None,
             header_footer_modal: None,
             page_number_modal: None,
+            create_pdf_images_modal: None,
+            export_images_modal: None,
+            doc_props_modal: None,
+            unsaved_changes_modal: None,
+            user_guide_modal: None,
+            pending_app_exit: false,
             cached_text_view: None,
             text_view_font_size: 14.5,
+            text_view_max_scroll: 0.0,
             hovered_widget: None,
             scrollbar_drag: false,
             is_fullscreen: false,
@@ -1289,6 +1483,48 @@ impl<'a> PdfViewerApp<'a> {
             app.load_document(path)?;
         }
         Ok(app)
+    }
+
+    /// True while any modal dialog, full-window overlay, or interactive prompt owns input focus.
+    pub(super) fn has_blocking_modal(&self) -> bool {
+        self.unsaved_changes_modal.is_some()
+            || self.print_preview.is_some()
+            || self.manual_duplex_wait.is_some()
+            || self.combine_modal.is_some()
+            || self.header_footer_modal.is_some()
+            || self.page_number_modal.is_some()
+            || self.create_pdf_images_modal.is_some()
+            || self.export_images_modal.is_some()
+            || self.doc_props_modal.is_some()
+            || self.user_guide_modal.is_some()
+            || self.show_customize_toolbar
+            || self.show_help_overlay
+            || self.show_bookmark_format_overlay
+            || self.show_about_overlay
+            || self.input_mode != InputMode::Normal
+    }
+
+    /// True while any dropdown menu or floating popover is open above the document canvas.
+    pub(super) fn has_open_popover(&self) -> bool {
+        self.open_menu.is_some()
+            || self.show_tab_list_popover
+            || self.tab_context_menu.is_some()
+            || self.thumb_context_menu.is_some()
+            || self.annot_context_menu.is_some()
+            || self.show_reading_mode_popover
+            || self.show_notifications
+    }
+
+    /// Dismisses all transient menus, context menus, and floating popovers.
+    pub(super) fn close_all_popovers(&mut self) {
+        self.open_menu = None;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
+        self.annot_context_menu = None;
+        self.show_reading_mode_popover = false;
+        self.show_notifications = false;
+        self.active_note_popover = None;
     }
 
     /// Formats the current local wall-clock time as `HH:MM:SS` using zero extra dependencies.
@@ -1322,17 +1558,39 @@ impl<'a> PdfViewerApp<'a> {
             unsafe { GetLocalTime(&mut st) };
             return format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second);
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn time(tloc: *mut i64) -> i64;
+                fn localtime_r(timep: *const i64, result: *mut std::ffi::c_int) -> *mut std::ffi::c_void;
+            }
+            let now = unsafe { time(std::ptr::null_mut()) };
+            // POSIX guarantees tm_sec, tm_min, tm_hour are the first three c_int fields of struct tm;
+            // 16 c_ints (64 bytes) is safely larger than struct tm on Linux and macOS.
+            let mut tm_buf = [0 as std::ffi::c_int; 16];
+            let res = unsafe { localtime_r(&now, tm_buf.as_mut_ptr()) };
+            if !res.is_null() {
+                let s = tm_buf[0].clamp(0, 60);
+                let m = tm_buf[1].clamp(0, 59);
+                let h = tm_buf[2].clamp(0, 23);
+                return format!("{h:02}:{m:02}:{s:02}");
+            }
+            let secs = now.max(0) as u64 % 86_400;
+            format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let day_secs = secs % 86_400;
-            let h = day_secs / 3600;
-            let m = (day_secs % 3600) / 60;
-            let s = day_secs % 60;
-            format!("{h:02}:{m:02}:{s:02}")
+            format!(
+                "{:02}:{:02}:{:02}",
+                day_secs / 3600,
+                (day_secs % 3600) / 60,
+                day_secs % 60
+            )
         }
     }
 
@@ -1344,11 +1602,12 @@ impl<'a> PdfViewerApp<'a> {
         if self.last_recorded_notice.as_deref() == Some(msg.as_str()) {
             return;
         }
-        let is_error = msg.starts_with("Error")
-            || msg.starts_with("ERROR")
-            || msg.contains("failed")
-            || msg.contains("Invalid")
-            || msg.contains("error:");
+        let lower = msg.to_ascii_lowercase();
+        let is_error = lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("invalid")
+            || lower.contains("cannot")
+            || lower.contains("refusing");
         if self.notifications.len() >= 50 {
             self.notifications.pop_front();
         }
@@ -1401,10 +1660,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
-        let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
+        let mut out = String::from("# MicroPDF v1.4 Session, Recent Files, Last Positions & UI Preferences\n");
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
         out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
         out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
+        out.push_str(&format!("reading_filter={}\n", cfg.reading_filter.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
@@ -1428,6 +1688,17 @@ impl<'a> PdfViewerApp<'a> {
                 out.push_str(&format!("recent={}\n", r_str));
             }
         }
+        for lp in cfg.last_positions.iter().take(MAX_LAST_POSITIONS) {
+            let p_str = lp.path.to_string_lossy().replace('\n', "").replace('\r', "");
+            if !p_str.is_empty() {
+                out.push_str(&format!(
+                    "last_pos={}|{:.2}|{}\n",
+                    lp.page_index,
+                    lp.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                    p_str
+                ));
+            }
+        }
         out
     }
 
@@ -1448,6 +1719,8 @@ impl<'a> PdfViewerApp<'a> {
                 }
             } else if let Some(val) = line.strip_prefix("scroll_mode=") {
                 cfg.scroll_mode = ScrollMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("reading_filter=") {
+                cfg.reading_filter = ReadingFilter::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
@@ -1487,9 +1760,70 @@ impl<'a> PdfViewerApp<'a> {
                 {
                     cfg.recent_files.push(path);
                 }
+            } else if let Some(val) = line.strip_prefix("last_pos=") {
+                let mut parts = val.splitn(3, '|');
+                if let (Some(p_str), Some(z_str), Some(path_str)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    let page_index = p_str.trim().parse::<u16>().unwrap_or(0);
+                    let zoom_level = z_str
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|z| z.is_finite())
+                        .unwrap_or(1.0)
+                        .clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+                    let path = PathBuf::from(path_str.trim());
+                    if !path.as_os_str().is_empty()
+                        && cfg.last_positions.len() < MAX_LAST_POSITIONS
+                        && !cfg.last_positions.iter().any(|e| e.path == path)
+                    {
+                        cfg.last_positions.push(LastPositionEntry {
+                            path,
+                            page_index,
+                            zoom_level,
+                        });
+                    }
+                }
             }
         }
         cfg
+    }
+
+    /// Records `(page_index, zoom_level)` for `path` at the front of the 50-entry LRU table.
+    pub(super) fn record_last_position(
+        &mut self,
+        path: &std::path::Path,
+        page_index: u16,
+        zoom_level: f32,
+    ) {
+        if path.as_os_str().is_empty() || !path.exists() {
+            return;
+        }
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.last_positions
+            .retain(|e| e.path != resolved && e.path != path);
+        self.last_positions.insert(
+            0,
+            LastPositionEntry {
+                path: resolved,
+                page_index,
+                zoom_level: zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+            },
+        );
+        self.last_positions.truncate(MAX_LAST_POSITIONS);
+    }
+
+    /// Looks up a previously saved `(page_index, zoom_level)` for `path` in the 50-entry LRU table.
+    pub(super) fn lookup_last_position(&self, path: &std::path::Path) -> Option<(u16, f32)> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.last_positions
+            .iter()
+            .find(|e| e.path == resolved || e.path == path)
+            .map(|e| (e.page_index, e.zoom_level))
     }
 
     /// Adds `path` to the front of `self.recent_files` (deduplicated, capped at `MAX_RECENT_FILES = 10`).
@@ -1503,13 +1837,35 @@ impl<'a> PdfViewerApp<'a> {
         self.recent_files.truncate(MAX_RECENT_FILES);
     }
 
-    /// Saves open tabs, current page, view mode, recent files, and UI preferences to `micropdf.ini`
+    /// Saves open tabs, current page, view mode, recent files, last positions, and UI preferences to `micropdf.ini`
     /// next to the executable, falling back to the OS config folder if not writable.
     ///
     /// IMPORTANT: Never calls `sync_active_tab_to_slot()` (which moves `self.doc` out into the slot),
     /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
+        // Record active and inactive tab reading positions into the 50-entry LRU table
+        let tab_positions: Vec<(PathBuf, u16, f32)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                if i == self.active_tab {
+                    (self.file_path.clone(), self.current_page_index, self.zoom_level)
+                } else {
+                    (tab.file_path.clone(), tab.current_page_index, tab.zoom_level)
+                }
+            })
+            .collect();
+        for (p, pg, zm) in tab_positions {
+            self.record_last_position(&p, pg, zm);
+        }
+        if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() {
+            let p = self.file_path.clone();
+            self.record_last_position(&p, self.current_page_index, self.zoom_level);
+        }
+
         let mut saved_tabs = Vec::new();
+        let mut mapped_active_tab: Option<usize> = None;
         for (i, tab) in self.tabs.iter().enumerate() {
             let (path, page_index, vm, last_vm) = if i == self.active_tab {
                 (
@@ -1527,6 +1883,9 @@ impl<'a> PdfViewerApp<'a> {
                 )
             };
             if !path.as_os_str().is_empty() && path.exists() {
+                if i == self.active_tab {
+                    mapped_active_tab = Some(saved_tabs.len());
+                }
                 saved_tabs.push(SavedSessionTab {
                     path: path.clone(),
                     page_index,
@@ -1537,6 +1896,7 @@ impl<'a> PdfViewerApp<'a> {
         // If no tabs slice entry exists yet but a doc is loaded directly on self
         if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() && self.file_path.exists()
         {
+            mapped_active_tab = Some(0);
             saved_tabs.push(SavedSessionTab {
                 path: self.file_path.clone(),
                 page_index: self.current_page_index,
@@ -1548,12 +1908,15 @@ impl<'a> PdfViewerApp<'a> {
             });
         }
         let cfg = SessionConfig {
-            active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),
+            active_tab: mapped_active_tab
+                .unwrap_or_else(|| self.active_tab.min(saved_tabs.len().saturating_sub(1))),
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
+            last_positions: self.last_positions.clone(),
             ui_theme: self.ui_theme_mode,
             ui_scale: self.ui_scale,
             scroll_mode: self.scroll_mode,
+            reading_filter: self.reading_filter,
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
             hf_profiles: self.hf_profiles.clone(),
@@ -1596,9 +1959,11 @@ impl<'a> PdfViewerApp<'a> {
         self.ui_theme_mode = cfg.ui_theme;
         self.ui_scale = cfg.ui_scale;
         self.scroll_mode = cfg.scroll_mode;
+        self.reading_filter = cfg.reading_filter;
         self.show_toolbar = cfg.show_toolbar;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
+        self.last_positions = cfg.last_positions;
         // Saved Header/Footer profiles stay opt-in via < > in the dialog; never auto-fill every PDF.
         self.last_hf_profile = HeaderFooterProfile::default();
         self.recent_files = cfg
@@ -1779,11 +2144,20 @@ impl<'a> PdfViewerApp<'a> {
             self.pending_ipc.clear();
         }
 
-        let mut opened = 0usize;
         for path in received_paths {
+            if is_acceptable_forwarded_pdf(&path) {
+                self.queued_ipc_paths.push_back(path);
+            }
+        }
+        if self.has_blocking_modal() {
+            return 0;
+        }
+        let mut opened = 0usize;
+        while let Some(path) = self.queued_ipc_paths.pop_front() {
             if !is_acceptable_forwarded_pdf(&path) {
                 continue;
             }
+            self.close_all_popovers();
             let fname = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1857,8 +2231,9 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         };
         let new_total = new_doc.pages().len();
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&new_doc);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&new_doc, &self.file_path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&new_doc);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&new_doc, &self.file_path, skip_pages, roman_end);
 
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();
@@ -1869,8 +2244,13 @@ impl<'a> PdfViewerApp<'a> {
         // would silently bring back the old file content over the external change.
         self.undo_stack.clear();
         self.undo_stack.shrink_to_fit();
+        self.redo_stack.clear();
+        self.redo_stack.shrink_to_fit();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.last_file_mtime = Some(disk_mtime);
+        self.skip_pages = skip_pages;
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = if self.bookmarks.is_empty() {
@@ -1895,9 +2275,13 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].pan_x = self.pan_x;
             self.tabs[self.active_tab].zoom_level = self.zoom_level;
             self.tabs[self.active_tab].view_mode = self.view_mode;
+            self.tabs[self.active_tab].skip_pages = self.skip_pages;
             self.tabs[self.active_tab].roman_end = self.roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redo_stack.clear();
+            self.tabs[self.active_tab].undo_generation = 0;
+            self.tabs[self.active_tab].saved_undo_generation = 0;
             self.tabs[self.active_tab].redacted = false;
         }
 
@@ -1948,67 +2332,162 @@ impl<'a> PdfViewerApp<'a> {
         self.cached_char_boxes = None;
         self.cached_text_view = None;
         self.active_note_popover = None;
+        self.annot_context_menu = None;
+        self.hovered_form_field = None;
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.invalidate_caches();
+        }
         self.selected_text.clear();
         self.selected_text_page = None;
         self.selected_text_rects.clear();
     }
 
+    fn trim_snapshot_stack(stack: &mut VecDeque<UndoSnapshot>) {
+        while stack.len() > MAX_UNDO_STATES {
+            stack.pop_front();
+        }
+        let mut total: usize = stack.iter().map(UndoSnapshot::byte_len).sum();
+        while stack.len() > 1 && total > UNDO_BYTES_BUDGET {
+            if let Some(old) = stack.pop_front() {
+                total = total.saturating_sub(old.byte_len());
+            }
+        }
+        stack.shrink_to(MAX_UNDO_STATES);
+    }
 
-    /// Captures the current document's serialized PDF bytes onto `self.undo_stack` (max 8 steps)
-    /// before a mutating action.
-    pub(super) fn push_undo_snapshot(&mut self) {
-        let Some(doc) = self.doc.as_ref() else {
-            return;
+    fn capture_snapshot(&self, include_pdf_bytes: bool) -> Option<UndoSnapshot> {
+        let pdf_bytes = if include_pdf_bytes {
+            let doc = self.doc.as_ref()?;
+            Some(doc.save_to_bytes().ok()?)
+        } else {
+            None
         };
-        if let Ok(bytes) = doc.save_to_bytes() {
-            self.has_unsaved_edits = true;
-            if self.undo_stack.len() >= MAX_UNDO_STATES {
-                self.undo_stack.pop_front();
-            }
-            self.undo_stack.push_back(bytes);
-            // v1.1: cap total snapshot memory (large scans would otherwise cost 8x file size).
-            let mut total: usize = self.undo_stack.iter().map(|b| b.len()).sum();
-            while self.undo_stack.len() > 1 && total > UNDO_BYTES_BUDGET {
-                if let Some(old) = self.undo_stack.pop_front() {
-                    total -= old.len();
-                }
-            }
-            self.undo_stack.shrink_to(MAX_UNDO_STATES);
+        Some(UndoSnapshot {
+            pdf_bytes,
+            bookmarks: self.bookmarks.clone(),
+            bw_pages: self.bw_pages.clone(),
+            roman_end: self.roman_end,
+            skip_pages: self.skip_pages,
+            redacted: self.redacted,
+            generation: self.undo_generation,
+        })
+    }
+
+    /// Captures the current document's serialized PDF bytes AND metadata (`bookmarks`, `bw_pages`,
+    /// `roman_end`, `skip_pages`, `redacted`) onto `self.undo_stack` (max 8 steps) before a mutating action.
+    pub(super) fn push_undo_snapshot(&mut self) {
+        if let Some(snap) = self.capture_snapshot(true) {
+            self.redo_stack.clear();
+            self.redo_stack.shrink_to_fit();
+            self.undo_stack.push_back(snap);
+            Self::trim_snapshot_stack(&mut self.undo_stack);
+            self.undo_generation = self.undo_generation.wrapping_add(1);
+            self.has_unsaved_edits = self.undo_generation != self.saved_undo_generation;
         }
     }
 
-    /// Pops the latest snapshot from `self.undo_stack` and reloads the active document in memory.
+    /// Captures a 0-byte-PDF metadata-only snapshot (for bookmark add/edit/delete/reorder/indent/import)
+    /// so metadata edits are also Undoable & Redoable without allocating PDF bytes.
+    pub(super) fn push_metadata_undo_snapshot(&mut self) {
+        if let Some(snap) = self.capture_snapshot(false) {
+            self.redo_stack.clear();
+            self.redo_stack.shrink_to_fit();
+            self.undo_stack.push_back(snap);
+            Self::trim_snapshot_stack(&mut self.undo_stack);
+            self.undo_generation = self.undo_generation.wrapping_add(1);
+            self.has_unsaved_edits = self.undo_generation != self.saved_undo_generation;
+        }
+    }
+
+    fn apply_snapshot(&mut self, snap: UndoSnapshot, push_target_is_redo: bool) -> Result<(), String> {
+        let needs_pdf_reload = snap.pdf_bytes.is_some();
+        let current_snap = self.capture_snapshot(needs_pdf_reload);
+        if let Some(bytes) = snap.pdf_bytes {
+            let restored_doc = self
+                .engine
+                .load_pdf_from_bytes_safe(bytes)
+                .map_err(|e| e.to_string())?;
+            let new_total = restored_doc.pages().len();
+            if self.current_page_index >= new_total && new_total > 0 {
+                self.current_page_index = new_total - 1;
+            }
+            self.doc = Some(restored_doc);
+            self.invalidate_page_caches();
+            self.thumbnail_cache.clear();
+        }
+        self.bookmarks = snap.bookmarks;
+        self.selected_bookmark = self
+            .selected_bookmark
+            .filter(|&i| i < self.bookmarks.len())
+            .or_else(|| if self.bookmarks.is_empty() { None } else { Some(0) });
+        self.bw_pages = snap.bw_pages;
+        self.roman_end = snap.roman_end;
+        self.skip_pages = snap.skip_pages;
+        self.redacted = snap.redacted;
+        self.undo_generation = snap.generation;
+        self.has_unsaved_edits = self.undo_generation != self.saved_undo_generation;
+        self.selected_thumbs.clear();
+
+        if let Some(cur) = current_snap {
+            let target_stack = if push_target_is_redo {
+                &mut self.redo_stack
+            } else {
+                &mut self.undo_stack
+            };
+            target_stack.push_back(cur);
+            Self::trim_snapshot_stack(target_stack);
+        }
+        Ok(())
+    }
+
+    /// Pops the latest snapshot from `self.undo_stack`, pushes the current state to `self.redo_stack`,
+    /// and restores both PDF bytes (when modified) and all document metadata.
     pub(super) fn perform_undo(&mut self) {
-        let Some(prev_bytes) = self.undo_stack.pop_back() else {
+        let Some(prev_snap) = self.undo_stack.pop_back() else {
             self.status_notice = Some("Nothing to undo (0 steps left)".to_string());
             self.update_title_bar();
             self.request_redraw();
             return;
         };
-        match self.engine.load_pdf_from_bytes_safe(prev_bytes) {
-            Ok(restored_doc) => {
-                let new_total = restored_doc.pages().len();
-                if self.current_page_index >= new_total && new_total > 0 {
-                    self.current_page_index = new_total - 1;
-                }
-                self.doc = Some(restored_doc);
-                if self.undo_stack.is_empty() {
-                    self.has_unsaved_edits = false;
-                }
-                self.invalidate_page_caches();
-                self.thumbnail_cache.clear();
+        match self.apply_snapshot(prev_snap, true) {
+            Ok(()) => {
                 let steps_left = self.undo_stack.len();
-                self.status_notice =
-                    Some(format!("Undo successful! ({steps_left} steps left)"));
-                self.update_title_bar();
-                self.request_redraw();
+                self.status_notice = Some(format!(
+                    "Undo successful ({steps_left} undo / {} redo)",
+                    self.redo_stack.len()
+                ));
             }
             Err(e) => {
                 self.status_notice = Some(format!("Undo failed: {e}"));
-                self.update_title_bar();
-                self.request_redraw();
             }
         }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Pops the latest snapshot from `self.redo_stack`, pushes the current state to `self.undo_stack`,
+    /// and re-applies both PDF bytes (when modified) and all document metadata.
+    pub(super) fn perform_redo(&mut self) {
+        let Some(next_snap) = self.redo_stack.pop_back() else {
+            self.status_notice = Some("Nothing to redo (0 steps left)".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        };
+        match self.apply_snapshot(next_snap, false) {
+            Ok(()) => {
+                let redo_left = self.redo_stack.len();
+                self.status_notice = Some(format!(
+                    "Redo successful ({} undo / {redo_left} redo)",
+                    self.undo_stack.len()
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Redo failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
     }
 
     pub(super) fn total_pages(&self) -> u16 {
@@ -2088,7 +2567,7 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         self.is_fullscreen = !self.is_fullscreen;
-        self.open_menu = None;
+        self.close_all_popovers();
         if let Some(w) = self.window.as_ref() {
             w.set_fullscreen(if self.is_fullscreen {
                 Some(winit::window::Fullscreen::Borderless(None))
@@ -2119,7 +2598,7 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.is_presentation = true;
         self.is_fullscreen = true;
-        self.open_menu = None;
+        self.close_all_popovers();
         self.view_mode = ViewMode::FitPage;
         self.scroll_mode = ScrollMode::SinglePage;
         self.zoom_level = 1.0;

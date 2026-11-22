@@ -25,6 +25,11 @@ pub(super) struct CachedPreviewSheet {
     pub(super) key_left: Option<u16>,
     pub(super) key_right: Option<u16>,
     pub(super) booklet: bool,
+    pub(super) paper: PrintPaperSize,
+    pub(super) orientation: PrintOrientation,
+    pub(super) fit_to_page: bool,
+    pub(super) box_w: u32,
+    pub(super) box_h: u32,
     pub(super) render_w: u32,
     pub(super) render_h: u32,
     pub(super) auto_trim: bool,
@@ -221,11 +226,16 @@ impl<'a> PdfViewerApp<'a> {
             self.request_redraw();
             return;
         }
-        self.open_menu = None;
+        self.close_all_popovers();
         self.show_customize_toolbar = false;
         self.show_help_overlay = false;
+        self.show_bookmark_format_overlay = false;
         self.show_about_overlay = false;
         self.combine_modal = None;
+        self.header_footer_modal = None;
+        self.page_number_modal = None;
+        self.manual_duplex_wait = None;
+        self.input_mode = InputMode::Normal;
 
         let (printers, selected) = crate::print::discover_system_printers();
         let total = self.total_pages();
@@ -434,7 +444,9 @@ impl<'a> PdfViewerApp<'a> {
 
         let bindings = self.engine.pdfium.bindings();
         let form_copy = if crate::engine::PdfEngine::page_has_form_widgets(&page) {
-            self.engine.flattened_page_copy(doc, page_idx).ok()
+            self.engine
+                .flattened_page_copy_with_opts(doc, page_idx, opts.include_annotations)
+                .ok()
         } else {
             None
         };
@@ -528,11 +540,15 @@ impl<'a> PdfViewerApp<'a> {
                 c.key_left == key_left
                     && c.key_right == key_right
                     && c.booklet == opts.booklet
+                    && c.paper == paper
+                    && c.orientation == opts.orientation
+                    && c.fit_to_page == opts.fit_to_page
+                    && c.box_w == print_w
+                    && c.box_h == print_h
                     && c.auto_trim == opts.auto_trim_margins
                     && c.zoom_percent == opts.zoom_percent
                     && c.grayscale == opts.grayscale
                     && c.include_annotations == opts.include_annotations
-                    && ((opts.booklet && c.render_w == print_w && c.render_h == print_h) || !opts.booklet)
             });
         if already_valid {
             return;
@@ -575,6 +591,11 @@ impl<'a> PdfViewerApp<'a> {
                     key_left,
                     key_right,
                     booklet: true,
+                    paper,
+                    orientation: opts.orientation,
+                    fit_to_page: opts.fit_to_page,
+                    box_w: print_w,
+                    box_h: print_h,
                     render_w: print_w,
                     render_h: print_h,
                     auto_trim: opts.auto_trim_margins,
@@ -591,6 +612,11 @@ impl<'a> PdfViewerApp<'a> {
                         key_left,
                         key_right: None,
                         booklet: false,
+                        paper,
+                        orientation: opts.orientation,
+                        fit_to_page: opts.fit_to_page,
+                        box_w: print_w,
+                        box_h: print_h,
                         render_w: rw,
                         render_h: rh,
                         auto_trim: opts.auto_trim_margins,
@@ -646,8 +672,14 @@ impl<'a> PdfViewerApp<'a> {
         // Left canvas: Virtual paper sheet
         let avail_w = layout.left_w.saturating_sub((56.0 * s).round() as u32).max(80);
         let avail_h = layout.mh.saturating_sub((110.0 * s).round() as u32).max(80);
-        let (page_w_pts, page_h_pts) = pp
-            .active_page_index()
+        let preview_page_idx = if pp.render_opts.booklet {
+            pp.booklet_sheets()
+                .get(pp.sheet_pos)
+                .and_then(|sh| sh.left.or(sh.right))
+        } else {
+            pp.active_page_index()
+        };
+        let (page_w_pts, page_h_pts) = preview_page_idx
             .and_then(|idx| self.doc.as_ref()?.pages().page_size(idx).ok())
             .map(|r| (r.width().value.max(1.0), r.height().value.max(1.0)))
             .unwrap_or((595.28, 841.89));
@@ -1091,9 +1123,18 @@ impl<'a> PdfViewerApp<'a> {
                     pp.paper = pp.paper.next();
                     pp.cached_sheet = None;
                 }
-                PrintPreviewHit::OrientAuto => pp.render_opts.orientation = PrintOrientation::Auto,
-                PrintPreviewHit::OrientPortrait => pp.render_opts.orientation = PrintOrientation::Portrait,
-                PrintPreviewHit::OrientLandscape => pp.render_opts.orientation = PrintOrientation::Landscape,
+                PrintPreviewHit::OrientAuto => {
+                    pp.render_opts.orientation = PrintOrientation::Auto;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::OrientPortrait => {
+                    pp.render_opts.orientation = PrintOrientation::Portrait;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::OrientLandscape => {
+                    pp.render_opts.orientation = PrintOrientation::Landscape;
+                    pp.cached_sheet = None;
+                }
                 PrintPreviewHit::DuplexOff => {
                     pp.manual_duplex = false;
                     pp.duplex = DuplexMode::Off;
@@ -1120,10 +1161,22 @@ impl<'a> PdfViewerApp<'a> {
                         pp.duplex = DuplexMode::Off;
                     }
                 }
-                PrintPreviewHit::ScaleFit => pp.render_opts.fit_to_page = true,
-                PrintPreviewHit::ScaleActual => pp.render_opts.fit_to_page = false,
-                PrintPreviewHit::ColorColor => pp.render_opts.grayscale = false,
-                PrintPreviewHit::ColorGray => pp.render_opts.grayscale = true,
+                PrintPreviewHit::ScaleFit => {
+                    pp.render_opts.fit_to_page = true;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::ScaleActual => {
+                    pp.render_opts.fit_to_page = false;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::ColorColor => {
+                    pp.render_opts.grayscale = false;
+                    pp.cached_sheet = None;
+                }
+                PrintPreviewHit::ColorGray => {
+                    pp.render_opts.grayscale = true;
+                    pp.cached_sheet = None;
+                }
                 PrintPreviewHit::AnnotationsInclude => {
                     pp.render_opts.include_annotations = true;
                     pp.cached_sheet = None;
@@ -1134,12 +1187,15 @@ impl<'a> PdfViewerApp<'a> {
                 }
                 PrintPreviewHit::ToggleAutoTrim => {
                     pp.render_opts.auto_trim_margins = !pp.render_opts.auto_trim_margins;
+                    pp.cached_sheet = None;
                 }
                 PrintPreviewHit::ZoomMinus => {
                     pp.render_opts.zoom_percent = pp.render_opts.zoom_percent.saturating_sub(5).max(100);
+                    pp.cached_sheet = None;
                 }
                 PrintPreviewHit::ZoomPlus => {
                     pp.render_opts.zoom_percent = (pp.render_opts.zoom_percent + 5).min(200);
+                    pp.cached_sheet = None;
                 }
                 PrintPreviewHit::PrevSheet => {
                     if pp.sheet_pos > 0 {
@@ -1161,6 +1217,25 @@ impl<'a> PdfViewerApp<'a> {
         use winit::keyboard::{Key, NamedKey};
         let total = self.total_pages();
         let cur = self.current_page_index;
+        if self.cmd_or_ctrl_pressed {
+            if let Key::Character(c) = &logical_key {
+                if c.eq_ignore_ascii_case("v") {
+                    if let Ok(clip) = Self::read_text_from_os_clipboard() {
+                        if let Some(pp) = self.print_preview.as_mut() {
+                            for ch in clip.chars() {
+                                if ch.is_ascii_digit() || ch == '-' || ch == ',' || ch == ' ' {
+                                    pp.page_scope = PrintPageScope::Custom;
+                                    pp.custom_range.push(ch);
+                                }
+                            }
+                            pp.recompute_pages(total, cur);
+                        }
+                        self.request_redraw();
+                    }
+                }
+            }
+            return;
+        }
         match logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.close_print_preview();
@@ -1188,6 +1263,14 @@ impl<'a> PdfViewerApp<'a> {
                 if let Some(pp) = self.print_preview.as_mut() {
                     pp.page_scope = PrintPageScope::Custom;
                     pp.custom_range.pop();
+                    pp.recompute_pages(total, cur);
+                }
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(pp) = self.print_preview.as_mut() {
+                    pp.page_scope = PrintPageScope::Custom;
+                    pp.custom_range.clear();
                     pp.recompute_pages(total, cur);
                 }
                 self.request_redraw();
@@ -1264,15 +1347,21 @@ impl<'a> PdfViewerApp<'a> {
                     false
                 }
                 Ok(Some(setup)) => {
+                    let (eff_slots, eff_opts) = crate::print::prepare_windows_duplex_slots(
+                        &slots,
+                        setup.loop_copies,
+                        duplex,
+                        render_opts,
+                    );
                     let job_res = self.doc.as_ref().map(|doc| {
                         crate::print::PagedPrintJob::new_with_optional_pages(
                             self.engine,
                             doc,
-                            &slots,
+                            &eff_slots,
                             setup.loop_copies,
                             setup.reported_copies,
                             self.redacted,
-                            render_opts,
+                            eff_opts,
                             &std::env::temp_dir(),
                             Box::new(setup.sink),
                         )
@@ -1532,6 +1621,15 @@ impl<'a> PdfViewerApp<'a> {
                 self.status_notice = Some("Manual 2-Sided Pass 2 cancelled".to_string());
             }
             ManualDuplexHit::PrintPass2 => {
+                if self.print_job.is_some() || self.lp_job.is_some() {
+                    self.status_notice = Some(
+                        "Pass 1 is still spooling — wait a moment until it finishes, then click Print Pass 2"
+                            .to_string(),
+                    );
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                }
                 if let Some(md) = self.manual_duplex_wait.take() {
                     let passes = build_manual_duplex_passes(
                         &md.resolved_pages,

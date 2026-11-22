@@ -638,12 +638,16 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
 
+                let (_, cur_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                let cur_max_sy = (cur_h_u32.saturating_sub(content_h)) as f32;
+                self.scroll_y = self.scroll_y.clamp(0.0, cur_max_sy);
+
                 let anchor_left = min_screen_x + (PAGE_MARGIN_PX as f32) - self.scroll_x;
-                let compute_hy = |app: &mut Self, bh: u32| -> i32 {
+                let compute_hy = |app: &Self, bh: u32| -> i32 {
                     if bh > content_h {
                         let max_sy = (bh - content_h) as f32;
-                        app.scroll_y = app.scroll_y.clamp(0.0, max_sy);
-                        (top_bars_h as i32) - (app.scroll_y.round() as i32)
+                        let sy = app.scroll_y.clamp(0.0, max_sy);
+                        (top_bars_h as i32) - (sy.round() as i32)
                     } else {
                         (top_bars_h as i32) + ((content_h as i32 - bh as i32) / 2)
                     }
@@ -1218,6 +1222,63 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    /// Transforms a single `0x00RRGGBB` pixel through the selected eye-care `ReadingFilter`.
+    #[inline]
+    pub(super) fn apply_reading_filter_pixel(px: u32, filter: ReadingFilter) -> u32 {
+        match filter {
+            ReadingFilter::Normal => px,
+            ReadingFilter::PaperEInk => {
+                let r = (px >> 16) & 0xFF;
+                let g = (px >> 8) & 0xFF;
+                let b = px & 0xFF;
+                let lum = (77 * r + 150 * g + 29 * b) >> 8;
+                let dr = (lum * 4 + r) / 5;
+                let dg = (lum * 4 + g) / 5;
+                let db = (lum * 4 + b) / 5;
+                let nr = 30 + ((dr * 204) >> 8);
+                let ng = 31 + ((dg * 204) >> 8);
+                let nb = 29 + ((db * 201) >> 8);
+                (nr << 16) | (ng << 8) | nb
+            }
+            ReadingFilter::WarmSepia => {
+                let r = (px >> 16) & 0xFF;
+                let g = (px >> 8) & 0xFF;
+                let b = px & 0xFF;
+                let nr = 43 + ((r * 204) >> 8);
+                let ng = 35 + ((g * 205) >> 8);
+                let nb = 24 + ((b * 199) >> 8);
+                (nr << 16) | (ng << 8) | nb
+            }
+            ReadingFilter::SageEyeCare => {
+                let r = (px >> 16) & 0xFF;
+                let g = (px >> 8) & 0xFF;
+                let b = px & 0xFF;
+                let nr = 29 + ((r * 204) >> 8);
+                let ng = 39 + ((g * 203) >> 8);
+                let nb = 31 + ((b * 203) >> 8);
+                (nr << 16) | (ng << 8) | nb
+            }
+            ReadingFilter::DarkInvert => {
+                let ir = 255 - ((px >> 16) & 0xFF);
+                let ig = 255 - ((px >> 8) & 0xFF);
+                let ib = 255 - (px & 0xFF);
+                let nr = 30 + ((ir * 186) >> 8);
+                let ng = 32 + ((ig * 188) >> 8);
+                let nb = 36 + ((ib * 190) >> 8);
+                (nr << 16) | (ng << 8) | nb
+            }
+            ReadingFilter::NightAmber => {
+                let ir = 255 - ((px >> 16) & 0xFF);
+                let ig = 255 - ((px >> 8) & 0xFF);
+                let ib = 255 - (px & 0xFF);
+                let nr = 26 + ((ir * 203) >> 8);
+                let ng = 23 + ((ig * 184) >> 8);
+                let nb = 19 + ((ib * 149) >> 8);
+                (nr << 16) | (ng << 8) | nb
+            }
+        }
+    }
+
     /// Blits a `CachedPageBitmap` into `buffer` clipped to the content area
     /// `(sidebar_w..buf_w, top_bars_h..buf_h - status_bar_h)` while applying `self.reading_filter` on the fly.
     pub(super) fn blit_cached_page(
@@ -1253,80 +1314,12 @@ impl<'a> PdfViewerApp<'a> {
             let src_idx = (row * bmp_w + start_col) as usize;
             let dst_idx = (dst_y * buf_w + dst_x) as usize;
 
-            match filter {
-                ReadingFilter::Normal => {
-                    buffer[dst_idx..dst_idx + copy_len]
-                        .copy_from_slice(&pixels[src_idx..src_idx + copy_len]);
-                }
-                ReadingFilter::PaperEInk => {
-                    // Best for day: Matte low-glare neutral gray e-ink paper (#EAEBE6 bg, #1E1F1D ink), gently desaturated
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        let r = (px >> 16) & 0xFF;
-                        let g = (px >> 8) & 0xFF;
-                        let b = px & 0xFF;
-                        let lum = (77 * r + 150 * g + 29 * b) >> 8;
-                        // 80% grayscale + 20% original color so highlights/charts stay subtly legible
-                        let dr = (lum * 4 + r) / 5;
-                        let dg = (lum * 4 + g) / 5;
-                        let db = (lum * 4 + b) / 5;
-                        let nr = 30 + ((dr * 204) >> 8); // 30..234
-                        let ng = 31 + ((dg * 204) >> 8); // 31..235
-                        let nb = 29 + ((db * 201) >> 8); // 29..230
-                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
-                    }
-                }
-                ReadingFilter::WarmSepia => {
-                    // Warm book parchment (#F7F0DF bg, #2B2318 ink)
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        let r = (px >> 16) & 0xFF;
-                        let g = (px >> 8) & 0xFF;
-                        let b = px & 0xFF;
-                        let nr = 43 + ((r * 204) >> 8); // 43..247
-                        let ng = 35 + ((g * 205) >> 8); // 35..240
-                        let nb = 24 + ((b * 199) >> 8); // 24..223
-                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
-                    }
-                }
-                ReadingFilter::SageEyeCare => {
-                    // Ultra-pale desaturated mint paper (#E9F2EA bg, #1D271F ink) for long study sessions
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        let r = (px >> 16) & 0xFF;
-                        let g = (px >> 8) & 0xFF;
-                        let b = px & 0xFF;
-                        let nr = 29 + ((r * 204) >> 8); // 29..233
-                        let ng = 39 + ((g * 203) >> 8); // 39..242
-                        let nb = 31 + ((b * 203) >> 8); // 31..234
-                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
-                    }
-                }
-                ReadingFilter::DarkInvert => {
-                    // Anti-halation Soft Charcoal (#1E2024 bg, #D8DCE2 text) — no harsh pure-black/white bleed
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        let ir = 255 - ((px >> 16) & 0xFF);
-                        let ig = 255 - ((px >> 8) & 0xFF);
-                        let ib = 255 - (px & 0xFF);
-                        let nr = 30 + ((ir * 186) >> 8); // 30..216
-                        let ng = 32 + ((ig * 188) >> 8); // 32..220
-                        let nb = 36 + ((ib * 190) >> 8); // 36..226
-                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
-                    }
-                }
-                ReadingFilter::NightAmber => {
-                    // Best for night: Deep espresso dark (#1A1713 bg) + warm amber text (#E5CFA8), lowest blue light
-                    for i in 0..copy_len {
-                        let px = pixels[src_idx + i];
-                        let ir = 255 - ((px >> 16) & 0xFF);
-                        let ig = 255 - ((px >> 8) & 0xFF);
-                        let ib = 255 - (px & 0xFF);
-                        let nr = 26 + ((ir * 203) >> 8); // 26..229
-                        let ng = 23 + ((ig * 184) >> 8); // 23..207
-                        let nb = 19 + ((ib * 149) >> 8); // 19..168
-                        buffer[dst_idx + i] = (nr << 16) | (ng << 8) | nb;
-                    }
+            if filter == ReadingFilter::Normal {
+                buffer[dst_idx..dst_idx + copy_len]
+                    .copy_from_slice(&pixels[src_idx..src_idx + copy_len]);
+            } else {
+                for i in 0..copy_len {
+                    buffer[dst_idx + i] = Self::apply_reading_filter_pixel(pixels[src_idx + i], filter);
                 }
             }
         }
@@ -1545,6 +1538,15 @@ impl<'a> PdfViewerApp<'a> {
             }
             let max_scroll = (total_h - content_h as f32).max(1.0);
             ((self.grid_scroll_y / max_scroll).clamp(0.0, 1.0), (content_h as f32 / total_h).clamp(0.08, 1.0))
+        } else if self.view_mode == ViewMode::TextView {
+            if self.text_view_max_scroll <= 1.0 {
+                return None;
+            }
+            let total_h = content_h as f32 + self.text_view_max_scroll;
+            (
+                (self.scroll_y / self.text_view_max_scroll).clamp(0.0, 1.0),
+                (content_h as f32 / total_h).clamp(0.08, 0.9),
+            )
         } else if total > 1 {
             let denom = (total - 1) as f32;
             ((self.current_page_index as f32 / denom).clamp(0.0, 1.0), (1.0 / total as f32).clamp(0.08, 0.5))
@@ -1592,6 +1594,8 @@ impl<'a> PdfViewerApp<'a> {
             let total_h = (rows * cell_h + 40) as f32;
             let max_scroll = (total_h - content_h as f32).max(0.0);
             self.grid_scroll_y = frac * max_scroll;
+        } else if self.view_mode == ViewMode::TextView {
+            self.scroll_y = frac * self.text_view_max_scroll.max(0.0);
         } else if total > 1 {
             let target = (frac * ((total - 1) as f32)).round() as u16;
             if target != self.current_page_index {
@@ -1693,10 +1697,12 @@ impl<'a> PdfViewerApp<'a> {
             .status_bar_height_px(scale_factor)
             .min(height.saturating_sub(top_bars_h + 16));
 
-        if self.view_mode.is_page_view() {
-            self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
-        } else if self.view_mode == ViewMode::ThumbnailGrid {
-            self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
+        if self.compare_mode.is_none() {
+            if self.view_mode.is_page_view() {
+                self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
+            } else if self.view_mode == ViewMode::ThumbnailGrid {
+                self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
+            }
         }
 
         if self.print_preview.is_some() {
@@ -1715,6 +1721,10 @@ impl<'a> PdfViewerApp<'a> {
 
         if self.doc.is_none() {
             self.draw_welcome_screen(buffer, width, height, top_bars_h, status_bar_h, scale_factor);
+        } else if self.compare_mode.is_some() {
+            self.render_and_draw_compare_mode(
+                buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+            );
         } else if self.view_mode == ViewMode::TextView {
             self.draw_text_view(
                 buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
@@ -1773,6 +1783,21 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
 
+            // Subtle interactive highlight frame on hovered fillable PDF form field
+            if self.mouse_mode == MouseMode::Select {
+                if let Some((fp, frect)) = self.hovered_form_field {
+                    if let Some((fx, fy, fw, fh)) = self.pdf_rect_to_screen_rect(fp, frect) {
+                        let bottom_limit = height.saturating_sub(status_bar_h);
+                        super::ui_draw::fill_rounded_rect_alpha(
+                            buffer, width, bottom_limit, fx, fy, fw, fh, 3.0, theme.accent, 34,
+                        );
+                        super::ui_draw::stroke_rounded_rect(
+                            buffer, width, bottom_limit, fx, fy, fw, fh, 3.0, theme.accent,
+                        );
+                    }
+                }
+            }
+
             // Active drag preview: Move Annotation / Ink / Arrow / Select / Shapes / Redact / Crop / Stamp
             if let Some(ref drag) = self.dragging_annotation {
                 let ddx = (self.cursor_pos.0 - drag.start_screen_x).round() as i32;
@@ -1801,83 +1826,81 @@ impl<'a> PdfViewerApp<'a> {
                         buffer, width, height, win[0].0, win[0].1, win[1].0, win[1].1, thick, col,
                     );
                 }
-            } else if let Some((sx1, sy1)) = self.drag_start {
-                let (sx2, sy2) = self.cursor_pos;
-                if self.mouse_mode == MouseMode::ArrowShape {
-                    let col = self.annotation_color.u32_rgb();
-                    let thick = (2.2 * scale_factor as f32).clamp(1.6, 5.0);
-                    let dx = (sx2 - sx1) as f32;
-                    let dy = (sy2 - sy1) as f32;
-                    let len = (dx * dx + dy * dy).sqrt();
-                    if len > 4.0 {
-                        super::ui_draw::draw_line_aa(
-                            buffer, width, height, sx1 as f32, sy1 as f32, sx2 as f32, sy2 as f32, thick, col,
-                        );
-                        let ux = dx / len;
-                        let uy = dy / len;
-                        let px = -uy;
-                        let py = ux;
-                        let hlen = (thick * 5.0).min(len * 0.45).max(3.0);
-                        let hw = hlen * 0.45;
-                        let bx = sx2 as f32 - ux * hlen;
-                        let by = sy2 as f32 - uy * hlen;
-                        super::ui_draw::draw_line_aa(buffer, width, height, sx2 as f32, sy2 as f32, bx + px * hw, by + py * hw, thick, col);
-                        super::ui_draw::draw_line_aa(buffer, width, height, sx2 as f32, sy2 as f32, bx - px * hw, by - py * hw, thick, col);
-                    }
-                } else {
-                    let (_, target_rect) = self.resolve_target_page_and_draw_rect(sx1, sy1);
-                    let (px, py, pw, ph) = target_rect;
-                    let page_left = px.max(sidebar_w as i32);
-                    let page_right = (px + pw as i32).min(width as i32);
-                    let page_top = py.max(top_bars_h as i32);
-                    let page_bottom =
-                        (py + ph as i32).min(height.saturating_sub(status_bar_h) as i32);
+            } else if self.mouse_mode != MouseMode::Measure {
+                if let Some((sx1, sy1)) = self.drag_start {
+                    let (sx2, sy2) = self.cursor_pos;
+                    if self.mouse_mode == MouseMode::ArrowShape {
+                        let col = self.annotation_color.u32_rgb();
+                        let thick = (2.2 * scale_factor as f32).clamp(1.6, 5.0);
+                        let dx = (sx2 - sx1) as f32;
+                        let dy = (sy2 - sy1) as f32;
+                        let len = (dx * dx + dy * dy).sqrt();
+                        if len > 4.0 {
+                            super::ui_draw::draw_line_aa(
+                                buffer, width, height, sx1 as f32, sy1 as f32, sx2 as f32, sy2 as f32, thick, col,
+                            );
+                            let ux = dx / len;
+                            let uy = dy / len;
+                            let px = -uy;
+                            let py = ux;
+                            let hlen = (thick * 5.0).min(len * 0.45).max(3.0);
+                            let hw = hlen * 0.45;
+                            let bx = sx2 as f32 - ux * hlen;
+                            let by = sy2 as f32 - uy * hlen;
+                            super::ui_draw::draw_line_aa(buffer, width, height, sx2 as f32, sy2 as f32, bx + px * hw, by + py * hw, thick, col);
+                            super::ui_draw::draw_line_aa(buffer, width, height, sx2 as f32, sy2 as f32, bx - px * hw, by - py * hw, thick, col);
+                        }
+                    } else {
+                        let (_, target_rect) = self.resolve_target_page_and_draw_rect(sx1, sy1);
+                        let (px, py, pw, ph) = target_rect;
+                        let page_left = px.max(sidebar_w as i32);
+                        let page_right = (px + pw as i32).min(width as i32);
+                        let page_top = py.max(top_bars_h as i32);
+                        let page_bottom =
+                            (py + ph as i32).min(height.saturating_sub(status_bar_h) as i32);
 
-                    if page_right > page_left && page_bottom > page_top {
-                        let min_x = (sx1.min(sx2).round() as i32).clamp(page_left, page_right) as u32;
-                        let max_x = (sx1.max(sx2).round() as i32).clamp(page_left, page_right) as u32;
-                        let min_y = (sy1.min(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
-                        let max_y = (sy1.max(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
+                        if page_right > page_left && page_bottom > page_top {
+                            let min_x = (sx1.min(sx2).round() as i32).clamp(page_left, page_right) as u32;
+                            let max_x = (sx1.max(sx2).round() as i32).clamp(page_left, page_right) as u32;
+                            let min_y = (sy1.min(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
+                            let max_y = (sy1.max(sy2).round() as i32).clamp(page_top, page_bottom) as u32;
 
-                        if max_x > min_x && max_y > min_y {
-                            let (ar, ag, ab) = self.annotation_color.rgb();
-                            let ann_col = self.annotation_color.u32_rgb();
-                            let (fill_rgba, border_col) = match self.mouse_mode {
-                                MouseMode::Select => ((37, 99, 235, 42), 0x002563EB),
-                                MouseMode::Highlight => ((ar as u32, ag as u32, ab as u32, 95), ann_col),
-                                MouseMode::Underline | MouseMode::Strikethrough => ((ar as u32, ag as u32, ab as u32, 48), ann_col),
-                                MouseMode::RectShape => ((ar as u32, ag as u32, ab as u32, 22), ann_col),
-                                MouseMode::Redact => ((220, 38, 38, 105), 0x00DC2626),
-                                MouseMode::Crop => ((5, 150, 105, 85), 0x00059669),
-                                MouseMode::StampImage => ((124, 58, 237, 85), 0x007C3AED),
-                                _ => ((ar as u32, ag as u32, ab as u32, 40), ann_col),
-                            };
-                            blend_rect_rgba(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, fill_rgba);
-                            draw_rect_border(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, border_col);
+                            if max_x > min_x && max_y > min_y {
+                                let (ar, ag, ab) = self.annotation_color.rgb();
+                                let ann_col = self.annotation_color.u32_rgb();
+                                let (fill_rgba, border_col) = match self.mouse_mode {
+                                    MouseMode::Select => ((37, 99, 235, 42), 0x002563EB),
+                                    MouseMode::Highlight => ((ar as u32, ag as u32, ab as u32, 95), ann_col),
+                                    MouseMode::Underline | MouseMode::Strikethrough => ((ar as u32, ag as u32, ab as u32, 48), ann_col),
+                                    MouseMode::RectShape => ((ar as u32, ag as u32, ab as u32, 22), ann_col),
+                                    MouseMode::Redact => ((220, 38, 38, 105), 0x00DC2626),
+                                    MouseMode::Crop => ((5, 150, 105, 85), 0x00059669),
+                                    MouseMode::StampImage => ((124, 58, 237, 85), 0x007C3AED),
+                                    _ => ((ar as u32, ag as u32, ab as u32, 40), ann_col),
+                                };
+                                blend_rect_rgba(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, fill_rgba);
+                                draw_rect_border(buffer, width, height, min_x, min_y, max_x - min_x, max_y - min_y, border_col);
+                            }
                         }
                     }
                 }
             }
 
-            // Floating Sticky Note popover when clicked
-            if let Some((ref note_text, nx, ny)) = self.active_note_popover {
-                let s = scale_factor as f32;
-                let pw = (240.0 * s).round().min((width as f32 - 24.0).max(80.0)) as u32;
-                let ph = (78.0 * s).round() as u32;
-                let max_px = (width as i32 - pw as i32 - 8).max(8);
-                let px = nx.clamp(8, max_px);
-                let min_py = top_bars_h as i32 + 6;
-                let max_py = (height as i32 - status_bar_h as i32 - ph as i32 - 6).max(min_py);
-                let py = (ny - ph as i32 - 8).clamp(min_py, max_py);
-                let rad = (7.0 * s).clamp(5.0, 12.0);
-                super::ui_draw::draw_soft_shadow(buffer, width, height, px, py, pw, ph, rad, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
-                super::ui_draw::fill_rounded_rect(buffer, width, height, px, py, pw, ph, rad, 0x00FEF9C3);
-                super::ui_draw::stroke_rounded_rect(buffer, width, height, px, py, pw, ph, rad, 0x00CA8A04);
-                let sz = (11.5 * s).clamp(10.0, 22.0);
-                super::ui_draw::draw_text(buffer, width, height, px + (10.0 * s).round() as i32, py + (8.0 * s).round() as i32, "Sticky Note", (10.5 * s).clamp(9.0, 18.0), 0x00854D0E, true);
-                let trunc = super::ui_draw::truncate_ellipsis(note_text, (pw as f32 - 20.0).max(40.0), sz, false);
-                super::ui_draw::draw_text_clipped(buffer, width, height, px + (10.0 * s).round() as i32, py + (28.0 * s).round() as i32, px + pw as i32 - 10, &trunc, sz, 0x001E293B, false);
-                super::ui_draw::draw_text(buffer, width, height, px + (10.0 * s).round() as i32, py + ph as i32 - (20.0 * s).round() as i32, "Click anywhere or Esc to dismiss", (9.5 * s).clamp(8.5, 16.0), 0x00A16207, false);
+            // Quick Measure / Ruler Tool HUD & live vector guides
+            if self.mouse_mode == MouseMode::Measure {
+                self.draw_measure_overlay(
+                    buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+                );
+            }
+
+            // Multi-line Sticky Note reader popover with Edit & Delete controls
+            if self.active_note_popover.is_some() {
+                self.draw_active_note_popover(buffer, width, height, scale_factor);
+            }
+
+            // Right-click Annotation Inspector Context Menu
+            if self.annot_context_menu.is_some() {
+                self.draw_annot_context_menu(buffer, width, height, scale_factor);
             }
         } else {
             self.draw_thumbnail_grid(
@@ -1926,30 +1949,22 @@ impl<'a> PdfViewerApp<'a> {
         // Centered Bottom Page View & Status Bar
         self.draw_status_bar(buffer, width, height, status_bar_h, scale_factor);
 
+        let chrome_visible = !self.is_fullscreen && !self.is_presentation;
+
         // Session Notification Board Popover (bottom-left)
-        if self.show_notifications {
+        if chrome_visible && self.show_notifications {
             self.draw_notification_board_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
         // Reading Color Mode Picker Popover (6 eye-care palettes)
-        if self.show_reading_mode_popover {
+        if chrome_visible && self.show_reading_mode_popover {
             self.draw_reading_mode_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
-        // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu is open)
-        if self.open_menu.is_none()
-            && !self.show_customize_toolbar
-            && !self.show_help_overlay
-            && !self.show_about_overlay
-            && !self.show_bookmark_format_overlay
-            && !self.show_tab_list_popover
-            && self.tab_context_menu.is_none()
-            && self.thumb_context_menu.is_none()
-            && self.combine_modal.is_none()
-            && self.print_preview.is_none()
-            && self.manual_duplex_wait.is_none()
-            && self.header_footer_modal.is_none()
-            && self.page_number_modal.is_none()
+        // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu/prompt is open)
+        if chrome_visible
+            && !self.has_blocking_modal()
+            && !self.has_open_popover()
         {
             self.draw_floating_hover_tooltip(buffer, width, height, menu_bar_h, status_bar_h, scale_factor);
         }
@@ -1960,12 +1975,12 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // All-Tabs Overflow Dropdown Popover (`▾`)
-        if self.show_tab_list_popover {
+        if chrome_visible && self.show_tab_list_popover {
             self.draw_tab_list_popover(buffer, width, height, top_bars_h, scale_factor);
         }
 
         // Tab Bar Right-Click Context Menu
-        if self.tab_context_menu.is_some() {
+        if chrome_visible && self.tab_context_menu.is_some() {
             self.draw_tab_context_menu(buffer, width, height, scale_factor);
         }
 
@@ -1975,13 +1990,20 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // Open Menu Dropdown
-        if let Some(cat) = self.open_menu {
-            self.draw_open_menu_dropdown(buffer, width, height, menu_bar_h, cat, scale_factor);
+        if chrome_visible {
+            if let Some(cat) = self.open_menu {
+                self.draw_open_menu_dropdown(buffer, width, height, menu_bar_h, cat, scale_factor);
+            }
         }
 
         // Customize Toolbar Modal
         if self.show_customize_toolbar {
             self.draw_customize_toolbar_modal(buffer, width, height, scale_factor);
+        }
+
+        // Built-in Step-by-Step User Guide Modal (`Help -> User Guide (How to Use)`)
+        if self.user_guide_modal.is_some() {
+            self.draw_user_guide_modal(buffer, width, height, scale_factor);
         }
 
         // Help Overlay (`?` / `F1`)
@@ -2014,6 +2036,21 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_page_number_modal(buffer, width, height, scale_factor);
         }
 
+        // Create PDF from Images Modal
+        if self.create_pdf_images_modal.is_some() {
+            self.draw_create_pdf_images_modal(buffer, width, height, scale_factor);
+        }
+
+        // Export Pages as Images Modal
+        if self.export_images_modal.is_some() {
+            self.draw_export_images_modal(buffer, width, height, scale_factor);
+        }
+
+        // Document Properties & Privacy Metadata Scrubber Modal
+        if self.doc_props_modal.is_some() {
+            self.draw_doc_props_modal(buffer, width, height, scale_factor);
+        }
+
         // Print Preview Modal (`Ctrl/Cmd+P`)
         if self.print_preview.is_some() {
             self.draw_print_preview_modal(buffer, width, height, scale_factor);
@@ -2023,10 +2060,16 @@ impl<'a> PdfViewerApp<'a> {
         if self.manual_duplex_wait.is_some() {
             self.draw_manual_duplex_modal(buffer, width, height, scale_factor);
         }
+
+        // Unsaved Changes Confirmation Dialog (top-most modal)
+        if self.unsaved_changes_modal.is_some() {
+            self.draw_unsaved_changes_modal(buffer, width, height, scale_factor);
+        }
     }
 
     /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`
     /// for rendering live move/selection ghosts over the currently visible page(s).
+    /// Handles 0°/90°/180°/270° rotated pages via PDFium's `points_to_pixels`.
     pub(super) fn pdf_rect_to_screen_rect(&self, page_idx: u16, rect: PdfRect) -> Option<(i32, i32, u32, u32)> {
         let draw_rect = if self.is_continuous_scroll() {
             let &(_, dr) = self.continuous_draw_rects.iter().find(|&&(p, _)| p == page_idx)?;
@@ -2046,12 +2089,29 @@ impl<'a> PdfViewerApp<'a> {
         if pw_pts <= 0.0 || ph_pts <= 0.0 || draw_rect.2 == 0 || draw_rect.3 == 0 {
             return None;
         }
-        let sx = draw_rect.2 as f32 / pw_pts;
-        let sy = draw_rect.3 as f32 / ph_pts;
-        let x0 = draw_rect.0 + (rect.left().value * sx).round() as i32;
-        let x1 = draw_rect.0 + (rect.right().value * sx).round() as i32;
-        let y0 = draw_rect.1 + ((ph_pts - rect.top().value) * sy).round() as i32;
-        let y1 = draw_rect.1 + ((ph_pts - rect.bottom().value) * sy).round() as i32;
+        let cfg = PdfRenderConfig::new()
+            .set_fixed_width(draw_rect.2 as i32)
+            .set_fixed_height(draw_rect.3 as i32);
+        let (bx1, by1, bx2, by2) = match (
+            page.points_to_pixels(rect.left(), rect.top(), &cfg),
+            page.points_to_pixels(rect.right(), rect.bottom(), &cfg),
+        ) {
+            (Ok((x1, y1)), Ok((x2, y2))) => (x1, y1, x2, y2),
+            _ => {
+                let sx = draw_rect.2 as f32 / pw_pts;
+                let sy = draw_rect.3 as f32 / ph_pts;
+                (
+                    (rect.left().value * sx).round() as i32,
+                    ((ph_pts - rect.top().value) * sy).round() as i32,
+                    (rect.right().value * sx).round() as i32,
+                    ((ph_pts - rect.bottom().value) * sy).round() as i32,
+                )
+            }
+        };
+        let x0 = draw_rect.0 + bx1;
+        let x1 = draw_rect.0 + bx2;
+        let y0 = draw_rect.1 + by1;
+        let y1 = draw_rect.1 + by2;
         let left = x0.min(x1);
         let top = y0.min(y1);
         let rw = (x1 - x0).unsigned_abs().max(4);

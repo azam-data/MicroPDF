@@ -210,10 +210,14 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn add_files_to_combine_modal(&mut self, paths: Vec<PathBuf>) {
         let Some(cm) = self.combine_modal.as_mut() else { return };
         let mut added = 0usize;
+        let mut skipped = 0usize;
         for path in paths {
             let total_pages = match self.engine.load_pdf_safe(&path) {
                 Ok(doc) => doc.pages().len().max(1),
-                Err(_) => continue,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
             };
             let file_name = path
                 .file_name()
@@ -234,8 +238,16 @@ impl<'a> PdfViewerApp<'a> {
             cm.preview_page = 0;
             cm.cached_preview = None;
         }
-        if added > 0 {
+        if added > 0 && skipped > 0 {
+            self.status_notice = Some(format!(
+                "Added {added} PDF(s) to queue (skipped {skipped} encrypted or unreadable file(s))"
+            ));
+        } else if added > 0 {
             self.status_notice = Some(format!("Added {added} PDF(s) to Combine queue"));
+        } else if skipped > 0 {
+            self.status_notice = Some(format!(
+                "Could not add {skipped} PDF(s) — encrypted or unreadable"
+            ));
         }
         self.request_redraw();
     }
@@ -827,6 +839,9 @@ impl<'a> PdfViewerApp<'a> {
                         if cm.selected >= cm.entries.len() {
                             cm.selected = cm.entries.len().saturating_sub(1);
                         }
+                        if cm.scroll_offset > cm.entries.len().saturating_sub(1) {
+                            cm.scroll_offset = cm.entries.len().saturating_sub(1);
+                        }
                         cm.preview_page = 0;
                         cm.cached_preview = None;
                         cm.editing_range = false;
@@ -856,6 +871,28 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn handle_combine_key(&mut self, logical_key: winit::keyboard::Key, text: Option<&str>) {
         use winit::keyboard::{Key, NamedKey};
+        if self.cmd_or_ctrl_pressed {
+            if let Key::Character(c) = &logical_key {
+                if c.eq_ignore_ascii_case("v") {
+                    if let Ok(clip) = Self::read_text_from_os_clipboard() {
+                        if let Some(cm) = self.combine_modal.as_mut() {
+                            if cm.editing_range {
+                                if let Some(e) = cm.entries.get_mut(cm.selected) {
+                                    for ch in clip.chars() {
+                                        if ch.is_ascii_digit() || ch == '-' || ch == ',' || ch == ' ' {
+                                            e.page_range.push(ch);
+                                        }
+                                    }
+                                    e.validate();
+                                }
+                            }
+                        }
+                        self.request_redraw();
+                    }
+                }
+            }
+            return;
+        }
         match logical_key {
             Key::Named(NamedKey::Escape) => {
                 self.close_combine_modal();
@@ -896,16 +933,31 @@ impl<'a> PdfViewerApp<'a> {
                         cm.selected += 1;
                         cm.preview_page = 0;
                         cm.cached_preview = None;
+                        if cm.selected >= cm.scroll_offset + 5 {
+                            cm.scroll_offset = cm.selected + 1 - 5;
+                        }
                     }
                 }
                 self.request_redraw();
             }
             Key::Named(NamedKey::Backspace) => {
                 if let Some(cm) = self.combine_modal.as_mut() {
-                    if let Some(e) = cm.entries.get_mut(cm.selected) {
-                        cm.editing_range = true;
-                        e.page_range.pop();
-                        e.validate();
+                    if cm.editing_range {
+                        if let Some(e) = cm.entries.get_mut(cm.selected) {
+                            e.page_range.pop();
+                            e.validate();
+                        }
+                    }
+                }
+                self.request_redraw();
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(cm) = self.combine_modal.as_mut() {
+                    if cm.editing_range {
+                        if let Some(e) = cm.entries.get_mut(cm.selected) {
+                            e.page_range.clear();
+                            e.validate();
+                        }
                     }
                 }
                 self.request_redraw();
@@ -994,10 +1046,36 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             if let Some(err) = insert_err {
-                let _ = self.undo_stack.pop_back();
-                self.status_notice = Some(format!("Insert PDF failed: {err}"));
+                // Roll back any partially inserted pages from the popped undo snapshot.
+                if let Some(snap) = self.undo_stack.pop_back() {
+                    if let Some(prev_bytes) = snap.pdf_bytes {
+                        if let Ok(restored) = self.engine.load_pdf_from_bytes_safe(prev_bytes) {
+                            self.doc = Some(restored);
+                            self.invalidate_page_caches();
+                            self.thumbnail_cache.clear();
+                        }
+                    }
+                    self.undo_generation = snap.generation;
+                    self.has_unsaved_edits = self.undo_generation != self.saved_undo_generation;
+                }
+                self.status_notice = Some(format!("Insert PDF failed (rolled back): {err}"));
             } else {
                 self.has_unsaved_edits = true;
+                crate::engine::PdfEngine::remap_bookmarks_after_insert(
+                    &mut self.bookmarks,
+                    base_idx as usize,
+                    total_inserted as usize,
+                    self.skip_pages,
+                    self.roman_end,
+                );
+                let shifted_bw: std::collections::HashSet<u16> = self
+                    .bw_pages
+                    .iter()
+                    .map(|&p| if p >= base_idx { p.saturating_add(total_inserted) } else { p })
+                    .collect();
+                self.bw_pages = shifted_bw;
+                self.search_matches.clear();
+                self.current_search_match = 0;
                 self.current_page_index = base_idx.min(self.total_pages().saturating_sub(1));
                 self.invalidate_page_caches();
                 self.thumbnail_cache.clear();

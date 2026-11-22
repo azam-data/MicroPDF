@@ -22,10 +22,10 @@ fn generate_self_test_pdf(engine: &PdfEngine) -> Result<PathBuf> {
     let output_pdf = temp_dir.join("micropdf_self_test_output.pdf");
 
     engine.create_sample_pdf(&input_pdf, 10)?;
-    let _ = engine.add_page_numbers(&input_pdf, &output_pdf, 5);
-    let _ = engine.add_header_footer(&output_pdf, &output_pdf, Some("MicroPDF Draft"), None, 1, 10);
-    let _ = engine.add_watermark(&output_pdf, &output_pdf, "CONFIDENTIAL", true);
-    let _ = engine.rotate_pages(&output_pdf, &output_pdf, &[2], 90);
+    engine.add_page_numbers(&input_pdf, &output_pdf, 5)?;
+    engine.add_header_footer(&output_pdf, &output_pdf, Some("MicroPDF Draft"), None, 1, 10)?;
+    engine.add_watermark(&output_pdf, &output_pdf, "CONFIDENTIAL", true)?;
+    engine.rotate_pages(&output_pdf, &output_pdf, &[2], 90)?;
     let _ = std::fs::remove_file(&input_pdf);
     println!("Generated {:?} in {:.2?}.", output_pdf, start_time.elapsed());
     Ok(output_pdf)
@@ -40,10 +40,10 @@ fn resolve_startup_pdf(engine: &PdfEngine) -> Result<(Option<PathBuf>, bool)> {
             run_self_test = true;
         } else if cli_pdf.is_none() {
             let candidate = PathBuf::from(&arg);
-            if candidate.exists() {
+            if candidate.is_file() {
                 cli_pdf = Some(candidate);
             } else {
-                eprintln!("Warning: CLI path {:?} does not exist.", candidate);
+                eprintln!("Warning: CLI path {:?} is not an existing file.", candidate);
             }
         }
     }
@@ -114,7 +114,7 @@ fn main() -> Result<()> {
             is_self_test = true;
         } else if cli_pdf_for_ipc.is_none() {
             let candidate = PathBuf::from(&arg);
-            if candidate.exists() {
+            if candidate.is_file() {
                 cli_pdf_for_ipc = Some(candidate);
             }
         }

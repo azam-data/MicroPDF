@@ -12,7 +12,10 @@ pub(super) enum OverlayHit {
     WelcomeRecent(usize),
     WelcomeRestoreSession,
     WelcomeDismissSession,
+    SearchPrev,
     SearchNext,
+    SearchCaseToggle,
+    SearchWholeWordToggle,
     SearchClose,
     OptimizePreset(u8),
     OptimizeColor(u8),
@@ -223,16 +226,26 @@ impl<'a> PdfViewerApp<'a> {
     /// Computes Floating Search Pill geometry anchored at the top-right of the page canvas.
     fn layout_floating_search(&self, buf_w: u32, top_bars_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
-        let pw = ((340.0 * s).round() as u32).min(buf_w.saturating_sub(24));
+        let pw = ((446.0 * s).round() as u32).min(buf_w.saturating_sub(24));
         let ph = (38.0 * s).round() as u32;
         let px = (buf_w as i32) - pw as i32 - (16.0 * s).round() as i32;
         let py = top_bars_h as i32 + (12.0 * s).round() as i32;
 
         let btn_sz = (24.0 * s).round() as u32;
+        let aa_w = (28.0 * s).round() as u32;
+        let ww_w = (26.0 * s).round() as u32;
+        let gap = (4.0 * s).round() as i32;
         let by = py + ((ph.saturating_sub(btn_sz)) / 2) as i32;
+
         let close_x = px + pw as i32 - btn_sz as i32 - (7.0 * s).round() as i32;
-        let next_x = close_x - btn_sz as i32 - (4.0 * s).round() as i32;
+        let next_x = close_x - btn_sz as i32 - gap;
+        let prev_x = next_x - btn_sz as i32 - gap;
+        let ww_x = prev_x - ww_w as i32 - gap - (2.0 * s).round() as i32;
+        let aa_x = ww_x - aa_w as i32 - gap;
         let hits = vec![
+            BoxHit { x: aa_x, y: by, w: aa_w, h: btn_sz, hit: OverlayHit::SearchCaseToggle },
+            BoxHit { x: ww_x, y: by, w: ww_w, h: btn_sz, hit: OverlayHit::SearchWholeWordToggle },
+            BoxHit { x: prev_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchPrev },
             BoxHit { x: next_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchNext },
             BoxHit { x: close_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchClose },
         ];
@@ -266,7 +279,8 @@ impl<'a> PdfViewerApp<'a> {
                 draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, theme.accent);
 
                 let body_sz = (12.0 * s).clamp(10.0, 26.0);
-                let next_x = hits[0].x;
+                let small_sz = (10.5 * s).clamp(9.0, 22.0);
+                let first_btn_x = hits[0].x;
                 let count_str = if !self.search_matches.is_empty() {
                     format!("{}/{}", self.current_search_match + 1, self.search_matches.len())
                 } else {
@@ -275,10 +289,10 @@ impl<'a> PdfViewerApp<'a> {
                 let count_w = if count_str.is_empty() {
                     0
                 } else {
-                    measure_text(&count_str, (11.0 * s).max(9.5), false).ceil() as i32 + (8.0 * s).round() as i32
+                    measure_text(&count_str, small_sz, false).ceil() as i32 + (8.0 * s).round() as i32
                 };
                 let input_x = px + (30.0 * s).round() as i32;
-                let input_max_x = next_x - count_w - 4;
+                let input_max_x = (first_btn_x - count_w - 6).max(input_x + 20);
                 let display = if query_input.is_empty() {
                     "Find in PDF... |".to_string()
                 } else {
@@ -288,17 +302,60 @@ impl<'a> PdfViewerApp<'a> {
                 draw_text_vcenter(buffer, buf_w, buf_h, input_x, py, ph, input_max_x, &display, body_sz, fg, false);
 
                 if !count_str.is_empty() {
-                    draw_text_vcenter(buffer, buf_w, buf_h, input_max_x + 2, py, ph, next_x - 2, &count_str, (11.0 * s).max(9.5), theme.text_muted, false);
+                    draw_text_vcenter(buffer, buf_w, buf_h, input_max_x + 2, py, ph, first_btn_x - 4, &count_str, small_sz, theme.text_muted, false);
                 }
 
                 for h in hits {
                     let hov = self.hovered_widget == Some(UiHit::Overlay(h.hit));
-                    if hov {
-                        fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.hover_bg);
+                    match h.hit {
+                        OverlayHit::SearchCaseToggle => {
+                            let active = self.search_case_sensitive;
+                            let bg = if active {
+                                theme.accent
+                            } else if hov {
+                                theme.hover_bg
+                            } else {
+                                theme.surface_elevated
+                            };
+                            fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, bg);
+                            if !active {
+                                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.border_subtle);
+                            }
+                            let fg_c = if active { theme.text_on_accent } else { theme.text_secondary };
+                            let tw = measure_text("Aa", small_sz, true);
+                            draw_text_vcenter(buffer, buf_w, buf_h, h.x + ((h.w as f32 - tw) * 0.5).round() as i32, h.y, h.h, h.x + h.w as i32, "Aa", small_sz, fg_c, true);
+                        }
+                        OverlayHit::SearchWholeWordToggle => {
+                            let active = self.search_whole_word;
+                            let bg = if active {
+                                theme.accent
+                            } else if hov {
+                                theme.hover_bg
+                            } else {
+                                theme.surface_elevated
+                            };
+                            fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, bg);
+                            if !active {
+                                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.border_subtle);
+                            }
+                            let fg_c = if active { theme.text_on_accent } else { theme.text_secondary };
+                            let tw = measure_text("W", small_sz, true);
+                            draw_text_vcenter(buffer, buf_w, buf_h, h.x + ((h.w as f32 - tw) * 0.5).round() as i32, h.y, h.h, h.x + h.w as i32, "W", small_sz, fg_c, true);
+                        }
+                        OverlayHit::SearchPrev | OverlayHit::SearchNext | OverlayHit::SearchClose => {
+                            if hov {
+                                fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.hover_bg);
+                            }
+                            let icon = match h.hit {
+                                OverlayHit::SearchPrev => UiIcon::MoveUp,
+                                OverlayHit::SearchNext => UiIcon::ChevronDown,
+                                _ => UiIcon::Close,
+                            };
+                            let b_ic = (12.0 * s).round() as u32;
+                            draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
+                        }
+                        _ => {}
                     }
-                    let icon = if h.hit == OverlayHit::SearchNext { UiIcon::ChevronDown } else { UiIcon::Close };
-                    let b_ic = (12.0 * s).round() as u32;
-                    draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
                 }
             }
             InputMode::OptimizePrompt {
@@ -452,20 +509,37 @@ impl<'a> PdfViewerApp<'a> {
         fill_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.surface_bg);
         stroke_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.border_subtle);
 
-        let (title, hint, value, ok_lbl) = match &self.input_mode {
-            InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump"),
-            InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply"),
-            InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next"),
-            InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next"),
-            InputMode::HeaderFooterText { text_input, .. } => ("Header / Footer (3 of 3)", "Enter text (leave empty to erase existing)", text_input.clone(), "Apply"),
-            InputMode::ClearMargins { input } => ("Clear Margins", "'1' Footers/Page#, '2' Headers, '3' Both (optional range)", input.clone(), "Clear"),
-            InputMode::Watermark { input } => ("Add Watermark", "Type watermark text", input.clone(), "Apply"),
-            InputMode::SplitRange { input } => ("Split / Extract Pages", "Page range (e.g. '1-3' or '2,4,6')", input.clone(), "Extract"),
-            InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add"),
-            InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save"),
-            InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach"),
-            InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place"),
-            InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open"),
+        let (title, hint, value, ok_lbl, is_confirm_only) = match &self.input_mode {
+            InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump", false),
+            InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply", false),
+            InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next", false),
+            InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next", false),
+            InputMode::HeaderFooterText { text_input, .. } => ("Header / Footer (3 of 3)", "Enter text (leave empty to erase existing)", text_input.clone(), "Apply", false),
+            InputMode::ClearMargins { input } => ("Clear Margins", "'1' Footers/Page#, '2' Headers, '3' Both (optional range)", input.clone(), "Clear", false),
+            InputMode::Watermark { input } => ("Add Watermark", "Type watermark text", input.clone(), "Apply", false),
+            InputMode::SplitRange { input } => ("Split / Extract Pages", "Page range (e.g. '1-3' or '2,4,6')", input.clone(), "Extract", false),
+            InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add", false),
+            InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save", false),
+            InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach", false),
+            InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place", false),
+            InputMode::EditAnnotationText { label, text_input, .. } => (
+                *label,
+                "Edit annotation text and press Enter to save",
+                text_input.clone(),
+                "Update",
+                false,
+            ),
+            InputMode::EditFormField { field_name, value_input, .. } => {
+                return self.draw_prompt_card_inner(
+                    buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf,
+                    &format!("Fill Form Field: {field_name}"),
+                    "Type field value and press Enter to apply (Ctrl+Z to undo)",
+                    value_input,
+                    "Apply",
+                    false,
+                );
+            }
+            InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open", true),
             InputMode::PasswordPrompt { path, password_input, attempts_left, .. } => {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("document.pdf");
                 let masked: String = "*".repeat(password_input.chars().count());
@@ -475,6 +549,7 @@ impl<'a> PdfViewerApp<'a> {
                     fname,
                     &masked,
                     "Unlock",
+                    false,
                 );
             }
             InputMode::RestoreSessionPrompt { tab_count } => {
@@ -482,13 +557,14 @@ impl<'a> PdfViewerApp<'a> {
                     buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf,
                     "Restore Previous Session?",
                     &format!("{tab_count} saved tab(s) from your last session"),
-                    "",
+                    "Press Enter / Y to restore, or Esc / N to start fresh",
                     "Restore",
+                    true,
                 );
             }
             _ => return,
         };
-        self.draw_prompt_card_inner(buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf, title, hint, &value, ok_lbl);
+        self.draw_prompt_card_inner(buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf, title, hint, &value, ok_lbl, is_confirm_only);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -507,6 +583,7 @@ impl<'a> PdfViewerApp<'a> {
         hint: &str,
         value: &str,
         ok_lbl: &str,
+        is_confirm_only: bool,
     ) {
         let theme = self.ui_theme();
         let s = sf as f32;
@@ -521,10 +598,17 @@ impl<'a> PdfViewerApp<'a> {
         let inp_y = cy + (52.0 * s).round() as i32;
         let inp_h = (28.0 * s).round() as u32;
         let inp_w = cw.saturating_sub((pad * 2) as u32);
-        fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_bg);
-        stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_focus_border);
-        let txt = format!("{value}|");
-        draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
+        if is_confirm_only {
+            fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.surface_elevated);
+            stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.border_subtle);
+            let clipped = truncate_ellipsis(value, (inp_w as f32 - 16.0 * s).max(40.0), hint_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &clipped, hint_sz, theme.text_secondary, false);
+        } else {
+            fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_focus_border);
+            let txt = format!("{value}|");
+            draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
+        }
 
         let ok_b = hits[0];
         let ok_hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::PromptSubmit));
@@ -577,14 +661,14 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Clean 2-column Help Overlay (`?` / `F1`) with styled keycaps and updated v1.3.0 header.
+    /// Clean 2-column Help Overlay (`?` / `F1`) with styled keycaps.
     pub(super) fn draw_themed_help_overlay(&self, buffer: &mut [u32], buf_w: u32, buf_h: u32, sf: f64) {
         let theme = self.ui_theme();
         let s = sf as f32;
         blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
 
-        let cw = ((700.0 * s).round() as u32).min(buf_w.saturating_sub(28));
-        let ch = ((430.0 * s).round() as u32).min(buf_h.saturating_sub(28));
+        let cw = ((760.0 * s).round() as u32).min(buf_w.saturating_sub(28));
+        let ch = ((480.0 * s).round() as u32).min(buf_h.saturating_sub(28));
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = (buf_h.saturating_sub(ch) / 2) as i32;
         let rad = (10.0 * s).clamp(6.0, 16.0);
@@ -598,48 +682,50 @@ impl<'a> PdfViewerApp<'a> {
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let key_sz = (10.5 * s).clamp(9.0, 22.0);
 
-        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.3.0", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.4", title_sz, theme.text_primary, true);
         let close_hint = "Esc or Click to close";
         let chw = measure_text(close_hint, key_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + cw as i32 - pad - chw.ceil() as i32, cy + (17.0 * s).round() as i32, close_hint, key_sz, theme.text_muted, false);
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll Flow (Vert/Book)"),
-            ("T", "Toggle Reflowable Text View (Tables + Export .md/.tex)"),
-            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 resets)"),
-            ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab tabs)"),
-            ("B / L", "Bookmark Sidebar / Import .txt"),
-            ("G / 0-9", "Smart Jump (5, ii, or #5)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book)"),
+            ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
+            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 / Ctrl+0 resets)"),
+            ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
+            ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
+            ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
+            ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "Navigation History Back / Forward"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night Amber)"),
-            ("Ctrl+F / F3", "Incremental Search / Next Match"),
+            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
+            ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S", "Open PDF / Save (Ctrl+Shift+S Save As)"),
-            ("Ctrl+P", "Print Preview (10 Paper Sizes / Booklet / Duplex)"),
-            ("Z", "Optimize PDF (Images + Form XObjects + Dedup)"),
-            ("Shift+M", "Combine Multiple PDFs (Interactive)"),
-            ("X / U", "Split Pages / Flatten & Unlock"),
-            ("P", "Stamp Signature / Image"),
-            ("N / H", "Page Numbering & Header/Footer Dialogs + Profiles"),
-            ("W / K", "Watermark / Convert Page to B&W"),
-            ("I / R / D", "Insert Blank / Rotate 90° / Delete"),
-            ("Ctrl+Z / C", "Undo Edit (up to 8 steps) / Copy Text"),
+            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S Save As) / Watermark"),
+            ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
+            ("Ctrl+P", "Print Preview (10 Paper Sizes, Manual 2-Sided)"),
+            ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
+            ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
+            ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
+            ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
+            ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
+            ("P / Z / U", "Stamp Image / Optimize PDF / Flatten & Unlock"),
+            ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
+            ("Help Menu", "Step-by-Step User Guide, Compare PDFs & Ruler"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;
-        let row_h = (34.0 * s).round() as i32;
+        let row_h = (35.0 * s).round() as i32;
         let start_y = cy + (54.0 * s).round() as i32;
-        let key_w = (76.0 * s).round() as u32;
+        let key_w = (82.0 * s).round() as u32;
         let key_h = (22.0 * s).round() as u32;
 
         for (col_idx, list) in [left_items, right_items].iter().enumerate() {
             let col_x = cx + pad + (col_idx as i32) * (col_w as i32 + pad);
             for (i, &(k, desc)) in list.iter().enumerate() {
                 let ry = start_y + (i as i32) * row_h;
-                if ry + key_h as i32 > cy + ch as i32 - (14.0 * s).round() as i32 {
+                if ry + key_h as i32 > cy + ch as i32 - (12.0 * s).round() as i32 {
                     break;
                 }
                 fill_rounded_rect(buffer, buf_w, buf_h, col_x, ry, key_w, key_h, (5.0 * s).max(3.0), theme.surface_elevated);
@@ -683,7 +769,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.3.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.4.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
@@ -719,14 +805,61 @@ impl<'a> PdfViewerApp<'a> {
                 self.input_mode = InputMode::Normal;
                 self.pending_restore_tabs.clear();
             }
+            OverlayHit::SearchPrev => {
+                if let InputMode::SearchText { ref query_input } = self.input_mode {
+                    if !query_input.is_empty() && query_input.trim() != self.search_query {
+                        let q = query_input.clone();
+                        self.execute_text_search(&q);
+                        return;
+                    }
+                }
+                self.jump_to_prev_search_match();
+            }
             OverlayHit::SearchNext => {
                 if let InputMode::SearchText { ref query_input } = self.input_mode {
-                    if !query_input.is_empty() && *query_input != self.search_query {
-                        self.handle_prompt_submission();
+                    if !query_input.is_empty() && query_input.trim() != self.search_query {
+                        let q = query_input.clone();
+                        self.execute_text_search(&q);
                         return;
                     }
                 }
                 self.jump_to_next_search_match();
+            }
+            OverlayHit::SearchCaseToggle => {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                let active_q = match &self.input_mode {
+                    InputMode::SearchText { query_input } if !query_input.trim().is_empty() => {
+                        Some(query_input.clone())
+                    }
+                    _ if !self.search_query.is_empty() => Some(self.search_query.clone()),
+                    _ => None,
+                };
+                if let Some(q) = active_q {
+                    self.execute_text_search(&q);
+                } else {
+                    self.status_notice = Some(format!(
+                        "Search Match Case (Aa): {}",
+                        if self.search_case_sensitive { "ON" } else { "OFF" }
+                    ));
+                }
+            }
+            OverlayHit::SearchWholeWordToggle => {
+                self.search_whole_word = !self.search_whole_word;
+                let active_q = match &self.input_mode {
+                    InputMode::SearchText { query_input } if !query_input.trim().is_empty() => {
+                        Some(query_input.clone())
+                    }
+                    _ if !self.search_query.is_empty() => Some(self.search_query.clone()),
+                    _ => None,
+                };
+                if let Some(q) = active_q {
+                    self.execute_text_search(&q);
+                } else {
+                    self.status_notice = Some(format!(
+                        "Search Whole Word (W): {}",
+                        if self.search_whole_word { "ON" } else { "OFF" }
+                    ));
+                }
             }
             OverlayHit::SearchClose => {
                 self.input_mode = InputMode::Normal;

@@ -459,52 +459,71 @@ impl<'a> PdfViewerApp<'a> {
             }
             stroke_rounded_rect(buffer, buf_w, buf_h, sx, sy, rw, rh, 1.0, theme.border_subtle);
 
-            // Overlay live Header/Footer preview at exact scaled coordinates!
-            let px_per_pt = rw as f32 / p_pts.0;
-            let band_h = (55.0 * px_per_pt).round().max(10.0) as u32;
-            if m.replace_existing && m.profile.has_header() {
-                fill_rect_clipped(buffer, buf_w, buf_h, sx + 1, sy + 1, rw.saturating_sub(2), band_h.min(rh), 0x00FF_FFFF);
-                fill_rect_clipped(buffer, buf_w, buf_h, sx + 4, sy + band_h as i32, rw.saturating_sub(8), 1, 0x00BF_DBFE);
-            }
-            if m.replace_existing && m.profile.has_footer() {
-                let fy = sy + rh as i32 - band_h as i32;
-                fill_rect_clipped(buffer, buf_w, buf_h, sx + 1, fy.max(sy), rw.saturating_sub(2), band_h.min(rh), 0x00FF_FFFF);
-                fill_rect_clipped(buffer, buf_w, buf_h, sx + 4, fy.max(sy), rw.saturating_sub(8), 1, 0x00BF_DBFE);
-            }
-
-            let preview_fs = (m.profile.font_size * px_per_pt).clamp(7.0, 22.0);
-            let side_px = (36.0 * px_per_pt).round() as i32;
-            let edge_px = (m.profile.margin_pt * px_per_pt).round() as i32;
-            let txt_col = m.profile.color.ui_rgb();
-            let pnum = m.preview_page + 1;
-            let draw_slot = |buffer: &mut [u32], pos: MarginPosition, raw: &str| {
-                let exp = PdfEngine::expand_hf_tokens(raw.trim(), pnum, total);
-                if exp.is_empty() {
-                    return;
+            // Overlay live Header/Footer preview only when preview_page is in selected range!
+            let page_in_scope = self
+                .resolve_hf_pages()
+                .map(|pages| pages.contains(&m.preview_page))
+                .unwrap_or(true);
+            if page_in_scope {
+                let px_per_pt = rw as f32 / p_pts.0;
+                let band_h = ((m.profile.margin_pt + m.profile.font_size + 14.0).clamp(55.0, 96.0)
+                    * px_per_pt)
+                    .round()
+                    .max(10.0) as u32;
+                if m.replace_existing && m.profile.has_header() {
+                    fill_rect_clipped(buffer, buf_w, buf_h, sx + 1, sy + 1, rw.saturating_sub(2), band_h.min(rh), 0x00FF_FFFF);
+                    fill_rect_clipped(buffer, buf_w, buf_h, sx + 4, sy + band_h as i32, rw.saturating_sub(8), 1, 0x00BF_DBFE);
                 }
-                let tw = measure_text(&exp, preview_fs, false);
-                let tx = match pos {
-                    MarginPosition::HeaderLeft | MarginPosition::FooterLeft => sx + side_px,
-                    MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
-                        sx + ((rw as f32 - tw) * 0.5).round() as i32
+                if m.replace_existing && m.profile.has_footer() {
+                    let fy = sy + rh as i32 - band_h as i32;
+                    fill_rect_clipped(buffer, buf_w, buf_h, sx + 1, fy.max(sy), rw.saturating_sub(2), band_h.min(rh), 0x00FF_FFFF);
+                    fill_rect_clipped(buffer, buf_w, buf_h, sx + 4, fy.max(sy), rw.saturating_sub(8), 1, 0x00BF_DBFE);
+                }
+
+                let preview_fs = (m.profile.font_size * px_per_pt).clamp(7.0, 22.0);
+                let side_px = (36.0 * px_per_pt).round() as i32;
+                let edge_px = (m.profile.margin_pt * px_per_pt).round() as i32;
+                let txt_col = m.profile.color.ui_rgb();
+                let pnum = m.preview_page + 1;
+                let draw_slot = |buffer: &mut [u32], pos: MarginPosition, raw: &str| {
+                    let exp = PdfEngine::expand_hf_tokens(raw.trim(), pnum, total);
+                    if exp.is_empty() {
+                        return;
                     }
-                    MarginPosition::HeaderRight | MarginPosition::FooterRight => {
-                        sx + rw as i32 - side_px - tw.ceil() as i32
-                    }
+                    let tw = measure_text(&exp, preview_fs, false);
+                    let tx = match pos {
+                        MarginPosition::HeaderLeft | MarginPosition::FooterLeft => sx + side_px,
+                        MarginPosition::HeaderCenter | MarginPosition::FooterCenter => {
+                            sx + ((rw as f32 - tw) * 0.5).round() as i32
+                        }
+                        MarginPosition::HeaderRight | MarginPosition::FooterRight => {
+                            sx + rw as i32 - side_px - tw.ceil() as i32
+                        }
+                    };
+                    let ty = if pos.is_header() {
+                        sy + edge_px
+                    } else {
+                        sy + rh as i32 - edge_px - preview_fs.ceil() as i32
+                    };
+                    draw_text(buffer, buf_w, buf_h, tx, ty, &exp, preview_fs, txt_col, false);
                 };
-                let ty = if pos.is_header() {
-                    sy + edge_px
-                } else {
-                    sy + rh as i32 - edge_px - preview_fs.ceil() as i32
-                };
-                draw_text(buffer, buf_w, buf_h, tx, ty, &exp, preview_fs, txt_col, false);
-            };
-            draw_slot(buffer, MarginPosition::HeaderLeft, &m.profile.header_left);
-            draw_slot(buffer, MarginPosition::HeaderCenter, &m.profile.header_center);
-            draw_slot(buffer, MarginPosition::HeaderRight, &m.profile.header_right);
-            draw_slot(buffer, MarginPosition::FooterLeft, &m.profile.footer_left);
-            draw_slot(buffer, MarginPosition::FooterCenter, &m.profile.footer_center);
-            draw_slot(buffer, MarginPosition::FooterRight, &m.profile.footer_right);
+                draw_slot(buffer, MarginPosition::HeaderLeft, &m.profile.header_left);
+                draw_slot(buffer, MarginPosition::HeaderCenter, &m.profile.header_center);
+                draw_slot(buffer, MarginPosition::HeaderRight, &m.profile.header_right);
+                draw_slot(buffer, MarginPosition::FooterLeft, &m.profile.footer_left);
+                draw_slot(buffer, MarginPosition::FooterCenter, &m.profile.footer_center);
+                draw_slot(buffer, MarginPosition::FooterRight, &m.profile.footer_right);
+            } else {
+                let badge = "Outside selected page range";
+                let b_sz = (10.5 * s).clamp(9.0, 16.0);
+                let bw = measure_text(badge, b_sz, true).ceil() as u32 + (18.0 * s).round() as u32;
+                let bh = (22.0 * s).round() as u32;
+                let bx = sx + ((rw.saturating_sub(bw)) / 2) as i32;
+                let by = sy + (10.0 * s).round() as i32;
+                fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, (bh as f32) * 0.5, theme.surface_elevated);
+                stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, (bh as f32) * 0.5, theme.border_subtle);
+                draw_text_vcenter(buffer, buf_w, buf_h, bx + (9.0 * s).round() as i32, by, bh, bx + bw as i32 - 4, badge, b_sz, theme.text_muted, true);
+            }
         }
 
         let title_sz = (14.0 * s).clamp(11.0, 22.0);
@@ -939,6 +958,7 @@ impl<'a> PdfViewerApp<'a> {
                     Ok(()) => {
                         self.has_unsaved_edits = true;
                         self.invalidate_page_caches();
+                        self.thumbnail_cache.clear();
                         let what = match hit {
                             HeaderFooterHit::ClearHeader => "Headers",
                             HeaderFooterHit::ClearFooter => "Footers",
@@ -953,6 +973,7 @@ impl<'a> PdfViewerApp<'a> {
                         self.update_title_bar();
                     }
                     Err(e) => {
+                        let _ = self.undo_stack.pop_back();
                         if let Some(m) = self.header_footer_modal.as_mut() {
                             m.status_msg = Some((format!("Clear failed: {e}"), true));
                         }
@@ -1014,6 +1035,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.has_unsaved_edits = true;
                 self.header_footer_modal = None;
                 self.invalidate_page_caches();
+                self.thumbnail_cache.clear();
                 self.status_notice = Some(format!(
                     "Applied Header/Footer to {} page(s) (press S to save)",
                     pages.len()
@@ -1021,6 +1043,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.update_title_bar();
             }
             Err(e) => {
+                let _ = self.undo_stack.pop_back();
                 if let Some(m) = self.header_footer_modal.as_mut() {
                     m.status_msg = Some((format!("Failed: {e}"), true));
                 }
@@ -1486,6 +1509,8 @@ impl<'a> PdfViewerApp<'a> {
             PageNumberHit::SkipPlus => {
                 if let Some(m) = self.page_number_modal.as_mut() {
                     m.config.skip_pages = (m.config.skip_pages + 1).min(total.saturating_sub(1));
+                    let max_r = total.saturating_sub(m.config.skip_pages);
+                    m.config.roman_end = m.config.roman_end.min(max_r);
                 }
             }
             PageNumberHit::RomanMinus => {
@@ -1530,15 +1555,24 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     Ok(())
                 };
-                if res.is_ok() {
-                    self.has_unsaved_edits = true;
-                    self.invalidate_page_caches();
-                    if let Some(m) = self.page_number_modal.as_mut() {
-                        m.preview_cache = None;
-                        m.status_msg = Some(("Cleared existing page numbers.".to_string(), false));
+                match res {
+                    Ok(()) => {
+                        self.has_unsaved_edits = true;
+                        self.invalidate_page_caches();
+                        self.thumbnail_cache.clear();
+                        if let Some(m) = self.page_number_modal.as_mut() {
+                            m.preview_cache = None;
+                            m.status_msg = Some(("Cleared existing page numbers.".to_string(), false));
+                        }
+                        self.status_notice = Some("Cleared existing page numbers".to_string());
+                        self.update_title_bar();
                     }
-                    self.status_notice = Some("Cleared existing page numbers".to_string());
-                    self.update_title_bar();
+                    Err(e) => {
+                        let _ = self.undo_stack.pop_back();
+                        if let Some(m) = self.page_number_modal.as_mut() {
+                            m.status_msg = Some((format!("Clear failed: {e}"), true));
+                        }
+                    }
                 }
             }
             PageNumberHit::Apply => {
@@ -1563,9 +1597,17 @@ impl<'a> PdfViewerApp<'a> {
             Ok(()) => {
                 self.roman_end = cfg.roman_end as usize;
                 self.skip_pages = cfg.skip_pages as usize;
+                let total_p = self.total_pages() as usize;
+                PdfEngine::resync_bookmarks_logical_pages_with_skip(
+                    &mut self.bookmarks,
+                    self.skip_pages,
+                    self.roman_end,
+                    total_p,
+                );
                 self.has_unsaved_edits = true;
                 self.page_number_modal = None;
                 self.invalidate_page_caches();
+                self.thumbnail_cache.clear();
                 self.status_notice = Some(format!(
                     "Applied Page Numbers ({}, {}) — press S to save",
                     cfg.position.label(),
@@ -1574,6 +1616,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.update_title_bar();
             }
             Err(e) => {
+                let _ = self.undo_stack.pop_back();
                 if let Some(m) = self.page_number_modal.as_mut() {
                     m.status_msg = Some((format!("Page Numbering failed: {e}"), true));
                 }

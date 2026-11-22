@@ -276,7 +276,14 @@ impl<'a> PdfViewerApp<'a> {
                         ReadingFilter::SageEyeCare => (0x00DA_E8DC, 0x00E2_EDE4, 0x00C4_D8C7),
                         ReadingFilter::DarkInvert => (0x0028_2C34, 0x0022_252B, 0x0037_3C47),
                         ReadingFilter::NightAmber => (0x0026_211B, 0x0020_1C17, 0x0038_3026),
-                        ReadingFilter::Normal => (theme.surface_elevated, 0x00F8_FAFC, theme.border_subtle),
+                        ReadingFilter::Normal => {
+                            let z = if self.ui_theme_mode == super::theme::UiThemeMode::Dark {
+                                0x0024_2832
+                            } else {
+                                0x00F8_FAFC
+                            };
+                            (theme.surface_elevated, z, theme.border_subtle)
+                        }
                     };
 
                     for (ri, r) in rows.iter().enumerate() {
@@ -390,6 +397,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let visible_h = (body_bottom - body_top).max(1);
         let max_scroll = (total_content_h - visible_h).max(0) as f32;
+        self.text_view_max_scroll = max_scroll;
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
     }
 
@@ -421,12 +429,17 @@ impl<'a> PdfViewerApp<'a> {
             }
             TextViewHit::CopyAll => {
                 self.ensure_text_view_cached();
-                if let Some(txt) = self.cached_text_view.as_ref().map(|c| c.plain_text.clone()) {
-                    if !txt.trim().is_empty() {
-                        match Self::copy_text_to_os_clipboard(&txt) {
-                            Ok(()) => self.status_notice = Some("Copied page text to clipboard".to_string()),
-                            Err(e) => self.status_notice = Some(format!("Copy failed: {e}")),
-                        }
+                let txt = self
+                    .cached_text_view
+                    .as_ref()
+                    .map(|c| c.plain_text.clone())
+                    .unwrap_or_default();
+                if txt.trim().is_empty() {
+                    self.status_notice = Some("No selectable text on this page to copy".to_string());
+                } else {
+                    match Self::copy_text_to_os_clipboard(&txt) {
+                        Ok(()) => self.status_notice = Some("Copied page text to clipboard".to_string()),
+                        Err(e) => self.status_notice = Some(format!("Copy failed: {e}")),
                     }
                 }
             }

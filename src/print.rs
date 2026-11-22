@@ -20,6 +20,54 @@ pub const PRINT_STRIP_ROWS: u32 = 256;
 /// Prefix of the temporary PDFs handed to `lp`.
 const TEMP_PRINT_PREFIX: &str = "micropdf_print_";
 
+/// Monotonic counter so rapid temp print file creations within the same OS clock tick never collide.
+static TEMP_PRINT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn create_private_temp_print_file(dir: &Path) -> Result<(PathBuf, std::fs::File)> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = TEMP_PRINT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = dir.join(format!(
+        "{TEMP_PRINT_PREFIX}{}_{nanos}_{seq}.pdf",
+        std::process::id()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(&path)
+        .with_context(|| format!("Failed to create temporary print PDF {path:?}"))?;
+    Ok((path, file))
+}
+
+/// Prepares page slots and collate mode for Windows GDI multi-copy duplex printing.
+/// When printing >1 copy in hardware duplex (non-booklet), forces collated order (so uncollated
+/// never puts Page 1 on both sides of Sheet 1) and pads an odd page count with a trailing blank
+/// page (`None`) so Copy 2 Page 1 begins on a fresh physical sheet instead of Copy 1's last back.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub fn prepare_windows_duplex_slots(
+    slots: &[Option<u16>],
+    copies: u16,
+    duplex: DuplexMode,
+    render_opts: PrintRenderOptions,
+) -> (Vec<Option<u16>>, PrintRenderOptions) {
+    let mut out_slots = slots.to_vec();
+    let mut out_opts = render_opts;
+    if duplex != DuplexMode::Off && copies > 1 && !render_opts.booklet {
+        out_opts.collate = true;
+        if out_slots.len() % 2 == 1 {
+            out_slots.push(None);
+        }
+    }
+    (out_slots, out_opts)
+}
+
 #[cfg_attr(not(any(windows, test)), allow(dead_code))] // GDI printing is Windows-only
 /// Where a page goes on the printable area, in device pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -505,6 +553,64 @@ where
     )
 }
 
+/// Like `compute_effective_crop_box`, but when `auto_trim` is enabled and vector object bounds
+/// cover >=90% of the page (typical of full-page scans), renders a tiny ~160 px probe bitmap to
+/// detect actual ink margins accurately on scanned PDFs with minimal transient RAM (~100 KB).
+pub fn compute_effective_crop_box_with_scan(
+    engine: &PdfEngine,
+    page: &PdfPage,
+    auto_trim: bool,
+    zoom_percent: u16,
+    include_annotations: bool,
+) -> (f32, f32, f32, f32) {
+    if auto_trim {
+        let pw = page.width().value.max(1.0);
+        let ph = page.height().value.max(1.0);
+        let (ox0, oy0, ox1, oy1) = PdfEngine::compute_page_content_bounds(page);
+        let obj_covers_most = (ox1 - ox0) >= pw * 0.90 && (oy1 - oy0) >= ph * 0.90;
+        if obj_covers_most {
+            let max_dim = 160.0f32;
+            let scale = (max_dim / pw.max(ph)).min(1.0);
+            let bw = ((pw * scale).round() as u32).clamp(16, 160);
+            let bh = ((ph * scale).round() as u32).clamp(16, 160);
+            let mut probe = vec![0x00FF_FFFFu32; (bw as usize) * (bh as usize)];
+            let cfg = PdfRenderConfig::new()
+                .set_fixed_width(bw as i32)
+                .set_fixed_height(bh as i32)
+                .render_form_data(false)
+                .render_annotations(include_annotations)
+                .limit_render_image_cache_size(true)
+                .set_reverse_byte_order(false);
+            let rendered_ok = {
+                let byte_slice: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(probe.as_mut_ptr() as *mut u8, probe.len() * 4)
+                };
+                unsafe {
+                    PdfBitmap::from_bytes(
+                        bw as i32,
+                        bh as i32,
+                        PdfBitmapFormat::BGRx,
+                        byte_slice,
+                        engine.pdfium.bindings(),
+                    )
+                }
+                .ok()
+                .and_then(|mut bmp| page.render_into_bitmap_with_config(&mut bmp, &cfg).ok())
+                .is_some()
+            };
+            if rendered_ok {
+                return compute_effective_crop_box(
+                    page,
+                    auto_trim,
+                    zoom_percent,
+                    Some((&probe, bw, bh)),
+                );
+            }
+        }
+    }
+    compute_effective_crop_box(page, auto_trim, zoom_percent, None)
+}
+
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 #[allow(clippy::too_many_arguments)]
 pub fn render_page_in_horizontal_strips_with_options<F>(
@@ -534,7 +640,7 @@ where
     drop(page);
 
     let copy = engine
-        .flattened_page_copy(doc, page_idx)
+        .flattened_page_copy_with_opts(doc, page_idx, opts.include_annotations)
         .context("Failed to prepare a form page for printing")?;
     let copied = copy.pages().get(0).context("Print copy has no page")?;
     render_strips_of_page(engine, copied, args, strip_buf, on_strip)
@@ -559,8 +665,13 @@ where
     F: FnMut(u32, u32, u32, u32, &[u32]) -> Result<()>,
 {
     let page_h_pts = page.height().value.max(1.0);
-    let (crop_x0, crop_y0, crop_x1, crop_y1) =
-        compute_effective_crop_box(&page, opts.auto_trim_margins, opts.zoom_percent, None);
+    let (crop_x0, crop_y0, crop_x1, crop_y1) = compute_effective_crop_box_with_scan(
+        engine,
+        &page,
+        opts.auto_trim_margins,
+        opts.zoom_percent,
+        opts.include_annotations,
+    );
     let eff_w_pts = (crop_x1 - crop_x0).max(1.0);
     let eff_h_pts = (crop_y1 - crop_y0).max(1.0);
     let placement = place_page_on_printable_area(
@@ -769,7 +880,12 @@ pub fn parse_lpstat_output(output: &str) -> (Vec<String>, usize) {
 #[cfg_attr(windows, allow(dead_code))] // CUPS printing is macOS/Linux-only
 /// Lists CUPS printers with `lpstat -p -d`.
 pub fn discover_cups_printers() -> (Vec<String>, usize) {
-    match std::process::Command::new("lpstat").args(["-p", "-d"]).output() {
+    match std::process::Command::new("lpstat")
+        .args(["-p", "-d"])
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+    {
         Ok(out) => parse_lpstat_output(&String::from_utf8_lossy(&out.stdout)),
         Err(_) => (Vec::new(), 0),
     }
@@ -861,17 +977,7 @@ pub fn write_pages_to_temp_pdf(
         Some(dest)
     };
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = dir.join(format!("{TEMP_PRINT_PREFIX}{}_{nanos}.pdf", std::process::id()));
-    // create_new: never write through an existing file or symlink of the same name.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("Failed to create temporary print PDF {path:?}"))?;
+    let (path, mut file) = create_private_temp_print_file(dir)?;
     let temp = TempPrintFile { path };
 
     match &subset_doc {
@@ -936,16 +1042,7 @@ pub fn write_optional_pages_to_temp_pdf(
         }
     }
 
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let path = dir.join(format!("{TEMP_PRINT_PREFIX}{}_{nanos}.pdf", std::process::id()));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .with_context(|| format!("Failed to create temporary print PDF {path:?}"))?;
+    let (path, mut file) = create_private_temp_print_file(dir)?;
     let temp = TempPrintFile { path };
     write_doc_for_print(&dest, redacted, &mut file)?;
     drop(file);
@@ -1123,6 +1220,9 @@ pub struct CupsPrintExtendedRequest<'a> {
 fn apply_crop_boxes_to_temp_pdf(pdf_path: &Path, crop_boxes: &[(f32, f32, f32, f32)]) -> Result<()> {
     let raw = std::fs::read(pdf_path).context("Failed to read temp print PDF for margin trim")?;
     let mut ldoc = lopdf::Document::load_mem(&raw).context("lopdf could not open temp print PDF")?;
+    if ldoc.is_encrypted() {
+        return Ok(());
+    }
     let pages = ldoc.get_pages();
     for ((_pnum, page_id), &(x0, y0, x1, y1)) in pages.iter().zip(crop_boxes.iter()) {
         if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(*page_id) {
@@ -1143,21 +1243,60 @@ fn apply_crop_boxes_to_temp_pdf(pdf_path: &Path, crop_boxes: &[(f32, f32, f32, f
     Ok(())
 }
 
-/// Removes all `/Annots` entries from every page of the temporary print PDF so CUPS prints
-/// without any highlights, sticky notes, shapes, or markup annotations (original file untouched).
+/// Removes non-Widget `/Annots` entries from every page of the temporary print PDF so CUPS prints
+/// without highlights, sticky notes, shapes, or markup annotations while preserving filled form
+/// fields (`/Subtype /Widget`). Original file is untouched.
 #[cfg_attr(windows, allow(dead_code))]
 fn strip_annotations_from_temp_pdf(pdf_path: &Path) -> Result<()> {
     let raw = std::fs::read(pdf_path).context("Failed to read temp print PDF for annotation strip")?;
     let mut ldoc = lopdf::Document::load_mem(&raw).context("lopdf could not open temp print PDF")?;
-    let pages = ldoc.get_pages();
-    for (_pnum, page_id) in pages {
-        if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(page_id) {
-            let _ = dict.remove(b"Annots");
+    if ldoc.is_encrypted() {
+        return Ok(());
+    }
+    let mut changed = false;
+    let pages: Vec<lopdf::ObjectId> = ldoc.get_pages().into_values().collect();
+    for page_id in pages {
+        let annots_items: Option<Vec<lopdf::Object>> = ldoc
+            .get_dictionary(page_id)
+            .ok()
+            .and_then(|d| d.get(b"Annots").ok())
+            .and_then(|obj| match obj {
+                lopdf::Object::Reference(r) => ldoc.get_object(*r).and_then(|o| o.as_array()).ok().cloned(),
+                lopdf::Object::Array(a) => Some(a.clone()),
+                _ => None,
+            });
+        let Some(items) = annots_items else { continue };
+        let orig_len = items.len();
+        let kept: Vec<lopdf::Object> = items
+            .into_iter()
+            .filter(|item| {
+                let dict_opt = match item {
+                    lopdf::Object::Reference(r) => ldoc.get_dictionary(*r).ok(),
+                    lopdf::Object::Dictionary(d) => Some(d),
+                    _ => None,
+                };
+                dict_opt
+                    .and_then(|d| d.get(b"Subtype").ok())
+                    .and_then(|s| s.as_name().ok())
+                    .is_some_and(|name| name == b"Widget")
+            })
+            .collect();
+        if kept.len() != orig_len {
+            if let Ok(lopdf::Object::Dictionary(dict)) = ldoc.get_object_mut(page_id) {
+                if kept.is_empty() {
+                    let _ = dict.remove(b"Annots");
+                } else {
+                    dict.set("Annots", lopdf::Object::Array(kept));
+                }
+                changed = true;
+            }
         }
     }
-    let mut out = Vec::with_capacity(raw.len());
-    ldoc.save_to(&mut out).context("lopdf could not save annotation-free temp print PDF")?;
-    std::fs::write(pdf_path, &out).context("Failed to write annotation-free temp print PDF")?;
+    if changed {
+        let mut out = Vec::with_capacity(raw.len());
+        ldoc.save_to(&mut out).context("lopdf could not save annotation-free temp print PDF")?;
+        std::fs::write(pdf_path, &out).context("Failed to write annotation-free temp print PDF")?;
+    }
     Ok(())
 }
 
@@ -1167,6 +1306,9 @@ fn strip_annotations_from_temp_pdf(pdf_path: &Path) -> Result<()> {
 fn ensure_annotations_printable_in_temp_pdf(pdf_path: &Path) -> Result<()> {
     let raw = std::fs::read(pdf_path)?;
     let mut ldoc = lopdf::Document::load_mem(&raw)?;
+    if ldoc.is_encrypted() {
+        return Ok(());
+    }
     let mut changed = false;
     let mut annot_ids = Vec::new();
     for (_pnum, page_id) in ldoc.get_pages() {
@@ -1232,9 +1374,30 @@ pub fn start_cups_print_extended(
     let copies = req.copies.clamp(1, 99);
     let temp = write_optional_pages_to_temp_pdf(engine, doc, &effective_slots, redacted, temp_dir)?;
 
+    // Check via PDFium whether any selected page actually has annotations before invoking lopdf,
+    // avoiding a full-PDF RAM spike when printing ordinary unannotated documents.
+    let mut has_any_annots = false;
+    let mut has_non_widget_annots = false;
+    for p_idx in effective_slots.iter().flatten().copied() {
+        if let Ok(page) = doc.pages().get(p_idx) {
+            if !page.annotations().is_empty() {
+                has_any_annots = true;
+                if page
+                    .annotations()
+                    .iter()
+                    .any(|a| a.annotation_type() != PdfPageAnnotationType::Widget)
+                {
+                    has_non_widget_annots = true;
+                    break;
+                }
+            }
+        }
+    }
     if !req.render_opts.include_annotations {
-        let _ = strip_annotations_from_temp_pdf(temp.path());
-    } else {
+        if has_non_widget_annots {
+            let _ = strip_annotations_from_temp_pdf(temp.path());
+        }
+    } else if has_any_annots {
         let _ = ensure_annotations_printable_in_temp_pdf(temp.path());
     }
 
@@ -1244,11 +1407,12 @@ pub fn start_cups_print_extended(
             match slot {
                 Some(p_idx) => {
                     if let Ok(page) = doc.pages().get(*p_idx) {
-                        boxes.push(compute_effective_crop_box(
+                        boxes.push(compute_effective_crop_box_with_scan(
+                            engine,
                             &page,
                             req.render_opts.auto_trim_margins,
                             req.render_opts.zoom_percent,
-                            None,
+                            req.render_opts.include_annotations,
                         ));
                     }
                 }
@@ -1280,10 +1444,9 @@ pub fn start_cups_print_extended(
             .arg(if req.render_opts.collate { "Collate=True" } else { "Collate=False" });
     }
     if req.render_opts.booklet {
-        cmd.arg("-o")
-            .arg("number-up=2")
-            .arg("-o")
-            .arg("orientation-requested=4");
+        // CUPS `number-up=2` already rotates portrait pairs onto a landscape sheet; passing
+        // `orientation-requested=4` on top causes double-rotation on macOS/CUPS drivers.
+        cmd.arg("-o").arg("number-up=2");
     } else {
         match req.render_opts.orientation {
             PrintOrientation::Auto => {}
@@ -1688,6 +1851,8 @@ pub mod gdi {
 
     const DM_ORIENTATION: u32 = 0x0000_0001;
     const DM_PAPERSIZE: u32 = 0x0000_0002;
+    const DM_PAPERLENGTH: u32 = 0x0000_0004;
+    const DM_PAPERWIDTH: u32 = 0x0000_0008;
     const DM_COPIES: u32 = 0x0000_0100;
     const DM_DUPLEX: u32 = 0x0000_1000;
     const DMORIENT_PORTRAIT: i16 = 1;
@@ -1710,6 +1875,7 @@ pub mod gdi {
     const PRINTER_ENUM_LOCAL: u32 = 0x0000_0002;
     const PRINTER_ENUM_CONNECTIONS: u32 = 0x0000_0004;
     const GMEM_MOVEABLE: u32 = 0x0002;
+    const GMEM_ZEROINIT: u32 = 0x0040;
 
     // commdlg.h packs its structs to 1 byte on 32-bit Windows only.
     #[cfg_attr(target_pointer_width = "32", repr(C, packed))]
@@ -1890,14 +2056,17 @@ pub mod gdi {
             EnumPrintersW(flags, std::ptr::null(), 4, std::ptr::null_mut(), 0, &mut needed, &mut returned);
         }
         if needed > 0 {
-            let mut buf = vec![0u8; needed as usize];
+            // Allocate 8-byte aligned backing storage for PrinterInfo4W structs.
+            let words = (needed as usize).div_ceil(std::mem::size_of::<u64>());
+            let mut buf = vec![0u64; words];
+            let buf_bytes = (buf.len() * std::mem::size_of::<u64>()) as u32;
             let ok = unsafe {
                 EnumPrintersW(
                     flags,
                     std::ptr::null(),
                     4,
-                    buf.as_mut_ptr(),
-                    needed,
+                    buf.as_mut_ptr() as *mut u8,
+                    buf_bytes,
                     &mut needed,
                     &mut returned,
                 )
@@ -1970,8 +2139,9 @@ pub mod gdi {
 
         let mut h_dev_mode: *mut c_void = std::ptr::null_mut();
         if dm_size > 0 && (dm_size as usize) >= std::mem::size_of::<DevModeWPrefix>() {
-            h_dev_mode = unsafe { GlobalAlloc(GMEM_MOVEABLE, dm_size as usize) };
+            h_dev_mode = unsafe { GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, dm_size as usize) };
             if !h_dev_mode.is_null() {
+                let mut devmode_valid = false;
                 unsafe {
                     let dm_ptr = GlobalLock(h_dev_mode);
                     if !dm_ptr.is_null() {
@@ -2004,10 +2174,12 @@ pub mod gdi {
                                 PrintPaperSize::Statement => Some(DMPAPER_STATEMENT),
                             };
                             if let Some(pcode) = dm_paper {
-                                (*dm).dm_fields |= DM_PAPERSIZE;
+                                (*dm).dm_fields = ((*dm).dm_fields
+                                    & !(DM_PAPERLENGTH | DM_PAPERWIDTH))
+                                    | DM_PAPERSIZE;
                                 (*dm).dm_paper_size = pcode;
                             }
-                            let _ = DocumentPropertiesW(
+                            let apply_res = DocumentPropertiesW(
                                 std::ptr::null_mut(),
                                 h_printer,
                                 name_w.as_ptr(),
@@ -2015,8 +2187,13 @@ pub mod gdi {
                                 dm_ptr,
                                 DM_IN_BUFFER | DM_OUT_BUFFER,
                             );
+                            devmode_valid = apply_res > 0;
                         }
                         GlobalUnlock(h_dev_mode);
+                    }
+                    if !devmode_valid {
+                        GlobalFree(h_dev_mode);
+                        h_dev_mode = std::ptr::null_mut();
                     }
                 }
             }
@@ -3193,5 +3370,27 @@ mod tests {
         assert_eq!(md_bk.sheets_per_pass, 2);
         assert_eq!(md_bk.pass1_pages, vec![None, Some(0), Some(5), Some(2)]);
         assert_eq!(md_bk.pass2_pages, vec![Some(3), Some(4), Some(1), None]);
+    }
+
+    #[test]
+    fn test_tier0_prepare_windows_duplex_slots() {
+        let mut opts = PrintRenderOptions::default();
+        opts.collate = false;
+        // 3 pages, 2 copies, hardware duplex -> forced collate + trailing None blank pad
+        let (slots, eff) =
+            prepare_windows_duplex_slots(&[Some(0), Some(1), Some(2)], 2, DuplexMode::LongEdge, opts);
+        assert_eq!(slots, vec![Some(0), Some(1), Some(2), None]);
+        assert!(eff.collate);
+
+        // Single copy in duplex -> no extra padding needed
+        let (slots1, _) =
+            prepare_windows_duplex_slots(&[Some(0), Some(1), Some(2)], 1, DuplexMode::LongEdge, opts);
+        assert_eq!(slots1, vec![Some(0), Some(1), Some(2)]);
+
+        // Simplex 2 copies -> keep uncollated & no blank pad
+        let (slots_sim, eff_sim) =
+            prepare_windows_duplex_slots(&[Some(0), Some(1), Some(2)], 2, DuplexMode::Off, opts);
+        assert_eq!(slots_sim, vec![Some(0), Some(1), Some(2)]);
+        assert!(!eff_sim.collate);
     }
 }
