@@ -889,7 +889,6 @@ fn extract_document_blocks(doc: &PdfDocument) -> Vec<Vec<ExportBlock>> {
 
 /// Detects likely document headings `(0-based page_index, heading_level 0|1, title)` across `doc`
 /// for one-click Bookmark generation on PDFs that lack an outline tree.
-#[allow(dead_code)]
 pub fn detect_document_headings(doc: &PdfDocument) -> Vec<(usize, u8, String)> {
     let pages = extract_document_blocks(doc);
     let mut out = Vec::new();

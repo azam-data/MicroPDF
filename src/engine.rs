@@ -398,6 +398,78 @@ impl AnnotationColor {
     }
 }
 
+/// Information about a clickable/right-clickable markup annotation found on a page.
+#[derive(Clone, Debug)]
+pub struct FoundAnnotationInfo {
+    pub index: usize,
+    pub label: &'static str,
+    pub is_text_editable: bool,
+    pub contents: String,
+}
+
+/// Page sizing mode when converting PNG/JPEG images into a new PDF.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImagePdfFitMode {
+    FitA4,
+    FitLetter,
+    MatchImageSize,
+}
+
+impl ImagePdfFitMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::FitA4 => "Fit A4 (Auto Orient)",
+            Self::FitLetter => "Fit Letter (Auto Orient)",
+            Self::MatchImageSize => "Match Image Size",
+        }
+    }
+}
+
+/// Image output format for `Export -> Export Pages as Images`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ImageExportFormat {
+    Png,
+    Jpeg,
+}
+
+impl ImageExportFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG (Lossless)",
+            Self::Jpeg => "JPEG (Compact)",
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+        }
+    }
+}
+
+/// Extracted metadata & properties shown in `File -> Document Properties...`.
+#[derive(Clone, Debug, Default)]
+pub struct DocumentPropertiesInfo {
+    pub file_name: String,
+    pub file_size_bytes: u64,
+    pub pdf_version: String,
+    pub page_count: u16,
+    pub current_page_size_pt: (f32, f32),
+    pub is_encrypted: bool,
+    pub has_xmp_metadata: bool,
+    pub has_info_dict: bool,
+    pub fonts: Vec<String>,
+    pub title: String,
+    pub author: String,
+    pub subject: String,
+    pub keywords: String,
+    pub creator: String,
+    pub producer: String,
+    pub creation_date: String,
+    pub mod_date: String,
+}
+
 /// Result of `flatten_and_unlock_doc`.
 pub struct FlattenReport {
     pub bytes: Vec<u8>,
@@ -4181,6 +4253,694 @@ impl PdfEngine {
         }
         result
     }
+
+    // =========================================================================
+    // Tier 1.2: Interactive Annotation Inspector & Editor Helpers
+    // =========================================================================
+
+    /// Finds the top-most editable/deletable markup annotation at `(pdf_x, pdf_y)` on `page`.
+    /// Skips interactive form `Widget` and `Link` annotations so form filling and links stay untouched.
+    pub fn find_annotation_at_point(
+        page: &PdfPage,
+        pdf_x: f32,
+        pdf_y: f32,
+    ) -> Option<FoundAnnotationInfo> {
+        let annots: Vec<_> = page.annotations().iter().enumerate().collect();
+        for (idx, annot) in annots.into_iter().rev() {
+            let atype = annot.annotation_type();
+            if matches!(
+                atype,
+                PdfPageAnnotationType::Link
+                    | PdfPageAnnotationType::Widget
+                    | PdfPageAnnotationType::Popup
+            ) {
+                continue;
+            }
+            let Ok(bounds) = annot.bounds() else {
+                continue;
+            };
+            let min_x = bounds.left().value.min(bounds.right().value) - 4.0;
+            let max_x = bounds.left().value.max(bounds.right().value) + 4.0;
+            let min_y = bounds.bottom().value.min(bounds.top().value) - 4.0;
+            let max_y = bounds.bottom().value.max(bounds.top().value) + 4.0;
+            if pdf_x < min_x || pdf_x > max_x || pdf_y < min_y || pdf_y > max_y {
+                continue;
+            }
+            let creator = annot.creator().unwrap_or_default();
+            let (label, is_text_editable) = match atype {
+                PdfPageAnnotationType::Text => ("Sticky Note", true),
+                PdfPageAnnotationType::FreeText => ("Text Box", true),
+                PdfPageAnnotationType::Highlight => ("Highlight", false),
+                PdfPageAnnotationType::Underline => ("Underline", false),
+                PdfPageAnnotationType::Strikeout => ("Strikethrough", false),
+                PdfPageAnnotationType::Ink => ("Ink Pen", false),
+                PdfPageAnnotationType::Square => ("Rectangle", false),
+                PdfPageAnnotationType::Circle => ("Circle", false),
+                PdfPageAnnotationType::Line => ("Line", false),
+                PdfPageAnnotationType::Stamp => match creator.as_str() {
+                    "MicroPDF:StickyNote" => ("Sticky Note", true),
+                    "MicroPDF:FreeText" => ("Text Box", true),
+                    "MicroPDF:Highlight" => ("Highlight", false),
+                    "MicroPDF:Underline" => ("Underline", false),
+                    "MicroPDF:Strikeout" => ("Strikethrough", false),
+                    "MicroPDF:Ink" => ("Ink Pen", false),
+                    "MicroPDF:Rect" => ("Rectangle", false),
+                    "MicroPDF:Arrow" => ("Arrow", false),
+                    _ => ("Stamp", false),
+                },
+                _ => ("Annotation", false),
+            };
+            return Some(FoundAnnotationInfo {
+                index: idx,
+                label,
+                is_text_editable,
+                contents: annot.contents().unwrap_or_default().trim().to_string(),
+            });
+        }
+        None
+    }
+
+    /// Deletes the annotation at `annot_index` on `page_index`.
+    pub fn delete_annotation_at(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+    ) -> Result<()> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let annot = page.annotations_mut().get(annot_index)?;
+        page.annotations_mut().delete_annotation(annot)?;
+        Ok(())
+    }
+
+    /// Updates the text contents of a Sticky Note or Text Box annotation at `annot_index`.
+    /// For `MicroPDF:FreeText` stamps, rebuilds the visible text box at the same anchor so width/height reflows cleanly.
+    pub fn update_annotation_contents(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+        new_text: &str,
+        fallback_color: AnnotationColor,
+    ) -> Result<()> {
+        let trimmed = new_text.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Annotation text cannot be empty");
+        }
+        let recreate_freetext: Option<(f32, f32, PdfColor)> = {
+            let page = doc.pages().get(page_index)?;
+            let annot = page.annotations().get(annot_index)?;
+            let creator = annot.creator().unwrap_or_default();
+            if annot.annotation_type() == PdfPageAnnotationType::Stamp
+                && creator == "MicroPDF:FreeText"
+            {
+                let bounds = annot.bounds()?;
+                let anchor_x = bounds.left().value.min(bounds.right().value) + 3.0;
+                let anchor_y = (bounds.top().value.max(bounds.bottom().value) - 14.0).max(8.0);
+                let color = annot
+                    .as_stamp_annotation()
+                    .and_then(|s| {
+                        s.objects()
+                            .iter()
+                            .find_map(|o| o.fill_color().ok())
+                    })
+                    .unwrap_or_else(|| fallback_color.stroke_pdf_color());
+                Some((anchor_x, anchor_y, color))
+            } else {
+                None
+            }
+        };
+
+        if let Some((ax, ay, color)) = recreate_freetext {
+            Self::delete_annotation_at(doc, page_index, annot_index)?;
+            let font = doc.fonts_mut().helvetica();
+            let fsz = 12.0f32;
+            let lines: Vec<&str> = trimmed.split('\n').collect();
+            let line_h = fsz * 1.25;
+            let mut text_objs = Vec::with_capacity(lines.len());
+            let mut min_x = ax.max(4.0);
+            let mut max_x = min_x + 40.0;
+            let mut min_y = (ay - fsz).max(4.0);
+            let mut max_y = ay + fsz * 0.9;
+            for (i, line) in lines.iter().enumerate() {
+                let mut tobj = PdfPageTextObject::new(doc, *line, font, PdfPoints::new(fsz))?;
+                let _ = tobj.set_fill_color(color);
+                let y = (ay - (i as f32) * line_h).max(8.0);
+                tobj.translate(PdfPoints::new(ax.max(4.0)), PdfPoints::new(y))?;
+                if let Ok(b) = tobj.bounds() {
+                    min_x = min_x.min(b.left().value);
+                    max_x = max_x.max(b.right().value);
+                    min_y = min_y.min(b.bottom().value);
+                    max_y = max_y.max(b.top().value);
+                }
+                text_objs.push(tobj);
+            }
+            let bounds = PdfRect::new_from_values(
+                (min_y - 3.0).max(2.0),
+                (min_x - 3.0).max(2.0),
+                max_y + 3.0,
+                max_x + 4.0,
+            );
+            let mut page = doc.pages_mut().get(page_index)?;
+            let mut annot = page.annotations_mut().create_stamp_annotation()?;
+            let _ = annot.set_is_printed(true);
+            let _ = annot.set_bounds(bounds);
+            let _ = annot.set_creator("MicroPDF:FreeText");
+            let _ = annot.set_contents(trimmed);
+            for tobj in text_objs {
+                annot.objects_mut().add_text_object(tobj)?;
+            }
+            return Ok(());
+        }
+
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        annot.set_contents(trimmed)?;
+        Ok(())
+    }
+
+    /// Recolors an annotation at `annot_index` on `page_index` to `color`.
+    pub fn recolor_annotation_at(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+        color: AnnotationColor,
+    ) -> Result<()> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        let creator = annot.creator().unwrap_or_default();
+        let (r, g, b) = color.rgb();
+        let stroke = color.stroke_pdf_color();
+        let highlight = color.highlight_pdf_color();
+
+        if let Some(stamp) = annot.as_stamp_annotation_mut() {
+            match creator.as_str() {
+                "MicroPDF:StickyNote" => {
+                    let fill = PdfColor::new(r, g, b, 235);
+                    if let Some(mut first) = stamp.objects_mut().iter().next() {
+                        let _ = first.set_fill_color(fill);
+                        let _ = first.set_stroke_color(stroke);
+                    }
+                }
+                "MicroPDF:Highlight" => {
+                    for mut obj in stamp.objects_mut().iter() {
+                        let _ = obj.set_fill_color(highlight);
+                    }
+                }
+                "MicroPDF:FreeText" => {
+                    for mut obj in stamp.objects_mut().iter() {
+                        let _ = obj.set_fill_color(stroke);
+                    }
+                }
+                "MicroPDF:Underline" | "MicroPDF:Strikeout" | "MicroPDF:Ink" | "MicroPDF:Rect" => {
+                    for mut obj in stamp.objects_mut().iter() {
+                        let _ = obj.set_stroke_color(stroke);
+                    }
+                }
+                "MicroPDF:Arrow" => {
+                    for (i, mut obj) in stamp.objects_mut().iter().enumerate() {
+                        let _ = obj.set_stroke_color(stroke);
+                        if i > 0 {
+                            let _ = obj.set_fill_color(stroke);
+                        }
+                    }
+                }
+                _ => {
+                    for mut obj in stamp.objects_mut().iter() {
+                        let _ = obj.set_stroke_color(stroke);
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        match annot.annotation_type() {
+            PdfPageAnnotationType::Highlight => {
+                let _ = annot.set_stroke_color(highlight);
+                let _ = annot.set_fill_color(highlight);
+            }
+            _ => {
+                let _ = annot.set_stroke_color(stroke);
+                let _ = annot.set_fill_color(PdfColor::new(r, g, b, 235));
+            }
+        }
+        Ok(())
+    }
+
+    // =========================================================================
+    // Tier 1.3: Create PDF from Images & Export Pages as PNG/JPEG
+    // =========================================================================
+
+    /// Builds a clean multi-page PDF document from `images` (PNG, JPEG, BMP, WebP, GIF, TIFF)
+    /// using pure Rust (`image` + `lopdf`) with zero new dependencies.
+    pub fn create_pdf_from_images(
+        images: &[PathBuf],
+        fit_mode: ImagePdfFitMode,
+    ) -> Result<Vec<u8>> {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+
+        if images.is_empty() {
+            anyhow::bail!("Select at least one image to create a PDF");
+        }
+
+        let mut doc = lopdf::Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let mut page_kids: Vec<lopdf::Object> = Vec::with_capacity(images.len());
+
+        for path in images {
+            let dyn_img = image::open(path)
+                .with_context(|| format!("Failed to decode image '{}'", path.display()))?;
+            let rgba = dyn_img.to_rgba8();
+            let (iw, ih) = rgba.dimensions();
+            if iw == 0 || ih == 0 {
+                anyhow::bail!("Image '{}' has zero dimensions", path.display());
+            }
+
+            // Composite any alpha over white paper so transparent PNGs never turn black in PDF.
+            let mut rgb = Vec::with_capacity((iw as usize) * (ih as usize) * 3);
+            for p in rgba.pixels() {
+                let a = p[3] as u32;
+                if a == 255 {
+                    rgb.push(p[0]);
+                    rgb.push(p[1]);
+                    rgb.push(p[2]);
+                } else {
+                    let inv = 255 - a;
+                    rgb.push(((p[0] as u32 * a + 255 * inv + 127) / 255) as u8);
+                    rgb.push(((p[1] as u32 * a + 255 * inv + 127) / 255) as u8);
+                    rgb.push(((p[2] as u32 * a + 255 * inv + 127) / 255) as u8);
+                }
+            }
+
+            let is_jpeg_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("jpg") || e.eq_ignore_ascii_case("jpeg"));
+
+            let (encoded_bytes, filter_name) = if is_jpeg_ext {
+                let mut jpg = Vec::new();
+                let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 90);
+                enc.encode(&rgb, iw, ih, image::ExtendedColorType::Rgb8)
+                    .context("Failed to encode JPEG stream for PDF")?;
+                (jpg, b"DCTDecode".as_slice())
+            } else {
+                let mut z = ZlibEncoder::new(Vec::new(), Compression::default());
+                z.write_all(&rgb)?;
+                let compressed = z.finish()?;
+                if compressed.len() > 4 * 1024 * 1024 {
+                    let mut jpg = Vec::new();
+                    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpg, 92);
+                    if enc
+                        .encode(&rgb, iw, ih, image::ExtendedColorType::Rgb8)
+                        .is_ok()
+                        && jpg.len() < compressed.len()
+                    {
+                        (jpg, b"DCTDecode".as_slice())
+                    } else {
+                        (compressed, b"FlateDecode".as_slice())
+                    }
+                } else {
+                    (compressed, b"FlateDecode".as_slice())
+                }
+            };
+
+            let mut img_dict = lopdf::Dictionary::new();
+            img_dict.set("Type", lopdf::Object::Name(b"XObject".to_vec()));
+            img_dict.set("Subtype", lopdf::Object::Name(b"Image".to_vec()));
+            img_dict.set("Width", lopdf::Object::Integer(iw as i64));
+            img_dict.set("Height", lopdf::Object::Integer(ih as i64));
+            img_dict.set("ColorSpace", lopdf::Object::Name(b"DeviceRGB".to_vec()));
+            img_dict.set("BitsPerComponent", lopdf::Object::Integer(8));
+            img_dict.set("Filter", lopdf::Object::Name(filter_name.to_vec()));
+            img_dict.set("Length", lopdf::Object::Integer(encoded_bytes.len() as i64));
+            let img_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+                img_dict,
+                encoded_bytes,
+            )));
+
+            let (pw, ph, dx, dy, dw, dh) = match fit_mode {
+                ImagePdfFitMode::FitA4 => {
+                    let (w, h) = if iw > ih { (841.89f32, 595.28f32) } else { (595.28f32, 841.89f32) };
+                    let margin = 24.0f32;
+                    let avail_w = (w - margin * 2.0).max(72.0);
+                    let avail_h = (h - margin * 2.0).max(72.0);
+                    let scale = (avail_w / iw as f32).min(avail_h / ih as f32);
+                    let dw = iw as f32 * scale;
+                    let dh = ih as f32 * scale;
+                    (w, h, (w - dw) * 0.5, (h - dh) * 0.5, dw, dh)
+                }
+                ImagePdfFitMode::FitLetter => {
+                    let (w, h) = if iw > ih { (792.0f32, 612.0f32) } else { (612.0f32, 792.0f32) };
+                    let margin = 24.0f32;
+                    let avail_w = (w - margin * 2.0).max(72.0);
+                    let avail_h = (h - margin * 2.0).max(72.0);
+                    let scale = (avail_w / iw as f32).min(avail_h / ih as f32);
+                    let dw = iw as f32 * scale;
+                    let dh = ih as f32 * scale;
+                    (w, h, (w - dw) * 0.5, (h - dh) * 0.5, dw, dh)
+                }
+                ImagePdfFitMode::MatchImageSize => {
+                    let mut w = (iw as f32) * (72.0 / 96.0);
+                    let mut h = (ih as f32) * (72.0 / 96.0);
+                    let max_dim = 4000.0f32;
+                    if w > max_dim || h > max_dim {
+                        let s = max_dim / w.max(h);
+                        w *= s;
+                        h *= s;
+                    }
+                    let w = w.max(72.0);
+                    let h = h.max(72.0);
+                    (w, h, 0.0f32, 0.0f32, w, h)
+                }
+            };
+
+            let content_ops = format!("q {dw:.2} 0 0 {dh:.2} {dx:.2} {dy:.2} cm /Im0 Do Q\n");
+            let content_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+                lopdf::Dictionary::new(),
+                content_ops.into_bytes(),
+            )));
+
+            let mut xobj_dict = lopdf::Dictionary::new();
+            xobj_dict.set("Im0", lopdf::Object::Reference(img_id));
+            let mut resources = lopdf::Dictionary::new();
+            resources.set("XObject", lopdf::Object::Dictionary(xobj_dict));
+
+            let mut page_dict = lopdf::Dictionary::new();
+            page_dict.set("Type", lopdf::Object::Name(b"Page".to_vec()));
+            page_dict.set("Parent", lopdf::Object::Reference(pages_id));
+            page_dict.set(
+                "MediaBox",
+                lopdf::Object::Array(vec![
+                    lopdf::Object::Real(0.0),
+                    lopdf::Object::Real(0.0),
+                    lopdf::Object::Real(pw),
+                    lopdf::Object::Real(ph),
+                ]),
+            );
+            page_dict.set("Resources", lopdf::Object::Dictionary(resources));
+            page_dict.set("Contents", lopdf::Object::Reference(content_id));
+            let page_id = doc.add_object(lopdf::Object::Dictionary(page_dict));
+            page_kids.push(lopdf::Object::Reference(page_id));
+        }
+
+        let mut pages_dict = lopdf::Dictionary::new();
+        pages_dict.set("Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Count", lopdf::Object::Integer(page_kids.len() as i64));
+        pages_dict.set("Kids", lopdf::Object::Array(page_kids));
+        doc.objects
+            .insert(pages_id, lopdf::Object::Dictionary(pages_dict));
+
+        let mut catalog = lopdf::Dictionary::new();
+        catalog.set("Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        catalog.set("Pages", lopdf::Object::Reference(pages_id));
+        let catalog_id = doc.add_object(lopdf::Object::Dictionary(catalog));
+        doc.trailer
+            .set("Root", lopdf::Object::Reference(catalog_id));
+
+        let mut out = Vec::new();
+        doc.save_to(&mut out)?;
+        Ok(out)
+    }
+
+    /// Exports the specified 0-based `pages` of `doc` as PNG or JPEG images into `out_dir`.
+    /// Returns the number of exported image files.
+    pub fn export_pages_as_images(
+        doc: &PdfDocument,
+        pages: &[u16],
+        dpi: u32,
+        format: ImageExportFormat,
+        out_dir: &Path,
+        stem: &str,
+    ) -> Result<usize> {
+        let total = doc.pages().len();
+        if total == 0 || pages.is_empty() {
+            anyhow::bail!("No pages selected to export");
+        }
+        std::fs::create_dir_all(out_dir)?;
+        let safe_stem: String = stem
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe_stem = if safe_stem.is_empty() {
+            "page".to_string()
+        } else {
+            safe_stem
+        };
+        let dpi_f = (dpi.clamp(72, 600)) as f32;
+        let width_digits = if total >= 1000 { 4 } else if total >= 100 { 3 } else { 2 };
+        let mut exported = 0usize;
+
+        for &p_idx in pages {
+            if p_idx >= total {
+                continue;
+            }
+            let page = doc.pages().get(p_idx)?;
+            let pw = page.width().value.max(1.0);
+            let ph = page.height().value.max(1.0);
+            let px_w = ((pw / 72.0) * dpi_f).round().clamp(16.0, 9600.0) as i32;
+            let px_h = ((ph / 72.0) * dpi_f).round().clamp(16.0, 9600.0) as i32;
+            let render_cfg = PdfRenderConfig::new()
+                .set_target_width(px_w)
+                .set_target_height(px_h)
+                .render_form_data(true)
+                .render_annotations(true);
+            let bmp = page.render_with_config(&render_cfg)?;
+            let img = bmp.as_image().to_rgb8();
+            let out_name = format!(
+                "{safe_stem}_p{:0width_digits$}.{}",
+                p_idx + 1,
+                format.extension()
+            );
+            let out_path = out_dir.join(out_name);
+            match format {
+                ImageExportFormat::Png => {
+                    img.save_with_format(&out_path, image::ImageFormat::Png)
+                        .with_context(|| format!("Failed to write '{}'", out_path.display()))?;
+                }
+                ImageExportFormat::Jpeg => {
+                    let mut f = std::fs::File::create(&out_path)
+                        .with_context(|| format!("Failed to create '{}'", out_path.display()))?;
+                    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut f, 90);
+                    enc.encode(
+                        img.as_raw(),
+                        img.width(),
+                        img.height(),
+                        image::ExtendedColorType::Rgb8,
+                    )
+                    .with_context(|| format!("Failed to encode '{}'", out_path.display()))?;
+                }
+            }
+            exported += 1;
+        }
+        Ok(exported)
+    }
+
+    // =========================================================================
+    // Tier 1.4: Document Properties Inspector & Privacy Metadata Scrubber
+    // =========================================================================
+
+    fn decode_pdf_string_bytes(bytes: &[u8]) -> String {
+        if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
+            let units: Vec<u16> = bytes[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect();
+            return String::from_utf16_lossy(&units)
+                .trim_matches('\0')
+                .trim()
+                .to_string();
+        }
+        if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
+            return String::from_utf8_lossy(&bytes[3..]).trim().to_string();
+        }
+        match std::str::from_utf8(bytes) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => bytes.iter().map(|&b| b as char).collect::<String>().trim().to_string(),
+        }
+    }
+
+    fn format_pdf_date(raw: &str) -> String {
+        let s = raw.trim().strip_prefix("D:").unwrap_or(raw.trim());
+        let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() >= 12 {
+            format!(
+                "{}-{}-{} {}:{}",
+                &digits[0..4],
+                &digits[4..6],
+                &digits[6..8],
+                &digits[8..10],
+                &digits[10..12]
+            )
+        } else if digits.len() >= 8 {
+            format!("{}-{}-{}", &digits[0..4], &digits[4..6], &digits[6..8])
+        } else {
+            raw.trim().to_string()
+        }
+    }
+
+    /// Inspects document metadata, version, encryption, fonts, and XMP status from serialized PDF bytes.
+    pub fn inspect_document_properties_from_bytes(
+        bytes: &[u8],
+        file_name: &str,
+        page_count: u16,
+        current_page_size_pt: (f32, f32),
+    ) -> DocumentPropertiesInfo {
+        let mut info = DocumentPropertiesInfo {
+            file_name: file_name.to_string(),
+            file_size_bytes: bytes.len() as u64,
+            pdf_version: "1.4".to_string(),
+            page_count,
+            current_page_size_pt,
+            ..Default::default()
+        };
+
+        let Ok(ldoc) = lopdf::Document::load_mem(bytes) else {
+            return info;
+        };
+        info.pdf_version = ldoc.version.clone();
+        info.is_encrypted = ldoc.is_encrypted();
+        if info.page_count == 0 {
+            info.page_count = ldoc.get_pages().len() as u16;
+        }
+        if let Ok(cat) = ldoc.catalog() {
+            info.has_xmp_metadata = cat.get(b"Metadata").is_ok();
+        }
+
+        // Read trailer /Info dictionary fields
+        let info_dict = ldoc.trailer.get(b"Info").ok().and_then(|obj| match obj {
+            lopdf::Object::Reference(id) => ldoc.get_dictionary(*id).ok(),
+            lopdf::Object::Dictionary(d) => Some(d),
+            _ => None,
+        });
+        if let Some(d) = info_dict {
+            info.has_info_dict = !d.is_empty();
+            let read_str = |key: &[u8]| -> String {
+                d.get(key)
+                    .ok()
+                    .and_then(|o| match o {
+                        lopdf::Object::String(b, _) => Some(Self::decode_pdf_string_bytes(b)),
+                        lopdf::Object::Reference(id) => match ldoc.get_object(*id) {
+                            Ok(lopdf::Object::String(b, _)) => {
+                                Some(Self::decode_pdf_string_bytes(b))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    })
+                    .unwrap_or_default()
+            };
+            info.title = read_str(b"Title");
+            info.author = read_str(b"Author");
+            info.subject = read_str(b"Subject");
+            info.keywords = read_str(b"Keywords");
+            info.creator = read_str(b"Creator");
+            info.producer = read_str(b"Producer");
+            info.creation_date = Self::format_pdf_date(&read_str(b"CreationDate"));
+            info.mod_date = Self::format_pdf_date(&read_str(b"ModDate"));
+        }
+
+        // Collect unique font BaseFont names (bounded to first 16 for clean display)
+        let mut fonts = Vec::new();
+        for obj in ldoc.objects.values() {
+            if let lopdf::Object::Dictionary(d) = obj {
+                let is_font = matches!(d.get(b"Type"), Ok(lopdf::Object::Name(n)) if n == b"Font");
+                if is_font {
+                    if let Ok(lopdf::Object::Name(base)) = d.get(b"BaseFont") {
+                        let raw_name = String::from_utf8_lossy(base);
+                        let clean = raw_name
+                            .split_once('+')
+                            .map(|(_, r)| r)
+                            .unwrap_or(&raw_name)
+                            .to_string();
+                        if !clean.is_empty() && !fonts.contains(&clean) {
+                            fonts.push(clean);
+                            if fonts.len() >= 16 {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fonts.sort();
+        info.fonts = fonts;
+        info
+    }
+
+    /// Convenience wrapper inspecting the active in-memory `PdfDocument`.
+    pub fn inspect_document_properties(
+        doc: &PdfDocument,
+        path: &Path,
+        current_page_idx: u16,
+    ) -> DocumentPropertiesInfo {
+        let fname = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document.pdf")
+            .to_string();
+        let page_count = doc.pages().len();
+        let page_size = doc
+            .pages()
+            .get(current_page_idx.min(page_count.saturating_sub(1)))
+            .map(|p| (p.width().value, p.height().value))
+            .unwrap_or((595.28, 841.89));
+        let bytes = doc.save_to_bytes().unwrap_or_default();
+        let mut props = Self::inspect_document_properties_from_bytes(
+            &bytes,
+            &fname,
+            page_count,
+            page_size,
+        );
+        if let Ok(meta) = std::fs::metadata(path) {
+            props.file_size_bytes = meta.len();
+        }
+        props
+    }
+
+    /// Strips all personal metadata (`/Info`, Catalog `/Metadata` XMP, `/PieceInfo`, and page-level
+    /// `/Metadata` & `/PieceInfo`) from serialized PDF bytes while preserving all content, bookmarks, and page labels.
+    pub fn scrub_document_metadata_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
+        let mut ldoc = lopdf::Document::load_mem(bytes)?;
+        if ldoc.is_encrypted() {
+            anyhow::bail!("Cannot scrub metadata on an encrypted PDF (use Flatten & Unlock first)");
+        }
+        if let Ok(lopdf::Object::Reference(info_id)) = ldoc.trailer.get(b"Info").cloned() {
+            ldoc.objects.remove(&info_id);
+        }
+        ldoc.trailer.remove(b"Info");
+
+        let mut orphan_ids = Vec::new();
+        if let Ok(cat) = ldoc.catalog_mut() {
+            for key in [b"Metadata".as_slice(), b"PieceInfo".as_slice()] {
+                if let Some(lopdf::Object::Reference(id)) = cat.remove(key) {
+                    orphan_ids.push(id);
+                }
+            }
+        }
+        let page_ids: Vec<lopdf::ObjectId> = ldoc.get_pages().values().copied().collect();
+        for pid in page_ids {
+            if let Ok(lopdf::Object::Dictionary(pdict)) = ldoc.get_object_mut(pid) {
+                for key in [b"Metadata".as_slice(), b"PieceInfo".as_slice()] {
+                    if let Some(lopdf::Object::Reference(id)) = pdict.remove(key) {
+                        orphan_ids.push(id);
+                    }
+                }
+            }
+        }
+        for id in orphan_ids {
+            ldoc.objects.remove(&id);
+        }
+
+        let mut out = Vec::new();
+        ldoc.save_to(&mut out)?;
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -4685,5 +5445,135 @@ mod tests {
         assert_eq!(parsed[1].title, "Chapter 1");
         assert_eq!(parsed[1].page_index, 1);
         assert_eq!(parsed[2].level, 1);
+    }
+
+    #[test]
+    fn test_tier1_create_pdf_from_images_all_fit_modes() -> Result<()> {
+        let tmp = std::env::temp_dir().join("micropdf_tier1_img_test");
+        let _ = std::fs::create_dir_all(&tmp);
+        let png_path = tmp.join("portrait.png");
+        let jpg_path = tmp.join("landscape.jpg");
+
+        // Transparent portrait PNG (120x240)
+        let png_img = image::RgbaImage::from_pixel(120, 240, image::Rgba([20, 120, 220, 128]));
+        png_img.save_with_format(&png_path, image::ImageFormat::Png)?;
+
+        // Opaque landscape JPEG (320x160)
+        let jpg_img = image::RgbImage::from_pixel(320, 160, image::Rgb([220, 80, 40]));
+        jpg_img.save_with_format(&jpg_path, image::ImageFormat::Jpeg)?;
+
+        for fit in [
+            ImagePdfFitMode::FitA4,
+            ImagePdfFitMode::FitLetter,
+            ImagePdfFitMode::MatchImageSize,
+        ] {
+            let bytes = PdfEngine::create_pdf_from_images(
+                &[png_path.clone(), jpg_path.clone()],
+                fit,
+            )?;
+            let doc = lopdf::Document::load_mem(&bytes)?;
+            let pages = doc.get_pages();
+            assert_eq!(pages.len(), 2, "Expected 2 pages for fit mode {:?}", fit);
+
+            if fit == ImagePdfFitMode::FitA4 {
+                // Page 1 (portrait PNG) -> portrait A4 (w < h); Page 2 (landscape JPG) -> landscape A4 (w > h)
+                let p1 = doc.get_dictionary(pages[&1])?;
+                let p2 = doc.get_dictionary(pages[&2])?;
+                let mb1 = p1.get(b"MediaBox")?.as_array()?;
+                let mb2 = p2.get(b"MediaBox")?.as_array()?;
+                assert!(mb1[2].as_float()? < mb1[3].as_float()?);
+                assert!(mb2[2].as_float()? > mb2[3].as_float()?);
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        Ok(())
+    }
+
+    #[test]
+    fn test_tier1_document_properties_and_privacy_metadata_scrubber() -> Result<()> {
+        // Build a minimal PDF containing /Info, XMP /Metadata, /PieceInfo, /Outlines, and /PageLabels
+        let mut doc = lopdf::Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        let mut pdict = lopdf::Dictionary::new();
+        pdict.set("Type", lopdf::Object::Name(b"Page".to_vec()));
+        pdict.set("Parent", lopdf::Object::Reference(pages_id));
+        pdict.set(
+            "MediaBox",
+            lopdf::Object::Array(vec![0.into(), 0.into(), 595.into(), 842.into()]),
+        );
+        let page_id = doc.add_object(lopdf::Object::Dictionary(pdict));
+        let mut pages_dict = lopdf::Dictionary::new();
+        pages_dict.set("Type", lopdf::Object::Name(b"Pages".to_vec()));
+        pages_dict.set("Kids", lopdf::Object::Array(vec![page_id.into()]));
+        pages_dict.set("Count", lopdf::Object::Integer(1));
+        doc.objects
+            .insert(pages_id, lopdf::Object::Dictionary(pages_dict));
+
+        let xmp_id = doc.add_object(lopdf::Object::Stream(lopdf::Stream::new(
+            lopdf::Dictionary::new(),
+            b"<x:xmpmeta>SecretAuthor</x:xmpmeta>".to_vec(),
+        )));
+        let piece_id = doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
+
+        let mut cat = lopdf::Dictionary::new();
+        cat.set("Type", lopdf::Object::Name(b"Catalog".to_vec()));
+        cat.set("Pages", lopdf::Object::Reference(pages_id));
+        cat.set("Metadata", lopdf::Object::Reference(xmp_id));
+        cat.set("PieceInfo", lopdf::Object::Reference(piece_id));
+        let cat_id = doc.add_object(lopdf::Object::Dictionary(cat));
+        doc.trailer.set("Root", lopdf::Object::Reference(cat_id));
+
+        let mut info_dict = lopdf::Dictionary::new();
+        info_dict.set("Title", lopdf::Object::string_literal("Quarterly Report"));
+        info_dict.set("Author", lopdf::Object::string_literal("Jane Doe"));
+        info_dict.set("Creator", lopdf::Object::string_literal("Writer Pro"));
+        info_dict.set("CreationDate", lopdf::Object::string_literal("D:20261121143000Z"));
+        let info_id = doc.add_object(lopdf::Object::Dictionary(info_dict));
+        doc.trailer.set("Info", lopdf::Object::Reference(info_id));
+
+        let mut raw = Vec::new();
+        doc.save_to(&mut raw)?;
+
+        let inspected = PdfEngine::inspect_document_properties_from_bytes(
+            &raw,
+            "report.pdf",
+            1,
+            (595.0, 842.0),
+        );
+        assert_eq!(inspected.pdf_version, "1.7");
+        assert_eq!(inspected.title, "Quarterly Report");
+        assert_eq!(inspected.author, "Jane Doe");
+        assert_eq!(inspected.creator, "Writer Pro");
+        assert_eq!(inspected.creation_date, "2026-11-21 14:30");
+        assert!(inspected.has_xmp_metadata);
+        assert!(inspected.has_info_dict);
+
+        // Scrub metadata and verify /Info, XMP, and /PieceInfo are completely stripped
+        let scrubbed = PdfEngine::scrub_document_metadata_bytes(&raw)?;
+        let after = PdfEngine::inspect_document_properties_from_bytes(
+            &scrubbed,
+            "report.pdf",
+            1,
+            (595.0, 842.0),
+        );
+        assert!(!after.has_info_dict);
+        assert!(!after.has_xmp_metadata);
+        assert!(after.title.is_empty());
+        assert!(after.author.is_empty());
+
+        let scrubbed_doc = lopdf::Document::load_mem(&scrubbed)?;
+        assert!(!scrubbed_doc.catalog()?.has(b"PieceInfo"));
+        assert!(!scrubbed_doc.catalog()?.has(b"Metadata"));
+        assert!(scrubbed_doc.trailer.get(b"Info").is_err());
+
+        // Encrypted PDF must be refused cleanly
+        let mut enc_doc = lopdf::Document::load_mem(&raw)?;
+        let enc_id = enc_doc.add_object(lopdf::Object::Dictionary(lopdf::Dictionary::new()));
+        enc_doc.trailer.set("Encrypt", lopdf::Object::Reference(enc_id));
+        let mut enc_raw = Vec::new();
+        enc_doc.save_to(&mut enc_raw)?;
+        assert!(PdfEngine::scrub_document_metadata_bytes(&enc_raw).is_err());
+        Ok(())
     }
 }

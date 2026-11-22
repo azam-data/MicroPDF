@@ -1,13 +1,17 @@
-//! Themed Left Bookmark Sidebar (`B`) with crisp proportional typography, Add/Import pill
-//! buttons, active-page accent bar, and hover-revealed delete button.
+//! Themed Left Bookmark Sidebar (`B`) with crisp proportional typography, Add/Import/Export/Auto
+//! action controls, Reorder (Up/Down) & Indent/Outdent controls, active-page accent bar, and hover delete.
 
-use crate::engine::PdfEngine;
+use crate::engine::{Bookmark, PdfEngine};
 use std::path::Path;
 use super::render::fill_rect_clipped;
 use super::state::*;
 use super::ui_draw::*;
 
 impl<'a> PdfViewerApp<'a> {
+    fn bookmark_sidebar_header_height(s: f32) -> u32 {
+        (96.0 * s).round() as u32
+    }
+
     pub(super) fn draw_bookmark_sidebar(
         &self,
         buffer: &mut [u32],
@@ -20,9 +24,11 @@ impl<'a> PdfViewerApp<'a> {
         let theme = self.ui_theme();
         let s = scale_factor as f32;
         let row_h = (28.0 * s).round() as u32;
-        let header_h = (68.0 * s).round() as u32;
+        let header_h = Self::bookmark_sidebar_header_height(s);
         let top_y = top_bars_h as i32;
-        let pad = (10.0 * s).round() as i32;
+        let pad = (8.0 * s).round() as i32;
+        let gap = (4.0 * s).round() as i32;
+        let rad = (4.5 * s).max(3.0);
 
         // Sidebar surface + right divider
         fill_rect_clipped(
@@ -52,34 +58,74 @@ impl<'a> PdfViewerApp<'a> {
 
         let title_sz = (12.0 * s).clamp(10.5, 26.0);
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
-        let sub_sz = (10.5 * s).clamp(9.0, 22.0);
-        draw_text(buffer, buf_w, buf_h, pad, top_y + (10.0 * s).round() as i32, "Bookmarks", title_sz, theme.text_primary, true);
+        let sub_sz = (10.0 * s).clamp(8.5, 20.0);
+        draw_text(buffer, buf_w, buf_h, pad, top_y + (9.0 * s).round() as i32, "Bookmarks", title_sz, theme.text_primary, true);
+        let count_lbl = format!("({})", self.bookmarks.len());
+        let cw = measure_text(&count_lbl, sub_sz, false).ceil() as i32;
+        draw_text(buffer, buf_w, buf_h, sidebar_w as i32 - pad - cw - 2, top_y + (10.0 * s).round() as i32, &count_lbl, sub_sz, theme.text_muted, false);
 
-        // Header action buttons: `+ Add` and `Import .txt`
-        let btn_y = top_y + (34.0 * s).round() as i32;
-        let btn_h = (24.0 * s).round() as u32;
-        let gap = (6.0 * s).round() as i32;
-        let add_w = (62.0 * s).round() as u32;
-        let imp_x = pad + add_w as i32 + gap;
-        let imp_w = sidebar_w.saturating_sub((imp_x + pad + 1) as u32);
-        let rad = (5.0 * s).max(3.0);
+        // Row 1 buttons: `+ Add` | `Import` | `Export` | `Auto`
+        let inner_w = sidebar_w.saturating_sub((pad * 2 + 1) as u32);
+        let btn_h = (22.0 * s).round() as u32;
+        let row1_y = top_y + (32.0 * s).round() as i32;
+        let b1_w = (inner_w.saturating_sub((gap * 3) as u32)) / 4;
+        let row1_btns = [
+            ("+ Add", UiHit::SidebarAdd, true),
+            ("Import", UiHit::SidebarImport, false),
+            ("Export", UiHit::SidebarExport, false),
+            ("Auto", UiHit::SidebarAuto, false),
+        ];
+        for (i, &(lbl, hit, primary)) in row1_btns.iter().enumerate() {
+            let bx = pad + (i as i32) * (b1_w as i32 + gap);
+            let bw = if i == 3 {
+                (sidebar_w as i32 - pad - 1 - bx).max(20) as u32
+            } else {
+                b1_w
+            };
+            let hov = self.hovered_widget == Some(hit);
+            let (bg, fg) = if primary {
+                (if hov { theme.accent_hover } else { theme.accent }, theme.text_on_accent)
+            } else {
+                (if hov { theme.hover_bg } else { theme.surface_elevated }, theme.text_secondary)
+            };
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, row1_y, bw, btn_h, rad, bg);
+            if !primary {
+                stroke_rounded_rect(buffer, buf_w, buf_h, bx, row1_y, bw, btn_h, rad, theme.border_subtle);
+            }
+            let tw = measure_text(lbl, sub_sz, primary);
+            draw_text_vcenter(buffer, buf_w, buf_h, bx + ((bw as f32 - tw) * 0.5).round().max(2.0) as i32, row1_y, btn_h, bx + bw as i32 - 2, lbl, sub_sz, fg, primary);
+        }
 
-        let add_hov = self.hovered_widget == Some(UiHit::SidebarAdd);
-        fill_rounded_rect(buffer, buf_w, buf_h, pad, btn_y, add_w, btn_h, rad, if add_hov { theme.accent_hover } else { theme.accent });
-        let atw = measure_text("+ Add", sub_sz, true);
-        draw_text_vcenter(buffer, buf_w, buf_h, pad + ((add_w as f32 - atw) * 0.5).round() as i32, btn_y, btn_h, pad + add_w as i32, "+ Add", sub_sz, theme.text_on_accent, true);
-
-        let imp_hov = self.hovered_widget == Some(UiHit::SidebarImport);
-        fill_rounded_rect(buffer, buf_w, buf_h, imp_x, btn_y, imp_w, btn_h, rad, if imp_hov { theme.hover_bg } else { theme.surface_elevated });
-        stroke_rounded_rect(buffer, buf_w, buf_h, imp_x, btn_y, imp_w, btn_h, rad, theme.border_subtle);
-        let itw = measure_text("Import .txt (L)", sub_sz, false);
-        draw_text_vcenter(buffer, buf_w, buf_h, imp_x + ((imp_w as f32 - itw) * 0.5).round().max(4.0) as i32, btn_y, btn_h, imp_x + imp_w as i32 - 3, "Import .txt (L)", sub_sz, theme.text_secondary, false);
+        // Row 2 buttons: `↑ Up` | `↓ Down` | `← Out` | `→ In`
+        let row2_y = row1_y + btn_h as i32 + (6.0 * s).round() as i32;
+        let has_sel = self.selected_bookmark.is_some_and(|i| i < self.bookmarks.len());
+        let row2_btns = [
+            ("↑ Up", UiHit::SidebarMoveUp),
+            ("↓ Down", UiHit::SidebarMoveDown),
+            ("← Out", UiHit::SidebarOutdent),
+            ("→ In", UiHit::SidebarIndent),
+        ];
+        for (i, &(lbl, hit)) in row2_btns.iter().enumerate() {
+            let bx = pad + (i as i32) * (b1_w as i32 + gap);
+            let bw = if i == 3 {
+                (sidebar_w as i32 - pad - 1 - bx).max(20) as u32
+            } else {
+                b1_w
+            };
+            let hov = has_sel && self.hovered_widget == Some(hit);
+            let bg = if hov { theme.hover_bg } else { theme.surface_elevated };
+            let fg = if has_sel { theme.text_secondary } else { theme.text_muted };
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, row2_y, bw, btn_h, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, row2_y, bw, btn_h, rad, theme.border_subtle);
+            let tw = measure_text(lbl, sub_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, bx + ((bw as f32 - tw) * 0.5).round().max(2.0) as i32, row2_y, btn_h, bx + bw as i32 - 2, lbl, sub_sz, fg, false);
+        }
 
         if self.bookmarks.is_empty() {
             let empty_y = top_y + header_h as i32 + (18.0 * s).round() as i32;
-            draw_text(buffer, buf_w, buf_h, pad, empty_y, "No bookmarks yet.", body_sz, theme.text_muted, false);
-            draw_text(buffer, buf_w, buf_h, pad, empty_y + (20.0 * s).round() as i32, "Click + Add or press 'A'", sub_sz, theme.text_muted, false);
-            draw_text(buffer, buf_w, buf_h, pad, empty_y + (36.0 * s).round() as i32, "or import a .txt outline.", sub_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y, "No bookmarks yet.", body_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y + (20.0 * s).round() as i32, "Click + Add (A), Import,", sub_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y + (36.0 * s).round() as i32, "or Auto to detect headings.", sub_sz, theme.text_muted, false);
             return;
         }
 
@@ -116,7 +162,6 @@ impl<'a> PdfViewerApp<'a> {
             }
 
             let indent_px = if bm.level > 0 {
-                // Subtle indent guide line
                 fill_rect_clipped(buffer, buf_w, buf_h, (14.0 * s).round() as i32, ry, 1, row_h, theme.divider);
                 (22.0 * s).round() as i32
             } else {
@@ -186,21 +231,52 @@ impl<'a> PdfViewerApp<'a> {
         }
         let s = scale_factor as f32;
         let row_h = (28.0 * s).round() as i32;
-        let header_h = (68.0 * s).round() as i32;
+        let header_h = Self::bookmark_sidebar_header_height(s) as i32;
         let rel_y = iy - top_bars_h as i32;
         if rel_y < header_h {
-            let pad = (10.0 * s).round() as i32;
-            let btn_y = (34.0 * s).round() as i32;
-            let btn_h = (24.0 * s).round() as i32;
-            let gap = (6.0 * s).round() as i32;
-            let add_w = (62.0 * s).round() as i32;
-            if rel_y >= btn_y && rel_y < btn_y + btn_h {
-                if ix >= pad && ix < pad + add_w {
-                    return Some(SidebarHit::AddBookmarkButton);
+            let pad = (8.0 * s).round() as i32;
+            let gap = (4.0 * s).round() as i32;
+            let inner_w = sidebar_w.saturating_sub((pad * 2 + 1) as u32);
+            let btn_h = (22.0 * s).round() as i32;
+            let b1_w = ((inner_w.saturating_sub((gap * 3) as u32)) / 4) as i32;
+            let row1_y = (32.0 * s).round() as i32;
+            let row2_y = row1_y + btn_h + (6.0 * s).round() as i32;
+
+            let hit_col = |x: i32| -> Option<usize> {
+                if x < pad || x >= sidebar_w as i32 - pad {
+                    return None;
                 }
-                if ix >= pad + add_w + gap && ix < sidebar_w as i32 - pad {
-                    return Some(SidebarHit::ImportTxtButton);
+                for i in 0..4 {
+                    let bx = pad + (i as i32) * (b1_w + gap);
+                    let bw = if i == 3 {
+                        (sidebar_w as i32 - pad - 1 - bx).max(20)
+                    } else {
+                        b1_w
+                    };
+                    if x >= bx && x < bx + bw {
+                        return Some(i);
+                    }
                 }
+                None
+            };
+
+            if rel_y >= row1_y && rel_y < row1_y + btn_h {
+                return match hit_col(ix) {
+                    Some(0) => Some(SidebarHit::AddBookmarkButton),
+                    Some(1) => Some(SidebarHit::ImportTxtButton),
+                    Some(2) => Some(SidebarHit::ExportTxtButton),
+                    Some(3) => Some(SidebarHit::AutoDetectButton),
+                    _ => None,
+                };
+            }
+            if rel_y >= row2_y && rel_y < row2_y + btn_h {
+                return match hit_col(ix) {
+                    Some(0) => Some(SidebarHit::MoveUpButton),
+                    Some(1) => Some(SidebarHit::MoveDownButton),
+                    Some(2) => Some(SidebarHit::OutdentButton),
+                    Some(3) => Some(SidebarHit::IndentButton),
+                    _ => None,
+                };
             }
             return None;
         }
@@ -224,6 +300,140 @@ impl<'a> PdfViewerApp<'a> {
         // in `PdfEngine::load_bookmarks` remains active for backward compatibility.
     }
 
+    pub(super) fn move_selected_bookmark(&mut self, delta: i32) {
+        let Some(idx) = self.selected_bookmark else {
+            return;
+        };
+        if idx >= self.bookmarks.len() {
+            return;
+        }
+        let target = if delta < 0 {
+            if idx == 0 {
+                return;
+            }
+            idx - 1
+        } else {
+            if idx + 1 >= self.bookmarks.len() {
+                return;
+            }
+            idx + 1
+        };
+        self.push_metadata_undo_snapshot();
+        self.bookmarks.swap(idx, target);
+        self.selected_bookmark = Some(target);
+        self.status_notice = Some(format!(
+            "Moved bookmark '{}' {} (Ctrl+Z to undo)",
+            self.bookmarks[target].title,
+            if delta < 0 { "up" } else { "down" }
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn adjust_selected_bookmark_level(&mut self, delta: i8) {
+        let Some(idx) = self.selected_bookmark else {
+            return;
+        };
+        if idx >= self.bookmarks.len() {
+            return;
+        }
+        let old_lvl = self.bookmarks[idx].level;
+        let new_lvl = if delta > 0 {
+            (old_lvl + 1).min(1)
+        } else {
+            old_lvl.saturating_sub(1)
+        };
+        if new_lvl == old_lvl {
+            return;
+        }
+        self.push_metadata_undo_snapshot();
+        self.bookmarks[idx].level = new_lvl;
+        self.status_notice = Some(format!(
+            "{} '{}' (Ctrl+Z to undo)",
+            if new_lvl > old_lvl { "Indented" } else { "Outdented" },
+            self.bookmarks[idx].title
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn auto_detect_bookmarks_from_headings(&mut self) {
+        let Some(doc) = self.doc.as_ref() else {
+            self.status_notice = Some("Open a PDF first to auto-detect headings".to_string());
+            self.request_redraw();
+            return;
+        };
+        let detected = crate::export::detect_document_headings(doc);
+        if detected.is_empty() {
+            self.status_notice = Some(
+                "No distinct headings detected (scanned/uniform-font PDF — add manually with 'A')"
+                    .to_string(),
+            );
+            self.request_redraw();
+            return;
+        }
+        self.push_metadata_undo_snapshot();
+        let mut major = 0usize;
+        let mut minor = 0usize;
+        let mut generated = Vec::with_capacity(detected.len());
+        for (page_idx, level, title) in detected {
+            let serial = if level == 0 {
+                major += 1;
+                minor = 0;
+                major.to_string()
+            } else {
+                if major == 0 {
+                    major = 1;
+                }
+                minor += 1;
+                format!("{major}.{minor}")
+            };
+            let logical_page = PdfEngine::format_logical_page_label_with_skip(
+                page_idx,
+                self.skip_pages,
+                self.roman_end,
+            );
+            generated.push(Bookmark {
+                serial,
+                title,
+                logical_page,
+                page_index: page_idx,
+                level,
+            });
+        }
+        let count = generated.len();
+        self.bookmarks = generated;
+        self.selected_bookmark = Some(0);
+        self.bookmark_scroll_y = 0;
+        self.show_bookmarks = true;
+        self.status_notice = Some(format!(
+            "Auto-detected {count} heading bookmark(s)! (Ctrl+Z to undo, S to save)"
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn export_bookmarks_to_path(&mut self, txt_path: &Path) {
+        let content = PdfEngine::format_bookmarks_as_txt(&self.bookmarks);
+        match std::fs::write(txt_path, content.as_bytes()) {
+            Ok(()) => {
+                let fname = txt_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("bookmarks.txt");
+                self.status_notice = Some(format!(
+                    "Exported {} bookmark(s) to '{fname}'",
+                    self.bookmarks.len()
+                ));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Export bookmarks failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
     pub(super) fn import_bookmarks_from_path(&mut self, txt_path: &Path) {
         match std::fs::read_to_string(txt_path) {
             Ok(content) => {
@@ -235,8 +445,8 @@ impl<'a> PdfViewerApp<'a> {
                     total,
                 );
                 let count = parsed.len();
+                self.push_metadata_undo_snapshot();
                 self.bookmarks = parsed;
-                self.has_unsaved_edits = true;
                 self.selected_bookmark = if self.bookmarks.is_empty() {
                     None
                 } else {

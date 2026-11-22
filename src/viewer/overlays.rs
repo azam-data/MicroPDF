@@ -465,6 +465,13 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save", false),
             InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach", false),
             InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place", false),
+            InputMode::EditAnnotationText { label, text_input, .. } => (
+                *label,
+                "Edit annotation text and press Enter to save",
+                text_input.clone(),
+                "Update",
+                false,
+            ),
             InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open", true),
             InputMode::PasswordPrompt { path, password_input, attempts_left, .. } => {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("document.pdf");

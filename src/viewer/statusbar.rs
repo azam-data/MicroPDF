@@ -71,6 +71,11 @@ impl<'a> PdfViewerApp<'a> {
                 "TEXT BOX: Type text to place on page and press Enter: {}_",
                 text_input
             )),
+            InputMode::EditAnnotationText { label, text_input, .. } => Some(format!(
+                "EDIT {}: Type updated text and press Enter: {}_",
+                label.to_ascii_uppercase(),
+                text_input
+            )),
             InputMode::ConfirmExternalUrl { url } => Some(format!(
                 "OPEN EXTERNAL URL IN BROWSER? {}  (Press Enter to confirm, Esc to cancel)",
                 url

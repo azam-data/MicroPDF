@@ -379,35 +379,49 @@ impl<'a> PdfViewerApp<'a> {
                 self.pending_dialog = Some(PendingDialog::Open);
             }
             (MenuCategory::File, 1) => {
-                self.open_combine_modal();
+                self.open_create_pdf_from_images_modal();
                 return;
             }
             (MenuCategory::File, 2) => {
-                self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
+                self.open_combine_modal();
+                return;
             }
             (MenuCategory::File, 3) => {
-                self.pending_dialog = Some(PendingDialog::Save);
+                self.pending_dialog = Some(PendingDialog::ImportBookmarksTxt);
             }
             (MenuCategory::File, 4) => {
+                self.open_document_properties_modal();
+                return;
+            }
+            (MenuCategory::File, 5) => {
+                self.pending_dialog = Some(PendingDialog::Save);
+            }
+            (MenuCategory::File, 6) => {
                 if self.doc.is_some() {
                     self.pending_dialog = Some(PendingDialog::SaveAs);
                 }
             }
-            (MenuCategory::File, 5) => {
+            (MenuCategory::File, 7) => {
                 self.trigger_print();
             }
-            (MenuCategory::File, 6) => {
+            (MenuCategory::File, 8) => {
                 if !self.tabs.is_empty() {
-                    let _ = self.close_tab(self.active_tab);
+                    let _ = self.request_close_action(
+                        super::doc_props_modal::PendingCloseAction::CloseTab(self.active_tab),
+                    );
                     return;
                 }
             }
-            (MenuCategory::File, 7) => {
-                self.close_other_tabs(self.active_tab);
+            (MenuCategory::File, 9) => {
+                let _ = self.request_close_action(
+                    super::doc_props_modal::PendingCloseAction::CloseOtherTabs(self.active_tab),
+                );
                 return;
             }
-            (MenuCategory::File, 8) => {
-                self.close_all_tabs();
+            (MenuCategory::File, 10) => {
+                let _ = self.request_close_action(
+                    super::doc_props_modal::PendingCloseAction::CloseAllTabs,
+                );
                 return;
             }
             (MenuCategory::File, idx) if idx >= MenuCategory::File.items().len() => {
@@ -510,90 +524,91 @@ impl<'a> PdfViewerApp<'a> {
 
             // Edit menu
             (MenuCategory::Edit, 0) => self.perform_undo(),
-            (MenuCategory::Edit, 1) => self.copy_selected_text_to_clipboard(),
-            (MenuCategory::Edit, 2) => {
+            (MenuCategory::Edit, 1) => self.perform_redo(),
+            (MenuCategory::Edit, 2) => self.copy_selected_text_to_clipboard(),
+            (MenuCategory::Edit, 3) => {
                 self.input_mode = InputMode::SearchText {
                     query_input: self.search_query.clone(),
                 };
             }
-            (MenuCategory::Edit, 3) => {
+            (MenuCategory::Edit, 4) => {
                 self.mouse_mode = MouseMode::Select;
                 self.status_notice = Some(
                     "Mouse Mode: Select Text (Drag or double-click text, Ctrl/Cmd+C to copy)"
                         .to_string(),
                 );
             }
-            (MenuCategory::Edit, 4) => {
+            (MenuCategory::Edit, 5) => {
                 self.mouse_mode = MouseMode::Highlight;
                 self.status_notice = Some(format!(
                     "Annotate: Highlight ({}) — drag across text",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 5) => {
+            (MenuCategory::Edit, 6) => {
                 self.mouse_mode = MouseMode::Underline;
                 self.status_notice = Some(format!(
                     "Annotate: Underline ({}) — drag across text",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 6) => {
+            (MenuCategory::Edit, 7) => {
                 self.mouse_mode = MouseMode::Strikethrough;
                 self.status_notice = Some(format!(
                     "Annotate: Strikethrough ({}) — drag across text",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 7) => {
+            (MenuCategory::Edit, 8) => {
                 self.mouse_mode = MouseMode::StickyNote;
                 self.status_notice = Some(format!(
                     "Annotate: Sticky Note ({}) — click page to place note",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 8) => {
+            (MenuCategory::Edit, 9) => {
                 self.mouse_mode = MouseMode::InkPen;
                 self.status_notice = Some(format!(
                     "Annotate: Freehand Pen ({}) — drag to draw",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 9) => {
+            (MenuCategory::Edit, 10) => {
                 self.mouse_mode = MouseMode::FreeText;
                 self.status_notice = Some(format!(
                     "Annotate: Text Box ({}) — click page to add text",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 10) => {
+            (MenuCategory::Edit, 11) => {
                 self.mouse_mode = MouseMode::RectShape;
                 self.status_notice = Some(format!(
                     "Annotate: Rectangle ({}) — drag box",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 11) => {
+            (MenuCategory::Edit, 12) => {
                 self.mouse_mode = MouseMode::ArrowShape;
                 self.status_notice = Some(format!(
                     "Annotate: Arrow ({}) — drag start to tip",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 12) => {
+            (MenuCategory::Edit, 13) => {
                 self.annotation_color = self.annotation_color.next();
                 self.status_notice = Some(format!(
                     "Annotation color: {}",
                     self.annotation_color.label()
                 ));
             }
-            (MenuCategory::Edit, 13) => {
+            (MenuCategory::Edit, 14) => {
                 self.mouse_mode = MouseMode::Redact;
                 self.status_notice = Some(
                     "Mouse Mode: Black-Box Redact (Drag red box to permanently purge & black out)"
                         .to_string(),
                 );
             }
-            (MenuCategory::Edit, 14) => {
+            (MenuCategory::Edit, 15) => {
                 self.mouse_mode = MouseMode::Crop;
                 self.status_notice = Some(
                     "Mouse Mode: Crop Page Area (Drag green box to crop page)".to_string(),
@@ -689,6 +704,10 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     self.status_notice = Some("Open a PDF first to export to LaTeX (.tex)".to_string());
                 }
+            }
+            (MenuCategory::Export, 4) => {
+                self.open_export_images_modal();
+                return;
             }
 
             // Help menu

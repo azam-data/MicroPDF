@@ -1874,25 +1874,14 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
 
-            // Floating Sticky Note popover when clicked
-            if let Some((ref note_text, nx, ny)) = self.active_note_popover {
-                let s = scale_factor as f32;
-                let pw = (240.0 * s).round().min((width as f32 - 24.0).max(80.0)) as u32;
-                let ph = (78.0 * s).round() as u32;
-                let max_px = (width as i32 - pw as i32 - 8).max(8);
-                let px = nx.clamp(8, max_px);
-                let min_py = top_bars_h as i32 + 6;
-                let max_py = (height as i32 - status_bar_h as i32 - ph as i32 - 6).max(min_py);
-                let py = (ny - ph as i32 - 8).clamp(min_py, max_py);
-                let rad = (7.0 * s).clamp(5.0, 12.0);
-                super::ui_draw::draw_soft_shadow(buffer, width, height, px, py, pw, ph, rad, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
-                super::ui_draw::fill_rounded_rect(buffer, width, height, px, py, pw, ph, rad, 0x00FEF9C3);
-                super::ui_draw::stroke_rounded_rect(buffer, width, height, px, py, pw, ph, rad, 0x00CA8A04);
-                let sz = (11.5 * s).clamp(10.0, 22.0);
-                super::ui_draw::draw_text(buffer, width, height, px + (10.0 * s).round() as i32, py + (8.0 * s).round() as i32, "Sticky Note", (10.5 * s).clamp(9.0, 18.0), 0x00854D0E, true);
-                let trunc = super::ui_draw::truncate_ellipsis(note_text, (pw as f32 - 20.0).max(40.0), sz, false);
-                super::ui_draw::draw_text_clipped(buffer, width, height, px + (10.0 * s).round() as i32, py + (28.0 * s).round() as i32, px + pw as i32 - 10, &trunc, sz, 0x001E293B, false);
-                super::ui_draw::draw_text(buffer, width, height, px + (10.0 * s).round() as i32, py + ph as i32 - (20.0 * s).round() as i32, "Click anywhere or Esc to dismiss", (9.5 * s).clamp(8.5, 16.0), 0x00A16207, false);
+            // Multi-line Sticky Note reader popover with Edit & Delete controls
+            if self.active_note_popover.is_some() {
+                self.draw_active_note_popover(buffer, width, height, scale_factor);
+            }
+
+            // Right-click Annotation Inspector Context Menu
+            if self.annot_context_menu.is_some() {
+                self.draw_annot_context_menu(buffer, width, height, scale_factor);
             }
         } else {
             self.draw_thumbnail_grid(
@@ -2023,6 +2012,21 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_page_number_modal(buffer, width, height, scale_factor);
         }
 
+        // Create PDF from Images Modal
+        if self.create_pdf_images_modal.is_some() {
+            self.draw_create_pdf_images_modal(buffer, width, height, scale_factor);
+        }
+
+        // Export Pages as Images Modal
+        if self.export_images_modal.is_some() {
+            self.draw_export_images_modal(buffer, width, height, scale_factor);
+        }
+
+        // Document Properties & Privacy Metadata Scrubber Modal
+        if self.doc_props_modal.is_some() {
+            self.draw_doc_props_modal(buffer, width, height, scale_factor);
+        }
+
         // Print Preview Modal (`Ctrl/Cmd+P`)
         if self.print_preview.is_some() {
             self.draw_print_preview_modal(buffer, width, height, scale_factor);
@@ -2031,6 +2035,11 @@ impl<'a> PdfViewerApp<'a> {
         // Guided Manual Duplex (Simplex Printer) Pass 2 Modal
         if self.manual_duplex_wait.is_some() {
             self.draw_manual_duplex_modal(buffer, width, height, scale_factor);
+        }
+
+        // Unsaved Changes Confirmation Dialog (top-most modal)
+        if self.unsaved_changes_modal.is_some() {
+            self.draw_unsaved_changes_modal(buffer, width, height, scale_factor);
         }
     }
 

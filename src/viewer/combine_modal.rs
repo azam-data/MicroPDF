@@ -1047,12 +1047,16 @@ impl<'a> PdfViewerApp<'a> {
             }
             if let Some(err) = insert_err {
                 // Roll back any partially inserted pages from the popped undo snapshot.
-                if let Some(prev_bytes) = self.undo_stack.pop_back() {
-                    if let Ok(restored) = self.engine.load_pdf_from_bytes_safe(prev_bytes) {
-                        self.doc = Some(restored);
-                        self.invalidate_page_caches();
-                        self.thumbnail_cache.clear();
+                if let Some(snap) = self.undo_stack.pop_back() {
+                    if let Some(prev_bytes) = snap.pdf_bytes {
+                        if let Ok(restored) = self.engine.load_pdf_from_bytes_safe(prev_bytes) {
+                            self.doc = Some(restored);
+                            self.invalidate_page_caches();
+                            self.thumbnail_cache.clear();
+                        }
                     }
+                    self.undo_generation = snap.generation;
+                    self.has_unsaved_edits = self.undo_generation != self.saved_undo_generation;
                 }
                 self.status_notice = Some(format!("Insert PDF failed (rolled back): {err}"));
             } else {

@@ -30,6 +30,9 @@ impl<'a> PdfViewerApp<'a> {
             slot.bw_pages = self.bw_pages.clone();
             // v1.1: move, don't deep-clone, up to 8 full-document snapshots on every tab switch.
             slot.undo_stack = std::mem::take(&mut self.undo_stack);
+            slot.redo_stack = std::mem::take(&mut self.redo_stack);
+            slot.undo_generation = self.undo_generation;
+            slot.saved_undo_generation = self.saved_undo_generation;
             slot.redacted = self.redacted;
             slot.has_unsaved_edits = self.has_unsaved_edits;
             slot.last_file_mtime = self.last_file_mtime;
@@ -61,10 +64,15 @@ impl<'a> PdfViewerApp<'a> {
             self.grid_scroll_y = slot.grid_scroll_y;
             self.bw_pages = slot.bw_pages.clone();
             self.undo_stack = std::mem::take(&mut slot.undo_stack);
+            self.redo_stack = std::mem::take(&mut slot.redo_stack);
+            self.undo_generation = slot.undo_generation;
+            self.saved_undo_generation = slot.saved_undo_generation;
             self.redacted = slot.redacted;
             self.has_unsaved_edits = slot.has_unsaved_edits;
             self.last_file_mtime = slot.last_file_mtime;
             self.flatten_confirm_at = None;
+            self.selected_thumbs.clear();
+            self.last_thumb_anchor = None;
             self.search_query.clear();
             self.search_matches.clear();
             self.current_search_match = 0;
@@ -131,6 +139,9 @@ impl<'a> PdfViewerApp<'a> {
         self.skip_pages = skip_pages;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = file_mtime;
@@ -138,6 +149,8 @@ impl<'a> PdfViewerApp<'a> {
         self.input_mode = InputMode::Normal;
         self.drag_start = None;
         self.grid_drag_page = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.grid_scroll_y = 0.0;
         self.search_query.clear();
         self.search_matches.clear();
@@ -176,6 +189,9 @@ impl<'a> PdfViewerApp<'a> {
                 grid_scroll_y: 0.0,
                 bw_pages: HashSet::new(),
                 undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+                redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+                undo_generation: 0,
+                saved_undo_generation: 0,
                 redacted: false,
                 has_unsaved_edits: false,
                 last_file_mtime: file_mtime,
@@ -199,6 +215,9 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].grid_scroll_y = 0.0;
             self.tabs[self.active_tab].bw_pages.clear();
             self.tabs[self.active_tab].undo_stack.clear();
+            self.tabs[self.active_tab].redo_stack.clear();
+            self.tabs[self.active_tab].undo_generation = 0;
+            self.tabs[self.active_tab].saved_undo_generation = 0;
             self.tabs[self.active_tab].redacted = false;
             self.tabs[self.active_tab].has_unsaved_edits = false;
             self.tabs[self.active_tab].last_file_mtime = file_mtime;
@@ -289,6 +308,9 @@ impl<'a> PdfViewerApp<'a> {
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
             redacted: false,
             has_unsaved_edits: false,
             last_file_mtime: file_mtime,
@@ -315,10 +337,15 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = file_mtime;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -333,7 +360,7 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
-    /// Opens an in-memory PDF byte vector in a brand-new tab named `virtual_path` (used by Combine Multiple PDFs).
+    /// Opens an in-memory PDF byte vector in a brand-new tab named `virtual_path` (used by Combine Multiple PDFs & Create PDF from Images).
     pub fn open_bytes_in_new_tab(&mut self, bytes: Vec<u8>, virtual_path: PathBuf) -> Result<()> {
         let loaded = self.engine.load_pdf_from_bytes_safe(bytes)?;
         self.sync_active_tab_to_slot();
@@ -363,6 +390,9 @@ impl<'a> PdfViewerApp<'a> {
             grid_scroll_y: 0.0,
             bw_pages: HashSet::new(),
             undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 1,
+            saved_undo_generation: 0,
             redacted: false,
             has_unsaved_edits: true,
             last_file_mtime: None,
@@ -389,10 +419,15 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 1;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = true;
         self.last_file_mtime = None;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -421,7 +456,10 @@ impl<'a> PdfViewerApp<'a> {
         self.drag_start = None;
         self.grid_drag_page = None;
         self.hovered_thumb = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.thumb_context_menu = None;
+        self.annot_context_menu = None;
         self.show_tab_list_popover = false;
         self.tab_context_menu = None;
         self.input_mode = InputMode::Normal;
@@ -456,6 +494,7 @@ impl<'a> PdfViewerApp<'a> {
         self.tab_list_scroll = 0;
         self.tab_context_menu = None;
         self.thumb_context_menu = None;
+        self.annot_context_menu = None;
         self.file_path = PathBuf::new();
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;
@@ -475,10 +514,15 @@ impl<'a> PdfViewerApp<'a> {
         self.grid_scroll_y = 0.0;
         self.bw_pages.clear();
         self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
         self.redacted = false;
         self.has_unsaved_edits = false;
         self.last_file_mtime = None;
         self.flatten_confirm_at = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
         self.search_query.clear();
         self.search_matches.clear();
         self.current_search_match = 0;
@@ -1334,16 +1378,16 @@ impl<'a> PdfViewerApp<'a> {
         };
         match hit {
             TabContextHit::CloseThis => {
-                let _ = self.close_tab(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseTab(tab_idx));
             }
             TabContextHit::CloseOthers => {
-                self.close_other_tabs(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseOtherTabs(tab_idx));
             }
             TabContextHit::CloseRight => {
-                self.close_tabs_to_right(tab_idx);
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseTabsToRight(tab_idx));
             }
             TabContextHit::CloseAll => {
-                self.close_all_tabs();
+                let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseAllTabs);
             }
         }
     }

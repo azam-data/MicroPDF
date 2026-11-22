@@ -1,8 +1,10 @@
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
+mod doc_props_modal;
 mod doc_tools_modal;
 mod grid;
+mod image_tools_modal;
 mod input;
 mod menu;
 mod overlays;
@@ -865,7 +867,15 @@ mod tests {
 
         // 2. When focused and no unsaved edits, reloads and preserves page & scroll_y
         //    v1.2.1: a stale pre-reload snapshot must not survive (Ctrl+Z would revert the change)
-        app.undo_stack.push_back(b"stale snapshot".to_vec());
+        app.undo_stack.push_back(state::UndoSnapshot {
+            pdf_bytes: Some(b"stale snapshot".to_vec()),
+            bookmarks: Vec::new(),
+            bw_pages: std::collections::HashSet::new(),
+            roman_end: 0,
+            skip_pages: 0,
+            redacted: false,
+            generation: 0,
+        });
         app.window_focused = true;
         app.poll_auto_reload_if_due();
         assert!(app.undo_stack.is_empty(), "undo history must be cleared on auto-reload");
