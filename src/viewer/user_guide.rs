@@ -282,6 +282,19 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "To extract a few pages into a separate PDF: click Tools -> Split / Extract Pages... (X), type a range like '1-3' or '2, 5, 8-10', and press Enter.",
             },
+            GuideBlock::Heading("Straightening Tilted or Scanned Pages (Page Deskew)"),
+            GuideBlock::Step {
+                number: 1,
+                text: "If a scanned page looks slightly crooked, click Page -> Deskew Page(s)... to open the compact Deskew bar at the top of the page.",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Drag the Angle slider (from -15.0° to +15.0°), click - / + for 0.1° fine steps, or click 'Draw Guide' and drag a line along any crooked text margin or table edge — MicroPDF automatically straightens it with a live preview!",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Toggle 'Grid' for visual alignment lines, choose Current Page or Page Range (like '1-6'), and click Apply. Your page stays sharp (no re-scanning or blurring) and can be undone with Ctrl+Z.",
+            },
             GuideBlock::Tip(
                 "Quick Page Shortcuts: Press R to rotate the current page 90°, I to insert a blank page after, D to delete the current page, K to convert a page to crisp Black & White, or G to jump straight to any page number (even Roman numerals like 'iii' or physical '#5').",
             ),
@@ -405,11 +418,11 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Click 'Export as Word (.docx)...' to create an editable document with headings, paragraphs, lists, and tables, OR click 'Export as Excel (.xlsx)...' to extract tables into real spreadsheet columns and numbers.",
+                text: "Click 'Export as Word (.docx)...' to create an editable document with headings, paragraphs, lists, and tables.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Choose where to save the file and click Save. Everything converts offline right on your computer.",
+                text: "Click 'Export as Excel (.xlsx)...' to open the Excel Export options: choose Auto (Hybrid) for most PDFs, Lattice for ruled tables with merged cells, or Stream for borderless columns; choose Stack on One Sheet or Separate Sheet per Table; and keep 'Normalize comma-decimal numbers' checked for financial tables (e.g. 123,9500 -> 123.95). Click 'Export Excel (.xlsx)...' to save offline.",
             },
             GuideBlock::Heading("Exporting Pages as PNG or JPEG Images"),
             GuideBlock::Step {
