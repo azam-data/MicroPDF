@@ -5,6 +5,7 @@ mod compare_mode;
 mod deskew;
 mod doc_props_modal;
 mod doc_tools_modal;
+mod excel_export_modal;
 mod grid;
 mod image_tools_modal;
 mod input;

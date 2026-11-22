@@ -1995,7 +1995,7 @@ impl<'a> PdfViewerApp<'a> {
         let Some(doc) = self.doc.as_ref() else {
             return;
         };
-        let bytes = crate::export::export_document_to_xlsx(doc);
+        let bytes = crate::export::export_document_to_xlsx_with_options(doc, self.excel_export_opts);
         match std::fs::write(&save_path, &bytes) {
             Ok(()) => {
                 let fname = save_path
@@ -3350,6 +3350,19 @@ impl<'a> PdfViewerApp<'a> {
         // 0a4. Export Pages as Images modal
         if self.export_images_modal.is_some() {
             self.handle_export_images_key(&logical_key, text);
+            return;
+        }
+        // 0a5. Export PDF to Excel options modal
+        if self.excel_export_modal.is_some() {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.handle_excel_export_click(super::excel_export_modal::ExcelExportHit::Cancel);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.handle_excel_export_click(super::excel_export_modal::ExcelExportHit::ExportNow);
+                }
+                _ => {}
+            }
             return;
         }
         // 0b. Print Preview modal takes top keyboard priority
@@ -5138,6 +5151,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::ExportImages(h));
                         }
                     }
+                } else if self.excel_export_modal.is_some() {
+                    if let Some(h) = self.hit_test_excel_export_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::excel_export_modal::ExcelExportHit::InsideModal {
+                            new_hover = Some(UiHit::ExcelExport(h));
+                        }
+                    }
                 } else if self.combine_modal.is_some() {
                     if let Some(h) = self.hit_test_combine_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::combine_modal::CombineHit::InsideModal {
@@ -5563,6 +5582,26 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             scale_factor,
                         ) {
                             self.handle_export_images_click(hit);
+                        }
+                    }
+                    return;
+                }
+
+                // Export PDF to Excel options modal
+                if self.excel_export_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_excel_export_modal(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(hit) => self.handle_excel_export_click(hit),
+                            None => {
+                                self.excel_export_modal = None;
+                                self.request_redraw();
+                            }
                         }
                     }
                     return;

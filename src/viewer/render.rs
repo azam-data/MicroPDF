@@ -2076,6 +2076,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_export_images_modal(buffer, width, height, scale_factor);
         }
 
+        // Export to Excel Options Modal
+        if self.excel_export_modal.is_some() {
+            self.draw_excel_export_modal(buffer, width, height, scale_factor);
+        }
+
         // Document Properties & Privacy Metadata Scrubber Modal
         if self.doc_props_modal.is_some() {
             self.draw_doc_props_modal(buffer, width, height, scale_factor);

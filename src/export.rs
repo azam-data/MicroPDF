@@ -1240,12 +1240,11 @@ pub fn export_document_to_docx(doc: &PdfDocument, doc_title: &str) -> Vec<u8> {
     render_blocks_to_docx(doc_title, &pages)
 }
 
-/// Converts an open `PdfDocument` to a Microsoft Excel OOXML (`.xlsx`) workbook.
-/// Detected tables become clean formatted worksheets with typed numbers & headers; non-table
-/// documents export cleanly as structured text sheets.
+/// Converts an open `PdfDocument` to a Microsoft Excel OOXML (`.xlsx`) workbook using the
+/// Hybrid Lattice + Stream engine (`AutoHybrid`, stacked sheet, comma-decimal normalization on).
+#[allow(dead_code)]
 pub fn export_document_to_xlsx(doc: &PdfDocument) -> Vec<u8> {
-    let pages = extract_document_blocks(doc);
-    render_blocks_to_xlsx(&pages)
+    export_document_to_xlsx_with_options(doc, ExcelExportOptions::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -1659,52 +1658,1118 @@ fn is_valid_grouped_number(num_part: &str) -> bool {
     total_digits >= 1 && total_digits <= 15
 }
 
-fn parse_excel_numeric(cell: &str) -> Option<(f64, u8)> {
+/// Extraction mode for the Milestone 4 Hybrid Lattice + Stream PDF-to-Excel engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExcelExportMode {
+    /// Automatically detects vector/ruled Lattice tables first and falls back to Stream for unruled regions.
+    AutoHybrid,
+    /// Strictly extracts ruled vector/thin-rect Lattice tables.
+    Lattice,
+    /// Uses whitespace-gutter Stream alignment across all page words.
+    Stream,
+}
+
+/// Multi-table worksheet layout for `.xlsx` export.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ExcelTableLayout {
+    /// Stack all extracted tables vertically on one sheet separated by 2 blank rows.
+    StackOnOneSheet,
+    /// Create a separate worksheet tab per extracted table.
+    SeparateSheets,
+}
+
+/// User-configurable options for PDF-to-Excel (`.xlsx`) export.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ExcelExportOptions {
+    pub mode: ExcelExportMode,
+    pub layout: ExcelTableLayout,
+    pub normalize_comma_decimals: bool,
+}
+
+impl Default for ExcelExportOptions {
+    fn default() -> Self {
+        Self {
+            mode: ExcelExportMode::AutoHybrid,
+            layout: ExcelTableLayout::StackOnOneSheet,
+            normalize_comma_decimals: true,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct HSegment {
+    pub y: f32,
+    pub x0: f32,
+    pub x1: f32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct VSegment {
+    pub x: f32,
+    pub y0: f32,
+    pub y1: f32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct WordBox {
+    pub text: String,
+    pub left: f32,
+    pub right: f32,
+    pub bottom: f32,
+    pub top: f32,
+}
+
+impl WordBox {
+    #[inline]
+    fn cx(&self) -> f32 {
+        (self.left + self.right) * 0.5
+    }
+    #[inline]
+    fn cy(&self) -> f32 {
+        (self.bottom + self.top) * 0.5
+    }
+    #[inline]
+    fn height(&self) -> f32 {
+        (self.top - self.bottom).abs().max(1.0)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct CellMerge {
+    pub row: usize,
+    pub col: usize,
+    pub row_span: usize,
+    pub col_span: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExcelTableGrid {
+    pub rows: Vec<Vec<String>>,
+    pub merges: Vec<CellMerge>,
+    pub page_num: usize,
+    pub is_lattice: bool,
+    pub bbox: (f32, f32, f32, f32),
+}
+
+fn decimal_style_for_digits(frac_digits: usize, has_thousands_sep: bool) -> u8 {
+    match frac_digits {
+        0 => {
+            if has_thousands_sep {
+                3
+            } else {
+                5
+            }
+        }
+        1 => 6,
+        2 => 3,
+        3 => 7,
+        4 => 8,
+        5 => 9,
+        _ => 10,
+    }
+}
+
+/// Pure-Rust financial number parser supporting standard thousands + decimals (`1,234.56`, `121.4000`)
+/// and optional European/financial comma-decimal normalization (`123,9500`, `0,7728`, `-45,50`).
+/// Preserves non-numeric strings (`N/A`, `USD`), leading-zero IDs (`00123`), and >15-digit codes.
+pub fn parse_excel_numeric_with_opts(cell: &str, normalize_comma_decimals: bool) -> Option<(f64, u8)> {
     let s = cell.trim();
     if s.is_empty() || s.len() > 24 {
         return None;
     }
-    // Style 3 = decimal/comma float (#,##0.00), Style 4 = percentage (0.00%), Style 5 = plain integer (General)
+    let owned_norm: String;
+    let s = if s.contains('\u{2212}') {
+        owned_norm = s.replace('\u{2212}', "-");
+        owned_norm.as_str()
+    } else {
+        s
+    };
+
     if let Some(pct) = s.strip_suffix('%') {
         let pt = pct.trim();
-        if !is_valid_grouped_number(pt) {
-            return None;
+        if let Some((v, _)) = parse_excel_numeric_with_opts(pt, normalize_comma_decimals) {
+            return Some((v / 100.0, 4));
         }
-        let cleaned = pt.replace(',', "");
+        return None;
+    }
+
+    if is_valid_grouped_number(s) {
+        let frac_digits = s.split_once('.').map_or(0, |(_, f)| f.len());
+        let has_comma = s.contains(',');
+        let cleaned = s.replace(',', "");
         if let Ok(v) = cleaned.parse::<f64>() {
             if v.is_finite() {
-                return Some((v / 100.0, 4));
+                let style = decimal_style_for_digits(frac_digits, has_comma);
+                return Some((v, style));
             }
         }
         return None;
     }
-    if !is_valid_grouped_number(s) {
-        return None;
-    }
-    let has_decimal_or_comma = s.contains('.') || s.contains(',');
-    let cleaned = s.replace(',', "");
-    if let Ok(v) = cleaned.parse::<f64>() {
-        if v.is_finite() {
-            let style = if has_decimal_or_comma { 3 } else { 5 };
-            return Some((v, style));
+
+    if normalize_comma_decimals && !s.contains('.') {
+        let unsigned = s
+            .strip_prefix('-')
+            .or_else(|| s.strip_prefix('+'))
+            .unwrap_or(s);
+        let comma_count = unsigned.bytes().filter(|&b| b == b',').count();
+        if comma_count == 1 {
+            if let Some((int_part, frac_part)) = unsigned.split_once(',') {
+                if !int_part.is_empty()
+                    && !frac_part.is_empty()
+                    && frac_part.len() <= 6
+                    && int_part.chars().all(|c| c.is_ascii_digit())
+                    && frac_part.chars().all(|c| c.is_ascii_digit())
+                {
+                    if int_part.len() > 1 && int_part.starts_with('0') {
+                        return None;
+                    }
+                    let total_digits = int_part.len() + frac_part.len();
+                    if total_digits <= 15 {
+                        let replaced = s.replacen(',', ".", 1);
+                        if let Ok(v) = replaced.parse::<f64>() {
+                            if v.is_finite() {
+                                let style = decimal_style_for_digits(frac_part.len(), false);
+                                return Some((v, style));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
+
     None
 }
 
-fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
-    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-    let mut col_widths = vec![12usize; max_cols];
-    for row in rows {
-        for (c, cell) in row.iter().enumerate() {
-            let len = cell.chars().count();
-            if len + 3 > col_widths[c] {
-                col_widths[c] = (len + 3).min(56);
+#[cfg(test)]
+fn parse_excel_numeric(cell: &str) -> Option<(f64, u8)> {
+    parse_excel_numeric_with_opts(cell, false)
+}
+
+/// Converts a thin filled rectangle (`w <= 3.0 pt` or `h <= 3.0 pt`) into its centerline `VSegment` / `HSegment`.
+pub fn extract_segments_from_thin_rect(
+    left: f32,
+    right: f32,
+    bottom: f32,
+    top: f32,
+    h_out: &mut Vec<HSegment>,
+    v_out: &mut Vec<VSegment>,
+) {
+    let x0 = left.min(right);
+    let x1 = left.max(right);
+    let y0 = bottom.min(top);
+    let y1 = bottom.max(top);
+    let w = x1 - x0;
+    let h = y1 - y0;
+    if w <= 3.0 && h >= 6.0 {
+        v_out.push(VSegment {
+            x: (x0 + x1) * 0.5,
+            y0,
+            y1,
+        });
+    } else if h <= 3.0 && w >= 6.0 {
+        h_out.push(HSegment {
+            y: (y0 + y1) * 0.5,
+            x0,
+            x1,
+        });
+    }
+}
+
+#[inline]
+fn compose_pdf_matrix(parent: [f32; 6], child: [f32; 6]) -> [f32; 6] {
+    let [pa, pb, pc, pd, pe, pf] = parent;
+    let [ca, cb, cc, cd, ce, cf] = child;
+    [
+        pa * ca + pc * cb,
+        pb * ca + pd * cb,
+        pa * cc + pc * cd,
+        pb * cc + pd * cd,
+        pa * ce + pc * cf + pe,
+        pb * ce + pd * cf + pf,
+    ]
+}
+
+#[inline]
+fn apply_pdf_matrix(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+    (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5])
+}
+
+fn push_axis_aligned_edge(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    h_out: &mut Vec<HSegment>,
+    v_out: &mut Vec<VSegment>,
+) {
+    let dx = (p1.0 - p0.0).abs();
+    let dy = (p1.1 - p0.1).abs();
+    if dy <= 1.2 && dx >= 4.0 {
+        h_out.push(HSegment {
+            y: (p0.1 + p1.1) * 0.5,
+            x0: p0.0.min(p1.0),
+            x1: p0.0.max(p1.0),
+        });
+    } else if dx <= 1.2 && dy >= 4.0 {
+        v_out.push(VSegment {
+            x: (p0.0 + p1.0) * 0.5,
+            y0: p0.1.min(p1.1),
+            y1: p0.1.max(p1.1),
+        });
+    }
+}
+
+/// Extracts all horizontal and vertical vector lines & thin filled rectangles from a PDFium page
+/// (recursing into Form XObjects up to depth 4 and composing 2D affine matrices accurately).
+pub fn extract_page_vector_segments(page: &PdfPage) -> (Vec<HSegment>, Vec<VSegment>) {
+    fn visit_obj(
+        obj: &PdfPageObject,
+        parent_m: [f32; 6],
+        h_out: &mut Vec<HSegment>,
+        v_out: &mut Vec<VSegment>,
+        depth: u8,
+    ) {
+        if let Some(path) = obj.as_path_object() {
+            let local_m = path
+                .matrix()
+                .map(|pm| [pm.a(), pm.b(), pm.c(), pm.d(), pm.e(), pm.f()])
+                .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+            let m = compose_pdf_matrix(parent_m, local_m);
+            let is_stroked = path.is_stroked().unwrap_or(false);
+            let is_filled = path
+                .fill_mode()
+                .map(|fm| fm != PdfPathFillMode::None)
+                .unwrap_or(false);
+            if !is_stroked && !is_filled {
+                return;
+            }
+
+            let mut subpaths: Vec<(Vec<(f32, f32)>, bool, bool)> = Vec::new();
+            let mut cur_pts: Vec<(f32, f32)> = Vec::new();
+            let mut cur_has_bezier = false;
+            let mut cur_closed = false;
+
+            for seg in path.segments().iter() {
+                let (rx, ry) = seg.point();
+                let pt = apply_pdf_matrix(m, rx.value, ry.value);
+                match seg.segment_type() {
+                    PdfPathSegmentType::MoveTo => {
+                        if !cur_pts.is_empty() {
+                            subpaths.push((std::mem::take(&mut cur_pts), cur_closed, cur_has_bezier));
+                        }
+                        cur_pts.push(pt);
+                        cur_has_bezier = false;
+                        cur_closed = seg.is_close();
+                    }
+                    PdfPathSegmentType::LineTo => {
+                        cur_pts.push(pt);
+                        if seg.is_close() {
+                            cur_closed = true;
+                        }
+                    }
+                    PdfPathSegmentType::BezierTo => {
+                        cur_has_bezier = true;
+                        cur_pts.push(pt);
+                        if seg.is_close() {
+                            cur_closed = true;
+                        }
+                    }
+                    PdfPathSegmentType::Unknown => {}
+                }
+            }
+            if !cur_pts.is_empty() {
+                subpaths.push((cur_pts, cur_closed, cur_has_bezier));
+            }
+
+            for (pts, closed, has_bezier) in subpaths {
+                if pts.len() < 2 {
+                    continue;
+                }
+                if is_stroked && !has_bezier {
+                    for w in pts.windows(2) {
+                        push_axis_aligned_edge(w[0], w[1], h_out, v_out);
+                    }
+                    if closed && pts.len() >= 3 {
+                        push_axis_aligned_edge(*pts.last().unwrap(), pts[0], h_out, v_out);
+                    }
+                }
+                if is_filled && pts.len() >= 3 {
+                    let mut min_x = f32::INFINITY;
+                    let mut max_x = f32::NEG_INFINITY;
+                    let mut min_y = f32::INFINITY;
+                    let mut max_y = f32::NEG_INFINITY;
+                    for &(px, py) in &pts {
+                        min_x = min_x.min(px);
+                        max_x = max_x.max(px);
+                        min_y = min_y.min(py);
+                        max_y = max_y.max(py);
+                    }
+                    extract_segments_from_thin_rect(min_x, max_x, min_y, max_y, h_out, v_out);
+                }
+            }
+        } else if depth < 4 {
+            if let Some(form) = obj.as_x_object_form_object() {
+                let local_m = form
+                    .matrix()
+                    .map(|pm| [pm.a(), pm.b(), pm.c(), pm.d(), pm.e(), pm.f()])
+                    .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+                let m = compose_pdf_matrix(parent_m, local_m);
+                for child in form.iter() {
+                    visit_obj(&child, m, h_out, v_out, depth + 1);
+                }
             }
         }
     }
 
-    let mut xml = String::with_capacity(2048);
+    let mut h_out = Vec::new();
+    let mut v_out = Vec::new();
+    let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    for obj in page.objects().iter() {
+        visit_obj(&obj, identity, &mut h_out, &mut v_out, 0);
+    }
+    (h_out, v_out)
+}
+
+/// Snaps collinear H/V segments within `snap_tol` (default `1.8 pt`) and merges overlapping or
+/// touching segments separated by `<= gap_tol` (default `2.0 pt`).
+pub fn cluster_and_merge_segments(
+    h_raw: &[HSegment],
+    v_raw: &[VSegment],
+    snap_tol: f32,
+    gap_tol: f32,
+) -> (Vec<HSegment>, Vec<VSegment>) {
+    let mut hs: Vec<HSegment> = h_raw
+        .iter()
+        .copied()
+        .filter(|s| s.x1 - s.x0 >= 3.0)
+        .map(|s| HSegment {
+            y: s.y,
+            x0: s.x0.min(s.x1),
+            x1: s.x0.max(s.x1),
+        })
+        .collect();
+    hs.sort_by(|a, b| a.y.total_cmp(&b.y));
+
+    let mut h_merged: Vec<HSegment> = Vec::new();
+    let mut i = 0;
+    while i < hs.len() {
+        let mut cluster = vec![hs[i]];
+        let mut y_sum = hs[i].y * (hs[i].x1 - hs[i].x0);
+        let mut w_sum = hs[i].x1 - hs[i].x0;
+        let mut y_ref = hs[i].y;
+        i += 1;
+        while i < hs.len() && (hs[i].y - y_ref).abs() <= snap_tol {
+            let len = (hs[i].x1 - hs[i].x0).max(1.0);
+            y_sum += hs[i].y * len;
+            w_sum += len;
+            y_ref = y_sum / w_sum;
+            cluster.push(hs[i]);
+            i += 1;
+        }
+        let snapped_y = y_sum / w_sum.max(1.0);
+        cluster.sort_by(|a, b| a.x0.total_cmp(&b.x0));
+        let mut cur_x0 = cluster[0].x0;
+        let mut cur_x1 = cluster[0].x1;
+        for seg in &cluster[1..] {
+            if seg.x0 <= cur_x1 + gap_tol {
+                cur_x1 = cur_x1.max(seg.x1);
+            } else {
+                h_merged.push(HSegment {
+                    y: snapped_y,
+                    x0: cur_x0,
+                    x1: cur_x1,
+                });
+                cur_x0 = seg.x0;
+                cur_x1 = seg.x1;
+            }
+        }
+        h_merged.push(HSegment {
+            y: snapped_y,
+            x0: cur_x0,
+            x1: cur_x1,
+        });
+    }
+
+    let mut vs: Vec<VSegment> = v_raw
+        .iter()
+        .copied()
+        .filter(|s| s.y1 - s.y0 >= 3.0)
+        .map(|s| VSegment {
+            x: s.x,
+            y0: s.y0.min(s.y1),
+            y1: s.y0.max(s.y1),
+        })
+        .collect();
+    vs.sort_by(|a, b| a.x.total_cmp(&b.x));
+
+    let mut v_merged: Vec<VSegment> = Vec::new();
+    let mut j = 0;
+    while j < vs.len() {
+        let mut cluster = vec![vs[j]];
+        let mut x_sum = vs[j].x * (vs[j].y1 - vs[j].y0);
+        let mut w_sum = vs[j].y1 - vs[j].y0;
+        let mut x_ref = vs[j].x;
+        j += 1;
+        while j < vs.len() && (vs[j].x - x_ref).abs() <= snap_tol {
+            let len = (vs[j].y1 - vs[j].y0).max(1.0);
+            x_sum += vs[j].x * len;
+            w_sum += len;
+            x_ref = x_sum / w_sum;
+            cluster.push(vs[j]);
+            j += 1;
+        }
+        let snapped_x = x_sum / w_sum.max(1.0);
+        cluster.sort_by(|a, b| a.y0.total_cmp(&b.y0));
+        let mut cur_y0 = cluster[0].y0;
+        let mut cur_y1 = cluster[0].y1;
+        for seg in &cluster[1..] {
+            if seg.y0 <= cur_y1 + gap_tol {
+                cur_y1 = cur_y1.max(seg.y1);
+            } else {
+                v_merged.push(VSegment {
+                    x: snapped_x,
+                    y0: cur_y0,
+                    y1: cur_y1,
+                });
+                cur_y0 = seg.y0;
+                cur_y1 = seg.y1;
+            }
+        }
+        v_merged.push(VSegment {
+            x: snapped_x,
+            y0: cur_y0,
+            y1: cur_y1,
+        });
+    }
+
+    (h_merged, v_merged)
+}
+
+fn cluster_coords_1d(vals: &[f32], tol: f32) -> Vec<f32> {
+    if vals.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = vals.to_vec();
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    let mut out = Vec::new();
+    let mut sum = sorted[0];
+    let mut count = 1usize;
+    let mut first = sorted[0];
+    for &v in &sorted[1..] {
+        if (v - first).abs() <= tol {
+            sum += v;
+            count += 1;
+        } else {
+            out.push(sum / (count as f32));
+            sum = v;
+            count = 1;
+            first = v;
+        }
+    }
+    out.push(sum / (count as f32));
+    out
+}
+
+/// Builds an intersection graph (`tol = 2.0 pt`) between `HSegment`s and `VSegment`s and isolates
+/// independent table regions as connected components (`>= 2` distinct H and `>= 2` distinct V lines).
+/// Returns components sorted top-to-bottom (and left-to-right for side-by-side tables).
+pub fn isolate_table_components(
+    h_segs: &[HSegment],
+    v_segs: &[VSegment],
+) -> Vec<(Vec<HSegment>, Vec<VSegment>, (f32, f32, f32, f32))> {
+    let nh = h_segs.len();
+    let nv = v_segs.len();
+    if nh < 2 || nv < 2 {
+        return Vec::new();
+    }
+    let tol = 2.0f32;
+    let mut h_adj: Vec<Vec<usize>> = vec![Vec::new(); nh];
+    let mut v_adj: Vec<Vec<usize>> = vec![Vec::new(); nv];
+
+    for (hi, h) in h_segs.iter().enumerate() {
+        for (vi, v) in v_segs.iter().enumerate() {
+            if v.x >= h.x0 - tol && v.x <= h.x1 + tol && h.y >= v.y0 - tol && h.y <= v.y1 + tol {
+                h_adj[hi].push(vi);
+                v_adj[vi].push(hi);
+            }
+        }
+    }
+
+    let mut h_vis = vec![false; nh];
+    let mut v_vis = vec![false; nv];
+    let mut components: Vec<(Vec<HSegment>, Vec<VSegment>, (f32, f32, f32, f32))> = Vec::new();
+
+    for start_h in 0..nh {
+        if h_vis[start_h] || h_adj[start_h].is_empty() {
+            continue;
+        }
+        let mut q_h = std::collections::VecDeque::new();
+        let mut q_v = std::collections::VecDeque::new();
+        let mut comp_h = Vec::new();
+        let mut comp_v = Vec::new();
+        h_vis[start_h] = true;
+        q_h.push_back(start_h);
+
+        while !q_h.is_empty() || !q_v.is_empty() {
+            while let Some(hi) = q_h.pop_front() {
+                comp_h.push(h_segs[hi]);
+                for &vi in &h_adj[hi] {
+                    if !v_vis[vi] {
+                        v_vis[vi] = true;
+                        q_v.push_back(vi);
+                    }
+                }
+            }
+            while let Some(vi) = q_v.pop_front() {
+                comp_v.push(v_segs[vi]);
+                for &hi in &v_adj[vi] {
+                    if !h_vis[hi] {
+                        h_vis[hi] = true;
+                        q_h.push_back(hi);
+                    }
+                }
+            }
+        }
+
+        let ys = cluster_coords_1d(&comp_h.iter().map(|s| s.y).collect::<Vec<_>>(), 1.8);
+        let xs = cluster_coords_1d(&comp_v.iter().map(|s| s.x).collect::<Vec<_>>(), 1.8);
+        if ys.len() < 2 || xs.len() < 2 {
+            continue;
+        }
+        let min_x = *xs.first().unwrap();
+        let max_x = *xs.last().unwrap();
+        let min_y = *ys.first().unwrap();
+        let max_y = *ys.last().unwrap();
+        if (max_x - min_x) < 18.0 || (max_y - min_y) < 10.0 {
+            continue;
+        }
+        components.push((comp_h, comp_v, (min_x, max_x, min_y, max_y)));
+    }
+
+    components.sort_by(|a, b| {
+        let (ax0, _, ay0, ay1) = a.2;
+        let (bx0, _, by0, by1) = b.2;
+        let y_overlap = (ay1.min(by1) - ay0.max(by0)).max(0.0);
+        let min_h = (ay1 - ay0).min(by1 - by0).max(1.0);
+        if y_overlap >= 0.4 * min_h {
+            ax0.total_cmp(&bx0)
+        } else {
+            by1.total_cmp(&ay1)
+        }
+    });
+
+    components
+}
+
+fn format_cell_words(mut cell_words: Vec<&WordBox>) -> String {
+    if cell_words.is_empty() {
+        return String::new();
+    }
+    let avg_h = (cell_words.iter().map(|w| w.height()).sum::<f32>() / cell_words.len() as f32).max(6.0);
+    cell_words.sort_by(|a, b| b.cy().total_cmp(&a.cy()).then_with(|| a.left.total_cmp(&b.left)));
+
+    let mut lines: Vec<Vec<&WordBox>> = Vec::new();
+    for w in cell_words {
+        if let Some(last_line) = lines.last_mut() {
+            let ref_cy = last_line[0].cy();
+            if (ref_cy - w.cy()).abs() <= avg_h * 0.55 {
+                last_line.push(w);
+                continue;
+            }
+        }
+        lines.push(vec![w]);
+    }
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(lines.len());
+    for mut line in lines {
+        line.sort_by(|a, b| a.left.total_cmp(&b.left));
+        let joined = line
+            .iter()
+            .map(|w| w.text.trim())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            out_lines.push(joined);
+        }
+    }
+    out_lines.join("\n")
+}
+
+/// Builds a Lattice `ExcelTableGrid` with true rectangular `<mergeCells>` spans and exact
+/// bounding-box word assignment (never shifting empty cells left). Also returns a boolean mask
+/// indicating which `words` were consumed by this table.
+pub fn build_lattice_grid_from_component(
+    comp_h: &[HSegment],
+    comp_v: &[VSegment],
+    words: &[WordBox],
+    page_num: usize,
+) -> Option<(ExcelTableGrid, Vec<bool>)> {
+    let mut y_lines = cluster_coords_1d(&comp_h.iter().map(|s| s.y).collect::<Vec<_>>(), 1.8);
+    let x_lines = cluster_coords_1d(&comp_v.iter().map(|s| s.x).collect::<Vec<_>>(), 1.8);
+    if y_lines.len() < 2 || x_lines.len() < 2 {
+        return None;
+    }
+    y_lines.sort_by(|a, b| b.total_cmp(a));
+    let nrows = y_lines.len() - 1;
+    let ncols = x_lines.len() - 1;
+    let snap = 2.2f32;
+
+    let has_h_wall = |row_b: usize, col: usize| -> bool {
+        let y = y_lines[row_b];
+        let x0 = x_lines[col];
+        let x1 = x_lines[col + 1];
+        let span = (x1 - x0).max(1.0);
+        let mut covered = 0.0f32;
+        for h in comp_h {
+            if (h.y - y).abs() <= snap {
+                let ov = (h.x1.min(x1) - h.x0.max(x0)).max(0.0);
+                covered += ov;
+            }
+        }
+        covered >= span * 0.55
+    };
+
+    let has_v_wall = |row: usize, col_b: usize| -> bool {
+        let x = x_lines[col_b];
+        let y_top = y_lines[row];
+        let y_bot = y_lines[row + 1];
+        let span = (y_top - y_bot).max(1.0);
+        let mut covered = 0.0f32;
+        for v in comp_v {
+            if (v.x - x).abs() <= snap {
+                let ov = (v.y1.min(y_top) - v.y0.max(y_bot)).max(0.0);
+                covered += ov;
+            }
+        }
+        covered >= span * 0.55
+    };
+
+    let mut owner: Vec<Vec<Option<(usize, usize)>>> = vec![vec![None; ncols]; nrows];
+    let mut merges: Vec<CellMerge> = Vec::new();
+    for r in 0..nrows {
+        for c in 0..ncols {
+            if owner[r][c].is_some() {
+                continue;
+            }
+            let mut c2 = c;
+            while c2 + 1 < ncols && owner[r][c2 + 1].is_none() && !has_v_wall(r, c2 + 1) {
+                c2 += 1;
+            }
+            let mut r2 = r;
+            'down: while r2 + 1 < nrows {
+                for cc in c..=c2 {
+                    if owner[r2 + 1][cc].is_some() || has_h_wall(r2 + 1, cc) {
+                        break 'down;
+                    }
+                }
+                for cc in c..c2 {
+                    if has_v_wall(r2 + 1, cc + 1) {
+                        break 'down;
+                    }
+                }
+                r2 += 1;
+            }
+            for rr in r..=r2 {
+                for cc in c..=c2 {
+                    owner[rr][cc] = Some((r, c));
+                }
+            }
+            if r2 > r || c2 > c {
+                merges.push(CellMerge {
+                    row: r,
+                    col: c,
+                    row_span: r2 - r + 1,
+                    col_span: c2 - c + 1,
+                });
+            }
+        }
+    }
+
+    let min_x = x_lines[0];
+    let max_x = x_lines[ncols];
+    let max_y = y_lines[0];
+    let min_y = y_lines[nrows];
+    let outer_tol = 2.0f32;
+
+    let mut buckets: Vec<Vec<Vec<&WordBox>>> = vec![vec![Vec::new(); ncols]; nrows];
+    let mut consumed = vec![false; words.len()];
+
+    for (wi, w) in words.iter().enumerate() {
+        let cx = w.cx();
+        let cy = w.cy();
+        if cx < min_x - outer_tol
+            || cx > max_x + outer_tol
+            || cy < min_y - outer_tol
+            || cy > max_y + outer_tol
+        {
+            continue;
+        }
+        let mut r_hit = None;
+        for r in 0..nrows {
+            if cy <= y_lines[r] + outer_tol && cy >= y_lines[r + 1] - outer_tol {
+                r_hit = Some(r);
+                break;
+            }
+        }
+        let mut c_hit = None;
+        for c in 0..ncols {
+            if cx >= x_lines[c] - outer_tol && cx <= x_lines[c + 1] + outer_tol {
+                c_hit = Some(c);
+                break;
+            }
+        }
+        if let (Some(r), Some(c)) = (r_hit, c_hit) {
+            let (ar, ac) = owner[r][c].unwrap_or((r, c));
+            buckets[ar][ac].push(w);
+            consumed[wi] = true;
+        }
+    }
+
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(nrows);
+    let mut non_empty_cells = 0usize;
+    for r in 0..nrows {
+        let mut row_cells = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            let txt = format_cell_words(std::mem::take(&mut buckets[r][c]));
+            if !txt.is_empty() {
+                non_empty_cells += 1;
+            }
+            row_cells.push(txt);
+        }
+        rows.push(row_cells);
+    }
+
+    if non_empty_cells == 0 {
+        return None;
+    }
+
+    Some((
+        ExcelTableGrid {
+            rows,
+            merges,
+            page_num,
+            is_lattice: true,
+            bbox: (min_x, max_x, min_y, max_y),
+        },
+        consumed,
+    ))
+}
+
+/// Extracts word-level bounding boxes from a PDFium page via `FPDFText_GetCharBox` (`page.text().chars()`).
+pub fn extract_page_word_boxes(page: &PdfPage) -> Vec<WordBox> {
+    let Ok(tp) = page.text() else {
+        return Vec::new();
+    };
+    let mut words: Vec<WordBox> = Vec::new();
+    let mut cur_text = String::new();
+    let mut cur_l = 0.0f32;
+    let mut cur_r = 0.0f32;
+    let mut cur_b = 0.0f32;
+    let mut cur_t = 0.0f32;
+
+    let flush = |cur_text: &mut String,
+                 cur_l: f32,
+                 cur_r: f32,
+                 cur_b: f32,
+                 cur_t: f32,
+                 out: &mut Vec<WordBox>| {
+        let trimmed = cur_text.trim();
+        if !trimmed.is_empty() {
+            out.push(WordBox {
+                text: trimmed.to_string(),
+                left: cur_l,
+                right: cur_r,
+                bottom: cur_b,
+                top: cur_t,
+            });
+        }
+        cur_text.clear();
+    };
+
+    for ch in tp.chars().iter() {
+        let Some(c) = ch.unicode_char() else {
+            continue;
+        };
+        if c.is_whitespace() || c.is_control() {
+            if !cur_text.is_empty() {
+                flush(&mut cur_text, cur_l, cur_r, cur_b, cur_t, &mut words);
+            }
+            continue;
+        }
+        let Ok(rect) = ch.tight_bounds().or_else(|_| ch.loose_bounds()) else {
+            continue;
+        };
+        let l = rect.left().value.min(rect.right().value);
+        let r = rect.left().value.max(rect.right().value);
+        let b = rect.bottom().value.min(rect.top().value);
+        let t = rect.bottom().value.max(rect.top().value);
+        let h = (t - b).max(4.0);
+
+        if cur_text.is_empty() {
+            cur_text.push(c);
+            cur_l = l;
+            cur_r = r;
+            cur_b = b;
+            cur_t = t;
+        } else {
+            let cur_h = (cur_t - cur_b).max(h).max(4.0);
+            let same_line = ((cur_b + cur_t) * 0.5 - (b + t) * 0.5).abs() <= cur_h * 0.65;
+            let gap = l - cur_r;
+            let max_char_gap = (cur_h * 0.30).max(1.8);
+            if same_line && gap >= -cur_h * 0.5 && gap <= max_char_gap {
+                cur_text.push(c);
+                cur_l = cur_l.min(l);
+                cur_r = cur_r.max(r);
+                cur_b = cur_b.min(b);
+                cur_t = cur_t.max(t);
+            } else {
+                flush(&mut cur_text, cur_l, cur_r, cur_b, cur_t, &mut words);
+                cur_text.push(c);
+                cur_l = l;
+                cur_r = r;
+                cur_b = b;
+                cur_t = t;
+            }
+        }
+    }
+    if !cur_text.is_empty() {
+        flush(&mut cur_text, cur_l, cur_r, cur_b, cur_t, &mut words);
+    }
+    words
+}
+
+/// Stream Fallback Engine: groups words into visual rows via Y-overlap, detects vertical whitespace
+/// gutters via an X-axis coverage histogram, and aligns columns without shifting empty cells left.
+pub fn extract_stream_tables_from_words(words: &[WordBox], page_num: usize) -> Vec<ExcelTableGrid> {
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted: Vec<&WordBox> = words.iter().collect();
+    sorted.sort_by(|a, b| b.cy().total_cmp(&a.cy()).then_with(|| a.left.total_cmp(&b.left)));
+
+    let mut visual_rows: Vec<(f32, f32, Vec<&WordBox>)> = Vec::new();
+    for w in sorted {
+        let mut placed = false;
+        for (r_bot, r_top, r_words) in visual_rows.iter_mut().rev().take(4) {
+            let ov = r_top.min(w.top) - r_bot.max(w.bottom);
+            let min_h = (*r_top - *r_bot).min(w.height()).max(1.0);
+            if ov >= 0.30 * min_h || ((*r_bot + *r_top) * 0.5 - w.cy()).abs() <= min_h * 0.45 {
+                *r_bot = r_bot.min(w.bottom);
+                *r_top = r_top.max(w.top);
+                r_words.push(w);
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            visual_rows.push((w.bottom, w.top, vec![w]));
+        }
+    }
+    visual_rows.sort_by(|a, b| ((b.0 + b.1) * 0.5).total_cmp(&((a.0 + a.1) * 0.5)));
+    for (_, _, r_words) in &mut visual_rows {
+        r_words.sort_by(|a, b| a.left.total_cmp(&b.left));
+    }
+
+    let min_x = words.iter().map(|w| w.left).fold(f32::INFINITY, f32::min);
+    let max_x = words.iter().map(|w| w.right).fold(f32::NEG_INFINITY, f32::max);
+    let min_y = words.iter().map(|w| w.bottom).fold(f32::INFINITY, f32::min);
+    let max_y = words.iter().map(|w| w.top).fold(f32::NEG_INFINITY, f32::max);
+    let span_x = (max_x - min_x).ceil().max(1.0) as usize;
+    let avg_h = (words.iter().map(|w| w.height()).sum::<f32>() / words.len() as f32).max(6.0);
+    let min_gutter_pts = (avg_h * 0.65).clamp(5.0, 18.0);
+
+    let mut coverage = vec![0u32; span_x + 2];
+    for (_, _, r_words) in &visual_rows {
+        let mut p_left = r_words[0].left;
+        let mut p_right = r_words[0].right;
+        for w in &r_words[1..] {
+            if w.left - p_right <= min_gutter_pts * 0.85 {
+                p_right = p_right.max(w.right);
+            } else {
+                let b0 = ((p_left - min_x).floor().max(0.0) as usize).min(span_x);
+                let b1 = ((p_right - min_x).ceil().max(0.0) as usize).min(span_x);
+                for slot in &mut coverage[b0..=b1] {
+                    *slot += 1;
+                }
+                p_left = w.left;
+                p_right = w.right;
+            }
+        }
+        let b0 = ((p_left - min_x).floor().max(0.0) as usize).min(span_x);
+        let b1 = ((p_right - min_x).ceil().max(0.0) as usize).min(span_x);
+        for slot in &mut coverage[b0..=b1] {
+            *slot += 1;
+        }
+    }
+
+    let mut splits: Vec<f32> = Vec::new();
+    let mut bin = 0usize;
+    let min_gutter_bins = min_gutter_pts.floor().max(4.0) as usize;
+    while bin <= span_x {
+        if coverage[bin] == 0 {
+            let start = bin;
+            while bin <= span_x && coverage[bin] == 0 {
+                bin += 1;
+            }
+            let end = bin;
+            if start > 0 && end <= span_x && (end - start) >= min_gutter_bins {
+                splits.push(min_x + ((start + end) as f32) * 0.5);
+            }
+        } else {
+            bin += 1;
+        }
+    }
+
+    let ncols = splits.len() + 1;
+    let mut rows: Vec<Vec<String>> = Vec::with_capacity(visual_rows.len());
+    for (_, _, r_words) in &visual_rows {
+        let mut buckets: Vec<Vec<&WordBox>> = vec![Vec::new(); ncols];
+        for &w in r_words {
+            let cx = w.cx();
+            let mut col = 0usize;
+            for &sx in &splits {
+                if cx > sx {
+                    col += 1;
+                } else {
+                    break;
+                }
+            }
+            buckets[col.min(ncols - 1)].push(w);
+        }
+        let row_cells: Vec<String> = buckets
+            .into_iter()
+            .map(|mut bw| {
+                bw.sort_by(|a, b| a.left.total_cmp(&b.left));
+                bw.iter()
+                    .map(|w| w.text.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
+        if row_cells.iter().any(|c| !c.is_empty()) {
+            rows.push(row_cells);
+        }
+    }
+
+    if rows.is_empty() {
+        return Vec::new();
+    }
+
+    vec![ExcelTableGrid {
+        rows,
+        merges: Vec::new(),
+        page_num,
+        is_lattice: false,
+        bbox: (min_x, max_x, min_y, max_y),
+    }]
+}
+
+/// Pure-Rust orchestrator for a single page: runs Lattice, Stream, or AutoHybrid extraction.
+pub fn extract_page_excel_tables_hybrid(
+    h_raw: &[HSegment],
+    v_raw: &[VSegment],
+    words: &[WordBox],
+    page_num: usize,
+    mode: ExcelExportMode,
+) -> Vec<ExcelTableGrid> {
+    let mut tables: Vec<ExcelTableGrid> = Vec::new();
+    let mut consumed = vec![false; words.len()];
+
+    if matches!(mode, ExcelExportMode::AutoHybrid | ExcelExportMode::Lattice) {
+        let (h_segs, v_segs) = cluster_and_merge_segments(h_raw, v_raw, 1.8, 2.0);
+        let components = isolate_table_components(&h_segs, &v_segs);
+        for (comp_h, comp_v, _) in components {
+            if let Some((grid, mask)) =
+                build_lattice_grid_from_component(&comp_h, &comp_v, words, page_num)
+            {
+                for (i, c) in mask.into_iter().enumerate() {
+                    if c {
+                        consumed[i] = true;
+                    }
+                }
+                tables.push(grid);
+            }
+        }
+    }
+
+    if mode == ExcelExportMode::Stream || (mode == ExcelExportMode::AutoHybrid && tables.is_empty()) {
+        let remaining: Vec<WordBox> = words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| mode == ExcelExportMode::Stream || !consumed[*i])
+            .map(|(_, w)| w.clone())
+            .collect();
+        tables.extend(extract_stream_tables_from_words(&remaining, page_num));
+    } else if mode == ExcelExportMode::AutoHybrid {
+        let remaining: Vec<WordBox> = words
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !consumed[*i])
+            .map(|(_, w)| w.clone())
+            .collect();
+        if remaining.len() >= 6 {
+            let stream_extra = extract_stream_tables_from_words(&remaining, page_num);
+            for st in stream_extra {
+                let cols = st.rows.iter().map(|r| r.len()).max().unwrap_or(0);
+                if cols >= 2 && st.rows.len() >= 2 {
+                    tables.push(st);
+                }
+            }
+        }
+    }
+
+    tables
+}
+
+/// Converts an open `PdfDocument` to `.xlsx` using the Milestone 4 Hybrid Lattice + Stream engine.
+pub fn export_document_to_xlsx_with_options(
+    doc: &PdfDocument,
+    opts: ExcelExportOptions,
+) -> Vec<u8> {
+    let mut all_tables: Vec<ExcelTableGrid> = Vec::new();
+    for (p_idx, page) in doc.pages().iter().enumerate() {
+        let words = extract_page_word_boxes(&page);
+        let (h_raw, v_raw) = if opts.mode == ExcelExportMode::Stream {
+            (Vec::new(), Vec::new())
+        } else {
+            extract_page_vector_segments(&page)
+        };
+        let page_tables =
+            extract_page_excel_tables_hybrid(&h_raw, &v_raw, &words, p_idx + 1, opts.mode);
+        all_tables.extend(page_tables);
+    }
+
+    if all_tables.is_empty() && opts.mode != ExcelExportMode::Lattice {
+        let pages = extract_document_blocks(doc);
+        return render_blocks_to_xlsx(&pages);
+    }
+
+    render_tables_to_xlsx(&all_tables, opts)
+}
+
+fn build_xlsx_sheet_xml_with_merges(
+    rows: &[Vec<String>],
+    merges: &[CellMerge],
+    header_rows: &[usize],
+    normalize_comma_decimals: bool,
+) -> String {
+    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let mut col_widths = vec![10usize; max_cols];
+    for row in rows {
+        for (c, cell) in row.iter().enumerate() {
+            let max_line = cell
+                .lines()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(0);
+            if max_line + 3 > col_widths[c] {
+                col_widths[c] = (max_line + 3).min(52);
+            }
+        }
+    }
+
+    let mut xml = String::with_capacity(4096);
     xml.push_str(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
          <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
@@ -1720,12 +2785,14 @@ fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
 
     for (r_idx, row) in rows.iter().enumerate() {
         let row_num = r_idx + 1;
-        let is_hdr = bold_first_row && r_idx == 0;
+        let is_hdr = header_rows.contains(&r_idx);
         xml.push_str(&format!("<row r=\"{row_num}\">"));
         for (c_idx, val) in row.iter().enumerate() {
             let col_ref = format!("{}{}", xlsx_col_letter(c_idx), row_num);
             if !is_hdr {
-                if let Some((num, num_style)) = parse_excel_numeric(val) {
+                if let Some((num, num_style)) =
+                    parse_excel_numeric_with_opts(val, normalize_comma_decimals)
+                {
                     xml.push_str(&format!(
                         "<c r=\"{col_ref}\" s=\"{num_style}\"><v>{num}</v></c>"
                     ));
@@ -1741,8 +2808,217 @@ fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
         xml.push_str("</row>");
     }
 
-    xml.push_str("</sheetData></worksheet>");
+    xml.push_str("</sheetData>");
+    if !merges.is_empty() {
+        xml.push_str(&format!("<mergeCells count=\"{}\">", merges.len()));
+        for m in merges {
+            let r1 = m.row + 1;
+            let r2 = m.row + m.row_span;
+            let c1 = xlsx_col_letter(m.col);
+            let c2 = xlsx_col_letter(m.col + m.col_span - 1);
+            xml.push_str(&format!("<mergeCell ref=\"{c1}{r1}:{c2}{r2}\"/>"));
+        }
+        xml.push_str("</mergeCells>");
+    }
+    xml.push_str("</worksheet>");
     xml
+}
+
+fn xlsx_styles_xml() -> &'static str {
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
+        <numFmts count=\"5\">\
+          <numFmt numFmtId=\"164\" formatCode=\"#,##0.0\"/>\
+          <numFmt numFmtId=\"165\" formatCode=\"#,##0.000\"/>\
+          <numFmt numFmtId=\"166\" formatCode=\"#,##0.0000\"/>\
+          <numFmt numFmtId=\"167\" formatCode=\"#,##0.00000\"/>\
+          <numFmt numFmtId=\"168\" formatCode=\"#,##0.000000\"/>\
+        </numFmts>\
+        <fonts count=\"2\">\
+          <font><sz val=\"11\"/><name val=\"Calibri\"/></font>\
+          <font><b/><sz val=\"11\"/><color rgb=\"FF0F172A\"/><name val=\"Calibri\"/></font>\
+        </fonts>\
+        <fills count=\"3\">\
+          <fill><patternFill patternType=\"none\"/></fill>\
+          <fill><patternFill patternType=\"gray125\"/></fill>\
+          <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFEFF6FF\"/></patternFill></fill>\
+        </fills>\
+        <borders count=\"2\">\
+          <border><left/><right/><top/><bottom/><diagonal/></border>\
+          <border>\
+            <left style=\"thin\"><color rgb=\"FFCBD5E1\"/></left>\
+            <right style=\"thin\"><color rgb=\"FFCBD5E1\"/></right>\
+            <top style=\"thin\"><color rgb=\"FFCBD5E1\"/></top>\
+            <bottom style=\"thin\"><color rgb=\"FFCBD5E1\"/></bottom>\
+            <diagonal/>\
+          </border>\
+        </borders>\
+        <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
+        <cellXfs count=\"11\">\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
+          <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\" applyAlignment=\"1\"><alignment wrapText=\"1\" vertical=\"top\"/></xf>\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\" applyAlignment=\"1\"><alignment wrapText=\"1\" vertical=\"top\"/></xf>\
+          <xf numFmtId=\"4\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"166\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"167\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+          <xf numFmtId=\"168\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
+        </cellXfs>\
+        </styleSheet>"
+}
+
+fn finish_xlsx_workbook(
+    sheets: &[(String, Vec<Vec<String>>, Vec<CellMerge>, Vec<usize>)],
+    normalize_comma_decimals: bool,
+) -> Vec<u8> {
+    let mut content_types = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
+         <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
+         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
+         <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
+         <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
+    );
+    let mut wb_sheets = String::new();
+    let mut wb_rels = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <Relationships xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
+    );
+
+    let mut zip = MiniZipWriter::new();
+    for (idx, (raw_name, rows, merges, header_rows)) in sheets.iter().enumerate() {
+        let s_num = idx + 1;
+        let rid = format!("rId{}", s_num + 1);
+        let safe_name: String = raw_name
+            .chars()
+            .filter(|c| !matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
+            .take(31)
+            .collect();
+        content_types.push_str(&format!(
+            "<Override PartName=\"/xl/worksheets/sheet{s_num}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
+        ));
+        wb_sheets.push_str(&format!(
+            "<sheet name=\"{}\" sheetId=\"{s_num}\" r:id=\"{rid}\"/>",
+            xml_escape(&safe_name)
+        ));
+        wb_rels.push_str(&format!(
+            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{s_num}.xml\"/>"
+        ));
+        let sheet_xml = build_xlsx_sheet_xml_with_merges(
+            rows,
+            merges,
+            header_rows,
+            normalize_comma_decimals,
+        );
+        zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
+    }
+    content_types.push_str("</Types>");
+    wb_rels.push_str("</Relationships>");
+
+    let workbook_xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+         <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
+         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+         <sheets>{wb_sheets}</sheets></workbook>"
+    );
+
+    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
+        <Relationships xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
+        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
+        </Relationships>";
+
+    zip.add_file("[Content_Types].xml", content_types.as_bytes());
+    zip.add_file("_rels/.rels", root_rels.as_bytes());
+    zip.add_file("xl/workbook.xml", workbook_xml.as_bytes());
+    zip.add_file("xl/styles.xml", xlsx_styles_xml().as_bytes());
+    zip.add_file("xl/_rels/workbook.xml.rels", wb_rels.as_bytes());
+    zip.finish()
+}
+
+/// Renders extracted `ExcelTableGrid`s to a valid OOXML `.xlsx` ZIP byte vector with `<mergeCells>`,
+/// financial decimal formats, `wrapText="1"`, auto-fit column widths, and chosen sheet layout.
+pub fn render_tables_to_xlsx(tables: &[ExcelTableGrid], opts: ExcelExportOptions) -> Vec<u8> {
+    if tables.is_empty() {
+        let sheets = vec![(
+            "Sheet1".to_string(),
+            vec![vec!["(No extractable tables or text found in PDF)".to_string()]],
+            Vec::new(),
+            Vec::new(),
+        )];
+        return finish_xlsx_workbook(&sheets, opts.normalize_comma_decimals);
+    }
+
+    let mut sheets: Vec<(String, Vec<Vec<String>>, Vec<CellMerge>, Vec<usize>)> = Vec::new();
+    match opts.layout {
+        ExcelTableLayout::StackOnOneSheet => {
+            let mut stacked_rows: Vec<Vec<String>> = Vec::new();
+            let mut stacked_merges: Vec<CellMerge> = Vec::new();
+            let mut header_rows: Vec<usize> = Vec::new();
+            for (t_idx, tbl) in tables.iter().enumerate() {
+                if tbl.rows.is_empty() {
+                    continue;
+                }
+                if t_idx > 0 {
+                    stacked_rows.push(Vec::new());
+                    stacked_rows.push(Vec::new());
+                }
+                let row_offset = stacked_rows.len();
+                header_rows.push(row_offset);
+                for m in &tbl.merges {
+                    stacked_merges.push(CellMerge {
+                        row: m.row + row_offset,
+                        col: m.col,
+                        row_span: m.row_span,
+                        col_span: m.col_span,
+                    });
+                }
+                stacked_rows.extend(tbl.rows.iter().cloned());
+            }
+            sheets.push((
+                "Extracted Tables".to_string(),
+                stacked_rows,
+                stacked_merges,
+                header_rows,
+            ));
+        }
+        ExcelTableLayout::SeparateSheets => {
+            for (t_idx, tbl) in tables.iter().enumerate() {
+                if tbl.rows.is_empty() {
+                    continue;
+                }
+                let table_num = t_idx + 1;
+                if sheets.len() < 30 {
+                    let name = format!("Table {table_num} (p.{})", tbl.page_num);
+                    sheets.push((name, tbl.rows.clone(), tbl.merges.clone(), vec![0]));
+                } else if let Some((_, last_rows, last_merges, last_hdrs)) = sheets.last_mut() {
+                    last_rows.push(Vec::new());
+                    last_rows.push(Vec::new());
+                    let off = last_rows.len();
+                    last_hdrs.push(off);
+                    for m in &tbl.merges {
+                        last_merges.push(CellMerge {
+                            row: m.row + off,
+                            col: m.col,
+                            row_span: m.row_span,
+                            col_span: m.col_span,
+                        });
+                    }
+                    last_rows.extend(tbl.rows.iter().cloned());
+                }
+            }
+        }
+    }
+
+    finish_xlsx_workbook(&sheets, opts.normalize_comma_decimals)
+}
+
+fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
+    let hdr = if bold_first_row { &[0usize][..] } else { &[] };
+    build_xlsx_sheet_xml_with_merges(rows, &[], hdr, false)
 }
 
 pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
@@ -1858,39 +3134,6 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
          <sheets>{wb_sheets}</sheets></workbook>"
     );
 
-    // Cell styles: 0=default, 1=bold blue-tinted header with border, 2=text with border, 3=number with border, 4=percent with border
-    let styles_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-        <fonts count=\"2\">\
-          <font><sz val=\"11\"/><name val=\"Calibri\"/></font>\
-          <font><b/><sz val=\"11\"/><color rgb=\"FF0F172A\"/><name val=\"Calibri\"/></font>\
-        </fonts>\
-        <fills count=\"3\">\
-          <fill><patternFill patternType=\"none\"/></fill>\
-          <fill><patternFill patternType=\"gray125\"/></fill>\
-          <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFEFF6FF\"/></patternFill></fill>\
-        </fills>\
-        <borders count=\"2\">\
-          <border><left/><right/><top/><bottom/><diagonal/></border>\
-          <border>\
-            <left style=\"thin\"><color rgb=\"FFCBD5E1\"/></left>\
-            <right style=\"thin\"><color rgb=\"FFCBD5E1\"/></right>\
-            <top style=\"thin\"><color rgb=\"FFCBD5E1\"/></top>\
-            <bottom style=\"thin\"><color rgb=\"FFCBD5E1\"/></bottom>\
-            <diagonal/>\
-          </border>\
-        </borders>\
-        <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
-        <cellXfs count=\"6\">\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
-          <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"4\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
-        </cellXfs>\
-        </styleSheet>";
-
     let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
@@ -1899,7 +3142,7 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
     zip.add_file("[Content_Types].xml", content_types.as_bytes());
     zip.add_file("_rels/.rels", root_rels.as_bytes());
     zip.add_file("xl/workbook.xml", workbook_xml.as_bytes());
-    zip.add_file("xl/styles.xml", styles_xml.as_bytes());
+    zip.add_file("xl/styles.xml", xlsx_styles_xml().as_bytes());
     zip.add_file("xl/_rels/workbook.xml.rels", wb_rels.as_bytes());
     zip.finish()
 }
@@ -2220,6 +3463,187 @@ mod tests {
             ])]],
         );
         assert!(tex.contains("{}[Note] & Val \\\\"), "tex: {tex}");
+    }
+
+    #[test]
+    fn test_milestone4_thin_rect_extraction_and_snapping() {
+        let mut h = Vec::new();
+        let mut v = Vec::new();
+        // Two slightly jittered horizontal thin filled rectangles separated by a 1.5 pt gap
+        extract_segments_from_thin_rect(10.0, 100.0, 499.6, 500.6, &mut h, &mut v);
+        extract_segments_from_thin_rect(101.5, 220.0, 500.2, 501.4, &mut h, &mut v);
+        // Thin vertical bar
+        extract_segments_from_thin_rect(9.5, 10.5, 400.0, 501.0, &mut h, &mut v);
+        // Thick shaded background box (NOT a border rule — must be ignored)
+        extract_segments_from_thin_rect(12.0, 200.0, 460.0, 498.0, &mut h, &mut v);
+
+        assert_eq!(h.len(), 2, "only thin horizontal rules should be captured");
+        assert_eq!(v.len(), 1, "only thin vertical rules should be captured");
+
+        let (hm, vm) = cluster_and_merge_segments(&h, &v, 1.8, 2.0);
+        assert_eq!(hm.len(), 1, "collinear segments within 1.8pt Y and 2.0pt X gap must merge");
+        assert!((hm[0].x0 - 10.0).abs() < 0.01 && (hm[0].x1 - 220.0).abs() < 0.01);
+        assert_eq!(vm.len(), 1);
+    }
+
+    #[test]
+    fn test_milestone4_side_by_side_connected_component_isolation() {
+        // Two independent 2x2 tables sitting side-by-side on the same Y band (x=20..180 and x=260..420)
+        let h_raw = vec![
+            // Left table
+            HSegment { y: 500.0, x0: 20.0, x1: 180.0 },
+            HSegment { y: 470.0, x0: 20.0, x1: 180.0 },
+            HSegment { y: 440.0, x0: 20.0, x1: 180.0 },
+            // Right table (same Y band, disconnected X)
+            HSegment { y: 500.0, x0: 260.0, x1: 420.0 },
+            HSegment { y: 470.0, x0: 260.0, x1: 420.0 },
+            HSegment { y: 440.0, x0: 260.0, x1: 420.0 },
+        ];
+        let v_raw = vec![
+            // Left table
+            VSegment { x: 20.0, y0: 440.0, y1: 500.0 },
+            VSegment { x: 100.0, y0: 440.0, y1: 500.0 },
+            VSegment { x: 180.0, y0: 440.0, y1: 500.0 },
+            // Right table
+            VSegment { x: 260.0, y0: 440.0, y1: 500.0 },
+            VSegment { x: 340.0, y0: 440.0, y1: 500.0 },
+            VSegment { x: 420.0, y0: 440.0, y1: 500.0 },
+        ];
+        let words = vec![
+            WordBox { text: "LeftA".into(), left: 30.0, right: 70.0, bottom: 480.0, top: 492.0 },
+            WordBox { text: "LeftB".into(), left: 110.0, right: 150.0, bottom: 480.0, top: 492.0 },
+            WordBox { text: "10,50".into(), left: 115.0, right: 150.0, bottom: 450.0, top: 462.0 },
+            WordBox { text: "RightA".into(), left: 270.0, right: 315.0, bottom: 480.0, top: 492.0 },
+            WordBox { text: "RightB".into(), left: 350.0, right: 395.0, bottom: 480.0, top: 492.0 },
+            WordBox { text: "20,75".into(), left: 355.0, right: 395.0, bottom: 450.0, top: 462.0 },
+        ];
+
+        let tables = extract_page_excel_tables_hybrid(&h_raw, &v_raw, &words, 1, ExcelExportMode::Lattice);
+        assert_eq!(tables.len(), 2, "side-by-side tables must be isolated into 2 independent tables");
+        assert_eq!(tables[0].rows[0], vec!["LeftA", "LeftB"]);
+        assert_eq!(tables[0].rows[1], vec!["", "10,50"], "empty left cell must NOT shift right cell left");
+        assert_eq!(tables[1].rows[0], vec!["RightA", "RightB"]);
+        assert_eq!(tables[1].rows[1], vec!["", "20,75"]);
+    }
+
+    #[test]
+    fn test_milestone4_merged_cells_and_empty_cell_preservation() {
+        // 3 rows x 3 cols grid where Row 0 merges Cols 0..=2 (title banner),
+        // Row 1 Col 0 merges Rows 1..=2 (row-span), and Row 2 Col 1 is empty while Row 2 Col 2 has a number.
+        let h_raw = vec![
+            HSegment { y: 600.0, x0: 0.0, x1: 300.0 },   // top
+            HSegment { y: 570.0, x0: 0.0, x1: 300.0 },   // below banner
+            HSegment { y: 540.0, x0: 100.0, x1: 300.0 }, // NO wall in col 0 between row 1 & 2!
+            HSegment { y: 510.0, x0: 0.0, x1: 300.0 },   // bottom
+        ];
+        let v_raw = vec![
+            VSegment { x: 0.0, y0: 510.0, y1: 600.0 },   // outer left
+            VSegment { x: 100.0, y0: 510.0, y1: 570.0 }, // NO wall in row 0!
+            VSegment { x: 200.0, y0: 510.0, y1: 570.0 }, // NO wall in row 0!
+            VSegment { x: 300.0, y0: 510.0, y1: 600.0 }, // outer right
+        ];
+        let words = vec![
+            WordBox { text: "FX".into(), left: 110.0, right: 130.0, bottom: 580.0, top: 592.0 },
+            WordBox { text: "Rates".into(), left: 140.0, right: 185.0, bottom: 580.0, top: 592.0 },
+            WordBox { text: "USD".into(), left: 20.0, right: 55.0, bottom: 535.0, top: 547.0 },
+            WordBox { text: "Spot".into(), left: 115.0, right: 155.0, bottom: 550.0, top: 562.0 },
+            WordBox { text: "123,9500".into(), left: 215.0, right: 275.0, bottom: 550.0, top: 562.0 },
+            // Row 2 Col 1 intentionally empty!
+            WordBox { text: "0,7728".into(), left: 215.0, right: 270.0, bottom: 520.0, top: 532.0 },
+        ];
+
+        let tables = extract_page_excel_tables_hybrid(&h_raw, &v_raw, &words, 1, ExcelExportMode::AutoHybrid);
+        assert_eq!(tables.len(), 1);
+        let t = &tables[0];
+        assert!(t.is_lattice);
+        assert_eq!(t.rows[0], vec!["FX Rates", "", ""]);
+        assert_eq!(t.rows[1], vec!["USD", "Spot", "123,9500"]);
+        assert_eq!(t.rows[2], vec!["", "", "0,7728"], "empty middle cell must keep col 2 value in col 2");
+        assert!(
+            t.merges.contains(&CellMerge { row: 0, col: 0, row_span: 1, col_span: 3 }),
+            "expected A1:C1 merge, got {:?}",
+            t.merges
+        );
+        assert!(
+            t.merges.contains(&CellMerge { row: 1, col: 0, row_span: 2, col_span: 1 }),
+            "expected A2:A3 merge, got {:?}",
+            t.merges
+        );
+    }
+
+    #[test]
+    fn test_milestone4_financial_number_parsing() {
+        // Comma-decimal normalization ON (default for Milestone 4)
+        let (v1, s1) = parse_excel_numeric_with_opts("123,9500", true).unwrap();
+        assert!((v1 - 123.95).abs() < 1e-9 && s1 == 8, "4 decimals -> style 8 (#,##0.0000)");
+
+        let (v2, s2) = parse_excel_numeric_with_opts("0,7728", true).unwrap();
+        assert!((v2 - 0.7728).abs() < 1e-9 && s2 == 8);
+
+        let (v3, s3) = parse_excel_numeric_with_opts("-45,50", true).unwrap();
+        assert!((v3 - (-45.5)).abs() < 1e-9 && s3 == 3, "2 decimals -> style 3 (#,##0.00)");
+
+        // Standard period decimals & thousands
+        let (v4, s4) = parse_excel_numeric_with_opts("121.4000", true).unwrap();
+        assert!((v4 - 121.4).abs() < 1e-9 && s4 == 8);
+
+        let (v5, s5) = parse_excel_numeric_with_opts("1,234.56", true).unwrap();
+        assert!((v5 - 1234.56).abs() < 1e-9 && s5 == 3);
+
+        // Non-numeric strings & codes preserved as text
+        assert_eq!(parse_excel_numeric_with_opts("N/A", true), None);
+        assert_eq!(parse_excel_numeric_with_opts("USD", true), None);
+        assert_eq!(parse_excel_numeric_with_opts("00123", true), None);
+        assert_eq!(parse_excel_numeric_with_opts("12345678901234567", true), None);
+
+        // Comma-decimal normalization OFF leaves European comma-decimals as text
+        assert_eq!(parse_excel_numeric_with_opts("123,9500", false), None);
+        assert_eq!(parse_excel_numeric_with_opts("0,7728", false), None);
+    }
+
+    #[test]
+    fn test_milestone4_stream_gutter_extraction_and_xlsx_merge_xml() {
+        // Unruled 3-column table with an empty middle cell on row 2
+        let words = vec![
+            WordBox { text: "Currency".into(), left: 20.0, right: 70.0, bottom: 500.0, top: 510.0 },
+            WordBox { text: "Bid".into(), left: 140.0, right: 165.0, bottom: 500.0, top: 510.0 },
+            WordBox { text: "Ask".into(), left: 230.0, right: 255.0, bottom: 500.0, top: 510.0 },
+
+            WordBox { text: "EUR".into(), left: 20.0, right: 48.0, bottom: 480.0, top: 490.0 },
+            WordBox { text: "1,0850".into(), left: 138.0, right: 175.0, bottom: 480.0, top: 490.0 },
+            WordBox { text: "1,0862".into(), left: 228.0, right: 265.0, bottom: 480.0, top: 490.0 },
+
+            WordBox { text: "JPY".into(), left: 20.0, right: 45.0, bottom: 460.0, top: 470.0 },
+            // Bid intentionally missing!
+            WordBox { text: "152,4000".into(), left: 225.0, right: 270.0, bottom: 460.0, top: 470.0 },
+        ];
+        let tables = extract_page_excel_tables_hybrid(&[], &[], &words, 1, ExcelExportMode::AutoHybrid);
+        assert_eq!(tables.len(), 1);
+        assert!(!tables[0].is_lattice);
+        assert_eq!(tables[0].rows[0], vec!["Currency", "Bid", "Ask"]);
+        assert_eq!(tables[0].rows[1], vec!["EUR", "1,0850", "1,0862"]);
+        assert_eq!(tables[0].rows[2], vec!["JPY", "", "152,4000"], "Stream mode must preserve empty middle cell");
+
+        // Verify OOXML ZIP with <mergeCells>, <numFmts>, wrapText="1", and stacked 2-blank-row layout
+        let mut t1 = tables[0].clone();
+        t1.merges.push(CellMerge { row: 0, col: 0, row_span: 1, col_span: 2 });
+        let t2 = tables[0].clone();
+        let xlsx = render_tables_to_xlsx(
+            &[t1, t2],
+            ExcelExportOptions {
+                mode: ExcelExportMode::AutoHybrid,
+                layout: ExcelTableLayout::StackOnOneSheet,
+                normalize_comma_decimals: true,
+            },
+        );
+        let entries = read_zip_entries(&xlsx);
+        let sheet1 = &entries.iter().find(|(n, _)| n == "xl/worksheets/sheet1.xml").unwrap().1;
+        let styles = &entries.iter().find(|(n, _)| n == "xl/styles.xml").unwrap().1;
+        assert!(sheet1.contains("<mergeCells count=\"1\"><mergeCell ref=\"A1:B1\"/></mergeCells>"), "sheet1: {sheet1}");
+        assert!(sheet1.contains("<v>1.085</v>") && sheet1.contains("s=\"8\""), "4-decimal comma float must write numeric f64 + style 8: {sheet1}");
+        assert!(sheet1.contains("<v>152.4</v>"), "sheet1: {sheet1}");
+        assert!(styles.contains("formatCode=\"#,##0.0000\""), "styles: {styles}");
+        assert!(styles.contains("wrapText=\"1\""), "styles: {styles}");
     }
 }
 

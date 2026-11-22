@@ -704,11 +704,8 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             (MenuCategory::Export, 1) => {
-                if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::ExportXlsx);
-                } else {
-                    self.status_notice = Some("Open a PDF first to export to Excel (.xlsx)".to_string());
-                }
+                self.open_excel_export_modal();
+                return;
             }
             (MenuCategory::Export, 2) => {
                 if self.doc.is_some() {

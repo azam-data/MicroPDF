@@ -22,6 +22,7 @@ use super::doc_props_modal::{
 use super::doc_tools_modal::{
     HeaderFooterHit, HeaderFooterModalState, PageNumberHit, PageNumberModalState,
 };
+use super::excel_export_modal::{ExcelExportHit, ExcelExportModalState};
 use super::image_tools_modal::{
     CreatePdfImagesHit, CreatePdfImagesModalState, ExportImagesHit, ExportImagesModalState,
 };
@@ -736,6 +737,7 @@ pub(super) enum UiHit {
     PageNumber(PageNumberHit),
     CreatePdfImages(CreatePdfImagesHit),
     ExportImages(ExportImagesHit),
+    ExcelExport(ExcelExportHit),
     DocProps(DocPropsHit),
     UnsavedChanges(UnsavedChangesHit),
     AnnotContext(AnnotContextHit),
@@ -1213,6 +1215,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) create_pdf_images_modal: Option<CreatePdfImagesModalState>,
     /// Active `Export Pages as Images` modal state (0 bytes when closed).
     pub(super) export_images_modal: Option<ExportImagesModalState>,
+    /// Active `Export PDF to Excel (.xlsx)` options modal state (0 bytes when closed).
+    pub(super) excel_export_modal: Option<ExcelExportModalState>,
+    /// Remembers last chosen Hybrid Lattice/Stream Excel export options for the session.
+    pub(super) excel_export_opts: crate::export::ExcelExportOptions,
     /// Active `Document Properties & Privacy` modal state (0 bytes when closed).
     pub(super) doc_props_modal: Option<DocPropsModalState>,
     /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
@@ -1458,6 +1464,8 @@ impl<'a> PdfViewerApp<'a> {
             page_number_modal: None,
             create_pdf_images_modal: None,
             export_images_modal: None,
+            excel_export_modal: None,
+            excel_export_opts: crate::export::ExcelExportOptions::default(),
             doc_props_modal: None,
             unsaved_changes_modal: None,
             user_guide_modal: None,
@@ -1501,6 +1509,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.page_number_modal.is_some()
             || self.create_pdf_images_modal.is_some()
             || self.export_images_modal.is_some()
+            || self.excel_export_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
             || self.show_customize_toolbar
