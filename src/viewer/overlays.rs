@@ -452,20 +452,20 @@ impl<'a> PdfViewerApp<'a> {
         fill_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.surface_bg);
         stroke_rounded_rect(buffer, buf_w, buf_h, cx, cy, cw, ch, rad, theme.border_subtle);
 
-        let (title, hint, value, ok_lbl) = match &self.input_mode {
-            InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump"),
-            InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply"),
-            InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next"),
-            InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next"),
-            InputMode::HeaderFooterText { text_input, .. } => ("Header / Footer (3 of 3)", "Enter text (leave empty to erase existing)", text_input.clone(), "Apply"),
-            InputMode::ClearMargins { input } => ("Clear Margins", "'1' Footers/Page#, '2' Headers, '3' Both (optional range)", input.clone(), "Clear"),
-            InputMode::Watermark { input } => ("Add Watermark", "Type watermark text", input.clone(), "Apply"),
-            InputMode::SplitRange { input } => ("Split / Extract Pages", "Page range (e.g. '1-3' or '2,4,6')", input.clone(), "Extract"),
-            InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add"),
-            InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save"),
-            InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach"),
-            InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place"),
-            InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open"),
+        let (title, hint, value, ok_lbl, is_confirm_only) = match &self.input_mode {
+            InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump", false),
+            InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply", false),
+            InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next", false),
+            InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next", false),
+            InputMode::HeaderFooterText { text_input, .. } => ("Header / Footer (3 of 3)", "Enter text (leave empty to erase existing)", text_input.clone(), "Apply", false),
+            InputMode::ClearMargins { input } => ("Clear Margins", "'1' Footers/Page#, '2' Headers, '3' Both (optional range)", input.clone(), "Clear", false),
+            InputMode::Watermark { input } => ("Add Watermark", "Type watermark text", input.clone(), "Apply", false),
+            InputMode::SplitRange { input } => ("Split / Extract Pages", "Page range (e.g. '1-3' or '2,4,6')", input.clone(), "Extract", false),
+            InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add", false),
+            InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save", false),
+            InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach", false),
+            InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place", false),
+            InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open", true),
             InputMode::PasswordPrompt { path, password_input, attempts_left, .. } => {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("document.pdf");
                 let masked: String = "*".repeat(password_input.chars().count());
@@ -475,6 +475,7 @@ impl<'a> PdfViewerApp<'a> {
                     fname,
                     &masked,
                     "Unlock",
+                    false,
                 );
             }
             InputMode::RestoreSessionPrompt { tab_count } => {
@@ -482,13 +483,14 @@ impl<'a> PdfViewerApp<'a> {
                     buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf,
                     "Restore Previous Session?",
                     &format!("{tab_count} saved tab(s) from your last session"),
-                    "",
+                    "Press Enter / Y to restore, or Esc / N to start fresh",
                     "Restore",
+                    true,
                 );
             }
             _ => return,
         };
-        self.draw_prompt_card_inner(buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf, title, hint, &value, ok_lbl);
+        self.draw_prompt_card_inner(buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf, title, hint, &value, ok_lbl, is_confirm_only);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -507,6 +509,7 @@ impl<'a> PdfViewerApp<'a> {
         hint: &str,
         value: &str,
         ok_lbl: &str,
+        is_confirm_only: bool,
     ) {
         let theme = self.ui_theme();
         let s = sf as f32;
@@ -521,10 +524,17 @@ impl<'a> PdfViewerApp<'a> {
         let inp_y = cy + (52.0 * s).round() as i32;
         let inp_h = (28.0 * s).round() as u32;
         let inp_w = cw.saturating_sub((pad * 2) as u32);
-        fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_bg);
-        stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_focus_border);
-        let txt = format!("{value}|");
-        draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
+        if is_confirm_only {
+            fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.surface_elevated);
+            stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.border_subtle);
+            let clipped = truncate_ellipsis(value, (inp_w as f32 - 16.0 * s).max(40.0), hint_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &clipped, hint_sz, theme.text_secondary, false);
+        } else {
+            fill_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_focus_border);
+            let txt = format!("{value}|");
+            draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
+        }
 
         let ok_b = hits[0];
         let ok_hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::PromptSubmit));
@@ -577,7 +587,7 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    /// Clean 2-column Help Overlay (`?` / `F1`) with styled keycaps and updated v1.3.0 header.
+    /// Clean 2-column Help Overlay (`?` / `F1`) with styled keycaps.
     pub(super) fn draw_themed_help_overlay(&self, buffer: &mut [u32], buf_w: u32, buf_h: u32, sf: f64) {
         let theme = self.ui_theme();
         let s = sf as f32;
@@ -598,7 +608,7 @@ impl<'a> PdfViewerApp<'a> {
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let key_sz = (10.5 * s).clamp(9.0, 22.0);
 
-        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.3.0", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF", title_sz, theme.text_primary, true);
         let close_hint = "Esc or Click to close";
         let chw = measure_text(close_hint, key_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + cw as i32 - pad - chw.ceil() as i32, cy + (17.0 * s).round() as i32, close_hint, key_sz, theme.text_muted, false);
@@ -607,10 +617,10 @@ impl<'a> PdfViewerApp<'a> {
         let left_items: &[(&str, &str)] = &[
             ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll Flow (Vert/Book)"),
             ("T", "Toggle Reflowable Text View (Tables + Export .md/.tex)"),
-            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 resets)"),
-            ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab tabs)"),
-            ("B / L", "Bookmark Sidebar / Import .txt"),
-            ("G / 0-9", "Smart Jump (5, ii, or #5)"),
+            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 / Ctrl+0 resets)"),
+            ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab switches tabs)"),
+            ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
+            ("G", "Smart Jump to Page (5, ii, or #5)"),
             ("Alt+Arrows", "Navigation History Back / Forward"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
             ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night Amber)"),
@@ -625,8 +635,8 @@ impl<'a> PdfViewerApp<'a> {
             ("P", "Stamp Signature / Image"),
             ("N / H", "Page Numbering & Header/Footer Dialogs + Profiles"),
             ("W / K", "Watermark / Convert Page to B&W"),
-            ("I / R / D", "Insert Blank / Rotate 90° / Delete"),
-            ("Ctrl+Z / C", "Undo Edit (up to 8 steps) / Copy Text"),
+            ("I / R / D", "Insert Blank / Rotate 90° / Delete Page"),
+            ("Ctrl+Z / C", "Undo Edit (Ctrl+Z) / Copy Selected Text (Ctrl+C)"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;

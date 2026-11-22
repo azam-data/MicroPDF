@@ -711,11 +711,13 @@ pub(super) enum InputMode {
         title_input: String,
     },
     StickyNotePrompt {
+        page_idx: u16,
         pdf_x: f32,
         pdf_y: f32,
         text_input: String,
     },
     FreeTextPrompt {
+        page_idx: u16,
         pdf_x: f32,
         pdf_y: f32,
         text_input: String,
@@ -838,6 +840,7 @@ pub(super) struct ActiveOptimizeJob {
     pub(super) out_path: PathBuf,
     pub(super) out_name: String,
     pub(super) disk_size: usize,
+    pub(super) skip_pages: usize,
     pub(super) roman_end: usize,
     pub(super) bookmarks: Vec<Bookmark>,
     pub(super) redacted: bool,
@@ -960,6 +963,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Accepted single-instance connections whose request line has not fully arrived yet.
     pub(super) pending_ipc: Vec<PendingIpcConnection>,
+    /// Verified forwarded PDF paths waiting until any blocking modal closes before switching tabs.
+    pub(super) queued_ipc_paths: VecDeque<PathBuf>,
     /// Flattened one-page copy of the form page being tiled (see `ensure_tile_rendered`).
     pub(super) tile_form_copy: Option<(u16, PdfDocument<'a>)>,
     /// Paged print job sent one page per frame (Windows GDI; a fake printer in tests).
@@ -1053,6 +1058,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) cached_text_view: Option<CachedTextViewPage>,
     /// Reading font size in logical pixels for `ViewMode::TextView`.
     pub(super) text_view_font_size: f32,
+    /// Last computed vertical max scroll in pixels for `ViewMode::TextView` (used by scrollbar & wheel).
+    pub(super) text_view_max_scroll: f32,
     /// Unified hovered UI widget to coalesce redraws and show crisp hover feedback.
     pub(super) hovered_widget: Option<UiHit>,
     /// True while dragging the right-edge overlay vertical scrollbar.
@@ -1211,6 +1218,7 @@ impl<'a> PdfViewerApp<'a> {
             custom_session_ini_path: None,
             single_instance_listener: None,
             pending_ipc: Vec::new(),
+            queued_ipc_paths: VecDeque::new(),
             tile_form_copy: None,
             print_job: None,
             lp_job: None,
@@ -1265,6 +1273,7 @@ impl<'a> PdfViewerApp<'a> {
             page_number_modal: None,
             cached_text_view: None,
             text_view_font_size: 14.5,
+            text_view_max_scroll: 0.0,
             hovered_widget: None,
             scrollbar_drag: false,
             is_fullscreen: false,
@@ -1289,6 +1298,41 @@ impl<'a> PdfViewerApp<'a> {
             app.load_document(path)?;
         }
         Ok(app)
+    }
+
+    /// True while any modal dialog, full-window overlay, or interactive prompt owns input focus.
+    pub(super) fn has_blocking_modal(&self) -> bool {
+        self.print_preview.is_some()
+            || self.manual_duplex_wait.is_some()
+            || self.combine_modal.is_some()
+            || self.header_footer_modal.is_some()
+            || self.page_number_modal.is_some()
+            || self.show_customize_toolbar
+            || self.show_help_overlay
+            || self.show_bookmark_format_overlay
+            || self.show_about_overlay
+            || self.input_mode != InputMode::Normal
+    }
+
+    /// True while any dropdown menu or floating popover is open above the document canvas.
+    pub(super) fn has_open_popover(&self) -> bool {
+        self.open_menu.is_some()
+            || self.show_tab_list_popover
+            || self.tab_context_menu.is_some()
+            || self.thumb_context_menu.is_some()
+            || self.show_reading_mode_popover
+            || self.show_notifications
+    }
+
+    /// Dismisses all transient menus, context menus, and floating popovers.
+    pub(super) fn close_all_popovers(&mut self) {
+        self.open_menu = None;
+        self.show_tab_list_popover = false;
+        self.tab_context_menu = None;
+        self.thumb_context_menu = None;
+        self.show_reading_mode_popover = false;
+        self.show_notifications = false;
+        self.active_note_popover = None;
     }
 
     /// Formats the current local wall-clock time as `HH:MM:SS` using zero extra dependencies.
@@ -1322,17 +1366,39 @@ impl<'a> PdfViewerApp<'a> {
             unsafe { GetLocalTime(&mut st) };
             return format!("{:02}:{:02}:{:02}", st.w_hour, st.w_minute, st.w_second);
         }
-        #[cfg(not(target_os = "windows"))]
+        #[cfg(unix)]
+        {
+            unsafe extern "C" {
+                fn time(tloc: *mut i64) -> i64;
+                fn localtime_r(timep: *const i64, result: *mut std::ffi::c_int) -> *mut std::ffi::c_void;
+            }
+            let now = unsafe { time(std::ptr::null_mut()) };
+            // POSIX guarantees tm_sec, tm_min, tm_hour are the first three c_int fields of struct tm;
+            // 16 c_ints (64 bytes) is safely larger than struct tm on Linux and macOS.
+            let mut tm_buf = [0 as std::ffi::c_int; 16];
+            let res = unsafe { localtime_r(&now, tm_buf.as_mut_ptr()) };
+            if !res.is_null() {
+                let s = tm_buf[0].clamp(0, 60);
+                let m = tm_buf[1].clamp(0, 59);
+                let h = tm_buf[2].clamp(0, 23);
+                return format!("{h:02}:{m:02}:{s:02}");
+            }
+            let secs = now.max(0) as u64 % 86_400;
+            format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60)
+        }
+        #[cfg(not(any(windows, unix)))]
         {
             let secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let day_secs = secs % 86_400;
-            let h = day_secs / 3600;
-            let m = (day_secs % 3600) / 60;
-            let s = day_secs % 60;
-            format!("{h:02}:{m:02}:{s:02}")
+            format!(
+                "{:02}:{:02}:{:02}",
+                day_secs / 3600,
+                (day_secs % 3600) / 60,
+                day_secs % 60
+            )
         }
     }
 
@@ -1344,11 +1410,12 @@ impl<'a> PdfViewerApp<'a> {
         if self.last_recorded_notice.as_deref() == Some(msg.as_str()) {
             return;
         }
-        let is_error = msg.starts_with("Error")
-            || msg.starts_with("ERROR")
-            || msg.contains("failed")
-            || msg.contains("Invalid")
-            || msg.contains("error:");
+        let lower = msg.to_ascii_lowercase();
+        let is_error = lower.contains("error")
+            || lower.contains("failed")
+            || lower.contains("invalid")
+            || lower.contains("cannot")
+            || lower.contains("refusing");
         if self.notifications.len() >= 50 {
             self.notifications.pop_front();
         }
@@ -1510,6 +1577,7 @@ impl<'a> PdfViewerApp<'a> {
     /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
         let mut saved_tabs = Vec::new();
+        let mut mapped_active_tab: Option<usize> = None;
         for (i, tab) in self.tabs.iter().enumerate() {
             let (path, page_index, vm, last_vm) = if i == self.active_tab {
                 (
@@ -1527,6 +1595,9 @@ impl<'a> PdfViewerApp<'a> {
                 )
             };
             if !path.as_os_str().is_empty() && path.exists() {
+                if i == self.active_tab {
+                    mapped_active_tab = Some(saved_tabs.len());
+                }
                 saved_tabs.push(SavedSessionTab {
                     path: path.clone(),
                     page_index,
@@ -1537,6 +1608,7 @@ impl<'a> PdfViewerApp<'a> {
         // If no tabs slice entry exists yet but a doc is loaded directly on self
         if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() && self.file_path.exists()
         {
+            mapped_active_tab = Some(0);
             saved_tabs.push(SavedSessionTab {
                 path: self.file_path.clone(),
                 page_index: self.current_page_index,
@@ -1548,7 +1620,8 @@ impl<'a> PdfViewerApp<'a> {
             });
         }
         let cfg = SessionConfig {
-            active_tab: self.active_tab.min(saved_tabs.len().saturating_sub(1)),
+            active_tab: mapped_active_tab
+                .unwrap_or_else(|| self.active_tab.min(saved_tabs.len().saturating_sub(1))),
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
             ui_theme: self.ui_theme_mode,
@@ -1779,11 +1852,20 @@ impl<'a> PdfViewerApp<'a> {
             self.pending_ipc.clear();
         }
 
-        let mut opened = 0usize;
         for path in received_paths {
+            if is_acceptable_forwarded_pdf(&path) {
+                self.queued_ipc_paths.push_back(path);
+            }
+        }
+        if self.has_blocking_modal() {
+            return 0;
+        }
+        let mut opened = 0usize;
+        while let Some(path) = self.queued_ipc_paths.pop_front() {
             if !is_acceptable_forwarded_pdf(&path) {
                 continue;
             }
+            self.close_all_popovers();
             let fname = path
                 .file_name()
                 .and_then(|s| s.to_str())
@@ -1857,8 +1939,9 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         };
         let new_total = new_doc.pages().len();
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&new_doc);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&new_doc, &self.file_path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&new_doc);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&new_doc, &self.file_path, skip_pages, roman_end);
 
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();
@@ -1871,6 +1954,7 @@ impl<'a> PdfViewerApp<'a> {
         self.undo_stack.shrink_to_fit();
         self.redacted = false;
         self.last_file_mtime = Some(disk_mtime);
+        self.skip_pages = skip_pages;
         self.roman_end = roman_end;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = if self.bookmarks.is_empty() {
@@ -1895,6 +1979,7 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].pan_x = self.pan_x;
             self.tabs[self.active_tab].zoom_level = self.zoom_level;
             self.tabs[self.active_tab].view_mode = self.view_mode;
+            self.tabs[self.active_tab].skip_pages = self.skip_pages;
             self.tabs[self.active_tab].roman_end = self.roman_end;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].undo_stack.clear();
@@ -2088,7 +2173,7 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         self.is_fullscreen = !self.is_fullscreen;
-        self.open_menu = None;
+        self.close_all_popovers();
         if let Some(w) = self.window.as_ref() {
             w.set_fullscreen(if self.is_fullscreen {
                 Some(winit::window::Fullscreen::Borderless(None))
@@ -2119,7 +2204,7 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.is_presentation = true;
         self.is_fullscreen = true;
-        self.open_menu = None;
+        self.close_all_popovers();
         self.view_mode = ViewMode::FitPage;
         self.scroll_mode = ScrollMode::SinglePage;
         self.zoom_level = 1.0;

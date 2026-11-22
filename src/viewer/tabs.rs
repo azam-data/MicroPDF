@@ -107,8 +107,9 @@ impl<'a> PdfViewerApp<'a> {
         password: Option<&str>,
     ) -> Result<()> {
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&loaded, &path, skip_pages, roman_end);
 
         // Strictly drop previous cached page bitmaps, thumbnail cache, and previous document
         self.invalidate_page_caches();
@@ -122,11 +123,12 @@ impl<'a> PdfViewerApp<'a> {
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
         self.roman_end = roman_end;
-        self.skip_pages = 0;
+        self.skip_pages = skip_pages;
         self.bw_pages.clear();
         self.undo_stack.clear();
         self.redacted = false;
@@ -167,7 +169,7 @@ impl<'a> PdfViewerApp<'a> {
                 nav_back_stack: VecDeque::new(),
                 nav_forward_stack: Vec::new(),
                 roman_end,
-                skip_pages: 0,
+                skip_pages,
                 bookmarks: self.bookmarks.clone(),
                 selected_bookmark: self.selected_bookmark,
                 bookmark_scroll_y: 0,
@@ -190,7 +192,7 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].nav_back_stack.clear();
             self.tabs[self.active_tab].nav_forward_stack.clear();
             self.tabs[self.active_tab].roman_end = roman_end;
-            self.tabs[self.active_tab].skip_pages = 0;
+            self.tabs[self.active_tab].skip_pages = skip_pages;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].selected_bookmark = self.selected_bookmark;
             self.tabs[self.active_tab].bookmark_scroll_y = 0;
@@ -247,8 +249,9 @@ impl<'a> PdfViewerApp<'a> {
             return self.load_document_with_password(path, password);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
-        let roman_end = PdfEngine::read_page_labels_roman_end_from_doc(&loaded);
-        let loaded_bookmarks = PdfEngine::load_bookmarks(&loaded, &path, roman_end);
+        let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
+        let loaded_bookmarks =
+            PdfEngine::load_bookmarks_with_skip(&loaded, &path, skip_pages, roman_end);
         let selected_bookmark = if loaded_bookmarks.is_empty() {
             None
         } else {
@@ -279,7 +282,7 @@ impl<'a> PdfViewerApp<'a> {
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             roman_end,
-            skip_pages: 0,
+            skip_pages,
             bookmarks: loaded_bookmarks.clone(),
             selected_bookmark,
             bookmark_scroll_y: 0,
@@ -305,7 +308,7 @@ impl<'a> PdfViewerApp<'a> {
         self.nav_forward_stack.clear();
         self.hovered_link = None;
         self.roman_end = roman_end;
-        self.skip_pages = 0;
+        self.skip_pages = skip_pages;
         self.bookmarks = loaded_bookmarks;
         self.selected_bookmark = selected_bookmark;
         self.bookmark_scroll_y = 0;
@@ -1114,8 +1117,14 @@ impl<'a> PdfViewerApp<'a> {
                         .unwrap_or("document.pdf")
                         .to_string()
                 };
+                let is_dirty = if is_active {
+                    self.has_unsaved_edits
+                } else {
+                    self.tabs[idx].has_unsaved_edits
+                };
                 let prefix = if is_active { "✓ " } else { "" };
-                let full_lbl = format!("{prefix}{}. {fname}", idx + 1);
+                let dirty = if is_dirty { "• " } else { "" };
+                let full_lbl = format!("{prefix}{dirty}{}. {fname}", idx + 1);
                 let cx = px + pw as i32 - close_sz as i32 - (10.0 * s).round() as i32;
                 let cy = ry + ((row_h.saturating_sub(close_sz)) / 2) as i32;
                 let tx = px + (12.0 * s).round() as i32;

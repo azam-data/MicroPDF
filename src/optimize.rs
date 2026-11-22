@@ -240,6 +240,10 @@ impl PdfEngine {
             }
         }
 
+        if built.is_empty() {
+            return Ok(stats);
+        }
+
         let mut page = doc.pages_mut().get(page_index)?;
         let prev_strategy = page.content_regeneration_strategy();
         page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
@@ -383,6 +387,9 @@ impl PdfEngine {
     /// objects (the replaced originals), and Flate-compress uncompressed streams.
     fn finish_streams(pdf: &[u8], repack_bilevel: bool) -> Result<Vec<u8>> {
         let mut ldoc = lopdf::Document::load_mem(pdf).context("lopdf could not parse the output")?;
+        if ldoc.is_encrypted() {
+            return Ok(pdf.to_vec());
+        }
         drop_opaque_smasks(&mut ldoc);
         if repack_bilevel {
             for obj in ldoc.objects.values_mut() {
@@ -433,8 +440,19 @@ struct ImagePlan {
 impl OptimizeJob {
     pub fn new(pdf: Vec<u8>, opts: OptimizeOptions) -> Result<Self> {
         let original_len = pdf.len();
-        let ldoc = lopdf::Document::load_mem(&pdf).context("Could not parse the PDF for optimizing")?;
+        let mut ldoc =
+            lopdf::Document::load_mem(&pdf).context("Could not parse the PDF for optimizing")?;
         drop(pdf);
+        if ldoc.is_encrypted() {
+            // Try empty user password for owner-restricted PDFs; refuse still-encrypted PDFs so streams aren't corrupted
+            let _ = ldoc.decrypt("");
+            if ldoc.is_encrypted() {
+                anyhow::bail!("Cannot optimize an encrypted PDF — unlock/flatten it first");
+            }
+            ldoc.trailer.remove(b"Encrypt");
+        }
+        // Strip fully-opaque PDFium SMasks before planning so those images can also optimize in Gray/B&W
+        drop_opaque_smasks(&mut ldoc);
         let queue = plan_images(&ldoc);
         Ok(Self { ldoc, queue, next: 0, opts, original_len, rewritten: 0, skipped: 0 })
     }
@@ -723,9 +741,11 @@ fn rewrite_image_stream(
 ) -> Result<bool> {
     let d = &stream.dict;
     let int = |k: &[u8]| d.get(k).and_then(|v| v.as_i64()).ok();
-    // Leave stencil masks, colour-key masks, Decode arrays and non-8-bit images alone.
+    // Leave stencil masks, explicit masks, Decode arrays, non-8-bit images, and semi-transparent
+    // /SMask images under color-space conversion alone so alpha/Matte stays intact.
     if d.get(b"ImageMask").and_then(|v| v.as_bool()).unwrap_or(false)
-        || matches!(d.get(b"Mask"), Ok(lopdf::Object::Array(_)))
+        || d.has(b"Mask")
+        || (d.has(b"SMask") && opts.mode != ColorMode::Color)
         || d.has(b"Decode")
         || int(b"BitsPerComponent") != Some(8)
     {
@@ -746,6 +766,38 @@ fn rewrite_image_stream(
     let is_flate_or_raw = filters.is_empty() || (filters.len() == 1 && filters[0] == b"FlateDecode");
     if !is_jpeg && !is_flate_or_raw {
         return Ok(false); // JPX, JBIG2, CCITT, LZW, ...
+    }
+    // Check DecodeParms for TIFF Predictor 2 (unsupported by lopdf) or DCT /ColorTransform 0
+    if let Ok(dp) = d.get(b"DecodeParms") {
+        let dp_dict = match dp {
+            lopdf::Object::Dictionary(dict) => Some(dict),
+            lopdf::Object::Array(arr) => arr.first().and_then(|o| o.as_dict().ok()),
+            _ => None,
+        };
+        if let Some(dp_dict) = dp_dict {
+            if is_flate_or_raw
+                && dp_dict
+                    .get(b"Predictor")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(1)
+                    == 2
+            {
+                return Ok(false);
+            }
+            if is_jpeg
+                && dp_dict
+                    .get(b"ColorTransform")
+                    .and_then(|v| v.as_i64())
+                    .ok()
+                    == Some(0)
+            {
+                return Ok(false);
+            }
+        }
+    }
+    // Avoid CMYK JPEG decoding inversion (zune-jpeg assumes Adobe-inverted CMYK)
+    if is_jpeg && matches!(color_kind, ImageColorKind::Cmyk) {
+        return Ok(false);
     }
 
     let (wf, hf) = (w as f32, h as f32);
@@ -1100,11 +1152,18 @@ fn deduplicate_streams(ldoc: &mut lopdf::Document) -> usize {
 }
 
 /// Re-compresses single-filter FlateDecode streams using `flate2::Compression::best()` (level 9),
-/// keeping the new bytes only when strictly smaller.
+/// keeping the new bytes only when strictly smaller. Uses strict `flate2::read::ZlibDecoder`
+/// directly (never `lopdf`'s error-swallowing `decompressed_content`) so damaged or non-standard
+/// streams are never overwritten with empty data.
 fn recompress_flate_streams_best(ldoc: &mut lopdf::Document) {
+    use flate2::read::ZlibDecoder;
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
-    use std::io::Write;
+    use std::io::{Read, Write};
+
+    if ldoc.is_encrypted() {
+        return;
+    }
 
     for obj in ldoc.objects.values_mut() {
         let lopdf::Object::Stream(st) = obj else { continue };
@@ -1115,13 +1174,17 @@ fn recompress_flate_streams_best(ldoc: &mut lopdf::Document) {
         if !is_single_flate || st.dict.has(b"DecodeParms") || st.content.len() < 128 {
             continue;
         }
-        let Some(raw) = stream_data(st) else { continue };
+        let mut raw = Vec::new();
+        let mut dec = ZlibDecoder::new(st.content.as_slice());
+        if dec.read_to_end(&mut raw).is_err() || raw.is_empty() {
+            continue;
+        }
         let mut enc = ZlibEncoder::new(Vec::with_capacity(st.content.len()), Compression::best());
         if enc.write_all(&raw).is_err() {
             continue;
         }
         if let Ok(better) = enc.finish() {
-            if better.len() < st.content.len() {
+            if !better.is_empty() && better.len() < st.content.len() {
                 st.content = better;
                 st.dict.set("Length", st.content.len() as i64);
             }
@@ -1184,11 +1247,24 @@ fn stream_data(stream: &lopdf::Stream) -> Option<Vec<u8>> {
 
 /// PDFium attaches an `/SMask` to every image it creates from a bitmap, even when the bitmap
 /// is fully opaque. Removing masks whose every value is 255 is lossless and lets those
-/// images be repacked and stored without a second stream.
+/// images be repacked and stored without a second stream. Only inspects objects actually
+/// referenced by an `/SMask` key (never decompresses unrelated grayscale page scans).
 fn drop_opaque_smasks(ldoc: &mut lopdf::Document) {
+    let mut smask_targets = std::collections::HashSet::new();
+    for obj in ldoc.objects.values() {
+        if let lopdf::Object::Stream(s) = obj {
+            if let Ok(target_id) = s.dict.get(b"SMask").and_then(|v| v.as_reference()) {
+                smask_targets.insert(target_id);
+            }
+        }
+    }
+    if smask_targets.is_empty() {
+        return;
+    }
+
     let mut opaque = std::collections::HashSet::new();
-    for (id, obj) in &ldoc.objects {
-        let lopdf::Object::Stream(s) = obj else { continue };
+    for id in smask_targets {
+        let Some(lopdf::Object::Stream(s)) = ldoc.objects.get(&id) else { continue };
         let gray8 = s.dict.get(b"ColorSpace").and_then(|c| c.as_name()).ok() == Some(b"DeviceGray".as_slice())
             && s.dict.get(b"BitsPerComponent").and_then(|b| b.as_i64()).ok() == Some(8)
             && s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image".as_slice());
@@ -1197,7 +1273,7 @@ fn drop_opaque_smasks(ldoc: &mut lopdf::Document) {
         }
         let Some(data) = stream_data(s) else { continue };
         if !data.is_empty() && data.iter().all(|&v| v == 255) {
-            opaque.insert(*id);
+            opaque.insert(id);
         }
     }
     if opaque.is_empty() {
@@ -1239,7 +1315,20 @@ fn repack_to_one_bit(stream: &mut lopdf::Stream) {
     ) else {
         return;
     };
-    let (width, height) = (width.max(0) as usize, height.max(0) as usize);
+    if width <= 0 || height <= 0 {
+        return;
+    }
+    let (width, height) = (width as usize, height as usize);
+    let Some(expected_len) = width.checked_mul(height).and_then(|p| p.checked_mul(channels)) else {
+        return;
+    };
+    let row_bytes = width.div_ceil(8);
+    let Some(packed_len) = row_bytes.checked_mul(height) else {
+        return;
+    };
+    if expected_len == 0 || expected_len > 128 * 1024 * 1024 || packed_len > 32 * 1024 * 1024 {
+        return;
+    }
     let filter_ok = match d.get(b"Filter") {
         Err(_) => true,
         Ok(lopdf::Object::Name(n)) => n == b"FlateDecode",
@@ -1248,15 +1337,14 @@ fn repack_to_one_bit(stream: &mut lopdf::Stream) {
         }
         _ => false,
     };
-    if !filter_ok || width == 0 || height == 0 {
+    if !filter_ok {
         return;
     }
     let Some(data) = stream_data(stream) else { return };
-    if data.len() != width * height * channels {
+    if data.len() != expected_len {
         return;
     }
-    let row_bytes = width.div_ceil(8);
-    let mut packed = vec![0u8; row_bytes * height];
+    let mut packed = vec![0u8; packed_len];
     for y in 0..height {
         for x in 0..width {
             let px = &data[(y * width + x) * channels..(y * width + x + 1) * channels];

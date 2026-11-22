@@ -151,7 +151,12 @@ impl<'a> PdfViewerApp<'a> {
     /// Splits a menu label like `"Open PDF in Tab (O)"` into `("Open PDF in Tab", Some("O"))`
     /// so shortcuts can be cleanly right-aligned in the dropdown.
     fn split_label_and_shortcut(item: &str) -> (&str, Option<&str>) {
-        if item.starts_with("Recent") || item.ends_with("(default)") || item.ends_with("(.txt)") {
+        if item.starts_with("Recent")
+            || item.ends_with("(default)")
+            || item.ends_with("(.txt)")
+            || item.ends_with("(+10%)")
+            || item.ends_with("(-10%)")
+        {
             return (item, None);
         }
         if let Some(open_idx) = item.rfind(" (") {
@@ -256,7 +261,8 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
 
-            let hovered = self.hovered_widget == Some(UiHit::MenuItem(idx));
+            let is_disabled = item_str == "Recent: (none)";
+            let hovered = !is_disabled && self.hovered_widget == Some(UiHit::MenuItem(idx));
             if hovered {
                 fill_rounded_rect(
                     buffer,
@@ -271,7 +277,13 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
 
-            let fg = if hovered { theme.text_on_accent } else { theme.text_primary };
+            let fg = if is_disabled {
+                theme.text_muted
+            } else if hovered {
+                theme.text_on_accent
+            } else {
+                theme.text_primary
+            };
             let sc_fg = if hovered { theme.text_on_accent } else { theme.text_muted };
 
             if self.menu_item_checked(cat, idx) {

@@ -638,12 +638,16 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
 
+                let (_, cur_h_u32) = ensure_page_cached(self, self.current_page_index)?;
+                let cur_max_sy = (cur_h_u32.saturating_sub(content_h)) as f32;
+                self.scroll_y = self.scroll_y.clamp(0.0, cur_max_sy);
+
                 let anchor_left = min_screen_x + (PAGE_MARGIN_PX as f32) - self.scroll_x;
-                let compute_hy = |app: &mut Self, bh: u32| -> i32 {
+                let compute_hy = |app: &Self, bh: u32| -> i32 {
                     if bh > content_h {
                         let max_sy = (bh - content_h) as f32;
-                        app.scroll_y = app.scroll_y.clamp(0.0, max_sy);
-                        (top_bars_h as i32) - (app.scroll_y.round() as i32)
+                        let sy = app.scroll_y.clamp(0.0, max_sy);
+                        (top_bars_h as i32) - (sy.round() as i32)
                     } else {
                         (top_bars_h as i32) + ((content_h as i32 - bh as i32) / 2)
                     }
@@ -1545,6 +1549,15 @@ impl<'a> PdfViewerApp<'a> {
             }
             let max_scroll = (total_h - content_h as f32).max(1.0);
             ((self.grid_scroll_y / max_scroll).clamp(0.0, 1.0), (content_h as f32 / total_h).clamp(0.08, 1.0))
+        } else if self.view_mode == ViewMode::TextView {
+            if self.text_view_max_scroll <= 1.0 {
+                return None;
+            }
+            let total_h = content_h as f32 + self.text_view_max_scroll;
+            (
+                (self.scroll_y / self.text_view_max_scroll).clamp(0.0, 1.0),
+                (content_h as f32 / total_h).clamp(0.08, 0.9),
+            )
         } else if total > 1 {
             let denom = (total - 1) as f32;
             ((self.current_page_index as f32 / denom).clamp(0.0, 1.0), (1.0 / total as f32).clamp(0.08, 0.5))
@@ -1592,6 +1605,8 @@ impl<'a> PdfViewerApp<'a> {
             let total_h = (rows * cell_h + 40) as f32;
             let max_scroll = (total_h - content_h as f32).max(0.0);
             self.grid_scroll_y = frac * max_scroll;
+        } else if self.view_mode == ViewMode::TextView {
+            self.scroll_y = frac * self.text_view_max_scroll.max(0.0);
         } else if total > 1 {
             let target = (frac * ((total - 1) as f32)).round() as u16;
             if target != self.current_page_index {
@@ -1926,30 +1941,22 @@ impl<'a> PdfViewerApp<'a> {
         // Centered Bottom Page View & Status Bar
         self.draw_status_bar(buffer, width, height, status_bar_h, scale_factor);
 
+        let chrome_visible = !self.is_fullscreen && !self.is_presentation;
+
         // Session Notification Board Popover (bottom-left)
-        if self.show_notifications {
+        if chrome_visible && self.show_notifications {
             self.draw_notification_board_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
         // Reading Color Mode Picker Popover (6 eye-care palettes)
-        if self.show_reading_mode_popover {
+        if chrome_visible && self.show_reading_mode_popover {
             self.draw_reading_mode_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
-        // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu is open)
-        if self.open_menu.is_none()
-            && !self.show_customize_toolbar
-            && !self.show_help_overlay
-            && !self.show_about_overlay
-            && !self.show_bookmark_format_overlay
-            && !self.show_tab_list_popover
-            && self.tab_context_menu.is_none()
-            && self.thumb_context_menu.is_none()
-            && self.combine_modal.is_none()
-            && self.print_preview.is_none()
-            && self.manual_duplex_wait.is_none()
-            && self.header_footer_modal.is_none()
-            && self.page_number_modal.is_none()
+        // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu/prompt is open)
+        if chrome_visible
+            && !self.has_blocking_modal()
+            && !self.has_open_popover()
         {
             self.draw_floating_hover_tooltip(buffer, width, height, menu_bar_h, status_bar_h, scale_factor);
         }
@@ -1960,12 +1967,12 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // All-Tabs Overflow Dropdown Popover (`▾`)
-        if self.show_tab_list_popover {
+        if chrome_visible && self.show_tab_list_popover {
             self.draw_tab_list_popover(buffer, width, height, top_bars_h, scale_factor);
         }
 
         // Tab Bar Right-Click Context Menu
-        if self.tab_context_menu.is_some() {
+        if chrome_visible && self.tab_context_menu.is_some() {
             self.draw_tab_context_menu(buffer, width, height, scale_factor);
         }
 
@@ -1975,8 +1982,10 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // Open Menu Dropdown
-        if let Some(cat) = self.open_menu {
-            self.draw_open_menu_dropdown(buffer, width, height, menu_bar_h, cat, scale_factor);
+        if chrome_visible {
+            if let Some(cat) = self.open_menu {
+                self.draw_open_menu_dropdown(buffer, width, height, menu_bar_h, cat, scale_factor);
+            }
         }
 
         // Customize Toolbar Modal
@@ -2027,6 +2036,7 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`
     /// for rendering live move/selection ghosts over the currently visible page(s).
+    /// Handles 0°/90°/180°/270° rotated pages via PDFium's `points_to_pixels`.
     pub(super) fn pdf_rect_to_screen_rect(&self, page_idx: u16, rect: PdfRect) -> Option<(i32, i32, u32, u32)> {
         let draw_rect = if self.is_continuous_scroll() {
             let &(_, dr) = self.continuous_draw_rects.iter().find(|&&(p, _)| p == page_idx)?;
@@ -2046,12 +2056,29 @@ impl<'a> PdfViewerApp<'a> {
         if pw_pts <= 0.0 || ph_pts <= 0.0 || draw_rect.2 == 0 || draw_rect.3 == 0 {
             return None;
         }
-        let sx = draw_rect.2 as f32 / pw_pts;
-        let sy = draw_rect.3 as f32 / ph_pts;
-        let x0 = draw_rect.0 + (rect.left().value * sx).round() as i32;
-        let x1 = draw_rect.0 + (rect.right().value * sx).round() as i32;
-        let y0 = draw_rect.1 + ((ph_pts - rect.top().value) * sy).round() as i32;
-        let y1 = draw_rect.1 + ((ph_pts - rect.bottom().value) * sy).round() as i32;
+        let cfg = PdfRenderConfig::new()
+            .set_fixed_width(draw_rect.2 as i32)
+            .set_fixed_height(draw_rect.3 as i32);
+        let (bx1, by1, bx2, by2) = match (
+            page.points_to_pixels(rect.left(), rect.top(), &cfg),
+            page.points_to_pixels(rect.right(), rect.bottom(), &cfg),
+        ) {
+            (Ok((x1, y1)), Ok((x2, y2))) => (x1, y1, x2, y2),
+            _ => {
+                let sx = draw_rect.2 as f32 / pw_pts;
+                let sy = draw_rect.3 as f32 / ph_pts;
+                (
+                    (rect.left().value * sx).round() as i32,
+                    ((ph_pts - rect.top().value) * sy).round() as i32,
+                    (rect.right().value * sx).round() as i32,
+                    ((ph_pts - rect.bottom().value) * sy).round() as i32,
+                )
+            }
+        };
+        let x0 = draw_rect.0 + bx1;
+        let x1 = draw_rect.0 + bx2;
+        let y0 = draw_rect.1 + by1;
+        let y1 = draw_rect.1 + by2;
         let left = x0.min(x1);
         let top = y0.min(y1);
         let rw = (x1 - x0).unsigned_abs().max(4);

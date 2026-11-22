@@ -184,20 +184,33 @@ impl<'a> PdfViewerApp<'a> {
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
 
+        let s = self
+            .window
+            .as_ref()
+            .map(|w| self.effective_scale_factor(w.scale_factor()))
+            .unwrap_or(1.0) as f32;
+        let bw_w = (28.0 * s).round().clamp(24.0, 52.0) as i32;
+        let bw_h = (18.0 * s).round().clamp(16.0, 34.0) as i32;
+        let rot_w = (22.0 * s).round().clamp(20.0, 44.0) as i32;
+        let pad = (3.0 * s).round() as i32;
+
         for idx in 0..total {
             let (tx, ty, tw, th) =
                 self.thumbnail_screen_rect(idx, viewport_w, sidebar_w, top_bars_h);
             if ix >= tx && ix < tx + (tw as i32) && iy >= ty && iy < ty + (th as i32) + 22 {
-                // Top-left `[BW]` badge is 28x18 at `(tx, ty)`
-                let on_bw_badge = ix >= tx && ix <= tx + 28 && iy >= ty && iy <= ty + 18;
+                // Top-left `[BW]` badge
+                let on_bw_badge =
+                    ix >= tx + pad && ix <= tx + pad + bw_w && iy >= ty + pad && iy <= ty + pad + bw_h;
                 if on_bw_badge {
                     return Some((idx, ThumbBadgeHit::BwConvert));
                 }
-                // Top-right `[R]` badge is 24x18 at `(tx + tw - 24, ty)`
-                let badge_x = tx + (tw as i32) - 24;
-                let badge_y = ty;
-                let on_rotate_badge =
-                    ix >= badge_x && ix <= tx + (tw as i32) && iy >= badge_y && iy <= badge_y + 18;
+                // Top-right `[R]` badge
+                let badge_x = tx + (tw as i32) - rot_w - pad;
+                let badge_y = ty + pad;
+                let on_rotate_badge = ix >= badge_x
+                    && ix <= badge_x + rot_w
+                    && iy >= badge_y
+                    && iy <= badge_y + bw_h;
                 if on_rotate_badge {
                     return Some((idx, ThumbBadgeHit::Rotate));
                 }
@@ -320,33 +333,35 @@ impl<'a> PdfViewerApp<'a> {
 
             // Clean corner action pills: show on hover (and keep BW badge visible if page is BW)
             let show_badges = is_hovered || is_selected;
+            let bw_w = (28.0 * s).round().clamp(24.0, 52.0) as u32;
+            let bw_h = (18.0 * s).round().clamp(16.0, 34.0) as u32;
+            let rot_w = (22.0 * s).round().clamp(20.0, 44.0) as u32;
+            let b_pad = (3.0 * s).round() as i32;
+            let b_rad = (4.0 * s).clamp(3.0, 7.0);
             if (show_badges || is_bw)
                 && tx >= (sidebar_w as i32)
                 && ty >= (top_bars_h as i32)
-                && (ty as u32 + 22) < bottom_limit
+                && (ty + b_pad + bw_h as i32) < (bottom_limit as i32)
             {
-                let bw_w = 28u32;
-                let bw_h = 18u32;
                 let bg = if is_bw { theme.accent } else { theme.surface_bg };
                 let fg = if is_bw { theme.text_on_accent } else { theme.text_secondary };
-                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, bg);
-                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx + 3, ty + 3, bw_w, bw_h, 4.0, if is_bw { theme.accent } else { theme.border_subtle });
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, tx + b_pad, ty + b_pad, bw_w, bw_h, b_rad, bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, tx + b_pad, ty + b_pad, bw_w, bw_h, b_rad, if is_bw { theme.accent } else { theme.border_subtle });
                 let btw = super::ui_draw::measure_text("BW", badge_sz, true);
-                super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, tx + 3 + ((bw_w as f32 - btw) * 0.5).round() as i32, ty + 3, bw_h, tx + 3 + bw_w as i32, "BW", badge_sz, fg, true);
+                super::ui_draw::draw_text_vcenter(buffer, buf_w, bottom_limit, tx + b_pad + ((bw_w as f32 - btw) * 0.5).round() as i32, ty + b_pad, bw_h, tx + b_pad + bw_w as i32, "BW", badge_sz, fg, true);
             }
 
             if show_badges
-                && (tx + tw as i32 - 24) >= (sidebar_w as i32)
+                && (tx + tw as i32 - rot_w as i32 - b_pad) >= (sidebar_w as i32)
                 && ty >= (top_bars_h as i32)
-                && (ty as u32 + 22) < bottom_limit
+                && (ty + b_pad + bw_h as i32) < (bottom_limit as i32)
             {
-                let rw = 22u32;
-                let rh = 18u32;
-                let rx = tx + tw as i32 - rw as i32 - 3;
-                let ry = ty + 3;
-                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.surface_bg);
-                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rw, rh, 4.0, theme.border_subtle);
-                super::ui_draw::draw_icon(buffer, buf_w, bottom_limit, super::ui_draw::UiIcon::Rotate, rx + 4, ry + 2, 13, theme.accent);
+                let rx = tx + tw as i32 - rot_w as i32 - b_pad;
+                let ry = ty + b_pad;
+                let ic_sz = (12.0 * s).round().clamp(10.0, 22.0) as u32;
+                super::ui_draw::fill_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rot_w, bw_h, b_rad, theme.surface_bg);
+                super::ui_draw::stroke_rounded_rect(buffer, buf_w, bottom_limit, rx, ry, rot_w, bw_h, b_rad, theme.border_subtle);
+                super::ui_draw::draw_icon(buffer, buf_w, bottom_limit, super::ui_draw::UiIcon::Rotate, rx + ((rot_w.saturating_sub(ic_sz)) / 2) as i32, ry + ((bw_h.saturating_sub(ic_sz)) / 2) as i32, ic_sz, theme.accent);
             }
 
             // Crisp proportional page number centered below card

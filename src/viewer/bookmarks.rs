@@ -78,7 +78,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.bookmarks.is_empty() {
             let empty_y = top_y + header_h as i32 + (18.0 * s).round() as i32;
             draw_text(buffer, buf_w, buf_h, pad, empty_y, "No bookmarks yet.", body_sz, theme.text_muted, false);
-            draw_text(buffer, buf_w, buf_h, pad, empty_y + (20.0 * s).round() as i32, "Click + Add or press '+'", sub_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, pad, empty_y + (20.0 * s).round() as i32, "Click + Add or press 'A'", sub_sz, theme.text_muted, false);
             draw_text(buffer, buf_w, buf_h, pad, empty_y + (36.0 * s).round() as i32, "or import a .txt outline.", sub_sz, theme.text_muted, false);
             return;
         }
@@ -228,9 +228,15 @@ impl<'a> PdfViewerApp<'a> {
         match std::fs::read_to_string(txt_path) {
             Ok(content) => {
                 let total = self.total_pages() as usize;
-                let parsed = PdfEngine::parse_bookmarks_txt(&content, self.roman_end, total);
+                let parsed = PdfEngine::parse_bookmarks_txt_with_skip(
+                    &content,
+                    self.skip_pages,
+                    self.roman_end,
+                    total,
+                );
                 let count = parsed.len();
                 self.bookmarks = parsed;
+                self.has_unsaved_edits = true;
                 self.selected_bookmark = if self.bookmarks.is_empty() {
                     None
                 } else {
@@ -240,7 +246,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.show_bookmarks = true;
                 self.invalidate_page_caches();
                 self.persist_bookmarks();
-                self.status_notice = Some(format!("Imported {count} bookmarks!"));
+                self.status_notice = Some(format!("Imported {count} bookmarks! Press S to save into PDF."));
                 self.update_title_bar();
                 self.request_redraw();
             }
