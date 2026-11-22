@@ -1700,6 +1700,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.compare_mode.is_none() {
             if self.view_mode.is_page_view() {
                 self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
+                self.ensure_deskew_preview_pixels();
             } else if self.view_mode == ViewMode::ThumbnailGrid {
                 self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
             }
@@ -1752,9 +1753,31 @@ impl<'a> PdfViewerApp<'a> {
                     self.draw_page_frame_chrome(
                         buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, scale_factor,
                     );
-                    self.blit_page_or_tiles(
-                        buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, cache,
-                    );
+                    let deskew_preview = self
+                        .deskew_bar
+                        .as_ref()
+                        .and_then(|d| d.preview_cache.as_ref())
+                        .filter(|(p, _, w, h, _)| {
+                            *p == cache.page_index && *w == cache.bitmap_width && *h == cache.bitmap_height
+                        })
+                        .map(|(_, _, _, _, px)| px.as_slice());
+                    if let Some(rotated_pixels) = deskew_preview {
+                        Self::blit_cached_page(
+                            buffer,
+                            width,
+                            height,
+                            sidebar_w,
+                            top_bars_h,
+                            status_bar_h,
+                            self.page_draw_rect,
+                            rotated_pixels,
+                            self.reading_filter,
+                        );
+                    } else {
+                        self.blit_page_or_tiles(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, cache,
+                        );
+                    }
                     self.draw_search_overlays_on_page(
                         buffer, width, height, top_bars_h, status_bar_h, cache.page_index, self.page_draw_rect,
                     );
@@ -1901,6 +1924,13 @@ impl<'a> PdfViewerApp<'a> {
             // Right-click Annotation Inspector Context Menu
             if self.annot_context_menu.is_some() {
                 self.draw_annot_context_menu(buffer, width, height, scale_factor);
+            }
+
+            // Lightweight Matrix Page Deskew bar, alignment grid, and Draw Guideline overlay
+            if self.deskew_bar.is_some() {
+                self.draw_deskew_overlay(
+                    buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+                );
             }
         } else {
             self.draw_thumbnail_grid(

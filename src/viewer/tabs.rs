@@ -154,6 +154,7 @@ impl<'a> PdfViewerApp<'a> {
         self.hovered_form_field = None;
         self.last_measurement = None;
         self.compare_mode = None;
+        self.deskew_bar = None;
         self.roman_end = roman_end;
         self.skip_pages = skip_pages;
         self.bw_pages.clear();
@@ -361,6 +362,7 @@ impl<'a> PdfViewerApp<'a> {
         self.hovered_form_field = None;
         self.last_measurement = None;
         self.compare_mode = None;
+        self.deskew_bar = None;
         self.roman_end = roman_end;
         self.skip_pages = skip_pages;
         self.bookmarks = loaded_bookmarks;
@@ -446,6 +448,7 @@ impl<'a> PdfViewerApp<'a> {
         self.hovered_form_field = None;
         self.last_measurement = None;
         self.compare_mode = None;
+        self.deskew_bar = None;
         self.roman_end = 0;
         self.skip_pages = 0;
         self.bookmarks.clear();
@@ -495,6 +498,7 @@ impl<'a> PdfViewerApp<'a> {
         self.last_thumb_anchor = None;
         self.thumb_context_menu = None;
         self.annot_context_menu = None;
+        self.deskew_bar = None;
         self.show_tab_list_popover = false;
         self.tab_context_menu = None;
         self.input_mode = InputMode::Normal;
@@ -531,6 +535,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumb_context_menu = None;
         self.annot_context_menu = None;
         self.compare_mode = None;
+        self.deskew_bar = None;
         self.hovered_form_field = None;
         self.last_measurement = None;
         self.file_path = PathBuf::new();

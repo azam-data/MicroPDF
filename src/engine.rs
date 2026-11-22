@@ -5096,6 +5096,144 @@ impl PdfEngine {
         tf.set_value(new_value)?;
         Ok(())
     }
+
+    // =========================================================================
+    // Milestone 3: Strictly Matrix-Based Page Deskew (Zero Rasterization)
+    // =========================================================================
+
+    /// Applies a centered 2D affine deskew rotation (`cw_deg` in `-15.0..=15.0`, positive = CW)
+    /// directly to every PDFium page object on each page in `page_indices`, preserving MediaBox
+    /// and CropBox (white corners) and regenerating content streams once per page.
+    pub fn deskew_pages_in_doc(
+        doc: &mut PdfDocument,
+        page_indices: &[u16],
+        cw_deg: f32,
+    ) -> Result<usize> {
+        let clamped = cw_deg.clamp(-15.0, 15.0);
+        if clamped.abs() < 0.01 {
+            return Ok(0);
+        }
+        let total = doc.pages().len();
+        let mut applied = 0usize;
+        for &p_idx in page_indices {
+            if p_idx >= total {
+                continue;
+            }
+            let mut page = doc.pages_mut().get(p_idx)?;
+            let (cx, cy) = page
+                .boundaries()
+                .media()
+                .map(|mb| {
+                    let b = mb.bounds;
+                    (
+                        (b.left().value + b.right().value) * 0.5,
+                        (b.bottom().value + b.top().value) * 0.5,
+                    )
+                })
+                .unwrap_or_else(|_| (page.width().value * 0.5, page.height().value * 0.5));
+            let m = compute_deskew_affine_matrix_around(cx, cy, clamped);
+
+            let prev_strategy = page.content_regeneration_strategy();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+            for mut obj in page.objects_mut().iter() {
+                let _ = obj.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+            }
+            page.regenerate_content()?;
+            page.set_content_regeneration_strategy(prev_strategy);
+            applied += 1;
+        }
+        Ok(applied)
+    }
+}
+
+/// Auto-detected guideline snap axis for Milestone 3 Page Deskew.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeskewAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// 6-element PDF 2D affine matrix (`x' = a*x + c*y + e`, `y' = b*x + d*y + f`, Y-up PDF coords).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct DeskewMatrix {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl DeskewMatrix {
+    /// Applies this affine matrix to a PDF-space point `(x, y)`.
+    pub fn apply_point(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+}
+
+/// Computes the centered PDFium 2D affine matrix for `Translate(cx, cy) -> Rotate(cw_deg) -> Translate(-cx, -cy)`
+/// around `(page_w / 2, page_h / 2)` in PDF Y-up coordinates (`positive = CW`, `negative = CCW`).
+pub fn compute_deskew_affine_matrix(page_w: f32, page_h: f32, cw_deg: f32) -> DeskewMatrix {
+    compute_deskew_affine_matrix_around(page_w * 0.5, page_h * 0.5, cw_deg)
+}
+
+/// Computes the centered PDFium 2D affine matrix around arbitrary center `(cx, cy)` in PDF Y-up coords.
+pub fn compute_deskew_affine_matrix_around(cx: f32, cy: f32, cw_deg: f32) -> DeskewMatrix {
+    // In PDF Y-up coordinates, CCW by phi uses (cos(phi), sin(phi), -sin(phi), cos(phi)).
+    // Positive cw_deg = Clockwise -> phi = -cw_deg.to_radians().
+    let phi = (-cw_deg as f64).to_radians();
+    let cos_p = phi.cos() as f32;
+    let sin_p = phi.sin() as f32;
+    let a = cos_p;
+    let b = sin_p;
+    let c = -sin_p;
+    let d = cos_p;
+    let cx64 = cx as f64;
+    let cy64 = cy as f64;
+    let e = (cx64 - (a as f64) * cx64 - (c as f64) * cy64) as f32;
+    let f = (cy64 - (b as f64) * cx64 - (d as f64) * cy64) as f32;
+    DeskewMatrix { a, b, c, d, e, f }
+}
+
+/// Converts a user-drawn screen guideline delta `(dx_screen, dy_screen)` (screen space: +X right, +Y down)
+/// into `(snapped_axis, correction_cw_deg)` clamped to `-15.0..=15.0` (positive = CW, negative = CCW).
+/// - If `|dy| >= |dx|`: snaps to Vertical (`90°`).
+/// - Otherwise: snaps to Horizontal (`0°`).
+/// Returns `None` if the drawn guideline is too short (`< 4.0 px`).
+pub fn compute_guideline_deskew_angle(
+    dx_screen: f32,
+    dy_screen: f32,
+) -> Option<(DeskewAxis, f32)> {
+    let len = dx_screen.hypot(dy_screen);
+    if len < 4.0 {
+        return None;
+    }
+    if dy_screen.abs() >= dx_screen.abs() {
+        // Vertical margin: normalize top-to-bottom (ny > 0)
+        let (nx, ny) = if dy_screen < 0.0 {
+            (-dx_screen, -dy_screen)
+        } else {
+            (dx_screen, dy_screen)
+        };
+        // If line leans right going down (`\` shape, nx > 0), page is tilted CCW -> rotate CW (+)
+        let raw_deg = (nx as f64).atan2(ny as f64).to_degrees() as f32;
+        let clamped = (raw_deg.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+        Some((DeskewAxis::Vertical, clamped))
+    } else {
+        // Horizontal line: normalize left-to-right (nx > 0)
+        let (nx, ny) = if dx_screen < 0.0 {
+            (-dx_screen, -dy_screen)
+        } else {
+            (dx_screen, dy_screen)
+        };
+        // If line slopes downward to the right (ny > 0 in screen Y-down), page is tilted CW -> rotate CCW (-)
+        let raw_deg = -((ny as f64).atan2(nx as f64).to_degrees() as f32);
+        let clamped = (raw_deg.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+        Some((DeskewAxis::Horizontal, clamped))
+    }
 }
 
 #[cfg(test)]
@@ -5731,4 +5869,85 @@ mod tests {
         assert!(PdfEngine::scrub_document_metadata_bytes(&enc_raw).is_err());
         Ok(())
     }
+
+    #[test]
+    fn test_milestone3_deskew_guideline_all_directions() {
+        // Horizontal line sloping DOWN to the right (+dx, +dy in screen Y-down) => page tilted CW => needs CCW (-) correction
+        let (ax1, deg1) = compute_guideline_deskew_angle(200.0, 20.0).unwrap();
+        assert_eq!(ax1, DeskewAxis::Horizontal);
+        assert!((deg1 - (-5.7)).abs() < 0.15, "got {deg1}");
+
+        // Same line drawn right-to-left (-dx, -dy) => identical angle!
+        let (ax2, deg2) = compute_guideline_deskew_angle(-200.0, -20.0).unwrap();
+        assert_eq!(ax2, DeskewAxis::Horizontal);
+        assert!((deg2 - deg1).abs() < 1e-4);
+
+        // Horizontal line sloping UP to the right (+dx, -dy) => page tilted CCW => needs CW (+) correction
+        let (ax3, deg3) = compute_guideline_deskew_angle(200.0, -20.0).unwrap();
+        assert_eq!(ax3, DeskewAxis::Horizontal);
+        assert!((deg3 - 5.7).abs() < 0.15, "got {deg3}");
+
+        // Vertical margin leaning RIGHT going down (`\` shape: +dx, +dy) => tilted CCW => needs CW (+) correction
+        let (ax4, deg4) = compute_guideline_deskew_angle(15.0, 300.0).unwrap();
+        assert_eq!(ax4, DeskewAxis::Vertical);
+        assert!((deg4 - 2.9).abs() < 0.15, "got {deg4}");
+
+        // Same vertical margin drawn bottom-to-top (-dx, -dy) => identical angle!
+        let (ax5, deg5) = compute_guideline_deskew_angle(-15.0, -300.0).unwrap();
+        assert_eq!(ax5, DeskewAxis::Vertical);
+        assert!((deg5 - deg4).abs() < 1e-4);
+
+        // Vertical margin leaning LEFT going down (`/` shape: -dx, +dy) => tilted CW => needs CCW (-) correction
+        let (ax6, deg6) = compute_guideline_deskew_angle(-15.0, 300.0).unwrap();
+        assert_eq!(ax6, DeskewAxis::Vertical);
+        assert!((deg6 - (-2.9)).abs() < 0.15, "got {deg6}");
+
+        // Clamping to ±15.0°
+        let (_, clamped_pos) = compute_guideline_deskew_angle(100.0, -80.0).unwrap();
+        assert!((clamped_pos - 15.0).abs() < 1e-4);
+        let (_, clamped_neg) = compute_guideline_deskew_angle(100.0, 80.0).unwrap();
+        assert!((clamped_neg - (-15.0)).abs() < 1e-4);
+
+        // Too short (< 4 px) returns None
+        assert!(compute_guideline_deskew_angle(1.5, 1.5).is_none());
+    }
+
+    #[test]
+    fn test_milestone3_deskew_affine_matrix_centered() {
+        let w = 600.0f32;
+        let h = 800.0f32;
+        let cx = w * 0.5;
+        let cy = h * 0.5;
+
+        // 0° is exact identity
+        let id = compute_deskew_affine_matrix(w, h, 0.0);
+        assert!((id.a - 1.0).abs() < 1e-5);
+        assert!(id.b.abs() < 1e-5);
+        assert!(id.c.abs() < 1e-5);
+        assert!((id.d - 1.0).abs() < 1e-5);
+        assert!(id.e.abs() < 1e-4);
+        assert!(id.f.abs() < 1e-4);
+
+        // +5.0° CW rotation fixes center point (cx, cy) exactly
+        let m5 = compute_deskew_affine_matrix(w, h, 5.0);
+        let (rcx, rcy) = m5.apply_point(cx, cy);
+        assert!((rcx - cx).abs() < 1e-3);
+        assert!((rcy - cy).abs() < 1e-3);
+
+        // Determinant = a*d - b*c = 1.0 (pure rigid rotation, no scaling/shearing)
+        let det = m5.a * m5.d - m5.b * m5.c;
+        assert!((det - 1.0).abs() < 1e-5);
+
+        // Top-center point (cx, cy + 100) rotated +5° CW in PDF Y-up moves RIGHT (+X) and slightly DOWN (-Y)
+        let (tx, ty) = m5.apply_point(cx, cy + 100.0);
+        assert!(tx > cx + 8.0 && tx < cx + 9.5, "expected +X shift, got {tx}");
+        assert!(ty < cy + 100.0 && ty > cy + 99.0, "expected slight -Y drop, got {ty}");
+
+        // Applying -5° CW afterwards restores original point
+        let inv = compute_deskew_affine_matrix(w, h, -5.0);
+        let (ox, oy) = inv.apply_point(tx, ty);
+        assert!((ox - cx).abs() < 1e-2);
+        assert!((oy - (cy + 100.0)).abs() < 1e-2);
+    }
 }
+

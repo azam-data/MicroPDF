@@ -2,6 +2,7 @@ mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
 mod compare_mode;
+mod deskew;
 mod doc_props_modal;
 mod doc_tools_modal;
 mod grid;

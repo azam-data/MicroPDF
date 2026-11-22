@@ -14,6 +14,7 @@ use winit::window::Window;
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
 use super::compare_mode::{CompareHit, CompareModeState};
+use super::deskew::{DeskewBarState, DeskewHit};
 use super::doc_props_modal::{
     ActiveNotePopover, AnnotContextHit, AnnotationContextMenuState, DocPropsHit,
     DocPropsModalState, NotePopoverHit, UnsavedChangesHit, UnsavedChangesModalState,
@@ -161,6 +162,7 @@ impl MenuCategory {
             MenuCategory::Page => &[
                 "Jump to Page... (G)",
                 "Rotate Current Page 90° (R)",
+                "Deskew Page(s)...",
                 "Insert Blank Page After (I)",
                 "Insert Blank Page Before",
                 "Insert PDF(s) Before / After Page...",
@@ -739,6 +741,7 @@ pub(super) enum UiHit {
     AnnotContext(AnnotContextHit),
     NotePopover(NotePopoverHit),
     Compare(CompareHit),
+    Deskew(DeskewHit),
     MeasureBar(MeasureBarHit),
     UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
@@ -1136,6 +1139,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) incremental_search: Option<IncrementalSearchState>,
     /// Active Side-by-Side Compare Mode state (0 bytes when closed).
     pub(super) compare_mode: Option<CompareModeState<'a>>,
+    /// Active Page Deskew control bar state (0 bytes when closed).
+    pub(super) deskew_bar: Option<DeskewBarState>,
     /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
     pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
@@ -1409,6 +1414,7 @@ impl<'a> PdfViewerApp<'a> {
             current_search_match: 0,
             incremental_search: None,
             compare_mode: None,
+            deskew_bar: None,
             optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
@@ -2336,6 +2342,9 @@ impl<'a> PdfViewerApp<'a> {
         self.hovered_form_field = None;
         if let Some(ref mut cmp) = self.compare_mode {
             cmp.invalidate_caches();
+        }
+        if let Some(ref mut d) = self.deskew_bar {
+            d.preview_cache = None;
         }
         self.selected_text.clear();
         self.selected_text_page = None;

@@ -3357,6 +3357,86 @@ impl<'a> PdfViewerApp<'a> {
             self.handle_print_preview_key(logical_key, text);
             return;
         }
+        // 0b2. Deskew control bar focused text fields (Angle / Range)
+        if let Some(ref mut bar) = self.deskew_bar {
+            use super::deskew::DeskewTextFocus;
+            if bar.focus != DeskewTextFocus::None {
+                match logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        bar.focus = DeskewTextFocus::None;
+                        bar.angle_input = format!("{:.1}", bar.angle_deg);
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if bar.focus == DeskewTextFocus::Angle {
+                            if let Ok(v) = bar.angle_input.trim().parse::<f32>() {
+                                bar.set_angle(v);
+                            } else {
+                                bar.angle_input = format!("{:.1}", bar.angle_deg);
+                            }
+                            bar.focus = DeskewTextFocus::None;
+                            self.request_redraw();
+                            return;
+                        } else {
+                            bar.focus = DeskewTextFocus::None;
+                            self.apply_deskew_from_bar();
+                            return;
+                        }
+                    }
+                    Key::Named(NamedKey::Backspace) | Key::Named(NamedKey::Delete) => {
+                        match bar.focus {
+                            DeskewTextFocus::Angle => {
+                                bar.angle_input.pop();
+                                if let Ok(v) = bar.angle_input.trim().parse::<f32>() {
+                                    let snapped = (v.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+                                    bar.angle_deg = if snapped.abs() < 0.05 { 0.0 } else { snapped };
+                                    bar.preview_cache = None;
+                                }
+                            }
+                            DeskewTextFocus::Range => {
+                                bar.range_input.pop();
+                            }
+                            DeskewTextFocus::None => {}
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                    _ => {
+                        if let Some(t) = text {
+                            match bar.focus {
+                                DeskewTextFocus::Angle => {
+                                    for ch in t.chars() {
+                                        if (ch.is_ascii_digit() || ch == '.' || ch == '-' || ch == '+')
+                                            && bar.angle_input.len() < 7
+                                        {
+                                            bar.angle_input.push(ch);
+                                        }
+                                    }
+                                    if let Ok(v) = bar.angle_input.trim().parse::<f32>() {
+                                        let snapped = (v.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+                                        bar.angle_deg = if snapped.abs() < 0.05 { 0.0 } else { snapped };
+                                        bar.preview_cache = None;
+                                    }
+                                }
+                                DeskewTextFocus::Range => {
+                                    for ch in t.chars() {
+                                        if (ch.is_ascii_digit() || ch == '-' || ch == ',' || ch == ' ')
+                                            && bar.range_input.len() < 24
+                                        {
+                                            bar.range_input.push(ch);
+                                        }
+                                    }
+                                }
+                                DeskewTextFocus::None => {}
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // 0c. Combine Multiple PDFs modal
         if self.combine_modal.is_some() {
             self.handle_combine_key(logical_key, text);
@@ -4331,6 +4411,8 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.compare_mode.is_some() {
                     self.close_compare_mode();
+                } else if self.deskew_bar.is_some() {
+                    self.close_deskew_bar();
                 } else if self.incremental_search.is_some() {
                     self.cancel_incremental_search();
                 } else if self.optimize_job.is_some() {
@@ -5011,6 +5093,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.scroll_to_scrollbar_y(position.y, win_w, win_h, top_bars_h, status_bar_h, sf);
                     return;
                 }
+                if self.deskew_bar.as_ref().is_some_and(|d| d.dragging_slider) {
+                    self.update_deskew_slider_from_x(position.x, win_w, sidebar_w, top_bars_h, sf);
+                    return;
+                }
 
                 // Compute unified hover widget and only redraw when hover actually changes
                 let mut new_hover: Option<UiHit> = None;
@@ -5178,6 +5264,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                     }
+                    if new_hover.is_none() && self.compare_mode.is_none() && self.deskew_bar.is_some() && self.view_mode.is_page_view() {
+                        if let Some(h) = self.hit_test_deskew_bar(position.x, position.y, win_w, sidebar_w, top_bars_h, sf) {
+                            if h != super::deskew::DeskewHit::InsideBar {
+                                new_hover = Some(UiHit::Deskew(h));
+                            }
+                        }
+                    }
                     if new_hover.is_none() && self.compare_mode.is_none() && self.mouse_mode == MouseMode::Measure && self.view_mode.is_page_view() {
                         if let Some(h) = self.hit_test_measure_bar(position.x, position.y, win_w, sidebar_w, top_bars_h, sf) {
                             if h != super::measure::MeasureBarHit::InsideBar {
@@ -5293,6 +5386,17 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                     }
                     self.request_redraw();
+                } else if self.compare_mode.is_none()
+                    && self.view_mode.is_page_view()
+                    && new_hover.is_none()
+                    && self.deskew_bar.as_ref().is_some_and(|d| d.draw_guideline)
+                {
+                    if let Some(w) = self.window.as_ref() {
+                        w.set_cursor(CursorIcon::Crosshair);
+                    }
+                    if self.deskew_bar.as_ref().is_some_and(|d| d.guide_start.is_some() && d.guide_end.is_none()) {
+                        self.request_redraw();
+                    }
                 } else if self.compare_mode.is_none() && self.view_mode.is_page_view() && new_hover.is_none() {
                     let new_link = self.resolve_link_at_screen_pos(position.x, position.y);
                     let new_form = if new_link.is_none() && self.mouse_mode == MouseMode::Select {
@@ -5335,6 +5439,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Released && self.scrollbar_drag {
                     self.scrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.deskew_bar.as_ref().is_some_and(|d| d.dragging_slider) {
+                    if let Some(ref mut d) = self.deskew_bar {
+                        d.dragging_slider = false;
+                    }
                     self.request_redraw();
                     return;
                 }
@@ -5975,6 +6086,75 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     // Allow clicking Bookmark Sidebar during Compare Mode, otherwise ignore canvas clicks
                     if !(self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w) {
                         return;
+                    }
+                }
+
+                // 0d1a. Lightweight Matrix Page Deskew bar + Draw Guideline canvas interaction
+                if self.deskew_bar.is_some() && self.view_mode.is_page_view() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_deskew_bar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            sidebar_w,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.handle_deskew_bar_click(
+                                hit,
+                                self.cursor_pos.0,
+                                win_w,
+                                sidebar_w,
+                                top_bars_h,
+                                scale_factor,
+                            );
+                            return;
+                        }
+                    }
+                    let on_canvas = self.cursor_pos.0 >= sidebar_w as f64
+                        && self.cursor_pos.1 >= (top_bars_h + self.deskew_bar_height_px(scale_factor)) as f64
+                        && self.cursor_pos.1 < win_h.saturating_sub(status_bar_h) as f64;
+                    if button == MouseButton::Left
+                        && on_canvas
+                        && self.deskew_bar.as_ref().is_some_and(|d| d.draw_guideline)
+                    {
+                        match state {
+                            ElementState::Pressed => {
+                                let second_click_p1 = self.deskew_bar.as_ref().and_then(|d| {
+                                    if !d.guide_dragging && d.guide_end.is_none() {
+                                        d.guide_start
+                                    } else {
+                                        None
+                                    }
+                                });
+                                if let Some(p1) = second_click_p1 {
+                                    self.commit_deskew_guideline(p1, self.cursor_pos);
+                                } else if let Some(ref mut d) = self.deskew_bar {
+                                    d.focus = super::deskew::DeskewTextFocus::None;
+                                    d.guide_start = Some(self.cursor_pos);
+                                    d.guide_end = None;
+                                    d.guide_dragging = true;
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                            ElementState::Released => {
+                                let drag_p1 = self.deskew_bar.as_ref().and_then(|d| {
+                                    if d.guide_dragging { d.guide_start } else { None }
+                                });
+                                if let Some(p1) = drag_p1 {
+                                    let dist = (self.cursor_pos.0 - p1.0).hypot(self.cursor_pos.1 - p1.1);
+                                    if dist >= 6.0 {
+                                        self.commit_deskew_guideline(p1, self.cursor_pos);
+                                    } else if let Some(ref mut d) = self.deskew_bar {
+                                        // Stay waiting for second click in two-click mode
+                                        d.guide_dragging = false;
+                                        self.request_redraw();
+                                    }
+                                    return;
+                                }
+                            }
+                        }
                     }
                 }
 
