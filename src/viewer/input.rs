@@ -3621,6 +3621,29 @@ impl<'a> PdfViewerApp<'a> {
             }
             return;
         }
+        if let Some(g) = self.user_guide_modal {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => self.close_user_guide_modal(),
+                Key::Named(NamedKey::ArrowDown) => self.scroll_user_guide(48.0),
+                Key::Named(NamedKey::ArrowUp) => self.scroll_user_guide(-48.0),
+                Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
+                    self.scroll_user_guide(220.0);
+                }
+                Key::Named(NamedKey::PageUp) => self.scroll_user_guide(-220.0),
+                Key::Named(NamedKey::ArrowRight) => {
+                    if g.chapter + 1 < super::user_guide::USER_GUIDE_CHAPTERS.len() {
+                        self.select_user_guide_chapter(g.chapter + 1);
+                    }
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    if g.chapter > 0 {
+                        self.select_user_guide_chapter(g.chapter - 1);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.show_customize_toolbar || self.show_about_overlay || self.show_bookmark_format_overlay {
             if matches!(logical_key, Key::Named(NamedKey::Escape)) {
                 self.show_customize_toolbar = false;
@@ -3633,18 +3656,20 @@ impl<'a> PdfViewerApp<'a> {
 
         // 1. If in an interactive command/dialog prompt mode, handle typing, Backspace, Delete, Ctrl+A/V, F3, Enter, Esc
         if self.input_mode != InputMode::Normal {
-            // Allow F3 / Ctrl+G to step through matches even while SearchText pill is focused
+            // Allow F3 / Shift+F3 / Ctrl+G / Ctrl+Shift+G to step through matches while SearchText pill is focused
             if matches!(&self.input_mode, InputMode::SearchText { .. }) {
-                let is_find_next = matches!(logical_key, Key::Named(NamedKey::F3))
+                let is_find_step = matches!(logical_key, Key::Named(NamedKey::F3))
                     || (self.cmd_or_ctrl_pressed
                         && matches!(&logical_key, Key::Character(c) if c.eq_ignore_ascii_case("g")));
-                if is_find_next {
+                if is_find_step {
                     let q = match &self.input_mode {
                         InputMode::SearchText { query_input } => query_input.clone(),
                         _ => String::new(),
                     };
                     if !q.trim().is_empty() && q.trim() != self.search_query {
                         self.execute_text_search(q.trim());
+                    } else if self.shift_pressed {
+                        self.jump_to_prev_search_match();
                     } else {
                         self.jump_to_next_search_match();
                     }
@@ -4640,6 +4665,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ImportBookmarksTxt => self.import_bookmarks_txt_dialog(),
                 PendingDialog::ExportBookmarksTxt => self.export_bookmarks_txt_dialog(),
                 PendingDialog::SaveBookmarkSampleTxt => self.save_bookmark_sample_txt_dialog(),
+                PendingDialog::SaveUserGuideTxt => self.save_user_guide_txt_dialog(),
             }
         }
     }
@@ -4829,6 +4855,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => ((x as f64) * 36.0, (y as f64) * 36.0),
+                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
+                };
+                if self.user_guide_modal.is_some() {
+                    self.scroll_user_guide((-dy) as f32);
+                    return;
+                }
                 if self.has_blocking_modal()
                     || self.open_menu.is_some()
                     || self.tab_context_menu.is_some()
@@ -4838,10 +4872,6 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 {
                     return;
                 }
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => ((x as f64) * 36.0, (y as f64) * 36.0),
-                    MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
-                };
 
                 // Scroll inside the `▾` All-Tabs overflow dropdown popover if open and hovered
                 if self.show_tab_list_popover {
@@ -5050,6 +5080,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     ) {
                         if h != super::doc_tools_modal::PageNumberHit::InsideModal {
                             new_hover = Some(UiHit::PageNumber(h));
+                        }
+                    }
+                } else if self.user_guide_modal.is_some() {
+                    if let Some(h) = self.hit_test_user_guide_modal(position.x, position.y, win_w, win_h, sf) {
+                        if h != super::user_guide::UserGuideHit::InsideModal {
+                            new_hover = Some(UiHit::UserGuide(h));
                         }
                     }
                 } else if self.show_bookmark_format_overlay {
@@ -5475,6 +5511,23 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             scale_factor,
                         ) {
                             self.handle_page_number_click(hit);
+                        }
+                    }
+                    return;
+                }
+
+                // Built-in Step-by-Step User Guide modal (`Help -> User Guide (How to Use)`)
+                if self.user_guide_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_user_guide_modal(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(hit) => self.handle_user_guide_click(hit),
+                            None => self.close_user_guide_modal(),
                         }
                     }
                     return;

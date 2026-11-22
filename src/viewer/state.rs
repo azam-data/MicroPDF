@@ -30,6 +30,7 @@ use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewH
 use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
+use super::user_guide::{UserGuideHit, UserGuideState};
 
 #[allow(dead_code)]
 pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
@@ -185,6 +186,7 @@ impl MenuCategory {
                 "Export Pages as Images (PNG/JPG)...",
             ],
             MenuCategory::Help => &[
+                "User Guide (How to Use)",
                 "Keyboard & Mouse Shortcuts (? / F1)",
                 "Bookmark Import Format (.txt)",
                 "About MicroPDF",
@@ -738,6 +740,7 @@ pub(super) enum UiHit {
     NotePopover(NotePopoverHit),
     Compare(CompareHit),
     MeasureBar(MeasureBarHit),
+    UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
     Overlay(OverlayHit),
@@ -998,6 +1001,7 @@ pub(super) enum PendingDialog {
     ImportBookmarksTxt,
     ExportBookmarksTxt,
     SaveBookmarkSampleTxt,
+    SaveUserGuideTxt,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -1208,6 +1212,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) doc_props_modal: Option<DocPropsModalState>,
     /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
     pub(super) unsaved_changes_modal: Option<UnsavedChangesModalState>,
+    /// Active built-in Step-by-Step User Guide modal (`Help -> User Guide (How to Use)`).
+    pub(super) user_guide_modal: Option<UserGuideState>,
     /// Set true once exit has been confirmed through the unsaved-changes guard.
     pub(super) pending_app_exit: bool,
     /// Cached extracted blocks for `ViewMode::TextView` (0 bytes when not in Text View).
@@ -1448,6 +1454,7 @@ impl<'a> PdfViewerApp<'a> {
             export_images_modal: None,
             doc_props_modal: None,
             unsaved_changes_modal: None,
+            user_guide_modal: None,
             pending_app_exit: false,
             cached_text_view: None,
             text_view_font_size: 14.5,
@@ -1489,6 +1496,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.create_pdf_images_modal.is_some()
             || self.export_images_modal.is_some()
             || self.doc_props_modal.is_some()
+            || self.user_guide_modal.is_some()
             || self.show_customize_toolbar
             || self.show_help_overlay
             || self.show_bookmark_format_overlay

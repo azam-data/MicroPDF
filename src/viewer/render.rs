@@ -2001,6 +2001,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_customize_toolbar_modal(buffer, width, height, scale_factor);
         }
 
+        // Built-in Step-by-Step User Guide Modal (`Help -> User Guide (How to Use)`)
+        if self.user_guide_modal.is_some() {
+            self.draw_user_guide_modal(buffer, width, height, scale_factor);
+        }
+
         // Help Overlay (`?` / `F1`)
         if self.show_help_overlay {
             self.draw_themed_help_overlay(buffer, width, height, scale_factor);

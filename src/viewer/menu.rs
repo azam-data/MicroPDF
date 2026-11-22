@@ -727,19 +727,26 @@ impl<'a> PdfViewerApp<'a> {
 
             // Help menu
             (MenuCategory::Help, 0) => {
+                self.open_user_guide_modal();
+                return;
+            }
+            (MenuCategory::Help, 1) => {
                 self.show_help_overlay = !self.show_help_overlay;
                 self.show_bookmark_format_overlay = false;
                 self.show_about_overlay = false;
+                self.user_guide_modal = None;
             }
-            (MenuCategory::Help, 1) => {
+            (MenuCategory::Help, 2) => {
                 self.show_bookmark_format_overlay = !self.show_bookmark_format_overlay;
                 self.show_help_overlay = false;
                 self.show_about_overlay = false;
+                self.user_guide_modal = None;
             }
-            (MenuCategory::Help, 2) => {
+            (MenuCategory::Help, 3) => {
                 self.show_about_overlay = !self.show_about_overlay;
                 self.show_help_overlay = false;
                 self.show_bookmark_format_overlay = false;
+                self.user_guide_modal = None;
             }
             _ => {}
         }

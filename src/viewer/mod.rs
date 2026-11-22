@@ -19,6 +19,7 @@ mod text_view;
 mod theme;
 mod toolbar;
 mod ui_draw;
+mod user_guide;
 
 use crate::engine::PdfEngine;
 use anyhow::{Context, Result};
@@ -2908,7 +2909,45 @@ mod tests {
         assert!((parsed.last_positions[0].zoom_level - 1.25).abs() < 1e-3);
         assert_eq!(parsed.last_positions[5].page_index, 5);
     }
+
+    #[test]
+    fn test_tier3_user_guide_chapters_and_export() {
+        use super::user_guide::{format_full_user_guide_txt, GuideBlock, USER_GUIDE_CHAPTERS};
+
+        assert_eq!(USER_GUIDE_CHAPTERS.len(), 10, "User Guide must have 10 chapters");
+        for (idx, ch) in USER_GUIDE_CHAPTERS.iter().enumerate() {
+            assert_eq!(ch.number as usize, idx + 1, "Chapter numbering must be sequential 1..=10");
+            assert!(!ch.short_title.trim().is_empty());
+            assert!(!ch.title.trim().is_empty());
+            assert!(!ch.summary.trim().is_empty());
+            let step_count = ch
+                .blocks
+                .iter()
+                .filter(|b| matches!(b, GuideBlock::Step { .. }))
+                .count();
+            assert!(
+                step_count >= 3,
+                "Chapter {} ({}) should have at least 3 numbered steps, found {step_count}",
+                ch.number,
+                ch.title
+            );
+            let has_tip = ch.blocks.iter().any(|b| matches!(b, GuideBlock::Tip(_)));
+            assert!(has_tip, "Chapter {} ({}) should include a beginner Tip callout", ch.number, ch.title);
+        }
+
+        let txt = format_full_user_guide_txt();
+        assert!(txt.contains("MicroPDF v1.4 — Step-by-Step User Guide"));
+        assert!(txt.contains("CHAPTER 1:"));
+        assert!(txt.contains("CHAPTER 10:"));
+        assert!(txt.contains("Step 1:"));
+        assert!(txt.contains("[TIP]"));
+        assert!(txt.contains("Create PDF from Images"));
+        assert!(txt.contains("Compare with Another PDF"));
+        assert!(txt.contains("Measure Distance & Area"));
+        assert!(txt.contains("Strip Personal Metadata & XMP"));
+    }
 }
+
 
 
 

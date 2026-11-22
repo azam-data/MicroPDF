@@ -667,8 +667,8 @@ impl<'a> PdfViewerApp<'a> {
         let s = sf as f32;
         blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
 
-        let cw = ((700.0 * s).round() as u32).min(buf_w.saturating_sub(28));
-        let ch = ((430.0 * s).round() as u32).min(buf_h.saturating_sub(28));
+        let cw = ((760.0 * s).round() as u32).min(buf_w.saturating_sub(28));
+        let ch = ((480.0 * s).round() as u32).min(buf_h.saturating_sub(28));
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = (buf_h.saturating_sub(ch) / 2) as i32;
         let rad = (10.0 * s).clamp(6.0, 16.0);
@@ -682,48 +682,50 @@ impl<'a> PdfViewerApp<'a> {
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let key_sz = (10.5 * s).clamp(9.0, 22.0);
 
-        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.4", title_sz, theme.text_primary, true);
         let close_hint = "Esc or Click to close";
         let chw = measure_text(close_hint, key_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + cw as i32 - pad - chw.ceil() as i32, cy + (17.0 * s).round() as i32, close_hint, key_sz, theme.text_muted, false);
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll Flow (Vert/Book)"),
-            ("T", "Toggle Reflowable Text View (Tables + Export .md/.tex)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book)"),
+            ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
             ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 / Ctrl+0 resets)"),
-            ("Tab", "Toggle Thumbnail Grid (Ctrl+Tab switches tabs)"),
+            ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
+            ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
             ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
-            ("G", "Smart Jump to Page (5, ii, or #5)"),
+            ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "Navigation History Back / Forward"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night Amber)"),
-            ("Ctrl+F / F3", "Incremental Search / Next Match"),
+            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
+            ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S", "Open PDF / Save (Ctrl+Shift+S Save As)"),
-            ("Ctrl+P", "Print Preview (10 Paper Sizes / Booklet / Duplex)"),
-            ("Z", "Optimize PDF (Images + Form XObjects + Dedup)"),
-            ("Shift+M", "Combine Multiple PDFs (Interactive)"),
-            ("X / U", "Split Pages / Flatten & Unlock"),
-            ("P", "Stamp Signature / Image"),
-            ("N / H", "Page Numbering & Header/Footer Dialogs + Profiles"),
-            ("W / K", "Watermark / Convert Page to B&W"),
-            ("I / R / D", "Insert Blank / Rotate 90° / Delete Page"),
-            ("Ctrl+Z / C", "Undo Edit (Ctrl+Z) / Copy Selected Text (Ctrl+C)"),
+            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S Save As) / Watermark"),
+            ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
+            ("Ctrl+P", "Print Preview (10 Paper Sizes, Manual 2-Sided)"),
+            ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
+            ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
+            ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
+            ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
+            ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
+            ("P / Z / U", "Stamp Image / Optimize PDF / Flatten & Unlock"),
+            ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
+            ("Help Menu", "Step-by-Step User Guide, Compare PDFs & Ruler"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;
-        let row_h = (34.0 * s).round() as i32;
+        let row_h = (35.0 * s).round() as i32;
         let start_y = cy + (54.0 * s).round() as i32;
-        let key_w = (76.0 * s).round() as u32;
+        let key_w = (82.0 * s).round() as u32;
         let key_h = (22.0 * s).round() as u32;
 
         for (col_idx, list) in [left_items, right_items].iter().enumerate() {
             let col_x = cx + pad + (col_idx as i32) * (col_w as i32 + pad);
             for (i, &(k, desc)) in list.iter().enumerate() {
                 let ry = start_y + (i as i32) * row_h;
-                if ry + key_h as i32 > cy + ch as i32 - (14.0 * s).round() as i32 {
+                if ry + key_h as i32 > cy + ch as i32 - (12.0 * s).round() as i32 {
                     break;
                 }
                 fill_rounded_rect(buffer, buf_w, buf_h, col_x, ry, key_w, key_h, (5.0 * s).max(3.0), theme.surface_elevated);
@@ -767,7 +769,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.3.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.4.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
