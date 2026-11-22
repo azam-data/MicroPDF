@@ -465,20 +465,15 @@ impl<'a> PdfViewerApp<'a> {
                         },
                     );
                     if opts.normalize_comma_decimals {
-                        let cw = measure_text("v", 10.5 * s, true).round() as i32;
-                        draw_text_vcenter(
-                            buffer,
-                            buf_w,
-                            buf_h,
-                            cb_x + (cb_sz as i32 - cw) / 2,
-                            cb_y,
-                            cb_sz,
-                            cb_x + cb_sz as i32,
-                            "v",
-                            10.5 * s,
-                            0x00FF_FFFF,
-                            true,
-                        );
+                        let x0 = cb_x as f32 + cb_sz as f32 * 0.22;
+                        let y0 = cb_y as f32 + cb_sz as f32 * 0.54;
+                        let x1 = cb_x as f32 + cb_sz as f32 * 0.44;
+                        let y1 = cb_y as f32 + cb_sz as f32 * 0.74;
+                        let x2 = cb_x as f32 + cb_sz as f32 * 0.80;
+                        let y2 = cb_y as f32 + cb_sz as f32 * 0.28;
+                        let thick = (1.9 * s).max(1.4);
+                        draw_line_aa(buffer, buf_w, buf_h, x0, y0, x1, y1, thick, 0x00FF_FFFF);
+                        draw_line_aa(buffer, buf_w, buf_h, x1, y1, x2, y2, thick, 0x00FF_FFFF);
                     }
                     draw_text_vcenter(
                         buffer,

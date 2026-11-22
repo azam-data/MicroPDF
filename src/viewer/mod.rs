@@ -2947,6 +2947,8 @@ mod tests {
         assert!(txt.contains("Compare with Another PDF"));
         assert!(txt.contains("Measure Distance & Area"));
         assert!(txt.contains("Strip Personal Metadata & XMP"));
+        assert!(txt.contains("Deskew Page(s)"));
+        assert!(txt.contains("Auto (Hybrid)"));
     }
 }
 
