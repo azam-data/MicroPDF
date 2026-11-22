@@ -37,6 +37,10 @@ impl<'a> PdfViewerApp<'a> {
             slot.has_unsaved_edits = self.has_unsaved_edits;
             slot.last_file_mtime = self.last_file_mtime;
         }
+        if !self.file_path.as_os_str().is_empty() {
+            let path = self.file_path.clone();
+            self.record_last_position(&path, self.current_page_index, self.zoom_level);
+        }
     }
 
     pub(super) fn load_slot_into_active(&mut self, index: usize) {
@@ -56,6 +60,8 @@ impl<'a> PdfViewerApp<'a> {
             self.nav_back_stack = std::mem::take(&mut slot.nav_back_stack);
             self.nav_forward_stack = std::mem::take(&mut slot.nav_forward_stack);
             self.hovered_link = None;
+            self.hovered_form_field = None;
+            self.last_measurement = None;
             self.roman_end = slot.roman_end;
             self.skip_pages = slot.skip_pages;
             self.bookmarks = slot.bookmarks.clone();
@@ -126,15 +132,28 @@ impl<'a> PdfViewerApp<'a> {
         self.doc = None;
 
         let file_mtime = Self::read_file_mtime(&path);
+        let page_count = loaded.pages().len();
+        let (restored_page, restored_zoom) = self
+            .lookup_last_position(&path)
+            .map(|(p, z)| {
+                (
+                    if page_count > 0 { p.min(page_count - 1) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
         self.file_path = path.clone();
-        self.current_page_index = 0;
-        self.zoom_level = 1.0;
+        self.current_page_index = restored_page;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = roman_end;
         self.skip_pages = skip_pages;
         self.bw_pages.clear();
@@ -171,11 +190,11 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs.push(DocumentTab {
                 doc: None,
                 file_path: path,
-                current_page_index: 0,
+                current_page_index: restored_page,
                 view_mode: self.view_mode,
                 last_page_view_mode: self.last_page_view_mode,
                 scroll_mode: self.scroll_mode,
-                zoom_level: 1.0,
+                zoom_level: restored_zoom,
                 pan_x: 0.0,
                 scroll_y: 0.0,
                 scroll_x: 0.0,
@@ -200,8 +219,8 @@ impl<'a> PdfViewerApp<'a> {
             self.tab_scroll_offset = 0;
         } else if self.active_tab < self.tabs.len() {
             self.tabs[self.active_tab].file_path = path;
-            self.tabs[self.active_tab].current_page_index = 0;
-            self.tabs[self.active_tab].zoom_level = 1.0;
+            self.tabs[self.active_tab].current_page_index = restored_page;
+            self.tabs[self.active_tab].zoom_level = restored_zoom;
             self.tabs[self.active_tab].pan_x = 0.0;
             self.tabs[self.active_tab].scroll_y = 0.0;
             self.tabs[self.active_tab].scroll_x = 0.0;
@@ -286,15 +305,25 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
 
         let file_mtime = Self::read_file_mtime(&path);
+        let page_count = loaded.pages().len();
+        let (restored_page, restored_zoom) = self
+            .lookup_last_position(&path)
+            .map(|(p, z)| {
+                (
+                    if page_count > 0 { p.min(page_count - 1) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
         let new_idx = self.tabs.len();
         self.tabs.push(DocumentTab {
             doc: None,
             file_path: path.clone(),
-            current_page_index: 0,
+            current_page_index: restored_page,
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
             scroll_mode: self.scroll_mode,
-            zoom_level: 1.0,
+            zoom_level: restored_zoom,
             pan_x: 0.0,
             scroll_y: 0.0,
             scroll_x: 0.0,
@@ -319,16 +348,19 @@ impl<'a> PdfViewerApp<'a> {
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.file_path = path;
-        self.current_page_index = 0;
+        self.current_page_index = restored_page;
         self.view_mode = ViewMode::FitPage;
         self.last_page_view_mode = ViewMode::FitPage;
-        self.zoom_level = 1.0;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = roman_end;
         self.skip_pages = skip_pages;
         self.bookmarks = loaded_bookmarks;
@@ -411,6 +443,9 @@ impl<'a> PdfViewerApp<'a> {
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
         self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
         self.roman_end = 0;
         self.skip_pages = 0;
         self.bookmarks.clear();
@@ -495,6 +530,9 @@ impl<'a> PdfViewerApp<'a> {
         self.tab_context_menu = None;
         self.thumb_context_menu = None;
         self.annot_context_menu = None;
+        self.compare_mode = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
         self.file_path = PathBuf::new();
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;
@@ -545,6 +583,12 @@ impl<'a> PdfViewerApp<'a> {
             return false;
         }
         self.sync_active_tab_to_slot();
+        let closed_path = self.tabs[close_idx].file_path.clone();
+        let closed_page = self.tabs[close_idx].current_page_index;
+        let closed_zoom = self.tabs[close_idx].zoom_level;
+        if !closed_path.as_os_str().is_empty() {
+            self.record_last_position(&closed_path, closed_page, closed_zoom);
+        }
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();

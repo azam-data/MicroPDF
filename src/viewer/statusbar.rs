@@ -76,6 +76,14 @@ impl<'a> PdfViewerApp<'a> {
                 label.to_ascii_uppercase(),
                 text_input
             )),
+            InputMode::EditFormField {
+                field_name,
+                value_input,
+                ..
+            } => Some(format!(
+                "FILL FORM FIELD '{}': {}_  (Enter to save, Esc to cancel)",
+                field_name, value_input
+            )),
             InputMode::ConfirmExternalUrl { url } => Some(format!(
                 "OPEN EXTERNAL URL IN BROWSER? {}  (Press Enter to confirm, Esc to cancel)",
                 url

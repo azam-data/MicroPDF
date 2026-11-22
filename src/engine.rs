@@ -407,6 +407,24 @@ pub struct FoundAnnotationInfo {
     pub contents: String,
 }
 
+/// Interactive AcroForm field kind supported by Tier 2 native form filling.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FormFieldKind {
+    Text,
+    Checkbox,
+    Radio,
+}
+
+/// Fillable PDF form field found under a page coordinate.
+#[derive(Clone, Debug)]
+pub struct FoundFormFieldInfo {
+    pub annot_index: usize,
+    pub kind: FormFieldKind,
+    pub name: String,
+    pub value: String,
+    pub bounds: PdfRect,
+}
+
 /// Page sizing mode when converting PNG/JPEG images into a new PDF.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ImagePdfFitMode {
@@ -3685,6 +3703,48 @@ impl PdfEngine {
         Self::search_text_on_single_page_opts(doc, page_idx, q_chars, false, false)
     }
 
+    /// Pure-Rust character-stream matcher supporting optional `case_sensitive` and `whole_word`
+    /// matching (with whitespace equivalence). Returns non-overlapping `(start, end_excl)` ranges
+    /// in `haystack`.
+    pub fn find_text_match_ranges(
+        haystack: &[char],
+        query: &[char],
+        whole_word: bool,
+    ) -> Vec<(usize, usize)> {
+        if query.is_empty() || haystack.len() < query.len() {
+            return Vec::new();
+        }
+        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
+        let mut ranges = Vec::new();
+        let mut i = 0;
+        while i + query.len() <= haystack.len() {
+            let mut matched = true;
+            for j in 0..query.len() {
+                let pc = haystack[i + j];
+                let qc = query[j];
+                if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
+                    matched = false;
+                    break;
+                }
+            }
+            if matched && whole_word {
+                let before_ok = i == 0 || !is_word_char(haystack[i - 1]);
+                let after_idx = i + query.len();
+                let after_ok = after_idx >= haystack.len() || !is_word_char(haystack[after_idx]);
+                if !(before_ok && after_ok) {
+                    matched = false;
+                }
+            }
+            if matched {
+                ranges.push((i, i + query.len()));
+                i += query.len();
+            } else {
+                i += 1;
+            }
+        }
+        ranges
+    }
+
     /// Searches a single page for `q_chars`, collapsing `\r\n` / consecutive line breaks into a
     /// single space so phrases wrapped across lines match cleanly. Supports optional
     /// `case_sensitive` and `whole_word` matching.
@@ -3744,63 +3804,42 @@ impl PdfEngine {
             }
         }
 
-        if page_chars.len() < q_chars.len() {
-            return Vec::new();
-        }
+        let norm_query: Vec<char> = if case_sensitive {
+            q_chars.to_vec()
+        } else {
+            q_chars.iter().flat_map(|c| c.to_lowercase()).collect()
+        };
+        let plain: Vec<char> = page_chars.iter().map(|(c, _)| *c).collect();
+        let ranges = Self::find_text_match_ranges(&plain, &norm_query, whole_word);
 
-        let is_word_char = |c: char| c.is_alphanumeric() || c == '_';
         let mut matches = Vec::new();
-        let mut i = 0;
-        while i + q_chars.len() <= page_chars.len() {
-            let mut matched = true;
-            for j in 0..q_chars.len() {
-                let pc = page_chars[i + j].0;
-                let qc = q_chars[j];
-                if pc != qc && !(pc.is_whitespace() && qc.is_whitespace()) {
-                    matched = false;
-                    break;
-                }
-            }
-            if matched && whole_word {
-                let before_ok = i == 0 || !is_word_char(page_chars[i - 1].0);
-                let after_idx = i + q_chars.len();
-                let after_ok = after_idx >= page_chars.len() || !is_word_char(page_chars[after_idx].0);
-                if !(before_ok && after_ok) {
-                    matched = false;
-                }
-            }
-
-            if matched {
-                let mut line_rects: Vec<PdfRect> = Vec::new();
-                for j in 0..q_chars.len() {
-                    if let Some(cb) = page_chars[i + j].1 {
-                        if let Some(last) = line_rects.last_mut() {
-                            let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
-                            let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
-                            let lh = (last.top().value - last.bottom().value).max(4.0);
-                            if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
-                                *last = PdfRect::new_from_values(
-                                    last.bottom().value.min(cb.bottom().value),
-                                    last.left().value.min(cb.left().value),
-                                    last.top().value.max(cb.top().value),
-                                    last.right().value.max(cb.right().value),
-                                );
-                                continue;
-                            }
+        for (start, end) in ranges {
+            let mut line_rects: Vec<PdfRect> = Vec::new();
+            for (_, rect_opt) in &page_chars[start..end] {
+                if let Some(cb) = *rect_opt {
+                    if let Some(last) = line_rects.last_mut() {
+                        let last_mid_y = (last.bottom().value + last.top().value) * 0.5;
+                        let cb_mid_y = (cb.bottom().value + cb.top().value) * 0.5;
+                        let lh = (last.top().value - last.bottom().value).max(4.0);
+                        if (last_mid_y - cb_mid_y).abs() < lh * 0.65 {
+                            *last = PdfRect::new_from_values(
+                                last.bottom().value.min(cb.bottom().value),
+                                last.left().value.min(cb.left().value),
+                                last.top().value.max(cb.top().value),
+                                last.right().value.max(cb.right().value),
+                            );
+                            continue;
                         }
-                        line_rects.push(cb);
                     }
+                    line_rects.push(cb);
                 }
+            }
 
-                if !line_rects.is_empty() {
-                    matches.push(SearchMatch {
-                        page_index: page_idx,
-                        rects: line_rects,
-                    });
-                }
-                i += q_chars.len();
-            } else {
-                i += 1;
+            if !line_rects.is_empty() {
+                matches.push(SearchMatch {
+                    page_index: page_idx,
+                    rects: line_rects,
+                });
             }
         }
 
@@ -4940,6 +4979,122 @@ impl PdfEngine {
         let mut out = Vec::new();
         ldoc.save_to(&mut out)?;
         Ok(out)
+    }
+
+    // =========================================================================
+    // Tier 2.2: Native Interactive Form Filling (Text, Checkbox, Radio)
+    // =========================================================================
+
+    /// Finds a fillable PDF form widget (Text Field, Checkbox, or Radio Button) at `(pdf_x, pdf_y)` on `page`.
+    pub fn find_form_field_at_point(
+        page: &PdfPage,
+        pdf_x: f32,
+        pdf_y: f32,
+    ) -> Option<FoundFormFieldInfo> {
+        let annots: Vec<_> = page.annotations().iter().enumerate().collect();
+        for (idx, annot) in annots.into_iter().rev() {
+            let Some(widget) = annot.as_widget_annotation() else {
+                continue;
+            };
+            let Ok(bounds) = annot.bounds() else {
+                continue;
+            };
+            let min_x = bounds.left().value.min(bounds.right().value) - 2.0;
+            let max_x = bounds.left().value.max(bounds.right().value) + 2.0;
+            let min_y = bounds.bottom().value.min(bounds.top().value) - 2.0;
+            let max_y = bounds.bottom().value.max(bounds.top().value) + 2.0;
+            if pdf_x < min_x || pdf_x > max_x || pdf_y < min_y || pdf_y > max_y {
+                continue;
+            }
+            let Some(field) = widget.form_field() else {
+                continue;
+            };
+            let raw_name = field.name().unwrap_or_default().trim().to_string();
+            if let Some(tf) = field.as_text_field() {
+                return Some(FoundFormFieldInfo {
+                    annot_index: idx,
+                    kind: FormFieldKind::Text,
+                    name: if raw_name.is_empty() { "Text Field".to_string() } else { raw_name },
+                    value: tf.value().unwrap_or_default(),
+                    bounds,
+                });
+            }
+            if field.as_checkbox_field().is_some() {
+                return Some(FoundFormFieldInfo {
+                    annot_index: idx,
+                    kind: FormFieldKind::Checkbox,
+                    name: if raw_name.is_empty() { "Checkbox".to_string() } else { raw_name },
+                    value: String::new(),
+                    bounds,
+                });
+            }
+            if field.as_radio_button_field().is_some() {
+                return Some(FoundFormFieldInfo {
+                    annot_index: idx,
+                    kind: FormFieldKind::Radio,
+                    name: if raw_name.is_empty() { "Radio Button".to_string() } else { raw_name },
+                    value: String::new(),
+                    bounds,
+                });
+            }
+        }
+        None
+    }
+
+    /// Toggles a Checkbox or selects a Radio Button widget at `annot_index` on `page_index`.
+    /// Returns a user-friendly status label describing the new state.
+    pub fn toggle_form_button_at(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+    ) -> Result<String> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        let widget = annot
+            .as_widget_annotation_mut()
+            .context("Annotation is not a form widget")?;
+        let field = widget
+            .form_field_mut()
+            .context("Widget has no associated form field")?;
+        let name = field.name().unwrap_or_default().trim().to_string();
+        if let Some(cb) = field.as_checkbox_field_mut() {
+            let cur = cb.is_checked().unwrap_or(false);
+            cb.set_checked(!cur)?;
+            let label = if name.is_empty() { "Checkbox" } else { &name };
+            return Ok(format!(
+                "{} '{}'",
+                if !cur { "Checked" } else { "Unchecked" },
+                label
+            ));
+        }
+        if let Some(rb) = field.as_radio_button_field_mut() {
+            rb.set_checked()?;
+            let label = if name.is_empty() { "Radio option" } else { &name };
+            return Ok(format!("Selected '{label}'"));
+        }
+        anyhow::bail!("Form field is not a checkbox or radio button")
+    }
+
+    /// Sets the value of a PDF Text Form Field widget at `annot_index` on `page_index`.
+    pub fn set_form_text_value_at(
+        doc: &mut PdfDocument,
+        page_index: u16,
+        annot_index: usize,
+        new_value: &str,
+    ) -> Result<()> {
+        let mut page = doc.pages_mut().get(page_index)?;
+        let mut annot = page.annotations_mut().get(annot_index)?;
+        let widget = annot
+            .as_widget_annotation_mut()
+            .context("Annotation is not a form widget")?;
+        let field = widget
+            .form_field_mut()
+            .context("Widget has no associated form field")?;
+        let tf = field
+            .as_text_field_mut()
+            .context("Form field is not a text input")?;
+        tf.set_value(new_value)?;
+        Ok(())
     }
 }
 

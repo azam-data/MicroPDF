@@ -12,7 +12,10 @@ pub(super) enum OverlayHit {
     WelcomeRecent(usize),
     WelcomeRestoreSession,
     WelcomeDismissSession,
+    SearchPrev,
     SearchNext,
+    SearchCaseToggle,
+    SearchWholeWordToggle,
     SearchClose,
     OptimizePreset(u8),
     OptimizeColor(u8),
@@ -223,16 +226,26 @@ impl<'a> PdfViewerApp<'a> {
     /// Computes Floating Search Pill geometry anchored at the top-right of the page canvas.
     fn layout_floating_search(&self, buf_w: u32, top_bars_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
-        let pw = ((340.0 * s).round() as u32).min(buf_w.saturating_sub(24));
+        let pw = ((446.0 * s).round() as u32).min(buf_w.saturating_sub(24));
         let ph = (38.0 * s).round() as u32;
         let px = (buf_w as i32) - pw as i32 - (16.0 * s).round() as i32;
         let py = top_bars_h as i32 + (12.0 * s).round() as i32;
 
         let btn_sz = (24.0 * s).round() as u32;
+        let aa_w = (28.0 * s).round() as u32;
+        let ww_w = (26.0 * s).round() as u32;
+        let gap = (4.0 * s).round() as i32;
         let by = py + ((ph.saturating_sub(btn_sz)) / 2) as i32;
+
         let close_x = px + pw as i32 - btn_sz as i32 - (7.0 * s).round() as i32;
-        let next_x = close_x - btn_sz as i32 - (4.0 * s).round() as i32;
+        let next_x = close_x - btn_sz as i32 - gap;
+        let prev_x = next_x - btn_sz as i32 - gap;
+        let ww_x = prev_x - ww_w as i32 - gap - (2.0 * s).round() as i32;
+        let aa_x = ww_x - aa_w as i32 - gap;
         let hits = vec![
+            BoxHit { x: aa_x, y: by, w: aa_w, h: btn_sz, hit: OverlayHit::SearchCaseToggle },
+            BoxHit { x: ww_x, y: by, w: ww_w, h: btn_sz, hit: OverlayHit::SearchWholeWordToggle },
+            BoxHit { x: prev_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchPrev },
             BoxHit { x: next_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchNext },
             BoxHit { x: close_x, y: by, w: btn_sz, h: btn_sz, hit: OverlayHit::SearchClose },
         ];
@@ -266,7 +279,8 @@ impl<'a> PdfViewerApp<'a> {
                 draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, theme.accent);
 
                 let body_sz = (12.0 * s).clamp(10.0, 26.0);
-                let next_x = hits[0].x;
+                let small_sz = (10.5 * s).clamp(9.0, 22.0);
+                let first_btn_x = hits[0].x;
                 let count_str = if !self.search_matches.is_empty() {
                     format!("{}/{}", self.current_search_match + 1, self.search_matches.len())
                 } else {
@@ -275,10 +289,10 @@ impl<'a> PdfViewerApp<'a> {
                 let count_w = if count_str.is_empty() {
                     0
                 } else {
-                    measure_text(&count_str, (11.0 * s).max(9.5), false).ceil() as i32 + (8.0 * s).round() as i32
+                    measure_text(&count_str, small_sz, false).ceil() as i32 + (8.0 * s).round() as i32
                 };
                 let input_x = px + (30.0 * s).round() as i32;
-                let input_max_x = next_x - count_w - 4;
+                let input_max_x = (first_btn_x - count_w - 6).max(input_x + 20);
                 let display = if query_input.is_empty() {
                     "Find in PDF... |".to_string()
                 } else {
@@ -288,17 +302,60 @@ impl<'a> PdfViewerApp<'a> {
                 draw_text_vcenter(buffer, buf_w, buf_h, input_x, py, ph, input_max_x, &display, body_sz, fg, false);
 
                 if !count_str.is_empty() {
-                    draw_text_vcenter(buffer, buf_w, buf_h, input_max_x + 2, py, ph, next_x - 2, &count_str, (11.0 * s).max(9.5), theme.text_muted, false);
+                    draw_text_vcenter(buffer, buf_w, buf_h, input_max_x + 2, py, ph, first_btn_x - 4, &count_str, small_sz, theme.text_muted, false);
                 }
 
                 for h in hits {
                     let hov = self.hovered_widget == Some(UiHit::Overlay(h.hit));
-                    if hov {
-                        fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.hover_bg);
+                    match h.hit {
+                        OverlayHit::SearchCaseToggle => {
+                            let active = self.search_case_sensitive;
+                            let bg = if active {
+                                theme.accent
+                            } else if hov {
+                                theme.hover_bg
+                            } else {
+                                theme.surface_elevated
+                            };
+                            fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, bg);
+                            if !active {
+                                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.border_subtle);
+                            }
+                            let fg_c = if active { theme.text_on_accent } else { theme.text_secondary };
+                            let tw = measure_text("Aa", small_sz, true);
+                            draw_text_vcenter(buffer, buf_w, buf_h, h.x + ((h.w as f32 - tw) * 0.5).round() as i32, h.y, h.h, h.x + h.w as i32, "Aa", small_sz, fg_c, true);
+                        }
+                        OverlayHit::SearchWholeWordToggle => {
+                            let active = self.search_whole_word;
+                            let bg = if active {
+                                theme.accent
+                            } else if hov {
+                                theme.hover_bg
+                            } else {
+                                theme.surface_elevated
+                            };
+                            fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, bg);
+                            if !active {
+                                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.border_subtle);
+                            }
+                            let fg_c = if active { theme.text_on_accent } else { theme.text_secondary };
+                            let tw = measure_text("W", small_sz, true);
+                            draw_text_vcenter(buffer, buf_w, buf_h, h.x + ((h.w as f32 - tw) * 0.5).round() as i32, h.y, h.h, h.x + h.w as i32, "W", small_sz, fg_c, true);
+                        }
+                        OverlayHit::SearchPrev | OverlayHit::SearchNext | OverlayHit::SearchClose => {
+                            if hov {
+                                fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 4.0, theme.hover_bg);
+                            }
+                            let icon = match h.hit {
+                                OverlayHit::SearchPrev => UiIcon::MoveUp,
+                                OverlayHit::SearchNext => UiIcon::ChevronDown,
+                                _ => UiIcon::Close,
+                            };
+                            let b_ic = (12.0 * s).round() as u32;
+                            draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
+                        }
+                        _ => {}
                     }
-                    let icon = if h.hit == OverlayHit::SearchNext { UiIcon::ChevronDown } else { UiIcon::Close };
-                    let b_ic = (12.0 * s).round() as u32;
-                    draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
                 }
             }
             InputMode::OptimizePrompt {
@@ -472,6 +529,16 @@ impl<'a> PdfViewerApp<'a> {
                 "Update",
                 false,
             ),
+            InputMode::EditFormField { field_name, value_input, .. } => {
+                return self.draw_prompt_card_inner(
+                    buffer, buf_w, buf_h, cx, cy, cw, ch, &hits, sf,
+                    &format!("Fill Form Field: {field_name}"),
+                    "Type field value and press Enter to apply (Ctrl+Z to undo)",
+                    value_input,
+                    "Apply",
+                    false,
+                );
+            }
             InputMode::ConfirmExternalUrl { url } => ("Open External Link?", "This will open in your default browser:", url.clone(), "Open", true),
             InputMode::PasswordPrompt { path, password_input, attempts_left, .. } => {
                 let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("document.pdf");
@@ -736,14 +803,61 @@ impl<'a> PdfViewerApp<'a> {
                 self.input_mode = InputMode::Normal;
                 self.pending_restore_tabs.clear();
             }
+            OverlayHit::SearchPrev => {
+                if let InputMode::SearchText { ref query_input } = self.input_mode {
+                    if !query_input.is_empty() && query_input.trim() != self.search_query {
+                        let q = query_input.clone();
+                        self.execute_text_search(&q);
+                        return;
+                    }
+                }
+                self.jump_to_prev_search_match();
+            }
             OverlayHit::SearchNext => {
                 if let InputMode::SearchText { ref query_input } = self.input_mode {
-                    if !query_input.is_empty() && *query_input != self.search_query {
-                        self.handle_prompt_submission();
+                    if !query_input.is_empty() && query_input.trim() != self.search_query {
+                        let q = query_input.clone();
+                        self.execute_text_search(&q);
                         return;
                     }
                 }
                 self.jump_to_next_search_match();
+            }
+            OverlayHit::SearchCaseToggle => {
+                self.search_case_sensitive = !self.search_case_sensitive;
+                let active_q = match &self.input_mode {
+                    InputMode::SearchText { query_input } if !query_input.trim().is_empty() => {
+                        Some(query_input.clone())
+                    }
+                    _ if !self.search_query.is_empty() => Some(self.search_query.clone()),
+                    _ => None,
+                };
+                if let Some(q) = active_q {
+                    self.execute_text_search(&q);
+                } else {
+                    self.status_notice = Some(format!(
+                        "Search Match Case (Aa): {}",
+                        if self.search_case_sensitive { "ON" } else { "OFF" }
+                    ));
+                }
+            }
+            OverlayHit::SearchWholeWordToggle => {
+                self.search_whole_word = !self.search_whole_word;
+                let active_q = match &self.input_mode {
+                    InputMode::SearchText { query_input } if !query_input.trim().is_empty() => {
+                        Some(query_input.clone())
+                    }
+                    _ if !self.search_query.is_empty() => Some(self.search_query.clone()),
+                    _ => None,
+                };
+                if let Some(q) = active_q {
+                    self.execute_text_search(&q);
+                } else {
+                    self.status_notice = Some(format!(
+                        "Search Whole Word (W): {}",
+                        if self.search_whole_word { "ON" } else { "OFF" }
+                    ));
+                }
             }
             OverlayHit::SearchClose => {
                 self.input_mode = InputMode::Normal;

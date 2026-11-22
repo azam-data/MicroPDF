@@ -13,6 +13,7 @@ use winit::window::Window;
 
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
+use super::compare_mode::{CompareHit, CompareModeState};
 use super::doc_props_modal::{
     ActiveNotePopover, AnnotContextHit, AnnotationContextMenuState, DocPropsHit,
     DocPropsModalState, NotePopoverHit, UnsavedChangesHit, UnsavedChangesModalState,
@@ -23,6 +24,7 @@ use super::doc_tools_modal::{
 use super::image_tools_modal::{
     CreatePdfImagesHit, CreatePdfImagesModalState, ExportImagesHit, ExportImagesModalState,
 };
+use super::measure::{MeasureBarHit, MeasureUnit, MeasurementResult};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
@@ -54,6 +56,7 @@ pub(super) const MIN_UI_SCALE: f32 = 0.80;
 pub(super) const MAX_UI_SCALE: f32 = 1.60;
 pub(super) const MAX_NAV_HISTORY: usize = 50;
 pub(super) const MAX_RECENT_FILES: usize = 10;
+pub(super) const MAX_LAST_POSITIONS: usize = 50;
 pub(super) const MAX_UNDO_STATES: usize = 8;
 /// v1.1: total RAM allowed for undo snapshots per tab. The oldest snapshots are dropped first;
 /// the most recent one is always kept even if it alone exceeds the budget.
@@ -140,7 +143,7 @@ impl MenuCategory {
                 "Redo (Ctrl+Y / Ctrl+Shift+Z)",
                 "Copy Selected Text (Ctrl+C / Cmd+C)",
                 "Find Text in PDF... (Ctrl+F / Cmd+F)",
-                "Mouse Mode: Select Text (default)",
+                "Mouse Mode: Select Text / Fill Forms",
                 "Annotate: Highlight Text",
                 "Annotate: Underline Text",
                 "Annotate: Strikethrough Text",
@@ -150,6 +153,7 @@ impl MenuCategory {
                 "Annotate: Rectangle Shape",
                 "Annotate: Arrow Shape",
                 "Cycle Annotation Color",
+                "Measure Distance & Area (Ruler)",
                 "Mouse Mode: Black-Box Redact",
                 "Mouse Mode: Crop Page Area",
             ],
@@ -169,6 +173,7 @@ impl MenuCategory {
                 "Add Watermark... (W)",
                 "Stamp Signature / Image... (P)",
                 "Split / Extract Pages... (X)",
+                "Compare with Another PDF...",
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
             ],
@@ -200,6 +205,7 @@ pub enum MouseMode {
     FreeText,
     RectShape,
     ArrowShape,
+    Measure,
     Redact,
     Crop,
     StampImage,
@@ -217,6 +223,7 @@ impl MouseMode {
             MouseMode::FreeText => "TextBox",
             MouseMode::RectShape => "Rect",
             MouseMode::ArrowShape => "Arrow",
+            MouseMode::Measure => "Ruler",
             MouseMode::Redact => "REDACT",
             MouseMode::Crop => "CROP",
             MouseMode::StampImage => "STAMP",
@@ -315,6 +322,28 @@ impl ReadingFilter {
             Self::SageEyeCare => (0x00E9_F2EA, 0x001D_271F),
             Self::DarkInvert => (0x001E_2024, 0x00D8_DCE2),
             Self::NightAmber => (0x001A_1713, 0x00E5_CFA8),
+        }
+    }
+
+    pub fn to_ini_str(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::PaperEInk => "PaperEInk",
+            Self::WarmSepia => "WarmSepia",
+            Self::SageEyeCare => "SageEyeCare",
+            Self::DarkInvert => "DarkInvert",
+            Self::NightAmber => "NightAmber",
+        }
+    }
+
+    pub fn from_ini_str(s: &str) -> Self {
+        match s.trim() {
+            "PaperEInk" => Self::PaperEInk,
+            "WarmSepia" => Self::WarmSepia,
+            "SageEyeCare" => Self::SageEyeCare,
+            "DarkInvert" => Self::DarkInvert,
+            "NightAmber" => Self::NightAmber,
+            _ => Self::Normal,
         }
     }
 }
@@ -435,15 +464,25 @@ pub(super) struct SavedSessionTab {
     pub(super) view_mode: ViewMode,
 }
 
+/// Remembered reading position `(page_index, zoom_level)` for a file in the 50-entry LRU table.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct LastPositionEntry {
+    pub(super) path: PathBuf,
+    pub(super) page_index: u16,
+    pub(super) zoom_level: f32,
+}
+
 /// Parsed contents of `micropdf.ini` (open tabs, active tab, recent files, UI preferences & saved profiles).
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SessionConfig {
     pub(super) active_tab: usize,
     pub(super) tabs: Vec<SavedSessionTab>,
     pub(super) recent_files: Vec<PathBuf>,
+    pub(super) last_positions: Vec<LastPositionEntry>,
     pub(super) ui_theme: UiThemeMode,
     pub(super) ui_scale: f32,
     pub(super) scroll_mode: ScrollMode,
+    pub(super) reading_filter: ReadingFilter,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
@@ -455,9 +494,11 @@ impl Default for SessionConfig {
             active_tab: 0,
             tabs: Vec::new(),
             recent_files: Vec::new(),
+            last_positions: Vec::new(),
             ui_theme: UiThemeMode::Light,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
+            reading_filter: ReadingFilter::Normal,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
@@ -695,6 +736,8 @@ pub(super) enum UiHit {
     UnsavedChanges(UnsavedChangesHit),
     AnnotContext(AnnotContextHit),
     NotePopover(NotePopoverHit),
+    Compare(CompareHit),
+    MeasureBar(MeasureBarHit),
     ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
     Overlay(OverlayHit),
@@ -790,6 +833,12 @@ pub(super) enum InputMode {
         annot_idx: usize,
         label: &'static str,
         text_input: String,
+    },
+    EditFormField {
+        page_idx: u16,
+        annot_idx: usize,
+        field_name: String,
+        value_input: String,
     },
     ConfirmExternalUrl {
         url: String,
@@ -918,7 +967,10 @@ pub(super) struct ActiveOptimizeJob {
 #[derive(Clone, Debug)]
 pub(super) struct IncrementalSearchState {
     pub(super) query: String,
+    #[allow(dead_code)]
     pub(super) q_chars: Vec<char>,
+    pub(super) case_sensitive: bool,
+    pub(super) whole_word: bool,
     pub(super) next_page: u16,
     pub(super) total_pages: u16,
     pub(super) origin_page: u16,
@@ -934,6 +986,7 @@ pub(super) enum PendingDialog {
     CombineMultiple,
     CombineAddFiles,
     PickImagesForPdf,
+    PickComparePdf,
     ExportPagesAsImagesDir,
     ExportMarkdown,
     ExportLatex,
@@ -1020,6 +1073,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) nav_forward_stack: Vec<(u16, f32)>,
     /// Currently hovered link target on the page (triggers `CursorIcon::Pointer` hand cursor).
     pub(super) hovered_link: Option<ResolvedLinkTarget>,
+    /// Currently hovered fillable form widget `(page_idx, pdf_bounds)` in `MouseMode::Select`.
+    pub(super) hovered_form_field: Option<(u16, PdfRect)>,
     /// Cached character boxes `(page_index, chars)` for the current page only (freed on page change).
     pub(super) cached_char_boxes: Option<(u16, Vec<PageCharBox>)>,
     /// Currently selected text string and its page/line highlight rectangles in `MouseMode::Select`.
@@ -1030,6 +1085,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) last_select_click: Option<(u16, f64, f64, Instant)>,
     /// Last 10 recently opened/saved PDF file paths (shown in `File -> Recent` and persisted in `micropdf.ini`).
     pub(super) recent_files: Vec<PathBuf>,
+    /// Compact 50-entry LRU remembering `(page_index, zoom_level)` per previously read PDF path.
+    pub(super) last_positions: Vec<LastPositionEntry>,
     /// Saved session tabs loaded from `micropdf.ini` when starting with no file argument.
     pub(super) pending_restore_tabs: Vec<SavedSessionTab>,
     pub(super) pending_restore_active_tab: usize,
@@ -1054,20 +1111,27 @@ pub struct PdfViewerApp<'a> {
     pub(super) rename_for_save: fn(&std::path::Path, &std::path::Path) -> std::io::Result<()>,
     /// Top Menu Bar open dropdown state (`[ File ] [ View ] [ Edit ] [ Page ] [ Tools ] [ Help ]`).
     pub(super) open_menu: Option<MenuCategory>,
-    /// Active Mouse Mode (`Select`, `Highlight`, `Redact`, `Crop`, `StampImage`).
+    /// Active Mouse Mode (`Select`, `Highlight`, `Measure`, `Redact`, `Crop`, `StampImage`).
     pub(super) mouse_mode: MouseMode,
+    /// Active unit & last completed measurement for `MouseMode::Measure`.
+    pub(super) measure_unit: MeasureUnit,
+    pub(super) last_measurement: Option<MeasurementResult>,
     /// Decoded RGBA image waiting to be stamped on the next page click/drag (`P` key).
     pub(super) pending_stamp_image: Option<StampImageBuffer>,
     /// Zero-RAM CPU-rendered Reading Filter (6 eye-care palettes).
     pub(super) reading_filter: ReadingFilter,
     /// True when the bottom-bar Reading Mode picker popover is open.
     pub(super) show_reading_mode_popover: bool,
-    /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Ctrl+G`).
+    /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Shift+F3` / `Ctrl+G`).
     pub(super) search_query: String,
+    pub(super) search_case_sensitive: bool,
+    pub(super) search_whole_word: bool,
     pub(super) search_matches: Vec<SearchMatch>,
     pub(super) current_search_match: usize,
     /// Time-sliced (~8 ms/frame) incremental search state on the main thread (`Esc` cancels).
     pub(super) incremental_search: Option<IncrementalSearchState>,
+    /// Active Side-by-Side Compare Mode state (0 bytes when closed).
+    pub(super) compare_mode: Option<CompareModeState<'a>>,
     /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
     pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
@@ -1251,7 +1315,11 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
         self.reading_filter = filter;
         self.show_reading_mode_popover = false;
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.invalidate_caches();
+        }
         self.status_notice = Some(format!("Reading Mode: {}", filter.picker_title()));
+        self.save_session_to_ini();
         self.request_redraw();
     }
 
@@ -1302,12 +1370,14 @@ impl<'a> PdfViewerApp<'a> {
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
             hovered_link: None,
+            hovered_form_field: None,
             cached_char_boxes: None,
             selected_text: String::new(),
             selected_text_page: None,
             selected_text_rects: Vec::new(),
             last_select_click: None,
             recent_files: Vec::new(),
+            last_positions: Vec::new(),
             pending_restore_tabs: Vec::new(),
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
@@ -1321,13 +1391,18 @@ impl<'a> PdfViewerApp<'a> {
             rename_for_save: |from, to| std::fs::rename(from, to),
             open_menu: None,
             mouse_mode: MouseMode::Select,
+            measure_unit: MeasureUnit::Mm,
+            last_measurement: None,
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
             show_reading_mode_popover: false,
             search_query: String::new(),
+            search_case_sensitive: false,
+            search_whole_word: false,
             search_matches: Vec::new(),
             current_search_match: 0,
             incremental_search: None,
+            compare_mode: None,
             optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
@@ -1577,10 +1652,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
-        let mut out = String::from("# MicroPDF v1.3 Session, Recent Files & UI Preferences\n");
+        let mut out = String::from("# MicroPDF v1.4 Session, Recent Files, Last Positions & UI Preferences\n");
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
         out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
         out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
+        out.push_str(&format!("reading_filter={}\n", cfg.reading_filter.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
@@ -1604,6 +1680,17 @@ impl<'a> PdfViewerApp<'a> {
                 out.push_str(&format!("recent={}\n", r_str));
             }
         }
+        for lp in cfg.last_positions.iter().take(MAX_LAST_POSITIONS) {
+            let p_str = lp.path.to_string_lossy().replace('\n', "").replace('\r', "");
+            if !p_str.is_empty() {
+                out.push_str(&format!(
+                    "last_pos={}|{:.2}|{}\n",
+                    lp.page_index,
+                    lp.zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                    p_str
+                ));
+            }
+        }
         out
     }
 
@@ -1624,6 +1711,8 @@ impl<'a> PdfViewerApp<'a> {
                 }
             } else if let Some(val) = line.strip_prefix("scroll_mode=") {
                 cfg.scroll_mode = ScrollMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("reading_filter=") {
+                cfg.reading_filter = ReadingFilter::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
@@ -1663,9 +1752,70 @@ impl<'a> PdfViewerApp<'a> {
                 {
                     cfg.recent_files.push(path);
                 }
+            } else if let Some(val) = line.strip_prefix("last_pos=") {
+                let mut parts = val.splitn(3, '|');
+                if let (Some(p_str), Some(z_str), Some(path_str)) =
+                    (parts.next(), parts.next(), parts.next())
+                {
+                    let page_index = p_str.trim().parse::<u16>().unwrap_or(0);
+                    let zoom_level = z_str
+                        .trim()
+                        .parse::<f32>()
+                        .ok()
+                        .filter(|z| z.is_finite())
+                        .unwrap_or(1.0)
+                        .clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
+                    let path = PathBuf::from(path_str.trim());
+                    if !path.as_os_str().is_empty()
+                        && cfg.last_positions.len() < MAX_LAST_POSITIONS
+                        && !cfg.last_positions.iter().any(|e| e.path == path)
+                    {
+                        cfg.last_positions.push(LastPositionEntry {
+                            path,
+                            page_index,
+                            zoom_level,
+                        });
+                    }
+                }
             }
         }
         cfg
+    }
+
+    /// Records `(page_index, zoom_level)` for `path` at the front of the 50-entry LRU table.
+    pub(super) fn record_last_position(
+        &mut self,
+        path: &std::path::Path,
+        page_index: u16,
+        zoom_level: f32,
+    ) {
+        if path.as_os_str().is_empty() || !path.exists() {
+            return;
+        }
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.last_positions
+            .retain(|e| e.path != resolved && e.path != path);
+        self.last_positions.insert(
+            0,
+            LastPositionEntry {
+                path: resolved,
+                page_index,
+                zoom_level: zoom_level.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+            },
+        );
+        self.last_positions.truncate(MAX_LAST_POSITIONS);
+    }
+
+    /// Looks up a previously saved `(page_index, zoom_level)` for `path` in the 50-entry LRU table.
+    pub(super) fn lookup_last_position(&self, path: &std::path::Path) -> Option<(u16, f32)> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.last_positions
+            .iter()
+            .find(|e| e.path == resolved || e.path == path)
+            .map(|e| (e.page_index, e.zoom_level))
     }
 
     /// Adds `path` to the front of `self.recent_files` (deduplicated, capped at `MAX_RECENT_FILES = 10`).
@@ -1679,12 +1829,33 @@ impl<'a> PdfViewerApp<'a> {
         self.recent_files.truncate(MAX_RECENT_FILES);
     }
 
-    /// Saves open tabs, current page, view mode, recent files, and UI preferences to `micropdf.ini`
+    /// Saves open tabs, current page, view mode, recent files, last positions, and UI preferences to `micropdf.ini`
     /// next to the executable, falling back to the OS config folder if not writable.
     ///
     /// IMPORTANT: Never calls `sync_active_tab_to_slot()` (which moves `self.doc` out into the slot),
     /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
+        // Record active and inactive tab reading positions into the 50-entry LRU table
+        let tab_positions: Vec<(PathBuf, u16, f32)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                if i == self.active_tab {
+                    (self.file_path.clone(), self.current_page_index, self.zoom_level)
+                } else {
+                    (tab.file_path.clone(), tab.current_page_index, tab.zoom_level)
+                }
+            })
+            .collect();
+        for (p, pg, zm) in tab_positions {
+            self.record_last_position(&p, pg, zm);
+        }
+        if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() {
+            let p = self.file_path.clone();
+            self.record_last_position(&p, self.current_page_index, self.zoom_level);
+        }
+
         let mut saved_tabs = Vec::new();
         let mut mapped_active_tab: Option<usize> = None;
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -1733,9 +1904,11 @@ impl<'a> PdfViewerApp<'a> {
                 .unwrap_or_else(|| self.active_tab.min(saved_tabs.len().saturating_sub(1))),
             tabs: saved_tabs,
             recent_files: self.recent_files.clone(),
+            last_positions: self.last_positions.clone(),
             ui_theme: self.ui_theme_mode,
             ui_scale: self.ui_scale,
             scroll_mode: self.scroll_mode,
+            reading_filter: self.reading_filter,
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
             hf_profiles: self.hf_profiles.clone(),
@@ -1778,9 +1951,11 @@ impl<'a> PdfViewerApp<'a> {
         self.ui_theme_mode = cfg.ui_theme;
         self.ui_scale = cfg.ui_scale;
         self.scroll_mode = cfg.scroll_mode;
+        self.reading_filter = cfg.reading_filter;
         self.show_toolbar = cfg.show_toolbar;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
+        self.last_positions = cfg.last_positions;
         // Saved Header/Footer profiles stay opt-in via < > in the dialog; never auto-fill every PDF.
         self.last_hf_profile = HeaderFooterProfile::default();
         self.recent_files = cfg
@@ -2150,6 +2325,10 @@ impl<'a> PdfViewerApp<'a> {
         self.cached_text_view = None;
         self.active_note_popover = None;
         self.annot_context_menu = None;
+        self.hovered_form_field = None;
+        if let Some(ref mut cmp) = self.compare_mode {
+            cmp.invalidate_caches();
+        }
         self.selected_text.clear();
         self.selected_text_page = None;
         self.selected_text_rects.clear();

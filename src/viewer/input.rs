@@ -1438,7 +1438,13 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn execute_text_search(&mut self, query: &str) {
         let trimmed = query.trim().to_string();
-        let q_chars: Vec<char> = trimmed.chars().flat_map(|c| c.to_lowercase()).collect();
+        let case_sensitive = self.search_case_sensitive;
+        let whole_word = self.search_whole_word;
+        let q_chars: Vec<char> = if case_sensitive {
+            trimmed.chars().collect()
+        } else {
+            trimmed.chars().flat_map(|c| c.to_lowercase()).collect()
+        };
         if q_chars.is_empty() {
             self.search_query.clear();
             self.search_matches.clear();
@@ -1464,6 +1470,8 @@ impl<'a> PdfViewerApp<'a> {
         self.incremental_search = Some(IncrementalSearchState {
             query: trimmed,
             q_chars,
+            case_sensitive,
+            whole_word,
             next_page: 0,
             total_pages,
             origin_page: self.current_page_index,
@@ -1501,7 +1509,13 @@ impl<'a> PdfViewerApp<'a> {
         while state.next_page < state.total_pages && pages_scanned_in_slice < max_pages {
             let page_idx = state.next_page;
             let page_matches = match self.doc.as_ref() {
-                Some(doc) => PdfEngine::search_text_on_single_page(doc, page_idx, &state.q_chars),
+                Some(doc) => PdfEngine::search_text_on_single_page_opts(
+                    doc,
+                    page_idx,
+                    &state.q_chars,
+                    state.case_sensitive,
+                    state.whole_word,
+                ),
                 None => break,
             };
             if !page_matches.is_empty() {
@@ -1563,7 +1577,7 @@ impl<'a> PdfViewerApp<'a> {
                 let idx = self.current_search_match.min(self.search_matches.len() - 1);
                 let target_page = self.search_matches[idx].page_index;
                 self.status_notice = Some(format!(
-                    "Match {}/{} for '{}' on Page {} (Press F3 or Cmd/Ctrl+G for next)",
+                    "Match {}/{} for '{}' on Page {} (F3 next / Shift+F3 prev)",
                     idx + 1,
                     self.search_matches.len(),
                     state.query,
@@ -1603,6 +1617,38 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         self.current_search_match = (self.current_search_match + 1) % self.search_matches.len();
+        let target_page = self.search_matches[self.current_search_match].page_index;
+        if target_page != self.current_page_index {
+            self.current_page_index = target_page;
+            self.scroll_y = 0.0;
+            self.invalidate_page_caches();
+        }
+        self.status_notice = Some(format!(
+            "Match {}/{} for '{}' on Page {}",
+            self.current_search_match + 1,
+            self.search_matches.len(),
+            self.search_query,
+            target_page + 1
+        ));
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn jump_to_prev_search_match(&mut self) {
+        if self.search_matches.is_empty() {
+            self.input_mode = InputMode::SearchText {
+                query_input: self.search_query.clone(),
+            };
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+        let len = self.search_matches.len();
+        self.current_search_match = if self.current_search_match == 0 {
+            len - 1
+        } else {
+            self.current_search_match - 1
+        };
         let target_page = self.search_matches[self.current_search_match].page_index;
         if target_page != self.current_page_index {
             self.current_page_index = target_page;
@@ -3197,9 +3243,47 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
+            InputMode::EditFormField {
+                page_idx,
+                annot_idx,
+                field_name,
+                value_input,
+            } => {
+                self.push_undo_snapshot();
+                if let Some(doc) = self.doc.as_mut() {
+                    match PdfEngine::set_form_text_value_at(doc, page_idx, annot_idx, &value_input) {
+                        Ok(()) => {
+                            self.invalidate_page_caches();
+                            self.thumbnail_cache.remove(&page_idx);
+                            self.status_notice = Some(format!(
+                                "Updated form field '{field_name}' on Page {} (Ctrl+Z to undo, S to save)",
+                                page_idx + 1
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = self.undo_stack.pop_back();
+                            self.status_notice = Some(format!("Form field update failed: {e}"));
+                        }
+                    }
+                }
+            }
         }
         self.update_title_bar();
         self.request_redraw();
+    }
+
+    pub(super) fn pick_compare_pdf_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Choose Second PDF to Compare Side-by-Side")
+            .add_filter("PDF Document", &["pdf"]);
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_compare_with_path(path);
+        }
     }
 
     pub(super) fn handle_key_input(&mut self, logical_key: Key, text: Option<&str>) {
@@ -3631,6 +3715,7 @@ impl<'a> PdfViewerApp<'a> {
                                     | InputMode::StickyNotePrompt { text_input, .. }
                                     | InputMode::FreeTextPrompt { text_input, .. }
                                     | InputMode::EditAnnotationText { text_input, .. }
+                                    | InputMode::EditFormField { value_input: text_input, .. }
                                     | InputMode::AddBookmark { title_input: text_input }
                                     | InputMode::EditBookmark { title_input: text_input, .. } => {
                                         text_input.push_str(&clean);
@@ -3670,6 +3755,7 @@ impl<'a> PdfViewerApp<'a> {
                             | InputMode::StickyNotePrompt { text_input, .. }
                             | InputMode::FreeTextPrompt { text_input, .. }
                             | InputMode::EditAnnotationText { text_input, .. }
+                            | InputMode::EditFormField { value_input: text_input, .. }
                             | InputMode::AddBookmark { title_input: text_input }
                             | InputMode::EditBookmark { title_input: text_input, .. } => text_input.clear(),
                             InputMode::PasswordPrompt { password_input, .. } => password_input.clear(),
@@ -3721,6 +3807,7 @@ impl<'a> PdfViewerApp<'a> {
                         | InputMode::StickyNotePrompt { text_input, .. }
                         | InputMode::FreeTextPrompt { text_input, .. }
                         | InputMode::EditAnnotationText { text_input, .. }
+                        | InputMode::EditFormField { value_input: text_input, .. }
                         | InputMode::AddBookmark { title_input: text_input }
                         | InputMode::EditBookmark { title_input: text_input, .. } => text_input.clear(),
                         InputMode::PasswordPrompt { password_input, .. } => password_input.clear(),
@@ -3754,7 +3841,8 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::HeaderFooterText { text_input, .. }
                         | InputMode::StickyNotePrompt { text_input, .. }
                         | InputMode::FreeTextPrompt { text_input, .. }
-                        | InputMode::EditAnnotationText { text_input, .. } => {
+                        | InputMode::EditAnnotationText { text_input, .. }
+                        | InputMode::EditFormField { value_input: text_input, .. } => {
                             text_input.pop();
                         }
                         InputMode::AddBookmark { title_input }
@@ -3803,7 +3891,30 @@ impl<'a> PdfViewerApp<'a> {
                         self.request_redraw();
                     }
                 }
+                Key::Named(NamedKey::F3) => {
+                    if matches!(self.input_mode, InputMode::SearchText { .. }) {
+                        if self.shift_pressed {
+                            self.jump_to_prev_search_match();
+                        } else {
+                            self.jump_to_next_search_match();
+                        }
+                    }
+                }
                 Key::Named(NamedKey::Enter) => {
+                    if let InputMode::SearchText { ref query_input } = self.input_mode {
+                        let trimmed = query_input.trim();
+                        if !trimmed.is_empty()
+                            && trimmed == self.search_query
+                            && !self.search_matches.is_empty()
+                        {
+                            if self.shift_pressed {
+                                self.jump_to_prev_search_match();
+                            } else {
+                                self.jump_to_next_search_match();
+                            }
+                            return;
+                        }
+                    }
                     self.handle_prompt_submission();
                 }
                 _ => {
@@ -3885,6 +3996,7 @@ impl<'a> PdfViewerApp<'a> {
                             | InputMode::StickyNotePrompt { text_input, .. }
                             | InputMode::FreeTextPrompt { text_input, .. }
                             | InputMode::EditAnnotationText { text_input, .. }
+                            | InputMode::EditFormField { value_input: text_input, .. }
                             | InputMode::AddBookmark {
                                 title_input: text_input,
                             }
@@ -4078,7 +4190,11 @@ impl<'a> PdfViewerApp<'a> {
                         self.update_title_bar();
                         self.request_redraw();
                     } else if s.eq_ignore_ascii_case("g") {
-                        self.jump_to_next_search_match();
+                        if self.shift_pressed || s == "G" {
+                            self.jump_to_prev_search_match();
+                        } else {
+                            self.jump_to_next_search_match();
+                        }
                     } else if s.eq_ignore_ascii_case("p") {
                         self.trigger_print();
                     } else if s.eq_ignore_ascii_case("s") {
@@ -4135,7 +4251,11 @@ impl<'a> PdfViewerApp<'a> {
                 self.request_redraw();
             }
             Key::Named(NamedKey::F3) => {
-                self.jump_to_next_search_match();
+                if self.shift_pressed {
+                    self.jump_to_prev_search_match();
+                } else {
+                    self.jump_to_next_search_match();
+                }
             }
             Key::Named(NamedKey::F5) => {
                 if self.is_presentation {
@@ -4184,6 +4304,8 @@ impl<'a> PdfViewerApp<'a> {
                 } else if self.show_help_overlay {
                     self.show_help_overlay = false;
                     self.request_redraw();
+                } else if self.compare_mode.is_some() {
+                    self.close_compare_mode();
                 } else if self.incremental_search.is_some() {
                     self.cancel_incremental_search();
                 } else if self.optimize_job.is_some() {
@@ -4199,6 +4321,7 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.mouse_mode != MouseMode::Select {
                     self.mouse_mode = MouseMode::Select;
+                    self.last_measurement = None;
                     self.pending_stamp_image = None;
                     self.ink_stroke_screen_pts.clear();
                     self.status_notice =
@@ -4503,6 +4626,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::CombineMultiple => self.open_combine_modal(),
                 PendingDialog::CombineAddFiles => self.combine_add_files_dialog(),
                 PendingDialog::PickImagesForPdf => self.pick_images_for_pdf_dialog(),
+                PendingDialog::PickComparePdf => self.pick_compare_pdf_dialog(),
                 PendingDialog::ExportPagesAsImagesDir => self.export_pages_as_images_dir_dialog(),
                 PendingDialog::ExportMarkdown => self.export_markdown_dialog(),
                 PendingDialog::ExportLatex => self.export_latex_dialog(),
@@ -5011,6 +5135,20 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                     }
+                    if new_hover.is_none() && self.compare_mode.is_some() {
+                        if let Some(h) = self.hit_test_compare_bar(position.x, position.y, win_w, sidebar_w, top_bars_h, sf) {
+                            if h != super::compare_mode::CompareHit::InsideBar {
+                                new_hover = Some(UiHit::Compare(h));
+                            }
+                        }
+                    }
+                    if new_hover.is_none() && self.compare_mode.is_none() && self.mouse_mode == MouseMode::Measure && self.view_mode.is_page_view() {
+                        if let Some(h) = self.hit_test_measure_bar(position.x, position.y, win_w, sidebar_w, top_bars_h, sf) {
+                            if h != super::measure::MeasureBarHit::InsideBar {
+                                new_hover = Some(UiHit::MeasureBar(h));
+                            }
+                        }
+                    }
                     if new_hover.is_none() && (position.y as i32) < menu_bar_h as i32 {
                         if let Some(cat) = self.hit_test_menu_bar_header(position.x, position.y, menu_bar_h, sf) {
                             new_hover = Some(UiHit::MenuHeader(cat));
@@ -5078,7 +5216,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if hover_changed || menu_switched {
                     if let Some(w) = self.window.as_ref() {
-                        let pointer = new_hover.is_some() || self.hovered_link.is_some();
+                        let pointer = new_hover.is_some()
+                            || self.hovered_link.is_some()
+                            || self.hovered_form_field.is_some();
                         w.set_cursor(if pointer { CursorIcon::Pointer } else { CursorIcon::Default });
                     }
                     self.request_redraw();
@@ -5117,17 +5257,33 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                     }
                     self.request_redraw();
-                } else if self.view_mode.is_page_view() && new_hover.is_none() {
+                } else if self.compare_mode.is_none() && self.view_mode.is_page_view() && new_hover.is_none() {
                     let new_link = self.resolve_link_at_screen_pos(position.x, position.y);
-                    if new_link != self.hovered_link {
-                        let is_over_link = new_link.is_some();
+                    let new_form = if new_link.is_none() && self.mouse_mode == MouseMode::Select {
+                        self.screen_point_to_pdf_point(position.x, position.y).and_then(|(page_idx, pt_x, pt_y)| {
+                            let doc = self.doc.as_ref()?;
+                            let page = doc.pages().get(page_idx).ok()?;
+                            PdfEngine::find_form_field_at_point(&page, pt_x.value, pt_y.value)
+                                .map(|f| (page_idx, f.bounds))
+                        })
+                    } else {
+                        None
+                    };
+                    let form_changed = new_form != self.hovered_form_field;
+                    let link_changed = new_link != self.hovered_link;
+                    if link_changed || form_changed {
+                        let is_interactive = new_link.is_some() || new_form.is_some();
                         self.hovered_link = new_link;
+                        self.hovered_form_field = new_form;
                         if let Some(w) = self.window.as_ref() {
-                            w.set_cursor(if is_over_link {
+                            w.set_cursor(if is_interactive {
                                 CursorIcon::Pointer
                             } else {
                                 CursorIcon::Default
                             });
+                        }
+                        if form_changed {
+                            self.request_redraw();
                         }
                     }
                 } else if self.view_mode == ViewMode::ThumbnailGrid {
@@ -5748,6 +5904,44 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                // 0d1. Side-by-Side Compare Mode top control bar + canvas click guard
+                if self.compare_mode.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_compare_bar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            sidebar_w,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.handle_compare_bar_click(hit);
+                            return;
+                        }
+                    }
+                    // Allow clicking Bookmark Sidebar during Compare Mode, otherwise ignore canvas clicks
+                    if !(self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w) {
+                        return;
+                    }
+                }
+
+                // 0d1b. Quick Measure / Ruler floating bar clicks
+                if self.mouse_mode == MouseMode::Measure && self.view_mode.is_page_view() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_measure_bar(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            sidebar_w,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.handle_measure_bar_click(hit);
+                            return;
+                        }
+                    }
+                }
+
                 // 0d2. Reflowable Text View header controls
                 if self.view_mode == ViewMode::TextView {
                     if state == ElementState::Pressed && button == MouseButton::Left {
@@ -6317,6 +6511,46 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     return;
                                 }
 
+                                // Quick Measure / Ruler Tool commit
+                                if self.mouse_mode == MouseMode::Measure {
+                                    if !is_click {
+                                        if let (
+                                            Some((p1, x1, y1)),
+                                            Some((p2, x2, y2)),
+                                        ) = (
+                                            self.screen_point_to_pdf_point(sx1, sy1),
+                                            self.screen_point_to_pdf_point(sx2, sy2),
+                                        ) {
+                                            if p1 == p2 {
+                                                let m = super::measure::MeasurementResult {
+                                                    page_idx: p1,
+                                                    x1_pt: x1.value,
+                                                    y1_pt: y1.value,
+                                                    x2_pt: x2.value,
+                                                    y2_pt: y2.value,
+                                                };
+                                                let st = super::measure::compute_measurement_stats(
+                                                    m.x1_pt,
+                                                    m.y1_pt,
+                                                    m.x2_pt,
+                                                    m.y2_pt,
+                                                    self.measure_unit,
+                                                );
+                                                let u = self.measure_unit.label();
+                                                let au = self.measure_unit.area_label();
+                                                self.last_measurement = Some(m);
+                                                self.status_notice = Some(format!(
+                                                    "Measured: {:.2} {u}  (ΔX {:.2} × ΔY {:.2} {u}, Area {:.2} {au}, {:.1}°)",
+                                                    st.length, st.dx, st.dy, st.area, st.angle_deg
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    self.update_title_bar();
+                                    self.request_redraw();
+                                    return;
+                                }
+
                                 // Vector Arrow shape commit (directional drag from start -> end)
                                 if self.mouse_mode == MouseMode::ArrowShape {
                                     if !is_click {
@@ -6416,6 +6650,54 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                                         y: sy2.round() as i32,
                                                     },
                                                 );
+                                                self.request_redraw();
+                                                return;
+                                            }
+
+                                            // Check if user clicked on a fillable PDF Form Field (Text, Checkbox, Radio)
+                                            let hit_form = self.doc.as_ref().and_then(|doc| {
+                                                let page = doc.pages().get(page_idx).ok()?;
+                                                PdfEngine::find_form_field_at_point(&page, pt_x.value, pt_y.value)
+                                            });
+                                            if let Some(field) = hit_form {
+                                                match field.kind {
+                                                    crate::engine::FormFieldKind::Checkbox
+                                                    | crate::engine::FormFieldKind::Radio => {
+                                                        self.push_undo_snapshot();
+                                                        if let Some(doc) = self.doc.as_mut() {
+                                                            match PdfEngine::toggle_form_button_at(
+                                                                doc,
+                                                                page_idx,
+                                                                field.annot_index,
+                                                            ) {
+                                                                Ok(msg) => {
+                                                                    self.invalidate_page_caches();
+                                                                    self.thumbnail_cache.remove(&page_idx);
+                                                                    self.status_notice = Some(format!(
+                                                                        "{msg} on Page {} (Ctrl+Z to undo, S to save)",
+                                                                        page_idx + 1
+                                                                    ));
+                                                                }
+                                                                Err(e) => {
+                                                                    let _ = self.undo_stack.pop_back();
+                                                                    self.status_notice = Some(format!(
+                                                                        "Form toggle failed: {e}"
+                                                                    ));
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    crate::engine::FormFieldKind::Text => {
+                                                        self.input_mode = InputMode::EditFormField {
+                                                            page_idx,
+                                                            annot_idx: field.annot_index,
+                                                            field_name: field.name,
+                                                            value_input: field.value,
+                                                        };
+                                                        self.status_notice = None;
+                                                    }
+                                                }
+                                                self.update_title_bar();
                                                 self.request_redraw();
                                                 return;
                                             }
@@ -6588,7 +6870,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                         MouseMode::StickyNote
                                         | MouseMode::InkPen
                                         | MouseMode::FreeText
-                                        | MouseMode::ArrowShape => {}
+                                        | MouseMode::ArrowShape
+                                        | MouseMode::Measure => {}
                                         MouseMode::Redact => {
                                             self.push_undo_snapshot();
                                             if let Some(doc) = self.doc.as_mut() {

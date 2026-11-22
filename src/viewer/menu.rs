@@ -602,13 +602,21 @@ impl<'a> PdfViewerApp<'a> {
                 ));
             }
             (MenuCategory::Edit, 14) => {
+                self.mouse_mode = MouseMode::Measure;
+                self.last_measurement = None;
+                self.status_notice = Some(
+                    "Measure Tool: Drag between any two points on a page to measure length, area & angle (Esc exits)"
+                        .to_string(),
+                );
+            }
+            (MenuCategory::Edit, 15) => {
                 self.mouse_mode = MouseMode::Redact;
                 self.status_notice = Some(
                     "Mouse Mode: Black-Box Redact (Drag red box to permanently purge & black out)"
                         .to_string(),
                 );
             }
-            (MenuCategory::Edit, 15) => {
+            (MenuCategory::Edit, 16) => {
                 self.mouse_mode = MouseMode::Crop;
                 self.status_notice = Some(
                     "Mouse Mode: Crop Page Area (Drag green box to crop page)".to_string(),
@@ -673,8 +681,15 @@ impl<'a> PdfViewerApp<'a> {
                     input: String::new(),
                 };
             }
-            (MenuCategory::Tools, 5) => self.flatten_and_unlock_current_pdf(),
-            (MenuCategory::Tools, 6) => self.open_optimize_prompt(),
+            (MenuCategory::Tools, 5) => {
+                if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::PickComparePdf);
+                } else {
+                    self.status_notice = Some("Open a PDF first before starting Compare Mode".to_string());
+                }
+            }
+            (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
+            (MenuCategory::Tools, 7) => self.open_optimize_prompt(),
 
             // Export menu
             (MenuCategory::Export, 0) => {
