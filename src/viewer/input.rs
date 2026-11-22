@@ -5173,6 +5173,40 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.scroll_to_scrollbar_y(position.y, win_w, win_h, top_bars_h, status_bar_h, sf);
                     return;
                 }
+                if self.hscrollbar_drag {
+                    self.scroll_to_hscrollbar_x(position.x, win_w, win_h, status_bar_h, sf);
+                    return;
+                }
+                if let Some((lx, ly)) = self.hand_pan_drag_last {
+                    let dx = (lx - position.x) as f32;
+                    let dy = (ly - position.y) as f32;
+                    self.hand_pan_drag_last = Some((position.x, position.y));
+                    let mut changed = false;
+                    if dx.abs() > 0.25 {
+                        changed |= self.pan_horizontal(dx);
+                    }
+                    if dy.abs() > 0.25 {
+                        if self.effective_scroll_mode() == ScrollMode::ContinuousVertical {
+                            self.scroll_y += dy;
+                            changed = true;
+                        } else {
+                            let content_h = win_h.saturating_sub(top_bars_h + status_bar_h);
+                            let bmp_h = self.page_draw_rect.3;
+                            if bmp_h > content_h {
+                                let max_s = (bmp_h - content_h) as f32;
+                                let next_y = (self.scroll_y + dy).clamp(0.0, max_s);
+                                if (next_y - self.scroll_y).abs() > 0.25 {
+                                    self.scroll_y = next_y;
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        self.request_redraw();
+                    }
+                    return;
+                }
                 if self.deskew_bar.as_ref().is_some_and(|d| d.dragging_slider) {
                     self.update_deskew_slider_from_x(position.x, win_w, sidebar_w, top_bars_h, sf);
                     return;
@@ -5446,11 +5480,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::TextView(th));
                         }
                     } else if new_hover.is_none() {
-                        if let Some((tx, ty, tw, th, _, _)) = self.vertical_scrollbar_geometry(win_w, win_h, top_bars_h, status_bar_h, sf) {
-                            let ix = position.x.round() as i32;
-                            let iy = position.y.round() as i32;
-                            if ix >= tx - 4 && ix <= tx + tw as i32 + 4 && iy >= ty && iy < ty + th as i32 {
-                                new_hover = Some(UiHit::Scrollbar);
+                        let ix = position.x.round() as i32;
+                        let iy = position.y.round() as i32;
+                        if let Some((tx, ty, tw, th, _, _)) = self.horizontal_scrollbar_geometry(win_w, win_h, status_bar_h, sf) {
+                            if ix >= tx && ix < tx + tw as i32 && iy >= ty - 4 && iy <= ty + th as i32 + 4 {
+                                new_hover = Some(UiHit::HScrollbar);
+                            }
+                        }
+                        if new_hover.is_none() {
+                            if let Some((tx, ty, tw, th, _, _)) = self.vertical_scrollbar_geometry(win_w, win_h, top_bars_h, status_bar_h, sf) {
+                                if ix >= tx - 4 && ix <= tx + tw as i32 + 4 && iy >= ty && iy < ty + th as i32 {
+                                    new_hover = Some(UiHit::Scrollbar);
+                                }
                             }
                         }
                     }
@@ -5465,7 +5506,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let pointer = new_hover.is_some()
                             || self.hovered_link.is_some()
                             || self.hovered_form_field.is_some();
-                        w.set_cursor(if pointer { CursorIcon::Pointer } else { CursorIcon::Default });
+                        let grab = !pointer
+                            && (self.mouse_mode == MouseMode::Hand
+                                || self.compare_mode.as_ref().is_some_and(|c| c.max_pan_x > 1.0 || c.max_scroll_y > 1.0));
+                        w.set_cursor(if pointer {
+                            CursorIcon::Pointer
+                        } else if grab {
+                            CursorIcon::Grab
+                        } else {
+                            CursorIcon::Default
+                        });
                     }
                     self.request_redraw();
                 }
@@ -5535,6 +5585,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         if let Some(w) = self.window.as_ref() {
                             w.set_cursor(if is_interactive {
                                 CursorIcon::Pointer
+                            } else if self.mouse_mode == MouseMode::Hand {
+                                CursorIcon::Grab
                             } else {
                                 CursorIcon::Default
                             });
@@ -5556,6 +5608,23 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             WindowEvent::MouseInput { state, button, .. } => {
                 if state == ElementState::Released && self.scrollbar_drag {
                     self.scrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.hscrollbar_drag {
+                    self.hscrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.hand_pan_drag_last.is_some() {
+                    self.hand_pan_drag_last = None;
+                    if let Some(w) = self.window.as_ref() {
+                        w.set_cursor(if self.mouse_mode == MouseMode::Hand {
+                            CursorIcon::Grab
+                        } else {
+                            CursorIcon::Default
+                        });
+                    }
                     self.request_redraw();
                     return;
                 }
@@ -6281,11 +6350,60 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                // 0d0. Thin overlay Horizontal & Vertical Scrollbars (work in both Normal Window & Compare Window)
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    let ix = self.cursor_pos.0.round() as i32;
+                    let iy = self.cursor_pos.1.round() as i32;
+                    if let Some((tx, ty, tw, th, _, _)) = self.horizontal_scrollbar_geometry(
+                        win_w,
+                        win_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        if ix >= tx && ix < tx + tw as i32 && iy >= ty - 4 && iy <= ty + th as i32 + 4 {
+                            self.hscrollbar_drag = true;
+                            self.scroll_to_hscrollbar_x(
+                                self.cursor_pos.0,
+                                win_w,
+                                win_h,
+                                status_bar_h,
+                                scale_factor,
+                            );
+                            return;
+                        }
+                    }
+                    if let Some((tx, ty, tw, th, _, _)) = self.vertical_scrollbar_geometry(
+                        win_w,
+                        win_h,
+                        top_bars_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        if ix >= tx - 4 && ix <= tx + tw as i32 + 4 && iy >= ty && iy < ty + th as i32 {
+                            self.scrollbar_drag = true;
+                            self.scroll_to_scrollbar_y(
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                top_bars_h,
+                                status_bar_h,
+                                scale_factor,
+                            );
+                            return;
+                        }
+                    }
+                }
+
                 // 0d1. Side-by-Side Compare Mode top control bar + synced drag-to-pan
                 if self.compare_mode.is_some() {
                     if state == ElementState::Released && button == MouseButton::Left {
                         if let Some(ref mut cmp) = self.compare_mode {
                             cmp.pan_drag_last = None;
+                        }
+                        if let Some(w) = self.window.as_ref() {
+                            let grab = self.mouse_mode == MouseMode::Hand
+                                || self.compare_mode.as_ref().is_some_and(|c| c.max_pan_x > 1.0 || c.max_scroll_y > 1.0);
+                            w.set_cursor(if grab { CursorIcon::Grab } else { CursorIcon::Default });
                         }
                         return;
                     }
@@ -6304,6 +6422,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         if !(self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w) {
                             if let Some(ref mut cmp) = self.compare_mode {
                                 cmp.pan_drag_last = Some(self.cursor_pos);
+                            }
+                            if let Some(w) = self.window.as_ref() {
+                                w.set_cursor(CursorIcon::Grabbing);
                             }
                             return;
                         }
@@ -6773,6 +6894,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 self.active_note_popover = None;
                                 self.request_redraw();
                             }
+                            if self.mouse_mode == MouseMode::Hand {
+                                self.hand_pan_drag_last = Some(self.cursor_pos);
+                                if let Some(w) = self.window.as_ref() {
+                                    w.set_cursor(CursorIcon::Grabbing);
+                                }
+                                return;
+                            }
                             // Check if grabbing an existing Sticky Note or Text Box to drag-reposition it
                             if matches!(
                                 self.mouse_mode,
@@ -7204,6 +7332,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     allow_click,
                                 ) {
                                     match self.mouse_mode {
+                                        MouseMode::Hand => {}
                                         MouseMode::Select => {
                                             let count =
                                                 self.select_text_in_pdf_rect(page_idx, pdf_rect);

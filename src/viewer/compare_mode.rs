@@ -111,6 +111,7 @@ pub(super) enum CompareHit {
     FitPage,
     FitWidth,
     ActualSize,
+    HandTool,
     ToggleDiff,
     OffsetMinus,
     OffsetPlus,
@@ -248,10 +249,11 @@ impl<'a> PdfViewerApp<'a> {
         let swap_w = (50.0 * s).round() as u32;
         let sm_w = (22.0 * s).round() as u32;
         let off_lbl_w = (56.0 * s).round() as u32;
-        let diff_w = (106.0 * s).round() as u32;
-        let fit_w = (40.0 * s).round() as u32;
-        let wid_w = (50.0 * s).round() as u32;
-        let act_w = (46.0 * s).round() as u32;
+        let diff_w = (96.0 * s).round() as u32;
+        let hand_w = (46.0 * s).round() as u32;
+        let fit_w = (38.0 * s).round() as u32;
+        let wid_w = (48.0 * s).round() as u32;
+        let act_w = (44.0 * s).round() as u32;
 
         let close_x = x + w as i32 - pad - close_w as i32;
         let open_x = close_x - gap - open_w as i32;
@@ -259,7 +261,8 @@ impl<'a> PdfViewerApp<'a> {
         let plus_x = swap_x - gap - sm_w as i32;
         let minus_x = plus_x - off_lbl_w as i32 - sm_w as i32;
         let diff_x = minus_x - gap - diff_w as i32;
-        let act_x = diff_x - gap - act_w as i32;
+        let hand_x = diff_x - gap - hand_w as i32;
+        let act_x = hand_x - gap - act_w as i32;
         let wid_x = act_x - 3 - wid_w as i32;
         let fit_x = wid_x - 3 - fit_w as i32;
         let _ = cmp;
@@ -268,6 +271,7 @@ impl<'a> PdfViewerApp<'a> {
             (fit_x, by, fit_w, btn_h, CompareHit::FitPage),
             (wid_x, by, wid_w, btn_h, CompareHit::FitWidth),
             (act_x, by, act_w, btn_h, CompareHit::ActualSize),
+            (hand_x, by, hand_w, btn_h, CompareHit::HandTool),
             (diff_x, by, diff_w, btn_h, CompareHit::ToggleDiff),
             (minus_x, by, sm_w, btn_h, CompareHit::OffsetMinus),
             (plus_x, by, sm_w, btn_h, CompareHit::OffsetPlus),
@@ -332,6 +336,19 @@ impl<'a> PdfViewerApp<'a> {
             }
             CompareHit::ActualSize => {
                 self.set_compare_fit_mode(CompareFitMode::ActualSize);
+            }
+            CompareHit::HandTool => {
+                self.mouse_mode = if self.mouse_mode == MouseMode::Hand {
+                    MouseMode::Select
+                } else {
+                    MouseMode::Hand
+                };
+                self.status_notice = Some(if self.mouse_mode == MouseMode::Hand {
+                    "Compare Hand Tool: ON (Click & drag anywhere to pan both panes)".to_string()
+                } else {
+                    "Compare Hand Tool: OFF".to_string()
+                });
+                self.request_redraw();
             }
             CompareHit::ToggleDiff => {
                 if let Some(ref mut cmp) = self.compare_mode {
@@ -787,6 +804,16 @@ impl<'a> PdfViewerApp<'a> {
                         stroke_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bdr);
                         let tw = measure_text(lbl, sub_sz, active);
                         draw_text_vcenter(buffer, buf_w, buf_h, rx + ((rw as f32 - tw) * 0.5).round() as i32, ry, rh, rx + rw as i32, lbl, sub_sz, fg, active);
+                    }
+                    CompareHit::HandTool => {
+                        let on = self.mouse_mode == MouseMode::Hand;
+                        let bg = if on { theme.accent } else if hov { theme.hover_bg } else { theme.surface_elevated };
+                        let fg = if on { theme.text_on_accent } else { theme.text_primary };
+                        let bdr = if on { theme.accent } else { theme.border_subtle };
+                        fill_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bg);
+                        stroke_rounded_rect(buffer, buf_w, buf_h, rx, ry, rw, rh, rad, bdr);
+                        let tw = measure_text("Hand", sub_sz, on);
+                        draw_text_vcenter(buffer, buf_w, buf_h, rx + ((rw as f32 - tw) * 0.5).round() as i32, ry, rh, rx + rw as i32, "Hand", sub_sz, fg, on);
                     }
                     CompareHit::ToggleDiff => {
                         let on = cmp.visual_diff;

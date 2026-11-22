@@ -1918,12 +1918,67 @@ fn push_axis_aligned_edge(
     }
 }
 
+/// Maps unrotated PDF page points `(x, y)` (bottom-left origin, Y-up) into **visual top-left-origin**
+/// `(vx, vy)` coordinates where `vx` increases left-to-right and `vy` increases top-to-bottom as the
+/// user sees the page for `/Rotate` values `0`, `90`, `180`, or `270` degrees clockwise.
+pub fn to_visual_coords(x: f32, y: f32, page_w: f32, page_h: f32, rotation_deg: u16) -> (f32, f32) {
+    match rotation_deg % 360 {
+        90 => (y, x),
+        180 => (page_w - x, y),
+        270 => (page_h - y, page_w - x),
+        _ => (x, page_h - y),
+    }
+}
+
+/// Converts unrotated PDF page points into **visual Y-up** coordinates `(vx, vy_up)` matching
+/// the Lattice & Stream engines (larger `vy_up` = higher on screen, `vx` = left-to-right).
+#[inline]
+fn to_visual_yup(x: f32, y: f32, page_w: f32, page_h: f32, rotation_deg: u16) -> (f32, f32) {
+    let (vx, vy_down) = to_visual_coords(x, y, page_w, page_h, rotation_deg);
+    let vis_h = if matches!(rotation_deg % 360, 90 | 270) {
+        page_w
+    } else {
+        page_h
+    };
+    (vx, vis_h - vy_down)
+}
+
+/// Queries the page's `/Rotate` value (`0 | 90 | 180 | 270` CW) and unrotated MediaBox `(page_w, page_h)`.
+fn page_unrotated_dims_and_rotation(page: &PdfPage) -> (f32, f32, u16) {
+    let rot = match page.rotation().unwrap_or(PdfPageRenderRotation::None) {
+        PdfPageRenderRotation::None => 0u16,
+        PdfPageRenderRotation::Degrees90 => 90u16,
+        PdfPageRenderRotation::Degrees180 => 180u16,
+        PdfPageRenderRotation::Degrees270 => 270u16,
+    };
+    if let Ok(media) = page.boundaries().media() {
+        let mw = media.bounds.width().value.abs();
+        let mh = media.bounds.height().value.abs();
+        if mw > 1.0 && mh > 1.0 {
+            return (mw, mh, rot);
+        }
+    }
+    let pw = page.width().value.abs();
+    let ph = page.height().value.abs();
+    if matches!(rot, 90 | 270) {
+        (ph, pw, rot)
+    } else {
+        (pw, ph, rot)
+    }
+}
+
 /// Extracts all horizontal and vertical vector lines & thin filled rectangles from a PDFium page
-/// (recursing into Form XObjects up to depth 4 and composing 2D affine matrices accurately).
+/// (recursing into Form XObjects up to depth 4, composing 2D affine matrices, and normalizing for
+/// `/Rotate 0/90/180/270` into visual coordinates).
 pub fn extract_page_vector_segments(page: &PdfPage) -> (Vec<HSegment>, Vec<VSegment>) {
+    let (page_w, page_h, rot) = page_unrotated_dims_and_rotation(page);
+
     fn visit_obj(
         obj: &PdfPageObject,
         parent_m: [f32; 6],
+        page_w: f32,
+        page_h: f32,
+        rot: u16,
         h_out: &mut Vec<HSegment>,
         v_out: &mut Vec<VSegment>,
         depth: u8,
@@ -1950,7 +2005,8 @@ pub fn extract_page_vector_segments(page: &PdfPage) -> (Vec<HSegment>, Vec<VSegm
 
             for seg in path.segments().iter() {
                 let (rx, ry) = seg.point();
-                let pt = apply_pdf_matrix(m, rx.value, ry.value);
+                let (px, py) = apply_pdf_matrix(m, rx.value, ry.value);
+                let pt = to_visual_yup(px, py, page_w, page_h, rot);
                 match seg.segment_type() {
                     PdfPathSegmentType::MoveTo => {
                         if !cur_pts.is_empty() {
@@ -2014,7 +2070,7 @@ pub fn extract_page_vector_segments(page: &PdfPage) -> (Vec<HSegment>, Vec<VSegm
                     .unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
                 let m = compose_pdf_matrix(parent_m, local_m);
                 for child in form.iter() {
-                    visit_obj(&child, m, h_out, v_out, depth + 1);
+                    visit_obj(&child, m, page_w, page_h, rot, h_out, v_out, depth + 1);
                 }
             }
         }
@@ -2024,7 +2080,7 @@ pub fn extract_page_vector_segments(page: &PdfPage) -> (Vec<HSegment>, Vec<VSegm
     let mut v_out = Vec::new();
     let identity = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
     for obj in page.objects().iter() {
-        visit_obj(&obj, identity, &mut h_out, &mut v_out, 0);
+        visit_obj(&obj, identity, page_w, page_h, rot, &mut h_out, &mut v_out, 0);
     }
     (h_out, v_out)
 }
@@ -2455,11 +2511,13 @@ pub fn build_lattice_grid_from_component(
     ))
 }
 
-/// Extracts word-level bounding boxes from a PDFium page via `FPDFText_GetCharBox` (`page.text().chars()`).
+/// Extracts word-level bounding boxes from a PDFium page via `FPDFText_GetCharBox` (`page.text().chars()`),
+/// normalizing for `/Rotate 0/90/180/270` into visual coordinates before word grouping.
 pub fn extract_page_word_boxes(page: &PdfPage) -> Vec<WordBox> {
     let Ok(tp) = page.text() else {
         return Vec::new();
     };
+    let (page_w, page_h, rot) = page_unrotated_dims_and_rotation(page);
     let mut words: Vec<WordBox> = Vec::new();
     let mut cur_text = String::new();
     let mut cur_l = 0.0f32;
@@ -2499,10 +2557,16 @@ pub fn extract_page_word_boxes(page: &PdfPage) -> Vec<WordBox> {
         let Ok(rect) = ch.tight_bounds().or_else(|_| ch.loose_bounds()) else {
             continue;
         };
-        let l = rect.left().value.min(rect.right().value);
-        let r = rect.left().value.max(rect.right().value);
-        let b = rect.bottom().value.min(rect.top().value);
-        let t = rect.bottom().value.max(rect.top().value);
+        let raw_l = rect.left().value.min(rect.right().value);
+        let raw_r = rect.left().value.max(rect.right().value);
+        let raw_b = rect.bottom().value.min(rect.top().value);
+        let raw_t = rect.bottom().value.max(rect.top().value);
+        let (x0, y0) = to_visual_yup(raw_l, raw_b, page_w, page_h, rot);
+        let (x1, y1) = to_visual_yup(raw_r, raw_t, page_w, page_h, rot);
+        let l = x0.min(x1);
+        let r = x0.max(x1);
+        let b = y0.min(y1);
+        let t = y0.max(y1);
         let h = (t - b).max(4.0);
 
         if cur_text.is_empty() {
@@ -2753,8 +2817,10 @@ fn build_xlsx_sheet_xml_with_merges(
     merges: &[CellMerge],
     header_rows: &[usize],
     normalize_comma_decimals: bool,
+    sheet_idx: usize,
 ) -> String {
     let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+    let max_rows = rows.len().max(1);
     let mut col_widths = vec![10usize; max_cols];
     for row in rows {
         for (c, cell) in row.iter().enumerate() {
@@ -2769,12 +2835,35 @@ fn build_xlsx_sheet_xml_with_merges(
         }
     }
 
+    // Track every non-top-left cell covered by a <mergeCell> range so we emit an empty
+    // styled cell (<c r="..." s="..."/>) with zero <is>/<v> children per strict OOXML rules.
+    let mut covered_merge_cells: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    for m in merges {
+        for rr in m.row..(m.row + m.row_span) {
+            for cc in m.col..(m.col + m.col_span) {
+                if (rr, cc) != (m.row, m.col) {
+                    covered_merge_cells.insert((rr, cc));
+                }
+            }
+        }
+    }
+
+    let dim_end_col = xlsx_col_letter(max_cols - 1);
+    let sheet_view_tag = if sheet_idx == 0 {
+        "<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews>"
+    } else {
+        "<sheetViews><sheetView workbookViewId=\"0\"/></sheetViews>"
+    };
+
     let mut xml = String::with_capacity(4096);
-    xml.push_str(
+    xml.push_str(&format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
          <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-         <cols>",
-    );
+         <dimension ref=\"A1:{dim_end_col}{max_rows}\"/>\
+         {sheet_view_tag}\
+         <cols>"
+    ));
     for (i, w) in col_widths.iter().enumerate() {
         let col_idx = i + 1;
         xml.push_str(&format!(
@@ -2789,6 +2878,11 @@ fn build_xlsx_sheet_xml_with_merges(
         xml.push_str(&format!("<row r=\"{row_num}\">"));
         for (c_idx, val) in row.iter().enumerate() {
             let col_ref = format!("{}{}", xlsx_col_letter(c_idx), row_num);
+            let style = if is_hdr { 1 } else { 2 };
+            if covered_merge_cells.contains(&(r_idx, c_idx)) {
+                xml.push_str(&format!("<c r=\"{col_ref}\" s=\"{style}\"/>"));
+                continue;
+            }
             if !is_hdr {
                 if let Some((num, num_style)) =
                     parse_excel_numeric_with_opts(val, normalize_comma_decimals)
@@ -2799,7 +2893,6 @@ fn build_xlsx_sheet_xml_with_merges(
                     continue;
                 }
             }
-            let style = if is_hdr { 1 } else { 2 };
             xml.push_str(&format!(
                 "<c r=\"{col_ref}\" t=\"inlineStr\" s=\"{style}\"><is><t xml:space=\"preserve\">{}</t></is></c>",
                 xml_escape(val)
@@ -2867,6 +2960,7 @@ fn xlsx_styles_xml() -> &'static str {
           <xf numFmtId=\"167\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
           <xf numFmtId=\"168\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
         </cellXfs>\
+        <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\
         </styleSheet>"
 }
 
@@ -2913,6 +3007,7 @@ fn finish_xlsx_workbook(
             merges,
             header_rows,
             normalize_comma_decimals,
+            idx,
         );
         zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
     }
@@ -3016,9 +3111,9 @@ pub fn render_tables_to_xlsx(tables: &[ExcelTableGrid], opts: ExcelExportOptions
     finish_xlsx_workbook(&sheets, opts.normalize_comma_decimals)
 }
 
-fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool) -> String {
+fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool, sheet_idx: usize) -> String {
     let hdr = if bold_first_row { &[0usize][..] } else { &[] };
-    build_xlsx_sheet_xml_with_merges(rows, &[], hdr, false)
+    build_xlsx_sheet_xml_with_merges(rows, &[], hdr, false, sheet_idx)
 }
 
 pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
@@ -3121,7 +3216,7 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
         wb_rels.push_str(&format!(
             "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{s_num}.xml\"/>"
         ));
-        let sheet_xml = build_xlsx_sheet_xml(rows, *bold_hdr);
+        let sheet_xml = build_xlsx_sheet_xml(rows, *bold_hdr, idx);
         zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
     }
     content_types.push_str("</Types>");
@@ -3644,6 +3739,91 @@ mod tests {
         assert!(sheet1.contains("<v>152.4</v>"), "sheet1: {sheet1}");
         assert!(styles.contains("formatCode=\"#,##0.0000\""), "styles: {styles}");
         assert!(styles.contains("wrapText=\"1\""), "styles: {styles}");
+    }
+
+    #[test]
+    fn test_milestone4_to_visual_coords_all_rotations() {
+        let (pw, ph) = (595.0f32, 842.0f32);
+
+        // 0°: top-left origin (x, page_h - y)
+        assert_eq!(to_visual_coords(0.0, ph, pw, ph, 0), (0.0, 0.0));
+        assert_eq!(to_visual_coords(pw, 0.0, pw, ph, 0), (pw, ph));
+
+        // 90° CW (/Rotate 90): portrait 595x842 rotated CW -> landscape 842x595
+        // Unrotated bottom-left (0, 0) -> visual top-left (0, 0);
+        // Unrotated top-left (0, 842) -> visual top-right (842, 0);
+        // Unrotated top-right (595, 842) -> visual bottom-right (842, 595).
+        assert_eq!(to_visual_coords(0.0, 0.0, pw, ph, 90), (0.0, 0.0));
+        assert_eq!(to_visual_coords(0.0, ph, pw, ph, 90), (ph, 0.0));
+        assert_eq!(to_visual_coords(pw, ph, pw, ph, 90), (ph, pw));
+        assert_eq!(to_visual_coords(pw, 0.0, pw, ph, 90), (0.0, pw));
+
+        // Verify a word "0,7981" written along +Y at constant X on a /Rotate 90 page reads left-to-right:
+        let (vx0, vy0) = to_visual_coords(120.0, 100.0, pw, ph, 90);
+        let (vx1, vy1) = to_visual_coords(120.0, 140.0, pw, ph, 90);
+        assert!(vx0 < vx1 && (vy0 - vy1).abs() < 0.01, "90° CW text must read left-to-right");
+
+        // 180°: (page_w - x, y)
+        assert_eq!(to_visual_coords(pw, 0.0, pw, ph, 180), (0.0, 0.0));
+        assert_eq!(to_visual_coords(0.0, ph, pw, ph, 180), (pw, ph));
+
+        // 270° CW (/Rotate 270): (page_h - y, page_w - x)
+        assert_eq!(to_visual_coords(pw, ph, pw, ph, 270), (0.0, 0.0));
+        assert_eq!(to_visual_coords(0.0, ph, pw, ph, 270), (0.0, pw));
+        assert_eq!(to_visual_coords(0.0, 0.0, pw, ph, 270), (ph, pw));
+    }
+
+    #[test]
+    fn test_milestone4_xlsx_ooxml_strict_compliance() {
+        let grid = ExcelTableGrid {
+            page_num: 1,
+            is_lattice: true,
+            bbox: (0.0, 0.0, 300.0, 100.0),
+            rows: vec![
+                vec!["Merged Header".to_string(), "".to_string(), "Rate".to_string()],
+                vec!["USD".to_string(), "1,0850".to_string(), "1,0900".to_string()],
+                vec!["".to_string(), "1,0860".to_string(), "1,0910".to_string()],
+            ],
+            merges: vec![
+                // Horizontal merge A1:B1 (B1 is covered)
+                CellMerge { row: 0, col: 0, row_span: 1, col_span: 2 },
+                // Vertical merge A2:A3 (A3 is covered)
+                CellMerge { row: 1, col: 0, row_span: 2, col_span: 1 },
+            ],
+        };
+        let xlsx = render_tables_to_xlsx(
+            &[grid],
+            ExcelExportOptions {
+                mode: ExcelExportMode::Lattice,
+                layout: ExcelTableLayout::StackOnOneSheet,
+                normalize_comma_decimals: true,
+            },
+        );
+        let entries = read_zip_entries(&xlsx);
+        let styles = &entries.iter().find(|(n, _)| n == "xl/styles.xml").unwrap().1;
+        let sheet1 = &entries.iter().find(|(n, _)| n == "xl/worksheets/sheet1.xml").unwrap().1;
+        let ct = &entries.iter().find(|(n, _)| n == "[Content_Types].xml").unwrap().1;
+
+        // 1. xl/styles.xml has <cellStyles> immediately after </cellXfs>
+        assert!(
+            styles.contains("</cellXfs><cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>"),
+            "styles.xml missing <cellStyles> after </cellXfs>: {styles}"
+        );
+
+        // 2. Worksheet has <dimension> before <sheetViews> before <cols>
+        let dim_pos = sheet1.find("<dimension ref=\"A1:C3\"/>").expect("missing <dimension>");
+        let views_pos = sheet1
+            .find("<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews>")
+            .expect("missing <sheetViews>");
+        let cols_pos = sheet1.find("<cols>").expect("missing <cols>");
+        assert!(dim_pos < views_pos && views_pos < cols_pos, "worksheet element order invalid: {sheet1}");
+
+        // 3. Non-top-left merged cells B1 (header s=1) and A3 (body s=2) are empty styled cells only
+        assert!(sheet1.contains("<c r=\"B1\" s=\"1\"/>"), "B1 must be empty styled cell: {sheet1}");
+        assert!(sheet1.contains("<c r=\"A3\" s=\"2\"/>"), "A3 must be empty styled cell: {sheet1}");
+        assert!(!sheet1.contains("<c r=\"B1\" t=\"inlineStr\""), "B1 must not emit inlineStr: {sheet1}");
+        assert!(!sheet1.contains("<c r=\"A3\" t=\"inlineStr\""), "A3 must not emit inlineStr: {sheet1}");
+        assert!(ct.contains("/xl/worksheets/sheet1.xml"), "Content_Types missing sheet1");
     }
 }
 

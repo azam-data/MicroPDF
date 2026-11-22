@@ -206,6 +206,7 @@ impl MenuCategory {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseMode {
     Select,
+    Hand,
     Highlight,
     Underline,
     Strikethrough,
@@ -224,6 +225,7 @@ impl MouseMode {
     pub fn short_label(self) -> &'static str {
         match self {
             MouseMode::Select => "Select",
+            MouseMode::Hand => "Hand",
             MouseMode::Highlight => "Highlight",
             MouseMode::Underline => "Underline",
             MouseMode::Strikethrough => "Strike",
@@ -733,6 +735,7 @@ pub(super) enum UiHit {
     SidebarRow(usize),
     SidebarDelete(usize),
     Scrollbar,
+    HScrollbar,
     Customize(CustomizeHit),
     PrintPreview(PrintPreviewHit),
     ManualDuplex(ManualDuplexHit),
@@ -1254,6 +1257,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) hovered_widget: Option<UiHit>,
     /// True while dragging the right-edge overlay vertical scrollbar.
     pub(super) scrollbar_drag: bool,
+    /// True while dragging the bottom-edge overlay horizontal scrollbar.
+    pub(super) hscrollbar_drag: bool,
+    /// Active drag anchor `(x, y)` while panning the page with `MouseMode::Hand`.
+    pub(super) hand_pan_drag_last: Option<(f64, f64)>,
     /// True when `F11` fullscreen (or `F5` presentation) is active with menu/tab/status bars hidden.
     pub(super) is_fullscreen: bool,
     /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
@@ -1495,6 +1502,8 @@ impl<'a> PdfViewerApp<'a> {
             text_view_max_scroll: 0.0,
             hovered_widget: None,
             scrollbar_drag: false,
+            hscrollbar_drag: false,
+            hand_pan_drag_last: None,
             is_fullscreen: false,
             is_presentation: false,
             pre_presentation_state: None,

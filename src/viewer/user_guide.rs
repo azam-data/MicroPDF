@@ -116,7 +116,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Or press + to zoom in, - to zoom out, and 0 (or Ctrl+0) to reset zoom back to 100%.",
+                text: "Or press + to zoom in, - to zoom out, and 0 (or Ctrl+0) to reset zoom back to 100%. When zoomed in, click the Hand Tool icon on the top toolbar to grab and drag the page in any direction, or drag the horizontal scrollbar along the bottom edge (press Esc to return to Select Text).",
             },
             GuideBlock::Heading("Eye-Care Reading Modes (Day & Night)"),
             GuideBlock::Step {
@@ -524,7 +524,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Both PDFs appear side-by-side and turn, zoom, and scroll together! Switch freely between Fit, Width, 100%, or custom zoom (Ctrl+Wheel / + / -) and drag or scroll to pan both panes in sync. If one version has an extra page, use Offset '-' / '+' in the top Compare bar.",
+                text: "Both PDFs appear side-by-side and turn, zoom, and scroll together! Switch freely between Fit, Width, 100%, or custom zoom (Ctrl+Wheel / + / -), toggle the Hand button (or click & drag either pane) to pan in sync, or use the bottom horizontal and right vertical scrollbars. If one version has an extra page, use Offset '-' / '+' in the top Compare bar.",
             },
             GuideBlock::Step {
                 number: 3,
