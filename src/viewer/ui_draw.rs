@@ -856,6 +856,7 @@ pub enum UiIcon {
     Fullscreen,
     Presentation,
     Select,
+    Hand,
     Highlight,
     Underline,
     Strikethrough,
@@ -1001,6 +1002,20 @@ pub fn draw_icon(
             line(buffer, 0.34, 0.18, 0.66, 0.18);
             line(buffer, 0.50, 0.18, 0.50, 0.82);
             line(buffer, 0.34, 0.82, 0.66, 0.82);
+        }
+        UiIcon::Hand => {
+            // Open-palm pan / grab hand icon
+            // Four fingers
+            line(buffer, 0.36, 0.48, 0.36, 0.22);
+            line(buffer, 0.48, 0.46, 0.48, 0.16);
+            line(buffer, 0.60, 0.48, 0.60, 0.20);
+            line(buffer, 0.72, 0.52, 0.72, 0.30);
+            // Thumb on left
+            line(buffer, 0.32, 0.64, 0.20, 0.48);
+            // Palm outline & wrist base
+            line(buffer, 0.32, 0.64, 0.36, 0.82);
+            line(buffer, 0.36, 0.82, 0.68, 0.82);
+            line(buffer, 0.68, 0.82, 0.72, 0.52);
         }
         UiIcon::Highlight => {
             // Diagonal highlighter pen + underline

@@ -3,6 +3,7 @@
 mod app_icon;
 mod engine;
 mod export;
+mod fonts;
 mod optimize;
 mod print;
 mod viewer;

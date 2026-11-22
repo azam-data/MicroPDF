@@ -1528,7 +1528,20 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
 
-        let (fraction, visible_ratio) = if self.view_mode == ViewMode::ThumbnailGrid {
+        let (fraction, visible_ratio) = if let Some(cmp) = self.compare_mode.as_ref() {
+            if cmp.max_scroll_y > 1.0 {
+                let total_h = content_h as f32 + cmp.max_scroll_y;
+                (
+                    (self.scroll_y / cmp.max_scroll_y).clamp(0.0, 1.0),
+                    (content_h as f32 / total_h).clamp(0.10, 0.92),
+                )
+            } else if total > 1 {
+                let denom = (total - 1) as f32;
+                ((self.current_page_index as f32 / denom).clamp(0.0, 1.0), (1.0 / total as f32).clamp(0.08, 0.5))
+            } else {
+                return None;
+            }
+        } else if self.view_mode == ViewMode::ThumbnailGrid {
             let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
             let (cols, _cw, cell_h, _sx, _sy) = self.grid_metrics(buf_w, sidebar_w, top_bars_h);
             let rows = (total as u32).div_ceil(cols.max(1));
@@ -1587,7 +1600,18 @@ impl<'a> PdfViewerApp<'a> {
         let total = self.total_pages();
         let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
 
-        if self.view_mode == ViewMode::ThumbnailGrid {
+        if let Some(cmp_max_y) = self.compare_mode.as_ref().map(|c| c.max_scroll_y) {
+            if cmp_max_y > 1.0 {
+                self.scroll_y = frac * cmp_max_y;
+            } else if total > 1 {
+                let target = (frac * ((total - 1) as f32)).round() as u16;
+                if target != self.current_page_index {
+                    self.current_page_index = target.min(total - 1);
+                    self.scroll_y = 0.0;
+                    self.invalidate_page_caches();
+                }
+            }
+        } else if self.view_mode == ViewMode::ThumbnailGrid {
             let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
             let (cols, _cw, cell_h, _sx, _sy) = self.grid_metrics(buf_w, sidebar_w, top_bars_h);
             let rows = (total as u32).div_ceil(cols.max(1));
@@ -1609,6 +1633,93 @@ impl<'a> PdfViewerApp<'a> {
             self.scroll_y = frac * max_s;
         }
         self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Computes `(max_pan_x, visible_ratio)` for horizontal panning in both Normal Window and Compare Window.
+    pub(super) fn horizontal_pan_metrics(&self, buf_w: u32, scale_factor: f64) -> Option<(f32, f32)> {
+        if self.doc.is_none() || self.is_presentation {
+            return None;
+        }
+        let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
+        let content_w = buf_w.saturating_sub(sidebar_w).max(1);
+        if let Some(cmp) = self.compare_mode.as_ref() {
+            if cmp.max_pan_x <= 1.0 {
+                return None;
+            }
+            let half_w = (content_w / 2).max(1) as f32;
+            let total_w = half_w + cmp.max_pan_x;
+            return Some((cmp.max_pan_x, (half_w / total_w).clamp(0.10, 0.92)));
+        }
+        if !self.view_mode.is_page_view() || self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal {
+            return None;
+        }
+        let bmp_w = self.page_draw_rect.2;
+        if bmp_w <= content_w {
+            return None;
+        }
+        let max_pan = (bmp_w - content_w) as f32;
+        if max_pan <= 1.0 {
+            return None;
+        }
+        Some((max_pan, (content_w as f32 / bmp_w as f32).clamp(0.10, 0.92)))
+    }
+
+    /// Computes `(track_x, track_y, track_w, track_h, thumb_x, thumb_w)` for the thin bottom-edge
+    /// overlay horizontal scrollbar in both Normal Window and Compare Window, or `None` when not needed.
+    pub(super) fn horizontal_scrollbar_geometry(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        scale_factor: f64,
+    ) -> Option<(i32, i32, u32, u32, i32, u32)> {
+        let (max_pan, visible_ratio) = self.horizontal_pan_metrics(buf_w, scale_factor)?;
+        let s = scale_factor as f32;
+        let sidebar_w = self.sidebar_width_px(scale_factor).min(buf_w.saturating_sub(64));
+        let track_h = (8.0 * s).round().clamp(7.0, 12.0) as u32;
+        let pad_h = (10.0 * s).round() as i32;
+        let pad_b = (4.0 * s).round() as i32;
+        let vscroll_clear = (18.0 * s).round() as u32;
+        let content_w = buf_w.saturating_sub(sidebar_w);
+        if content_w < 80 {
+            return None;
+        }
+        let track_x = sidebar_w as i32 + pad_h;
+        let track_w = content_w.saturating_sub((pad_h as u32) + vscroll_clear);
+        if track_w < 40 {
+            return None;
+        }
+        let track_y = buf_h.saturating_sub(status_bar_h) as i32 - track_h as i32 - pad_b;
+        let fraction = (self.pan_x / max_pan).clamp(0.0, 1.0);
+        let min_thumb = (36.0 * s).round().min(track_w as f32);
+        let thumb_w = ((track_w as f32) * visible_ratio)
+            .round()
+            .clamp(min_thumb, track_w as f32) as u32;
+        let travel = track_w.saturating_sub(thumb_w);
+        let thumb_x = track_x + ((travel as f32) * fraction).round() as i32;
+        Some((track_x, track_y, track_w, track_h, thumb_x, thumb_w))
+    }
+
+    pub(super) fn scroll_to_hscrollbar_x(
+        &mut self,
+        mouse_x: f64,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        scale_factor: f64,
+    ) {
+        let Some((tx, _ty, tw, _th, _tbx, tbw)) =
+            self.horizontal_scrollbar_geometry(buf_w, buf_h, status_bar_h, scale_factor)
+        else {
+            return;
+        };
+        let Some((max_pan, _)) = self.horizontal_pan_metrics(buf_w, scale_factor) else {
+            return;
+        };
+        let travel = tw.saturating_sub(tbw).max(1) as f32;
+        let frac = (((mouse_x as f32) - (tx as f32) - (tbw as f32) * 0.5) / travel).clamp(0.0, 1.0);
+        self.pan_x = (frac * max_pan).clamp(0.0, max_pan);
         self.request_redraw();
     }
 
@@ -1700,6 +1811,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.compare_mode.is_none() {
             if self.view_mode.is_page_view() {
                 self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
+                self.ensure_deskew_preview_pixels();
             } else if self.view_mode == ViewMode::ThumbnailGrid {
                 self.update_visible_thumbnails(width, height, sidebar_w, top_bars_h, status_bar_h);
             }
@@ -1710,6 +1822,9 @@ impl<'a> PdfViewerApp<'a> {
         }
         if self.combine_modal.is_some() {
             self.ensure_combine_preview_rendered(width, height, scale_factor);
+        }
+        if self.watermark_modal.is_some() {
+            self.ensure_watermark_preview_rendered(width, height, scale_factor);
         }
 
         let theme = self.ui_theme();
@@ -1752,9 +1867,31 @@ impl<'a> PdfViewerApp<'a> {
                     self.draw_page_frame_chrome(
                         buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, scale_factor,
                     );
-                    self.blit_page_or_tiles(
-                        buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, cache,
-                    );
+                    let deskew_preview = self
+                        .deskew_bar
+                        .as_ref()
+                        .and_then(|d| d.preview_cache.as_ref())
+                        .filter(|(p, _, w, h, _)| {
+                            *p == cache.page_index && *w == cache.bitmap_width && *h == cache.bitmap_height
+                        })
+                        .map(|(_, _, _, _, px)| px.as_slice());
+                    if let Some(rotated_pixels) = deskew_preview {
+                        Self::blit_cached_page(
+                            buffer,
+                            width,
+                            height,
+                            sidebar_w,
+                            top_bars_h,
+                            status_bar_h,
+                            self.page_draw_rect,
+                            rotated_pixels,
+                            self.reading_filter,
+                        );
+                    } else {
+                        self.blit_page_or_tiles(
+                            buffer, width, height, sidebar_w, top_bars_h, status_bar_h, self.page_draw_rect, cache,
+                        );
+                    }
                     self.draw_search_overlays_on_page(
                         buffer, width, height, top_bars_h, status_bar_h, cache.page_index, self.page_draw_rect,
                     );
@@ -1902,6 +2039,13 @@ impl<'a> PdfViewerApp<'a> {
             if self.annot_context_menu.is_some() {
                 self.draw_annot_context_menu(buffer, width, height, scale_factor);
             }
+
+            // Lightweight Matrix Page Deskew bar, alignment grid, and Draw Guideline overlay
+            if self.deskew_bar.is_some() {
+                self.draw_deskew_overlay(
+                    buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+                );
+            }
         } else {
             self.draw_thumbnail_grid(
                 buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
@@ -1925,6 +2069,26 @@ impl<'a> PdfViewerApp<'a> {
             let th_col = (thm.0 << 16) | (thm.1 << 8) | thm.2;
             super::ui_draw::fill_rounded_rect_alpha(
                 buffer, width, height, tx, tby, tw, tbh, (tw as f32) * 0.5, th_col, thm.3,
+            );
+        }
+
+        // Thin bottom-edge overlay horizontal scrollbar (Normal & Compare windows when zoomed)
+        if let Some((tx, ty, tw, th, tbx, tbw)) =
+            self.horizontal_scrollbar_geometry(width, height, status_bar_h, scale_factor)
+        {
+            let tr = theme.scrollbar_track;
+            let tr_col = (tr.0 << 16) | (tr.1 << 8) | tr.2;
+            super::ui_draw::fill_rounded_rect_alpha(
+                buffer, width, height, tx, ty, tw, th, (th as f32) * 0.5, tr_col, tr.3,
+            );
+            let thm = if self.hscrollbar_drag || self.hovered_widget == Some(UiHit::HScrollbar) {
+                theme.scrollbar_thumb_hover
+            } else {
+                theme.scrollbar_thumb
+            };
+            let th_col = (thm.0 << 16) | (thm.1 << 8) | thm.2;
+            super::ui_draw::fill_rounded_rect_alpha(
+                buffer, width, height, tbx, ty, tbw, th, (th as f32) * 0.5, th_col, thm.3,
             );
         }
 
@@ -2044,6 +2208,26 @@ impl<'a> PdfViewerApp<'a> {
         // Export Pages as Images Modal
         if self.export_images_modal.is_some() {
             self.draw_export_images_modal(buffer, width, height, scale_factor);
+        }
+
+        // Export to Excel Options Modal
+        if self.excel_export_modal.is_some() {
+            self.draw_excel_export_modal(buffer, width, height, scale_factor);
+        }
+
+        // Split to Single-Page PDFs Modal
+        if self.split_pages_modal.is_some() {
+            self.draw_split_pages_modal(buffer, width, height, scale_factor);
+        }
+
+        // Detailed Watermark Modal with Live Preview
+        if self.watermark_modal.is_some() {
+            self.draw_watermark_modal(buffer, width, height, scale_factor);
+        }
+
+        // Portable Stamp & Signature Manager Modal
+        if self.stamp_manager_modal.is_some() {
+            self.draw_stamp_manager_modal(buffer, width, height, scale_factor);
         }
 
         // Document Properties & Privacy Metadata Scrubber Modal

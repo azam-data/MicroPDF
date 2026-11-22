@@ -162,6 +162,7 @@ pub enum ToolbarAction {
     SaveAs,
     Print,
     ToolSelect,
+    ToolHand,
     ToolHighlight,
     ToolUnderline,
     ToolStrikethrough,
@@ -192,6 +193,7 @@ impl ToolbarAction {
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview (Ctrl+P)",
             Self::ToolSelect => "Select Text Tool (default)",
+            Self::ToolHand => "Hand Tool (click & drag to pan)",
             Self::ToolHighlight => "Highlight Text (drag across text)",
             Self::ToolUnderline => "Underline Text (drag across text)",
             Self::ToolStrikethrough => "Strikethrough Text (drag across text)",
@@ -422,6 +424,7 @@ impl<'a> PdfViewerApp<'a> {
             push_sep(&mut cur_x, &mut seps, g1);
             let ann_btns = [
                 (ToolbarAction::ToolSelect, UiIcon::Select, self.mouse_mode == MouseMode::Select),
+                (ToolbarAction::ToolHand, UiIcon::Hand, self.mouse_mode == MouseMode::Hand),
                 (ToolbarAction::ToolHighlight, UiIcon::Highlight, self.mouse_mode == MouseMode::Highlight),
                 (ToolbarAction::ToolUnderline, UiIcon::Underline, self.mouse_mode == MouseMode::Underline),
                 (ToolbarAction::ToolStrikethrough, UiIcon::Strikethrough, self.mouse_mode == MouseMode::Strikethrough),
@@ -635,7 +638,13 @@ impl<'a> PdfViewerApp<'a> {
             }
             ToolbarAction::ToolSelect => {
                 self.mouse_mode = MouseMode::Select;
+                self.hand_pan_drag_last = None;
                 self.status_notice = Some("Mouse mode: Select Text".to_string());
+            }
+            ToolbarAction::ToolHand => {
+                self.mouse_mode = MouseMode::Hand;
+                self.hand_pan_drag_last = None;
+                self.status_notice = Some("Mouse mode: Hand Tool (Click & drag to pan, Esc to return to Select)".to_string());
             }
             ToolbarAction::ToolHighlight => {
                 self.mouse_mode = MouseMode::Highlight;
@@ -710,7 +719,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             ToolbarAction::ToolStamp => {
                 if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::PickStampImage);
+                    self.open_stamp_manager_modal();
                 }
             }
             ToolbarAction::RotatePage => {

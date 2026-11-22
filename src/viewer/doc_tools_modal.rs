@@ -49,6 +49,8 @@ pub(super) enum HeaderFooterHit {
     FocusField(HfField),
     ScopeAll,
     ScopeCustom,
+    FontPrev,
+    FontNext,
     FontMinus,
     FontPlus,
     MarginMinus,
@@ -136,6 +138,8 @@ pub(super) enum PageNumberHit {
     RomanMinus,
     RomanPlus,
     FocusRoman,
+    FontPrev,
+    FontNext,
     FontMinus,
     FontPlus,
     ColorGray,
@@ -340,10 +344,15 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(ModalBox { x: ix + (col3 as i32 + gap) * 2, y: cy, w: iw.saturating_sub(col3 * 2 + (gap * 2) as u32), h: row_h, hit: HeaderFooterHit::FocusField(HfField::FooterRight) });
         cy += row_h as i32 + sec_gap;
 
+        // 4b. System Font Picker row
+        let sm_btn = (24.0 * s).round() as u32;
+        hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontPrev });
+        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontNext });
+        cy += row_h as i32 + (4.0 * s).round() as i32;
+
         // 5. Font Size & Edge Margin row
         cy += lbl_h;
         let half_w = (iw.saturating_sub(gap as u32)) / 2;
-        let sm_btn = (24.0 * s).round() as u32;
         hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontMinus });
         hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontPlus });
         let mx2 = ix + half_w as i32 + gap;
@@ -653,6 +662,19 @@ impl<'a> PdfViewerApp<'a> {
             draw_input(buffer, r, HfField::FooterRight, &m.profile.footer_right, "Right");
         }
 
+        // 4b. System Font Picker
+        if let (Some(fp_prev), Some(fp_next)) = (find(HeaderFooterHit::FontPrev), find(HeaderFooterHit::FontNext)) {
+            draw_pill(buffer, fp_prev, "<", false);
+            draw_pill(buffer, fp_next, ">", false);
+            let fx = fp_prev.x + fp_prev.w as i32 + 4;
+            let fw = (fp_next.x - fx - 4).max(40) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, fx, fp_prev.y, fw, fp_prev.h, 5.0 * s, theme.input_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, fx, fp_prev.y, fw, fp_prev.h, 5.0 * s, theme.border_subtle);
+            let lbl = format!("Font: {}", m.profile.font_name);
+            let clipped = truncate_ellipsis(&lbl, (fw.saturating_sub(12)) as f32, body_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, fx + 6, fp_prev.y, fp_prev.h, fx + fw as i32 - 4, &clipped, body_sz, theme.text_primary, false);
+        }
+
         // 5. Font Size & Edge Margin
         if let (Some(fm), Some(fp)) = (find(HeaderFooterHit::FontMinus), find(HeaderFooterHit::FontPlus)) {
             draw_text(buffer, buf_w, buf_h, fm.x, fm.y - lbl_h, "Font Size", lbl_sz, theme.text_muted, true);
@@ -886,6 +908,16 @@ impl<'a> PdfViewerApp<'a> {
                     m.all_pages = false;
                     m.focused_field = HfField::CustomRange;
                     m.select_all = false;
+                }
+            }
+            HeaderFooterHit::FontPrev => {
+                if let Some(m) = self.header_footer_modal.as_mut() {
+                    m.profile.font_name = crate::fonts::step_font_name(&m.profile.font_name, -1);
+                }
+            }
+            HeaderFooterHit::FontNext => {
+                if let Some(m) = self.header_footer_modal.as_mut() {
+                    m.profile.font_name = crate::fonts::step_font_name(&m.profile.font_name, 1);
                 }
             }
             HeaderFooterHit::FontMinus => {
@@ -1154,10 +1186,13 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::RomanPlus });
         cy += row_h as i32 + sec_gap;
 
-        // 4. Font Size row
+        // 4. Font Size & System Font row
         cy += lbl_h;
         hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontMinus });
         hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPlus });
+        let fx2 = ix + half_w as i32 + gap;
+        hits.push(ModalBox { x: fx2, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPrev });
+        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontNext });
         cy += row_h as i32 + sec_gap;
 
         // 5. Text Color
@@ -1397,7 +1432,7 @@ impl<'a> PdfViewerApp<'a> {
             draw_text_vcenter(buffer, buf_w, buf_h, rf_box.x + ((rf_box.w as f32 - tw) * 0.5).round() as i32, rf_box.y, rf_box.h, rf_box.x + rf_box.w as i32 - 2, &clipped, body_sz, theme.text_primary, true);
         }
 
-        // 4. Font Size
+        // 4. Font Size & System Font Family
         if let (Some(fm), Some(fp)) = (find(PageNumberHit::FontMinus), find(PageNumberHit::FontPlus)) {
             draw_text(buffer, buf_w, buf_h, fm.x, fm.y - lbl_h, "Font Size", lbl_sz, theme.text_muted, true);
             draw_pill(buffer, fm, "-", false);
@@ -1406,17 +1441,17 @@ impl<'a> PdfViewerApp<'a> {
             let tw = measure_text(&txt, body_sz, true);
             let cx = fm.x + fm.w as i32 + (((fp.x - (fm.x + fm.w as i32)) as f32 - tw) * 0.5).round() as i32;
             draw_text_vcenter(buffer, buf_w, buf_h, cx, fm.y, fm.h, fp.x, &txt, body_sz, theme.text_primary, true);
-            // Live summary on right half of the Font Size row
-            let sum_x = fp.x + fp.w as i32 + (12.0 * s).round() as i32;
-            let first_arabic = m.config.skip_pages + m.config.roman_end + 1;
-            let summary = if first_arabic <= total {
-                format!("Body p.1 starts at sheet #{first_arabic}")
-            } else {
-                "All pages skipped/Roman".to_string()
-            };
-            let max_sw = (layout.panel_x + layout.panel_w as i32 - p - sum_x).max(40) as f32;
-            let clip_sum = truncate_ellipsis(&summary, max_sw, small_sz, false);
-            draw_text_vcenter(buffer, buf_w, buf_h, sum_x, fm.y, fm.h, layout.panel_x + layout.panel_w as i32 - p, &clip_sum, small_sz, theme.text_muted, false);
+        }
+        if let (Some(fprev), Some(fnext)) = (find(PageNumberHit::FontPrev), find(PageNumberHit::FontNext)) {
+            draw_text(buffer, buf_w, buf_h, fprev.x, fprev.y - lbl_h, "Font Family", lbl_sz, theme.text_muted, true);
+            draw_pill(buffer, fprev, "<", false);
+            draw_pill(buffer, fnext, ">", false);
+            let bx = fprev.x + fprev.w as i32 + 3;
+            let bw = (fnext.x - bx - 3).max(24) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, fprev.y, bw, fprev.h, 5.0 * s, theme.input_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, fprev.y, bw, fprev.h, 5.0 * s, theme.border_subtle);
+            let clipped = truncate_ellipsis(&m.config.font_name, (bw.saturating_sub(8)) as f32, small_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, bx + 4, fprev.y, fprev.h, bx + bw as i32 - 3, &clipped, small_sz, theme.text_primary, false);
         }
 
         // 5. Color
@@ -1522,6 +1557,16 @@ impl<'a> PdfViewerApp<'a> {
                 if let Some(m) = self.page_number_modal.as_mut() {
                     let max_r = total.saturating_sub(m.config.skip_pages);
                     m.config.roman_end = (m.config.roman_end + 1).min(max_r);
+                }
+            }
+            PageNumberHit::FontPrev => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.font_name = crate::fonts::step_font_name(&m.config.font_name, -1);
+                }
+            }
+            PageNumberHit::FontNext => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    m.config.font_name = crate::fonts::step_font_name(&m.config.font_name, 1);
                 }
             }
             PageNumberHit::FontMinus => {

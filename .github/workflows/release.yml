@@ -1,0 +1,67 @@
+name: Release MicroPDF
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release-windows:
+    name: Release Windows (x64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build Windows release binary
+        run: cargo build --release --locked
+
+      - name: Download PDFium (Windows x64)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pdfium_tmp | Out-Null
+          Invoke-WebRequest -Uri "https://github.com/bblanchon/pdfium-binaries/releases/latest/download/pdfium-win-x64.tgz" -OutFile "pdfium_tmp/pdfium.tgz"
+          tar -xzf pdfium_tmp/pdfium.tgz -C pdfium_tmp
+          $dll = Get-ChildItem -Path pdfium_tmp -Recurse -Filter "pdfium.dll" | Select-Object -First 1
+          if (-not $dll) { throw "pdfium.dll not found in archive" }
+          New-Item -ItemType Directory -Force -Path pdfium_dir | Out-Null
+          Copy-Item $dll.FullName -Destination "pdfium_dir/pdfium.dll"
+
+      - name: Package portable ZIP and generate SHA256SUMS.txt
+        shell: pwsh
+        run: |
+          $stage = "dist/MicroPDF-windows-x64"
+          $zipPath = "dist/MicroPDF-windows-x64.zip"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/release/micro_pdf.exe" -Destination "$stage/micro_pdf.exe"
+          Copy-Item "pdfium_dir/pdfium.dll" -Destination "$stage/pdfium.dll"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zipPath -Force
+
+          $exeHash = (Get-FileHash -Path "$stage/micro_pdf.exe" -Algorithm SHA256).Hash.ToLowerInvariant()
+          $zipHash = (Get-FileHash -Path $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          @(
+            "$exeHash  micro_pdf.exe"
+            "$zipHash  MicroPDF-windows-x64.zip"
+          ) | Set-Content -Path "dist/SHA256SUMS.txt" -Encoding Ascii
+
+          Write-Host "Generated dist/SHA256SUMS.txt:"
+          Get-Content "dist/SHA256SUMS.txt"
+
+      - name: Upload release assets to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/MicroPDF-windows-x64.zip
+            dist/SHA256SUMS.txt

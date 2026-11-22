@@ -14,6 +14,7 @@ use winit::window::Window;
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
 use super::compare_mode::{CompareHit, CompareModeState};
+use super::deskew::{DeskewBarState, DeskewHit};
 use super::doc_props_modal::{
     ActiveNotePopover, AnnotContextHit, AnnotationContextMenuState, DocPropsHit,
     DocPropsModalState, NotePopoverHit, UnsavedChangesHit, UnsavedChangesModalState,
@@ -21,16 +22,20 @@ use super::doc_props_modal::{
 use super::doc_tools_modal::{
     HeaderFooterHit, HeaderFooterModalState, PageNumberHit, PageNumberModalState,
 };
+use super::excel_export_modal::{ExcelExportHit, ExcelExportModalState};
 use super::image_tools_modal::{
     CreatePdfImagesHit, CreatePdfImagesModalState, ExportImagesHit, ExportImagesModalState,
 };
 use super::measure::{MeasureBarHit, MeasureUnit, MeasurementResult};
 use super::overlays::OverlayHit;
 use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewHit, PrintPreviewState};
+use super::split_pages_modal::{SplitPagesHit, SplitPagesModalState};
+use super::stamp_manager_modal::{StampManagerHit, StampManagerModalState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
 use super::theme::{UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
 use super::user_guide::{UserGuideHit, UserGuideState};
+use super::watermark_modal::{WatermarkHit, WatermarkModalState};
 
 #[allow(dead_code)]
 pub(super) const BG_COLOR_U32: u32 = 0x00E9EEF5;
@@ -161,6 +166,7 @@ impl MenuCategory {
             MenuCategory::Page => &[
                 "Jump to Page... (G)",
                 "Rotate Current Page 90° (R)",
+                "Deskew Page(s)...",
                 "Insert Blank Page After (I)",
                 "Insert Blank Page Before",
                 "Insert PDF(s) Before / After Page...",
@@ -172,8 +178,9 @@ impl MenuCategory {
                 "Page Numbering... (N)",
                 "Header & Footer / Clear Existing... (H)",
                 "Add Watermark... (W)",
-                "Stamp Signature / Image... (P)",
+                "Stamps & Signatures... (P)",
                 "Split / Extract Pages... (X)",
+                "Split to Single-Page PDFs...",
                 "Compare with Another PDF...",
                 "Flatten & Unlock PDF (U)",
                 "Optimize...",
@@ -199,6 +206,7 @@ impl MenuCategory {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MouseMode {
     Select,
+    Hand,
     Highlight,
     Underline,
     Strikethrough,
@@ -217,6 +225,7 @@ impl MouseMode {
     pub fn short_label(self) -> &'static str {
         match self {
             MouseMode::Select => "Select",
+            MouseMode::Hand => "Hand",
             MouseMode::Highlight => "Highlight",
             MouseMode::Underline => "Underline",
             MouseMode::Strikethrough => "Strike",
@@ -726,6 +735,7 @@ pub(super) enum UiHit {
     SidebarRow(usize),
     SidebarDelete(usize),
     Scrollbar,
+    HScrollbar,
     Customize(CustomizeHit),
     PrintPreview(PrintPreviewHit),
     ManualDuplex(ManualDuplexHit),
@@ -734,11 +744,16 @@ pub(super) enum UiHit {
     PageNumber(PageNumberHit),
     CreatePdfImages(CreatePdfImagesHit),
     ExportImages(ExportImagesHit),
+    ExcelExport(ExcelExportHit),
+    SplitPages(SplitPagesHit),
+    Watermark(WatermarkHit),
+    StampManager(StampManagerHit),
     DocProps(DocPropsHit),
     UnsavedChanges(UnsavedChangesHit),
     AnnotContext(AnnotContextHit),
     NotePopover(NotePopoverHit),
     Compare(CompareHit),
+    Deskew(DeskewHit),
     MeasureBar(MeasureBarHit),
     UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
@@ -806,6 +821,7 @@ pub(super) enum InputMode {
     ClearMargins {
         input: String,
     },
+    #[allow(dead_code)]
     Watermark {
         input: String,
     },
@@ -991,11 +1007,14 @@ pub(super) enum PendingDialog {
     PickImagesForPdf,
     PickComparePdf,
     ExportPagesAsImagesDir,
+    SplitSinglePagesDir,
     ExportMarkdown,
     ExportLatex,
     ExportDocx,
     ExportXlsx,
+    #[allow(dead_code)]
     PickStampImage,
+    ImportStampAssetPng,
     Split(String),
     ExtractSelectedPages(Vec<u16>),
     ImportBookmarksTxt,
@@ -1136,6 +1155,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) incremental_search: Option<IncrementalSearchState>,
     /// Active Side-by-Side Compare Mode state (0 bytes when closed).
     pub(super) compare_mode: Option<CompareModeState<'a>>,
+    /// Active Page Deskew control bar state (0 bytes when closed).
+    pub(super) deskew_bar: Option<DeskewBarState>,
     /// Incremental PDF optimization job driven one `step()` per event-loop iteration (`Esc` cancels).
     pub(super) optimize_job: Option<ActiveOptimizeJob>,
     /// Lightweight thumbnail cache populated ONLY when `view_mode == ViewMode::ThumbnailGrid`.
@@ -1208,6 +1229,16 @@ pub struct PdfViewerApp<'a> {
     pub(super) create_pdf_images_modal: Option<CreatePdfImagesModalState>,
     /// Active `Export Pages as Images` modal state (0 bytes when closed).
     pub(super) export_images_modal: Option<ExportImagesModalState>,
+    /// Active `Export PDF to Excel (.xlsx)` options modal state (0 bytes when closed).
+    pub(super) excel_export_modal: Option<ExcelExportModalState>,
+    /// Remembers last chosen Hybrid Lattice/Stream Excel export options for the session.
+    pub(super) excel_export_opts: crate::export::ExcelExportOptions,
+    /// Active `Split to Single-Page PDFs` modal state (0 bytes when closed).
+    pub(super) split_pages_modal: Option<SplitPagesModalState>,
+    /// Active Detailed Watermark modal with live preview (0 bytes when closed).
+    pub(super) watermark_modal: Option<WatermarkModalState>,
+    /// Active Portable Stamp & Signature Manager modal (0 bytes when closed).
+    pub(super) stamp_manager_modal: Option<StampManagerModalState>,
     /// Active `Document Properties & Privacy` modal state (0 bytes when closed).
     pub(super) doc_props_modal: Option<DocPropsModalState>,
     /// Active `Unsaved Changes` confirmation dialog (0 bytes when closed).
@@ -1226,6 +1257,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) hovered_widget: Option<UiHit>,
     /// True while dragging the right-edge overlay vertical scrollbar.
     pub(super) scrollbar_drag: bool,
+    /// True while dragging the bottom-edge overlay horizontal scrollbar.
+    pub(super) hscrollbar_drag: bool,
+    /// Active drag anchor `(x, y)` while panning the page with `MouseMode::Hand`.
+    pub(super) hand_pan_drag_last: Option<(f64, f64)>,
     /// True when `F11` fullscreen (or `F5` presentation) is active with menu/tab/status bars hidden.
     pub(super) is_fullscreen: bool,
     /// True when `F5` presentation mode is active (fullscreen, one page fit to screen, black background).
@@ -1409,6 +1444,7 @@ impl<'a> PdfViewerApp<'a> {
             current_search_match: 0,
             incremental_search: None,
             compare_mode: None,
+            deskew_bar: None,
             optimize_job: None,
             thumbnail_cache: HashMap::new(),
             grid_scroll_y: 0.0,
@@ -1452,6 +1488,11 @@ impl<'a> PdfViewerApp<'a> {
             page_number_modal: None,
             create_pdf_images_modal: None,
             export_images_modal: None,
+            excel_export_modal: None,
+            excel_export_opts: crate::export::ExcelExportOptions::default(),
+            split_pages_modal: None,
+            watermark_modal: None,
+            stamp_manager_modal: None,
             doc_props_modal: None,
             unsaved_changes_modal: None,
             user_guide_modal: None,
@@ -1461,6 +1502,8 @@ impl<'a> PdfViewerApp<'a> {
             text_view_max_scroll: 0.0,
             hovered_widget: None,
             scrollbar_drag: false,
+            hscrollbar_drag: false,
+            hand_pan_drag_last: None,
             is_fullscreen: false,
             is_presentation: false,
             pre_presentation_state: None,
@@ -1495,6 +1538,10 @@ impl<'a> PdfViewerApp<'a> {
             || self.page_number_modal.is_some()
             || self.create_pdf_images_modal.is_some()
             || self.export_images_modal.is_some()
+            || self.excel_export_modal.is_some()
+            || self.split_pages_modal.is_some()
+            || self.watermark_modal.is_some()
+            || self.stamp_manager_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
             || self.show_customize_toolbar
@@ -2336,6 +2383,9 @@ impl<'a> PdfViewerApp<'a> {
         self.hovered_form_field = None;
         if let Some(ref mut cmp) = self.compare_mode {
             cmp.invalidate_caches();
+        }
+        if let Some(ref mut d) = self.deskew_bar {
+            d.preview_cache = None;
         }
         self.selected_text.clear();
         self.selected_text_page = None;

@@ -637,9 +637,13 @@ impl<'a> PdfViewerApp<'a> {
                 };
                 self.rotate_page_clockwise(target);
             }
-            (MenuCategory::Page, 2) => self.insert_blank_page_after_current(),
-            (MenuCategory::Page, 3) => self.insert_blank_page_before_current(),
-            (MenuCategory::Page, 4) => {
+            (MenuCategory::Page, 2) => {
+                self.open_deskew_bar();
+                return;
+            }
+            (MenuCategory::Page, 3) => self.insert_blank_page_after_current(),
+            (MenuCategory::Page, 4) => self.insert_blank_page_before_current(),
+            (MenuCategory::Page, 5) => {
                 let target = if self.view_mode == ViewMode::ThumbnailGrid {
                     self.hovered_thumb.unwrap_or(self.current_page_index)
                 } else {
@@ -648,8 +652,8 @@ impl<'a> PdfViewerApp<'a> {
                 self.open_insert_pdf_modal(false, target);
                 return;
             }
-            (MenuCategory::Page, 5) => self.delete_current_page(),
-            (MenuCategory::Page, 6) => {
+            (MenuCategory::Page, 6) => self.delete_current_page(),
+            (MenuCategory::Page, 7) => {
                 let target = if self.view_mode == ViewMode::ThumbnailGrid {
                     self.hovered_thumb.unwrap_or(self.current_page_index)
                 } else {
@@ -657,7 +661,7 @@ impl<'a> PdfViewerApp<'a> {
                 };
                 self.convert_page_to_bw_in_place(target);
             }
-            (MenuCategory::Page, 7) => self.reset_current_page_crop(),
+            (MenuCategory::Page, 8) => self.reset_current_page_crop(),
 
             // Tools menu
             (MenuCategory::Tools, 0) => {
@@ -669,12 +673,12 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
             (MenuCategory::Tools, 2) => {
-                self.input_mode = InputMode::Watermark {
-                    input: String::new(),
-                };
+                self.open_watermark_modal();
+                return;
             }
             (MenuCategory::Tools, 3) => {
-                self.pending_dialog = Some(PendingDialog::PickStampImage);
+                self.open_stamp_manager_modal();
+                return;
             }
             (MenuCategory::Tools, 4) => {
                 self.input_mode = InputMode::SplitRange {
@@ -682,14 +686,18 @@ impl<'a> PdfViewerApp<'a> {
                 };
             }
             (MenuCategory::Tools, 5) => {
+                self.open_split_pages_modal();
+                return;
+            }
+            (MenuCategory::Tools, 6) => {
                 if self.doc.is_some() {
                     self.pending_dialog = Some(PendingDialog::PickComparePdf);
                 } else {
                     self.status_notice = Some("Open a PDF first before starting Compare Mode".to_string());
                 }
             }
-            (MenuCategory::Tools, 6) => self.flatten_and_unlock_current_pdf(),
-            (MenuCategory::Tools, 7) => self.open_optimize_prompt(),
+            (MenuCategory::Tools, 7) => self.flatten_and_unlock_current_pdf(),
+            (MenuCategory::Tools, 8) => self.open_optimize_prompt(),
 
             // Export menu
             (MenuCategory::Export, 0) => {
@@ -700,11 +708,8 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             (MenuCategory::Export, 1) => {
-                if self.doc.is_some() {
-                    self.pending_dialog = Some(PendingDialog::ExportXlsx);
-                } else {
-                    self.status_notice = Some("Open a PDF first to export to Excel (.xlsx)".to_string());
-                }
+                self.open_excel_export_modal();
+                return;
             }
             (MenuCategory::Export, 2) => {
                 if self.doc.is_some() {

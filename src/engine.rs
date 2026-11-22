@@ -125,6 +125,7 @@ pub struct HeaderFooterProfile {
     pub footer_left: String,
     pub footer_center: String,
     pub footer_right: String,
+    pub font_name: String,
     pub font_size: f32,
     pub margin_pt: f32,
     pub color: HeaderFooterColor,
@@ -140,6 +141,7 @@ impl Default for HeaderFooterProfile {
             footer_left: String::new(),
             footer_center: String::new(),
             footer_right: String::new(),
+            font_name: "Helvetica (Built-in)".to_string(),
             font_size: 10.0,
             margin_pt: 28.0,
             color: HeaderFooterColor::Gray,
@@ -187,7 +189,7 @@ impl HeaderFooterProfile {
 
     pub fn to_ini_str(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{:.1}|{:.1}|{}|{}",
             Self::esc(&self.name),
             Self::esc(&self.header_left),
             Self::esc(&self.header_center),
@@ -198,6 +200,7 @@ impl HeaderFooterProfile {
             self.font_size.clamp(6.0, 24.0),
             self.margin_pt.clamp(12.0, 72.0),
             self.color.to_ini_str(),
+            Self::esc(&self.font_name),
         )
     }
 
@@ -210,6 +213,12 @@ impl HeaderFooterProfile {
         if name.is_empty() {
             return None;
         }
+        let font_name = if parts.len() >= 11 {
+            let parsed = Self::unesc(parts[10]).trim().to_string();
+            if parsed.is_empty() { "Helvetica".to_string() } else { parsed }
+        } else {
+            "Helvetica".to_string()
+        };
         Some(Self {
             name,
             header_left: Self::unesc(parts[1]),
@@ -221,6 +230,7 @@ impl HeaderFooterProfile {
             font_size: parts[7].trim().parse::<f32>().unwrap_or(10.0).clamp(6.0, 24.0),
             margin_pt: parts[8].trim().parse::<f32>().unwrap_or(28.0).clamp(12.0, 72.0),
             color: HeaderFooterColor::from_ini_str(parts[9]),
+            font_name,
         })
     }
 }
@@ -263,6 +273,7 @@ pub struct PageNumberConfig {
     pub roman_end: u16,
     /// Number of leading cover/picture pages to leave completely unnumbered (0 = none).
     pub skip_pages: u16,
+    pub font_name: String,
     pub font_size: f32,
     pub margin_pt: f32,
     pub color: HeaderFooterColor,
@@ -275,9 +286,48 @@ impl Default for PageNumberConfig {
             format: PageNumberFormat::Plain,
             roman_end: 0,
             skip_pages: 0,
+            font_name: "Helvetica (Built-in)".to_string(),
             font_size: 10.0,
             margin_pt: 28.0,
             color: HeaderFooterColor::Gray,
+        }
+    }
+}
+
+/// Coverage / placement mode for the Milestone 2.2 Detailed Watermark dialog.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum WatermarkPlacement {
+    Centered,
+    /// Custom relative position `(x_pct, y_pct)` in `0.0..=1.0` (`0.5, 0.5` = center).
+    Custom { x_pct: f32, y_pct: f32 },
+    /// Repeating grid across the entire page with `(gap_x_pt, gap_y_pt)` spacing.
+    Tiled { gap_x_pt: f32, gap_y_pt: f32 },
+}
+
+/// Full configuration for Milestone 2.2 Detailed Watermark stamping.
+#[derive(Clone, Debug)]
+pub struct WatermarkConfig {
+    pub text: String,
+    pub font_name: String,
+    pub font_size: f32,
+    pub color_rgb: (u8, u8, u8),
+    /// Rotation angle in degrees (`-180.0..=180.0`; positive = CCW in PDF space, e.g. 45° diagonal).
+    pub rotation_deg: f32,
+    /// Opacity percentage (`5..=100`, default `28`).
+    pub opacity_pct: u8,
+    pub placement: WatermarkPlacement,
+}
+
+impl Default for WatermarkConfig {
+    fn default() -> Self {
+        Self {
+            text: "CONFIDENTIAL".to_string(),
+            font_name: "Helvetica Bold (Built-in)".to_string(),
+            font_size: 54.0,
+            color_rgb: (120, 125, 135),
+            rotation_deg: 45.0,
+            opacity_pct: 28,
+            placement: WatermarkPlacement::Centered,
         }
     }
 }
@@ -2775,7 +2825,7 @@ impl PdfEngine {
         if total_pages == 0 || page_indices.is_empty() {
             return Ok(());
         }
-        let font = doc.fonts_mut().helvetica();
+        let font = crate::fonts::load_pdf_font_by_name(doc, &profile.font_name);
         let font_sz = profile.font_size.clamp(6.0, 24.0);
         let edge_y = profile.margin_pt.clamp(12.0, 72.0);
         let side_x = 36.0_f32;
@@ -2860,7 +2910,7 @@ impl PdfEngine {
         if total_pages == 0 {
             return Ok(());
         }
-        let font = doc.fonts_mut().helvetica();
+        let font = crate::fonts::load_pdf_font_by_name(doc, &cfg.font_name);
         let font_sz = cfg.font_size.clamp(6.0, 24.0);
         let edge_y = cfg.margin_pt.clamp(12.0, 72.0);
         let side_x = 36.0_f32;
@@ -2906,6 +2956,91 @@ impl PdfEngine {
             obj.translate(PdfPoints::new(x), PdfPoints::new(y))?;
             let mut page = doc.pages_mut().get(idx)?;
             page.objects_mut().add_text_object(obj)?;
+        }
+        Ok(())
+    }
+
+    /// Stamps a detailed customizable watermark (`WatermarkConfig`: system font, size, color,
+    /// rotation `-180°..+180°`, opacity `5%..100%`, Centered / Custom / Tiled) onto selected 0-based `page_indices`.
+    pub fn apply_watermark_full(
+        doc: &mut PdfDocument,
+        cfg: &WatermarkConfig,
+        page_indices: &[u16],
+    ) -> Result<()> {
+        let txt = cfg.text.trim();
+        let total_pages = doc.pages().len();
+        if txt.is_empty() || total_pages == 0 || page_indices.is_empty() {
+            return Ok(());
+        }
+        let font = crate::fonts::load_pdf_font_by_name(doc, &cfg.font_name);
+        let font_sz = cfg.font_size.clamp(10.0, 160.0);
+        let alpha = ((cfg.opacity_pct.clamp(5, 100) as f32 / 100.0) * 255.0).round() as u8;
+        let (r, g, b) = cfg.color_rgb;
+        let color = PdfColor::new(r, g, b, alpha);
+        let rot_deg = cfg.rotation_deg.clamp(-180.0, 180.0);
+
+        for &idx in page_indices {
+            if idx >= total_pages {
+                continue;
+            }
+            let (pw, ph) = {
+                let page = doc.pages().get(idx)?;
+                (page.width().value.max(1.0), page.height().value.max(1.0))
+            };
+
+            // Measure single watermark box once per page
+            let probe = PdfPageTextObject::new(doc, txt, font, PdfPoints::new(font_sz))?;
+            let tw = probe.width().unwrap_or(PdfPoints::new(font_sz * txt.len() as f32 * 0.55)).value.max(10.0);
+            let th = probe.height().unwrap_or(PdfPoints::new(font_sz)).value.max(8.0);
+            drop(probe);
+
+            let centers: Vec<(f32, f32)> = match cfg.placement {
+                WatermarkPlacement::Centered => vec![(pw * 0.5, ph * 0.5)],
+                WatermarkPlacement::Custom { x_pct, y_pct } => {
+                    let cx = (pw * x_pct.clamp(0.05, 0.95)).clamp(20.0, (pw - 20.0).max(20.0));
+                    // y_pct: 0.0 = top, 1.0 = bottom -> PDF Y is bottom-up
+                    let cy = (ph * (1.0 - y_pct.clamp(0.05, 0.95))).clamp(20.0, (ph - 20.0).max(20.0));
+                    vec![(cx, cy)]
+                }
+                WatermarkPlacement::Tiled { gap_x_pt, gap_y_pt } => {
+                    let step_x = (tw * 0.85 + gap_x_pt.clamp(24.0, 320.0)).max(60.0);
+                    let step_y = (th * 1.4 + gap_y_pt.clamp(24.0, 320.0)).max(50.0);
+                    let mut pts = Vec::new();
+                    let mut row_i = 0usize;
+                    let mut y = step_y * 0.5;
+                    while y < ph + step_y * 0.5 {
+                        let stagger = if row_i % 2 == 1 { step_x * 0.5 } else { 0.0 };
+                        let mut x = step_x * 0.5 - stagger;
+                        while x < pw + step_x * 0.5 {
+                            if x > -tw * 0.25 && x < pw + tw * 0.25 {
+                                pts.push((x, y));
+                            }
+                            x += step_x;
+                        }
+                        y += step_y;
+                        row_i += 1;
+                    }
+                    pts
+                }
+            };
+
+            let mut objs = Vec::with_capacity(centers.len());
+            for (cx, cy) in centers {
+                let mut obj = PdfPageTextObject::new(doc, txt, font, PdfPoints::new(font_sz))?;
+                obj.set_fill_color(color)?;
+                // Center text around origin, rotate by -rot_deg (CW = negative CCW), then translate to (cx, cy)
+                obj.translate(PdfPoints::new(-tw * 0.5), PdfPoints::new(-th * 0.35))?;
+                if rot_deg.abs() > 0.05 {
+                    let _ = obj.rotate_counter_clockwise_degrees(rot_deg);
+                }
+                obj.translate(PdfPoints::new(cx), PdfPoints::new(cy))?;
+                objs.push(obj);
+            }
+
+            let mut page = doc.pages_mut().get(idx)?;
+            for obj in objs {
+                page.objects_mut().add_text_object(obj)?;
+            }
         }
         Ok(())
     }
@@ -3382,6 +3517,72 @@ impl PdfEngine {
         drop(dest_doc);
         drop(src_doc);
         Self::write_atomic(output_path.as_ref(), &bytes).context("Failed to save extracted PDF")
+    }
+
+    /// Formats a zero-padded single-page PDF filename (e.g., `report_page_001.pdf`).
+    pub fn format_single_page_pdf_name(prefix: &str, page_num_1based: u16, total_pages: u16) -> String {
+        let clean: String = prefix
+            .trim()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let clean = clean.trim();
+        let stem = if clean.is_empty() { "page" } else { clean };
+        let width = total_pages.max(1).to_string().len().max(3);
+        format!("{stem}_page_{page_num_1based:0width$}.pdf")
+    }
+
+    /// Losslessly splits selected 0-based `page_indices` of `doc` into individual single-page
+    /// `.pdf` files inside `out_dir` via PDFium page-import/export APIs (zero rasterization).
+    pub fn split_doc_to_single_page_pdfs<P: AsRef<Path>>(
+        &self,
+        doc: &PdfDocument,
+        page_indices: &[u16],
+        out_dir: P,
+        prefix: &str,
+        mut on_progress: impl FnMut(usize, usize),
+    ) -> Result<usize> {
+        let total_doc_pages = doc.pages().len();
+        if total_doc_pages == 0 || page_indices.is_empty() {
+            anyhow::bail!("No pages selected to split");
+        }
+        let dir = out_dir.as_ref();
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create output folder {}", dir.display()))?;
+
+        let total_to_export = page_indices.len();
+        let mut written = 0usize;
+        for (step, &page_idx) in page_indices.iter().enumerate() {
+            if page_idx >= total_doc_pages {
+                continue;
+            }
+            let mut single = self
+                .pdfium
+                .create_new_pdf()
+                .context("Failed to create single-page destination PDF")?;
+            single
+                .pages_mut()
+                .copy_page_from_document(doc, page_idx, 0)
+                .with_context(|| format!("Failed to copy page {} losslessly", page_idx + 1))?;
+            let bytes = single
+                .save_to_bytes()
+                .with_context(|| format!("Failed to serialize page {}", page_idx + 1))?;
+            drop(single);
+
+            let fname = Self::format_single_page_pdf_name(prefix, page_idx + 1, total_doc_pages);
+            let out_path = dir.join(fname);
+            Self::write_atomic(&out_path, &bytes)
+                .with_context(|| format!("Failed to write {}", out_path.display()))?;
+            written += 1;
+            on_progress(step + 1, total_to_export);
+        }
+        Ok(written)
     }
 
     /// Stamp Page Numbers (`add_page_numbers`) supporting Roman numerals (e.g., i, ii, iii, iv, v)
@@ -5096,6 +5297,144 @@ impl PdfEngine {
         tf.set_value(new_value)?;
         Ok(())
     }
+
+    // =========================================================================
+    // Milestone 3: Strictly Matrix-Based Page Deskew (Zero Rasterization)
+    // =========================================================================
+
+    /// Applies a centered 2D affine deskew rotation (`cw_deg` in `-15.0..=15.0`, positive = CW)
+    /// directly to every PDFium page object on each page in `page_indices`, preserving MediaBox
+    /// and CropBox (white corners) and regenerating content streams once per page.
+    pub fn deskew_pages_in_doc(
+        doc: &mut PdfDocument,
+        page_indices: &[u16],
+        cw_deg: f32,
+    ) -> Result<usize> {
+        let clamped = cw_deg.clamp(-15.0, 15.0);
+        if clamped.abs() < 0.01 {
+            return Ok(0);
+        }
+        let total = doc.pages().len();
+        let mut applied = 0usize;
+        for &p_idx in page_indices {
+            if p_idx >= total {
+                continue;
+            }
+            let mut page = doc.pages_mut().get(p_idx)?;
+            let (cx, cy) = page
+                .boundaries()
+                .media()
+                .map(|mb| {
+                    let b = mb.bounds;
+                    (
+                        (b.left().value + b.right().value) * 0.5,
+                        (b.bottom().value + b.top().value) * 0.5,
+                    )
+                })
+                .unwrap_or_else(|_| (page.width().value * 0.5, page.height().value * 0.5));
+            let m = compute_deskew_affine_matrix_around(cx, cy, clamped);
+
+            let prev_strategy = page.content_regeneration_strategy();
+            page.set_content_regeneration_strategy(PdfPageContentRegenerationStrategy::Manual);
+            for mut obj in page.objects_mut().iter() {
+                let _ = obj.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+            }
+            page.regenerate_content()?;
+            page.set_content_regeneration_strategy(prev_strategy);
+            applied += 1;
+        }
+        Ok(applied)
+    }
+}
+
+/// Auto-detected guideline snap axis for Milestone 3 Page Deskew.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum DeskewAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// 6-element PDF 2D affine matrix (`x' = a*x + c*y + e`, `y' = b*x + d*y + f`, Y-up PDF coords).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct DeskewMatrix {
+    pub a: f32,
+    pub b: f32,
+    pub c: f32,
+    pub d: f32,
+    pub e: f32,
+    pub f: f32,
+}
+
+impl DeskewMatrix {
+    /// Applies this affine matrix to a PDF-space point `(x, y)`.
+    pub fn apply_point(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.a * x + self.c * y + self.e,
+            self.b * x + self.d * y + self.f,
+        )
+    }
+}
+
+/// Computes the centered PDFium 2D affine matrix for `Translate(cx, cy) -> Rotate(cw_deg) -> Translate(-cx, -cy)`
+/// around `(page_w / 2, page_h / 2)` in PDF Y-up coordinates (`positive = CW`, `negative = CCW`).
+pub fn compute_deskew_affine_matrix(page_w: f32, page_h: f32, cw_deg: f32) -> DeskewMatrix {
+    compute_deskew_affine_matrix_around(page_w * 0.5, page_h * 0.5, cw_deg)
+}
+
+/// Computes the centered PDFium 2D affine matrix around arbitrary center `(cx, cy)` in PDF Y-up coords.
+pub fn compute_deskew_affine_matrix_around(cx: f32, cy: f32, cw_deg: f32) -> DeskewMatrix {
+    // In PDF Y-up coordinates, CCW by phi uses (cos(phi), sin(phi), -sin(phi), cos(phi)).
+    // Positive cw_deg = Clockwise -> phi = -cw_deg.to_radians().
+    let phi = (-cw_deg as f64).to_radians();
+    let cos_p = phi.cos() as f32;
+    let sin_p = phi.sin() as f32;
+    let a = cos_p;
+    let b = sin_p;
+    let c = -sin_p;
+    let d = cos_p;
+    let cx64 = cx as f64;
+    let cy64 = cy as f64;
+    let e = (cx64 - (a as f64) * cx64 - (c as f64) * cy64) as f32;
+    let f = (cy64 - (b as f64) * cx64 - (d as f64) * cy64) as f32;
+    DeskewMatrix { a, b, c, d, e, f }
+}
+
+/// Converts a user-drawn screen guideline delta `(dx_screen, dy_screen)` (screen space: +X right, +Y down)
+/// into `(snapped_axis, correction_cw_deg)` clamped to `-15.0..=15.0` (positive = CW, negative = CCW).
+/// - If `|dy| >= |dx|`: snaps to Vertical (`90°`).
+/// - Otherwise: snaps to Horizontal (`0°`).
+/// Returns `None` if the drawn guideline is too short (`< 4.0 px`).
+pub fn compute_guideline_deskew_angle(
+    dx_screen: f32,
+    dy_screen: f32,
+) -> Option<(DeskewAxis, f32)> {
+    let len = dx_screen.hypot(dy_screen);
+    if len < 4.0 {
+        return None;
+    }
+    if dy_screen.abs() >= dx_screen.abs() {
+        // Vertical margin: normalize top-to-bottom (ny > 0)
+        let (nx, ny) = if dy_screen < 0.0 {
+            (-dx_screen, -dy_screen)
+        } else {
+            (dx_screen, dy_screen)
+        };
+        // If line leans right going down (`\` shape, nx > 0), page is tilted CCW -> rotate CW (+)
+        let raw_deg = (nx as f64).atan2(ny as f64).to_degrees() as f32;
+        let clamped = (raw_deg.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+        Some((DeskewAxis::Vertical, clamped))
+    } else {
+        // Horizontal line: normalize left-to-right (nx > 0)
+        let (nx, ny) = if dx_screen < 0.0 {
+            (-dx_screen, -dy_screen)
+        } else {
+            (dx_screen, dy_screen)
+        };
+        // If line slopes downward to the right (ny > 0 in screen Y-down), page is tilted CW -> rotate CCW (-)
+        let raw_deg = -((ny as f64).atan2(nx as f64).to_degrees() as f32);
+        let clamped = (raw_deg.clamp(-15.0, 15.0) * 10.0).round() / 10.0;
+        Some((DeskewAxis::Horizontal, clamped))
+    }
 }
 
 #[cfg(test)]
@@ -5731,4 +6070,85 @@ mod tests {
         assert!(PdfEngine::scrub_document_metadata_bytes(&enc_raw).is_err());
         Ok(())
     }
+
+    #[test]
+    fn test_milestone3_deskew_guideline_all_directions() {
+        // Horizontal line sloping DOWN to the right (+dx, +dy in screen Y-down) => page tilted CW => needs CCW (-) correction
+        let (ax1, deg1) = compute_guideline_deskew_angle(200.0, 20.0).unwrap();
+        assert_eq!(ax1, DeskewAxis::Horizontal);
+        assert!((deg1 - (-5.7)).abs() < 0.15, "got {deg1}");
+
+        // Same line drawn right-to-left (-dx, -dy) => identical angle!
+        let (ax2, deg2) = compute_guideline_deskew_angle(-200.0, -20.0).unwrap();
+        assert_eq!(ax2, DeskewAxis::Horizontal);
+        assert!((deg2 - deg1).abs() < 1e-4);
+
+        // Horizontal line sloping UP to the right (+dx, -dy) => page tilted CCW => needs CW (+) correction
+        let (ax3, deg3) = compute_guideline_deskew_angle(200.0, -20.0).unwrap();
+        assert_eq!(ax3, DeskewAxis::Horizontal);
+        assert!((deg3 - 5.7).abs() < 0.15, "got {deg3}");
+
+        // Vertical margin leaning RIGHT going down (`\` shape: +dx, +dy) => tilted CCW => needs CW (+) correction
+        let (ax4, deg4) = compute_guideline_deskew_angle(15.0, 300.0).unwrap();
+        assert_eq!(ax4, DeskewAxis::Vertical);
+        assert!((deg4 - 2.9).abs() < 0.15, "got {deg4}");
+
+        // Same vertical margin drawn bottom-to-top (-dx, -dy) => identical angle!
+        let (ax5, deg5) = compute_guideline_deskew_angle(-15.0, -300.0).unwrap();
+        assert_eq!(ax5, DeskewAxis::Vertical);
+        assert!((deg5 - deg4).abs() < 1e-4);
+
+        // Vertical margin leaning LEFT going down (`/` shape: -dx, +dy) => tilted CW => needs CCW (-) correction
+        let (ax6, deg6) = compute_guideline_deskew_angle(-15.0, 300.0).unwrap();
+        assert_eq!(ax6, DeskewAxis::Vertical);
+        assert!((deg6 - (-2.9)).abs() < 0.15, "got {deg6}");
+
+        // Clamping to ±15.0°
+        let (_, clamped_pos) = compute_guideline_deskew_angle(100.0, -80.0).unwrap();
+        assert!((clamped_pos - 15.0).abs() < 1e-4);
+        let (_, clamped_neg) = compute_guideline_deskew_angle(100.0, 80.0).unwrap();
+        assert!((clamped_neg - (-15.0)).abs() < 1e-4);
+
+        // Too short (< 4 px) returns None
+        assert!(compute_guideline_deskew_angle(1.5, 1.5).is_none());
+    }
+
+    #[test]
+    fn test_milestone3_deskew_affine_matrix_centered() {
+        let w = 600.0f32;
+        let h = 800.0f32;
+        let cx = w * 0.5;
+        let cy = h * 0.5;
+
+        // 0° is exact identity
+        let id = compute_deskew_affine_matrix(w, h, 0.0);
+        assert!((id.a - 1.0).abs() < 1e-5);
+        assert!(id.b.abs() < 1e-5);
+        assert!(id.c.abs() < 1e-5);
+        assert!((id.d - 1.0).abs() < 1e-5);
+        assert!(id.e.abs() < 1e-4);
+        assert!(id.f.abs() < 1e-4);
+
+        // +5.0° CW rotation fixes center point (cx, cy) exactly
+        let m5 = compute_deskew_affine_matrix(w, h, 5.0);
+        let (rcx, rcy) = m5.apply_point(cx, cy);
+        assert!((rcx - cx).abs() < 1e-3);
+        assert!((rcy - cy).abs() < 1e-3);
+
+        // Determinant = a*d - b*c = 1.0 (pure rigid rotation, no scaling/shearing)
+        let det = m5.a * m5.d - m5.b * m5.c;
+        assert!((det - 1.0).abs() < 1e-5);
+
+        // Top-center point (cx, cy + 100) rotated +5° CW in PDF Y-up moves RIGHT (+X) and slightly DOWN (-Y)
+        let (tx, ty) = m5.apply_point(cx, cy + 100.0);
+        assert!(tx > cx + 8.0 && tx < cx + 9.5, "expected +X shift, got {tx}");
+        assert!(ty < cy + 100.0 && ty > cy + 99.0, "expected slight -Y drop, got {ty}");
+
+        // Applying -5° CW afterwards restores original point
+        let inv = compute_deskew_affine_matrix(w, h, -5.0);
+        let (ox, oy) = inv.apply_point(tx, ty);
+        assert!((ox - cx).abs() < 1e-2);
+        assert!((oy - (cy + 100.0)).abs() < 1e-2);
+    }
 }
+

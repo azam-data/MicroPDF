@@ -702,7 +702,7 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S Save As) / Watermark"),
+            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S) / Watermark Dialog"),
             ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
             ("Ctrl+P", "Print Preview (10 Paper Sizes, Manual 2-Sided)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
@@ -710,7 +710,7 @@ impl<'a> PdfViewerApp<'a> {
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
             ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
-            ("P / Z / U", "Stamp Image / Optimize PDF / Flatten & Unlock"),
+            ("P / Z / U", "Stamps & Signatures / Optimize / Flatten & Unlock"),
             ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
             ("Help Menu", "Step-by-Step User Guide, Compare PDFs & Ruler"),
         ];
