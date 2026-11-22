@@ -1589,20 +1589,8 @@ pub fn render_blocks_to_docx(doc_title: &str, pages: &[Vec<ExportBlock>]) -> Vec
 }
 
 // ---------------------------------------------------------------------------
-// Pure-Rust Excel (.xlsx) OOXML Generator
+// Pure-Rust Excel (.xlsx) Generator (powered by rust_xlsxwriter)
 // ---------------------------------------------------------------------------
-
-fn xlsx_col_letter(mut col_zero_based: usize) -> String {
-    let mut chars = Vec::new();
-    loop {
-        chars.push((b'A' + (col_zero_based % 26) as u8) as char);
-        if col_zero_based < 26 {
-            break;
-        }
-        col_zero_based = col_zero_based / 26 - 1;
-    }
-    chars.into_iter().rev().collect()
-}
 
 /// Validates strict English thousands grouping (e.g. `1,234` or `12,345,678.90`) or plain
 /// dot-decimal numbers (`1234.56`), rejecting European comma-decimals (`12,50`), comma lists
@@ -2812,226 +2800,170 @@ pub fn export_document_to_xlsx_with_options(
     render_tables_to_xlsx(&all_tables, opts)
 }
 
-fn build_xlsx_sheet_xml_with_merges(
-    rows: &[Vec<String>],
-    merges: &[CellMerge],
-    header_rows: &[usize],
-    normalize_comma_decimals: bool,
-    sheet_idx: usize,
-) -> String {
-    let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
-    let max_rows = rows.len().max(1);
-    let mut col_widths = vec![10usize; max_cols];
-    for row in rows {
-        for (c, cell) in row.iter().enumerate() {
-            let max_line = cell
-                .lines()
-                .map(|l| l.chars().count())
-                .max()
-                .unwrap_or(0);
-            if max_line + 3 > col_widths[c] {
-                col_widths[c] = (max_line + 3).min(52);
-            }
-        }
-    }
-
-    // Track every non-top-left cell covered by a <mergeCell> range so we emit an empty
-    // styled cell (<c r="..." s="..."/>) with zero <is>/<v> children per strict OOXML rules.
-    let mut covered_merge_cells: std::collections::HashSet<(usize, usize)> =
-        std::collections::HashSet::new();
-    for m in merges {
-        for rr in m.row..(m.row + m.row_span) {
-            for cc in m.col..(m.col + m.col_span) {
-                if (rr, cc) != (m.row, m.col) {
-                    covered_merge_cells.insert((rr, cc));
-                }
-            }
-        }
-    }
-
-    let dim_end_col = xlsx_col_letter(max_cols - 1);
-    let sheet_view_tag = if sheet_idx == 0 {
-        "<sheetViews><sheetView tabSelected=\"1\" workbookViewId=\"0\"/></sheetViews>"
-    } else {
-        "<sheetViews><sheetView workbookViewId=\"0\"/></sheetViews>"
-    };
-
-    let mut xml = String::with_capacity(4096);
-    xml.push_str(&format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-         <dimension ref=\"A1:{dim_end_col}{max_rows}\"/>\
-         {sheet_view_tag}\
-         <cols>"
-    ));
-    for (i, w) in col_widths.iter().enumerate() {
-        let col_idx = i + 1;
-        xml.push_str(&format!(
-            "<col min=\"{col_idx}\" max=\"{col_idx}\" width=\"{w}\" customWidth=\"1\"/>"
-        ));
-    }
-    xml.push_str("</cols><sheetData>");
-
-    for (r_idx, row) in rows.iter().enumerate() {
-        let row_num = r_idx + 1;
-        let is_hdr = header_rows.contains(&r_idx);
-        xml.push_str(&format!("<row r=\"{row_num}\">"));
-        for (c_idx, val) in row.iter().enumerate() {
-            let col_ref = format!("{}{}", xlsx_col_letter(c_idx), row_num);
-            let style = if is_hdr { 1 } else { 2 };
-            if covered_merge_cells.contains(&(r_idx, c_idx)) {
-                xml.push_str(&format!("<c r=\"{col_ref}\" s=\"{style}\"/>"));
-                continue;
-            }
-            if !is_hdr {
-                if let Some((num, num_style)) =
-                    parse_excel_numeric_with_opts(val, normalize_comma_decimals)
-                {
-                    xml.push_str(&format!(
-                        "<c r=\"{col_ref}\" s=\"{num_style}\"><v>{num}</v></c>"
-                    ));
-                    continue;
-                }
-            }
-            xml.push_str(&format!(
-                "<c r=\"{col_ref}\" t=\"inlineStr\" s=\"{style}\"><is><t xml:space=\"preserve\">{}</t></is></c>",
-                xml_escape(val)
-            ));
-        }
-        xml.push_str("</row>");
-    }
-
-    xml.push_str("</sheetData>");
-    if !merges.is_empty() {
-        xml.push_str(&format!("<mergeCells count=\"{}\">", merges.len()));
-        for m in merges {
-            let r1 = m.row + 1;
-            let r2 = m.row + m.row_span;
-            let c1 = xlsx_col_letter(m.col);
-            let c2 = xlsx_col_letter(m.col + m.col_span - 1);
-            xml.push_str(&format!("<mergeCell ref=\"{c1}{r1}:{c2}{r2}\"/>"));
-        }
-        xml.push_str("</mergeCells>");
-    }
-    xml.push_str("</worksheet>");
-    xml
-}
-
-fn xlsx_styles_xml() -> &'static str {
-    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\
-        <numFmts count=\"5\">\
-          <numFmt numFmtId=\"164\" formatCode=\"#,##0.0\"/>\
-          <numFmt numFmtId=\"165\" formatCode=\"#,##0.000\"/>\
-          <numFmt numFmtId=\"166\" formatCode=\"#,##0.0000\"/>\
-          <numFmt numFmtId=\"167\" formatCode=\"#,##0.00000\"/>\
-          <numFmt numFmtId=\"168\" formatCode=\"#,##0.000000\"/>\
-        </numFmts>\
-        <fonts count=\"2\">\
-          <font><sz val=\"11\"/><name val=\"Calibri\"/></font>\
-          <font><b/><sz val=\"11\"/><color rgb=\"FF0F172A\"/><name val=\"Calibri\"/></font>\
-        </fonts>\
-        <fills count=\"3\">\
-          <fill><patternFill patternType=\"none\"/></fill>\
-          <fill><patternFill patternType=\"gray125\"/></fill>\
-          <fill><patternFill patternType=\"solid\"><fgColor rgb=\"FFEFF6FF\"/></patternFill></fill>\
-        </fills>\
-        <borders count=\"2\">\
-          <border><left/><right/><top/><bottom/><diagonal/></border>\
-          <border>\
-            <left style=\"thin\"><color rgb=\"FFCBD5E1\"/></left>\
-            <right style=\"thin\"><color rgb=\"FFCBD5E1\"/></right>\
-            <top style=\"thin\"><color rgb=\"FFCBD5E1\"/></top>\
-            <bottom style=\"thin\"><color rgb=\"FFCBD5E1\"/></bottom>\
-            <diagonal/>\
-          </border>\
-        </borders>\
-        <cellStyleXfs count=\"1\"><xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\"/></cellStyleXfs>\
-        <cellXfs count=\"11\">\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\"/>\
-          <xf numFmtId=\"0\" fontId=\"1\" fillId=\"2\" borderId=\"1\" xfId=\"0\" applyFont=\"1\" applyFill=\"1\" applyBorder=\"1\" applyAlignment=\"1\"><alignment wrapText=\"1\" vertical=\"top\"/></xf>\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\" applyAlignment=\"1\"><alignment wrapText=\"1\" vertical=\"top\"/></xf>\
-          <xf numFmtId=\"4\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"0\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"164\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"165\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"166\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"167\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-          <xf numFmtId=\"168\" fontId=\"0\" fillId=\"0\" borderId=\"1\" xfId=\"0\" applyNumberFormat=\"1\" applyBorder=\"1\"/>\
-        </cellXfs>\
-        <cellStyles count=\"1\"><cellStyle name=\"Normal\" xfId=\"0\" builtinId=\"0\"/></cellStyles>\
-        </styleSheet>"
-}
-
 fn finish_xlsx_workbook(
     sheets: &[(String, Vec<Vec<String>>, Vec<CellMerge>, Vec<usize>)],
     normalize_comma_decimals: bool,
 ) -> Vec<u8> {
-    let mut content_types = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
-         <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-         <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
-         <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
-    );
-    let mut wb_sheets = String::new();
-    let mut wb_rels = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <Relationships xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
-    );
+    use rust_xlsxwriter::{Color, Format, FormatAlign, FormatBorder, Workbook};
+    use std::collections::HashSet;
 
-    let mut zip = MiniZipWriter::new();
+    let border_col = Color::RGB(0xCBD5E1);
+    let make_base = || {
+        Format::new()
+            .set_font_name("Calibri")
+            .set_font_size(11.0)
+            .set_border(FormatBorder::Thin)
+            .set_border_color(border_col)
+    };
+
+    let fmt_header = make_base()
+        .set_bold()
+        .set_font_color(Color::RGB(0x0F172A))
+        .set_background_color(Color::RGB(0xEFF6FF))
+        .set_text_wrap()
+        .set_align(FormatAlign::Top);
+    let fmt_text = make_base()
+        .set_text_wrap()
+        .set_align(FormatAlign::Top);
+    let fmt_num_2 = make_base().set_num_format("#,##0.00");
+    let fmt_pct = make_base().set_num_format("0.00%");
+    let fmt_int = make_base();
+    let fmt_num_1 = make_base().set_num_format("#,##0.0");
+    let fmt_num_3 = make_base().set_num_format("#,##0.000");
+    let fmt_num_4 = make_base().set_num_format("#,##0.0000");
+    let fmt_num_5 = make_base().set_num_format("#,##0.00000");
+    let fmt_num_6 = make_base().set_num_format("#,##0.000000");
+
+    let num_format_for = |style_id: u8| -> &Format {
+        match style_id {
+            3 => &fmt_num_2,
+            4 => &fmt_pct,
+            5 => &fmt_int,
+            6 => &fmt_num_1,
+            7 => &fmt_num_3,
+            8 => &fmt_num_4,
+            9 => &fmt_num_5,
+            10 => &fmt_num_6,
+            _ => &fmt_int,
+        }
+    };
+
+    let mut workbook = Workbook::new();
+    let mut used_names: HashSet<String> = HashSet::new();
+
     for (idx, (raw_name, rows, merges, header_rows)) in sheets.iter().enumerate() {
-        let s_num = idx + 1;
-        let rid = format!("rId{}", s_num + 1);
-        let safe_name: String = raw_name
+        let worksheet = workbook.add_worksheet();
+
+        // Sanitize sheet name (max 31 chars, no : \ / ? * [ ], unique case-insensitively)
+        let cleaned: String = raw_name
             .chars()
             .filter(|c| !matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
             .take(31)
             .collect();
-        content_types.push_str(&format!(
-            "<Override PartName=\"/xl/worksheets/sheet{s_num}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
-        ));
-        wb_sheets.push_str(&format!(
-            "<sheet name=\"{}\" sheetId=\"{s_num}\" r:id=\"{rid}\"/>",
-            xml_escape(&safe_name)
-        ));
-        wb_rels.push_str(&format!(
-            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{s_num}.xml\"/>"
-        ));
-        let sheet_xml = build_xlsx_sheet_xml_with_merges(
-            rows,
-            merges,
-            header_rows,
-            normalize_comma_decimals,
-            idx,
-        );
-        zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
+        let base_name = if cleaned.trim().is_empty() {
+            format!("Sheet{}", idx + 1)
+        } else {
+            cleaned.trim().to_string()
+        };
+        let mut safe_name = base_name.clone();
+        let mut suffix = 2usize;
+        while !used_names.insert(safe_name.to_ascii_lowercase()) {
+            let tag = format!(" ({suffix})");
+            let max_base = 31usize.saturating_sub(tag.len());
+            safe_name = format!("{}{}", base_name.chars().take(max_base).collect::<String>(), tag);
+            suffix += 1;
+        }
+        let _ = worksheet.set_name(&safe_name);
+
+        let max_cols = rows.iter().map(|r| r.len()).max().unwrap_or(1).max(1);
+        let mut col_widths = vec![10usize; max_cols];
+        for row in rows {
+            for (c, cell) in row.iter().enumerate() {
+                let max_line = cell
+                    .lines()
+                    .map(|l| l.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                if max_line + 3 > col_widths[c] {
+                    col_widths[c] = (max_line + 3).min(52);
+                }
+            }
+        }
+        for (c, &w) in col_widths.iter().enumerate() {
+            let _ = worksheet.set_column_width(c as u16, w as f64);
+        }
+
+        // Collect all cells covered by merges so regular cell writing skips them
+        let mut merged_cells: HashSet<(usize, usize)> = HashSet::new();
+        for m in merges {
+            if m.row_span == 0 || m.col_span == 0 {
+                continue;
+            }
+            for rr in m.row..(m.row + m.row_span) {
+                for cc in m.col..(m.col + m.col_span) {
+                    merged_cells.insert((rr, cc));
+                }
+            }
+        }
+
+        // Write non-merged cells
+        for (r_idx, row) in rows.iter().enumerate() {
+            let is_hdr = header_rows.contains(&r_idx);
+            let r_u32 = r_idx as u32;
+            for (c_idx, val) in row.iter().enumerate() {
+                if merged_cells.contains(&(r_idx, c_idx)) {
+                    continue;
+                }
+                let c_u16 = c_idx as u16;
+                if !is_hdr {
+                    if let Some((num, num_style)) =
+                        parse_excel_numeric_with_opts(val, normalize_comma_decimals)
+                    {
+                        let _ = worksheet.write_number_with_format(
+                            r_u32,
+                            c_u16,
+                            num,
+                            num_format_for(num_style),
+                        );
+                        continue;
+                    }
+                }
+                let fmt = if is_hdr { &fmt_header } else { &fmt_text };
+                let _ = worksheet.write_string_with_format(r_u32, c_u16, val, fmt);
+            }
+        }
+
+        // Apply merged ranges cleanly via rust_xlsxwriter::Worksheet::merge_range
+        for m in merges {
+            if m.row_span == 0 || m.col_span == 0 {
+                continue;
+            }
+            let r1 = m.row as u32;
+            let c1 = m.col as u16;
+            let r2 = (m.row + m.row_span - 1) as u32;
+            let c2 = (m.col + m.col_span - 1) as u16;
+            let is_hdr = header_rows.contains(&m.row);
+            let val = rows
+                .get(m.row)
+                .and_then(|r| r.get(m.col))
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if !is_hdr {
+                if let Some((num, num_style)) =
+                    parse_excel_numeric_with_opts(val, normalize_comma_decimals)
+                {
+                    let num_fmt = num_format_for(num_style);
+                    let _ = worksheet.merge_range(r1, c1, r2, c2, "", num_fmt);
+                    let _ = worksheet.write_number_with_format(r1, c1, num, num_fmt);
+                    continue;
+                }
+            }
+            let fmt = if is_hdr { &fmt_header } else { &fmt_text };
+            let _ = worksheet.merge_range(r1, c1, r2, c2, val, fmt);
+        }
     }
-    content_types.push_str("</Types>");
-    wb_rels.push_str("</Relationships>");
 
-    let workbook_xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
-         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-         <sheets>{wb_sheets}</sheets></workbook>"
-    );
-
-    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Relationships xmlns=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
-        </Relationships>";
-
-    zip.add_file("[Content_Types].xml", content_types.as_bytes());
-    zip.add_file("_rels/.rels", root_rels.as_bytes());
-    zip.add_file("xl/workbook.xml", workbook_xml.as_bytes());
-    zip.add_file("xl/styles.xml", xlsx_styles_xml().as_bytes());
-    zip.add_file("xl/_rels/workbook.xml.rels", wb_rels.as_bytes());
-    zip.finish()
+    workbook.save_to_buffer().unwrap_or_default()
 }
 
 /// Renders extracted `ExcelTableGrid`s to a valid OOXML `.xlsx` ZIP byte vector with `<mergeCells>`,
@@ -3111,13 +3043,8 @@ pub fn render_tables_to_xlsx(tables: &[ExcelTableGrid], opts: ExcelExportOptions
     finish_xlsx_workbook(&sheets, opts.normalize_comma_decimals)
 }
 
-fn build_xlsx_sheet_xml(rows: &[Vec<String>], bold_first_row: bool, sheet_idx: usize) -> String {
-    let hdr = if bold_first_row { &[0usize][..] } else { &[] };
-    build_xlsx_sheet_xml_with_merges(rows, &[], hdr, false, sheet_idx)
-}
-
 pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
-    let mut sheets: Vec<(String, Vec<Vec<String>>, bool)> = Vec::new();
+    let mut sheets: Vec<(String, Vec<Vec<String>>, Vec<CellMerge>, Vec<usize>)> = Vec::new();
     let mut text_rows: Vec<Vec<String>> = Vec::new();
     let mut table_num = 0usize;
 
@@ -3129,8 +3056,8 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
                     table_num += 1;
                     if sheets.len() < 28 {
                         let name = format!("Table {table_num} (p.{})", p_idx + 1);
-                        sheets.push((name, rows.clone(), true));
-                    } else if let Some((_, last_rows, _)) = sheets.last_mut() {
+                        sheets.push((name, rows.clone(), Vec::new(), vec![0]));
+                    } else if let Some((_, last_rows, _, _)) = sheets.last_mut() {
                         last_rows.push(Vec::new());
                         last_rows.push(vec![format!("Table {table_num} ({page_lbl})")]);
                         last_rows.extend(rows.iter().cloned());
@@ -3170,76 +3097,19 @@ pub fn render_blocks_to_xlsx(pages: &[Vec<ExportBlock>]) -> Vec<u8> {
         let mut with_hdr = Vec::with_capacity(text_rows.len() + 1);
         with_hdr.push(vec!["Page".to_string(), "Type".to_string(), "Content".to_string()]);
         with_hdr.extend(text_rows);
-        sheets.push(("Document Text".to_string(), with_hdr, true));
+        sheets.push(("Document Text".to_string(), with_hdr, Vec::new(), vec![0]));
     }
 
     if sheets.is_empty() {
         sheets.push((
             "Sheet1".to_string(),
             vec![vec!["(No extractable text or tables found in PDF)".to_string()]],
-            false,
+            Vec::new(),
+            Vec::new(),
         ));
     }
 
-    let mut content_types = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">\
-         <Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>\
-         <Default Extension=\"xml\" ContentType=\"application/xml\"/>\
-         <Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>\
-         <Override PartName=\"/xl/styles.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml\"/>",
-    );
-    let mut wb_sheets = String::new();
-    let mut wb_rels = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-         <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles\" Target=\"styles.xml\"/>",
-    );
-
-    let mut zip = MiniZipWriter::new();
-    for (idx, (raw_name, rows, bold_hdr)) in sheets.iter().enumerate() {
-        let s_num = idx + 1;
-        let rid = format!("rId{}", s_num + 1);
-        // Excel sheet names max 31 chars, no : \ / ? * [ ]
-        let safe_name: String = raw_name
-            .chars()
-            .filter(|c| !matches!(c, ':' | '\\' | '/' | '?' | '*' | '[' | ']'))
-            .take(31)
-            .collect();
-        content_types.push_str(&format!(
-            "<Override PartName=\"/xl/worksheets/sheet{s_num}.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>"
-        ));
-        wb_sheets.push_str(&format!(
-            "<sheet name=\"{}\" sheetId=\"{s_num}\" r:id=\"{rid}\"/>",
-            xml_escape(&safe_name)
-        ));
-        wb_rels.push_str(&format!(
-            "<Relationship Id=\"{rid}\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet{s_num}.xml\"/>"
-        ));
-        let sheet_xml = build_xlsx_sheet_xml(rows, *bold_hdr, idx);
-        zip.add_file(&format!("xl/worksheets/sheet{s_num}.xml"), sheet_xml.as_bytes());
-    }
-    content_types.push_str("</Types>");
-    wb_rels.push_str("</Relationships>");
-
-    let workbook_xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-         <workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" \
-         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">\
-         <sheets>{wb_sheets}</sheets></workbook>"
-    );
-
-    let root_rels = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\
-        <Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">\
-        <Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>\
-        </Relationships>";
-
-    zip.add_file("[Content_Types].xml", content_types.as_bytes());
-    zip.add_file("_rels/.rels", root_rels.as_bytes());
-    zip.add_file("xl/workbook.xml", workbook_xml.as_bytes());
-    zip.add_file("xl/styles.xml", xlsx_styles_xml().as_bytes());
-    zip.add_file("xl/_rels/workbook.xml.rels", wb_rels.as_bytes());
-    zip.finish()
+    finish_xlsx_workbook(&sheets, false)
 }
 
 /// Extracts reflowable plain-text paragraphs for the single-page Text View mode.
@@ -3735,9 +3605,8 @@ mod tests {
         let sheet1 = &entries.iter().find(|(n, _)| n == "xl/worksheets/sheet1.xml").unwrap().1;
         let styles = &entries.iter().find(|(n, _)| n == "xl/styles.xml").unwrap().1;
         assert!(sheet1.contains("<mergeCells count=\"1\"><mergeCell ref=\"A1:B1\"/></mergeCells>"), "sheet1: {sheet1}");
-        assert!(sheet1.contains("<v>1.085</v>") && sheet1.contains("s=\"8\""), "4-decimal comma float must write numeric f64 + style 8: {sheet1}");
+        assert!(sheet1.contains("<v>1.085</v>") && styles.contains("formatCode=\"#,##0.0000\""), "4-decimal comma float must write numeric f64 with #,##0.0000 format: {sheet1}");
         assert!(sheet1.contains("<v>152.4</v>"), "sheet1: {sheet1}");
-        assert!(styles.contains("formatCode=\"#,##0.0000\""), "styles: {styles}");
         assert!(styles.contains("wrapText=\"1\""), "styles: {styles}");
     }
 
@@ -3818,11 +3687,15 @@ mod tests {
         let cols_pos = sheet1.find("<cols>").expect("missing <cols>");
         assert!(dim_pos < views_pos && views_pos < cols_pos, "worksheet element order invalid: {sheet1}");
 
-        // 3. Non-top-left merged cells B1 (header s=1) and A3 (body s=2) are empty styled cells only
-        assert!(sheet1.contains("<c r=\"B1\" s=\"1\"/>"), "B1 must be empty styled cell: {sheet1}");
-        assert!(sheet1.contains("<c r=\"A3\" s=\"2\"/>"), "A3 must be empty styled cell: {sheet1}");
-        assert!(!sheet1.contains("<c r=\"B1\" t=\"inlineStr\""), "B1 must not emit inlineStr: {sheet1}");
-        assert!(!sheet1.contains("<c r=\"A3\" t=\"inlineStr\""), "A3 must not emit inlineStr: {sheet1}");
+        // 3. Non-top-left merged cells B1 and A3 are self-closing empty styled cells with no <is>/<v>
+        let b1_start = sheet1.find("<c r=\"B1\"").expect("missing B1");
+        let b1_tag = &sheet1[b1_start..sheet1[b1_start..].find('>').unwrap() + b1_start + 1];
+        assert!(b1_tag.ends_with("/>") && !b1_tag.contains("t="), "B1 must be empty styled cell: {b1_tag}");
+
+        let a3_start = sheet1.find("<c r=\"A3\"").expect("missing A3");
+        let a3_tag = &sheet1[a3_start..sheet1[a3_start..].find('>').unwrap() + a3_start + 1];
+        assert!(a3_tag.ends_with("/>") && !a3_tag.contains("t="), "A3 must be empty styled cell: {a3_tag}");
+
         assert!(ct.contains("/xl/worksheets/sheet1.xml"), "Content_Types missing sheet1");
     }
 }
