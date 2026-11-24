@@ -226,10 +226,10 @@ impl<'a> PdfViewerApp<'a> {
                 self.request_redraw();
             }
             MarkdownExportHit::ExportPdf => {
-                self.run_markdown_pdf_export();
+                self.pending_dialog = Some(PendingDialog::ExportMdPdf);
             }
             MarkdownExportHit::ExportDocx => {
-                self.run_markdown_docx_export();
+                self.pending_dialog = Some(PendingDialog::ExportMdDocx);
             }
         }
     }
@@ -268,7 +268,7 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    fn run_markdown_pdf_export(&mut self) {
+    pub(super) fn run_markdown_pdf_export(&mut self) {
         let Some(ref md) = self.markdown_doc else { return };
         let Some(ref modal) = self.markdown_export_modal else { return };
         let page_size = modal.page_size;

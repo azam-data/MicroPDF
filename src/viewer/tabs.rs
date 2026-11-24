@@ -190,6 +190,8 @@ impl<'a> PdfViewerApp<'a> {
 
         self.file_path = path.clone();
         self.current_page_index = 0;
+        self.view_mode = ViewMode::FitWidth;
+        self.last_page_view_mode = ViewMode::FitWidth;
         self.zoom_level = 1.0;
         self.pan_x = 0.0;
         self.scroll_y = 0.0;

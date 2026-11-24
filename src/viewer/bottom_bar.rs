@@ -496,7 +496,12 @@ impl<'a> PdfViewerApp<'a> {
                 self.toggle_view_mode();
             }
             BottomBarAction::PrevPage => {
-                self.step_pages_backward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(-step);
+                } else {
+                    self.step_pages_backward();
+                }
             }
             BottomBarAction::PageJump => {
                 if self.doc.is_some() {
@@ -504,7 +509,12 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             BottomBarAction::NextPage => {
-                self.step_pages_forward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(step);
+                } else {
+                    self.step_pages_forward();
+                }
             }
             BottomBarAction::ZoomOut => {
                 self.zoom_by_step(0.8);

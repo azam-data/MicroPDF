@@ -1016,6 +1016,19 @@ impl<'a> PdfViewerApp<'a> {
     /// or in any page view when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
+        if self.is_markdown_tab() {
+            if let Some(w) = self.window.as_ref() {
+                let sz = w.inner_size();
+                let sf = self.effective_scale_factor(w.scale_factor());
+                let top_bars_h = self.top_bars_height_px(sf);
+                let status_bar_h = self.status_bar_height_px(sf);
+                let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
+                let max_s = self.md_max_scroll_y(canvas_h, sf);
+                self.scroll_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
+                self.request_redraw();
+            }
+            return true;
+        }
         if self.view_mode.is_page_view() {
             match self.effective_scroll_mode() {
                 ScrollMode::ContinuousVertical => {
@@ -4590,30 +4603,61 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowRight) => {
                 if self.alt_pressed {
                     self.navigate_forward();
+                } else if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(step);
                 } else if !self.pan_horizontal(64.0) {
                     self.step_pages_forward();
                 }
             }
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
-                self.step_pages_forward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(step);
+                } else {
+                    self.step_pages_forward();
+                }
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 if self.alt_pressed {
                     self.navigate_back();
+                } else if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(-step);
                 } else if !self.pan_horizontal(-64.0) {
                     self.step_pages_backward();
                 }
             }
             Key::Named(NamedKey::PageUp) => {
-                self.step_pages_backward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(-step);
+                } else {
+                    self.step_pages_backward();
+                }
             }
             Key::Named(NamedKey::Home) => {
-                self.navigate_to_page(0);
+                if self.is_markdown_tab() {
+                    self.scroll_y = 0.0;
+                    self.request_redraw();
+                } else {
+                    self.navigate_to_page(0);
+                }
             }
             Key::Named(NamedKey::End) => {
-                let total = self.total_pages();
-                if total > 0 {
-                    self.navigate_to_page(total - 1);
+                if self.is_markdown_tab() {
+                    if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = self.effective_scale_factor(w.scale_factor());
+                        let canvas_h = sz.height.saturating_sub(self.top_bars_height_px(sf) + self.status_bar_height_px(sf));
+                        self.scroll_y = self.md_max_scroll_y(canvas_h, sf);
+                        self.request_redraw();
+                    }
+                } else {
+                    let total = self.total_pages();
+                    if total > 0 {
+                        self.navigate_to_page(total - 1);
+                    }
                 }
             }
             Key::Character(ch) => {
@@ -4848,6 +4892,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ExportLatex => self.export_latex_dialog(),
                 PendingDialog::ExportDocx => self.export_docx_dialog(),
                 PendingDialog::ExportXlsx => self.export_xlsx_dialog(),
+                PendingDialog::ExportMdPdf => self.run_markdown_pdf_export(),
+                PendingDialog::ExportMdDocx => self.run_markdown_docx_export(),
                 PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
                 PendingDialog::ImportStampAssetPng => self.import_stamp_asset_png_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
@@ -6512,7 +6558,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // 0d. Welcome Screen clicks when no document is open
-                if self.doc.is_none() {
+                if self.doc.is_none() && !self.is_markdown_tab() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(oh) = self.hit_test_welcome(
                             self.cursor_pos.0,

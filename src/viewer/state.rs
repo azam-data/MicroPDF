@@ -1016,6 +1016,8 @@ pub(super) enum PendingDialog {
     ExportLatex,
     ExportDocx,
     ExportXlsx,
+    ExportMdPdf,
+    ExportMdDocx,
     #[allow(dead_code)]
     PickStampImage,
     ImportStampAssetPng,
