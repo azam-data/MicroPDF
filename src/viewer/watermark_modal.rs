@@ -9,6 +9,7 @@ use crate::engine::{PdfEngine, WatermarkConfig, WatermarkPlacement};
 use pdfium_render::prelude::*;
 
 use super::deskew::parse_deskew_page_range;
+use super::font_dropdown::*;
 use super::render::{blend_rect_rgba, fill_rect_clipped};
 use super::state::*;
 use super::ui_draw::*;
@@ -35,8 +36,9 @@ pub(super) enum WatermarkHit {
     PrevPage,
     NextPage,
     FocusText,
-    FontPrev,
-    FontNext,
+    FontDropdownToggle,
+    FontDropdownPopup(FontDropdownHit),
+    FontDropdownClose,
     SizeMinus,
     SizePlus,
     OpacityMinus,
@@ -84,6 +86,7 @@ pub(super) struct WatermarkModalState {
     /// `(page_idx, avail_w, avail_h, rw, rh, pixels)`
     pub(super) preview_cache: Option<(u16, u32, u32, u32, u32, Vec<u32>)>,
     pub(super) status_msg: Option<(String, bool)>,
+    pub(super) font_dropdown: FontDropdownState,
 }
 
 impl WatermarkModalState {
@@ -96,6 +99,7 @@ impl WatermarkModalState {
             preview_page: current_page,
             preview_cache: None,
             status_msg: None,
+            font_dropdown: FontDropdownState::default(),
         }
     }
 }
@@ -250,8 +254,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // 2. System Font Picker
         cy += lbl_h;
-        hits.push(WmBox { x: ix, y: cy, w: sm, h: row_h, hit: WatermarkHit::FontPrev });
-        hits.push(WmBox { x: ix + iw as i32 - sm as i32, y: cy, w: sm, h: row_h, hit: WatermarkHit::FontNext });
+        hits.push(WmBox { x: ix, y: cy, w: iw, h: row_h, hit: WatermarkHit::FontDropdownToggle });
         cy += row_h as i32 + (8.0 * s).round() as i32;
 
         // 3. Font Size & Opacity
@@ -545,16 +548,24 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // 2. System Font Picker
-        if let (Some(fp), Some(fnx)) = (find(WatermarkHit::FontPrev), find(WatermarkHit::FontNext)) {
-            draw_text(buffer, buf_w, buf_h, fp.x, fp.y - lbl_h, "Font Family (System & Built-in)", lbl_sz, theme.text_muted, true);
-            draw_pill(buffer, fp, "<", false);
-            draw_pill(buffer, fnx, ">", false);
-            let bx = fp.x + fp.w as i32 + 4;
-            let bw = (fnx.x - bx - 4).max(40) as u32;
-            fill_rounded_rect(buffer, buf_w, buf_h, bx, fp.y, bw, fp.h, btn_rad, theme.input_bg);
-            stroke_rounded_rect(buffer, buf_w, buf_h, bx, fp.y, bw, fp.h, btn_rad, theme.border_subtle);
-            let clipped = truncate_ellipsis(&st.cfg.font_name, (bw.saturating_sub(12)) as f32, body_sz, false);
-            draw_text_vcenter(buffer, buf_w, buf_h, bx + 6, fp.y, fp.h, bx + bw as i32 - 4, &clipped, body_sz, theme.text_primary, false);
+        if let Some(r) = find(WatermarkHit::FontDropdownToggle) {
+            draw_text(buffer, buf_w, buf_h, r.x, r.y - lbl_h, "Font Family (System & Built-in)", lbl_sz, theme.text_muted, true);
+            let hov = self.hovered_widget == Some(UiHit::Watermark(WatermarkHit::FontDropdownToggle));
+            draw_font_dropdown_button(
+                buffer,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                &st.cfg.font_name,
+                None,
+                st.font_dropdown.open,
+                hov,
+                &theme,
+                s,
+            );
         }
 
         // 3. Font Size & Opacity
@@ -688,6 +699,23 @@ impl<'a> PdfViewerApp<'a> {
         if let Some(cb) = find(WatermarkHit::Cancel) {
             draw_pill(buffer, cb, "Cancel", false);
         }
+        if st.font_dropdown.open {
+            if let Some(r) = find(WatermarkHit::FontDropdownToggle) {
+                draw_font_dropdown_popup(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
+                    sf,
+                    &st.font_dropdown,
+                    &st.cfg.font_name,
+                    &theme,
+                );
+            }
+        }
     }
 
     pub(super) fn hit_test_watermark_modal(
@@ -698,9 +726,32 @@ impl<'a> PdfViewerApp<'a> {
         buf_h: u32,
         sf: f64,
     ) -> Option<WatermarkHit> {
+        let st = self.watermark_modal.as_ref()?;
         let (x, y, w, h, _, hits) = self.watermark_modal_layout(buf_w, buf_h, sf)?;
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
+        if st.font_dropdown.open {
+            if let Some(anchor) = hits.iter().find(|b| b.hit == WatermarkHit::FontDropdownToggle) {
+                if let Some(pop_hit) = hit_test_font_dropdown_popup(
+                    ix,
+                    iy,
+                    anchor.x,
+                    anchor.y,
+                    anchor.w,
+                    anchor.h,
+                    buf_w,
+                    buf_h,
+                    sf,
+                    &st.font_dropdown,
+                ) {
+                    return Some(WatermarkHit::FontDropdownPopup(pop_hit));
+                }
+                if anchor.contains(ix, iy) {
+                    return Some(WatermarkHit::FontDropdownToggle);
+                }
+            }
+            return Some(WatermarkHit::FontDropdownClose);
+        }
         if ix < x || ix >= x + w as i32 || iy < y || iy >= y + h as i32 {
             return None;
         }
@@ -737,14 +788,34 @@ impl<'a> PdfViewerApp<'a> {
                     m.focus = WatermarkFocus::Text;
                 }
             }
-            WatermarkHit::FontPrev => {
+            WatermarkHit::FontDropdownToggle => {
                 if let Some(m) = self.watermark_modal.as_mut() {
-                    m.cfg.font_name = crate::fonts::step_font_name(&m.cfg.font_name, -1);
+                    let cur = m.cfg.font_name.clone();
+                    m.font_dropdown.toggle(&cur);
                 }
             }
-            WatermarkHit::FontNext => {
+            WatermarkHit::FontDropdownClose => {
                 if let Some(m) = self.watermark_modal.as_mut() {
-                    m.cfg.font_name = crate::fonts::step_font_name(&m.cfg.font_name, 1);
+                    m.font_dropdown.close();
+                }
+            }
+            WatermarkHit::FontDropdownPopup(pop) => {
+                if let Some(m) = self.watermark_modal.as_mut() {
+                    match pop {
+                        FontDropdownHit::Row(idx) => {
+                            if let Some(entry) = crate::fonts::global_system_fonts().get(idx) {
+                                m.cfg.font_name = entry.display_name.clone();
+                            }
+                            m.font_dropdown.close();
+                        }
+                        FontDropdownHit::TrackPageUp => {
+                            m.font_dropdown.scroll_by(-(FONT_DROPDOWN_MAX_ROWS as isize));
+                        }
+                        FontDropdownHit::TrackPageDown => {
+                            m.font_dropdown.scroll_by(FONT_DROPDOWN_MAX_ROWS as isize);
+                        }
+                        FontDropdownHit::InsidePopup => {}
+                    }
                 }
             }
             WatermarkHit::SizeMinus => {
@@ -871,7 +942,13 @@ impl<'a> PdfViewerApp<'a> {
         use winit::keyboard::{Key, NamedKey};
         match key {
             Key::Named(NamedKey::Escape) => {
-                self.watermark_modal = None;
+                if self.watermark_modal.as_ref().is_some_and(|m| m.font_dropdown.open) {
+                    if let Some(m) = self.watermark_modal.as_mut() {
+                        m.font_dropdown.close();
+                    }
+                } else {
+                    self.watermark_modal = None;
+                }
                 self.request_redraw();
             }
             Key::Named(NamedKey::Enter) => {

@@ -942,6 +942,14 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn zoom_by_step(&mut self, factor: f32) {
+        if self.is_markdown_tab() {
+            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 2.2);
+            let pct = (self.zoom_level * 100.0).round() as u32;
+            self.status_notice = Some(format!("Markdown Zoom: {pct}%"));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         let target = (self.zoom_level * factor).clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL);
         let (cx, cy) = self.cursor_pos;
         self.set_zoom_around_cursor(target, cx, cy);
@@ -952,6 +960,12 @@ impl<'a> PdfViewerApp<'a> {
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
+        if self.is_markdown_tab() {
+            self.status_notice = Some("Markdown Zoom reset to 100%".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         if let Some(ref mut cmp) = self.compare_mode {
             cmp.fit_mode = super::compare_mode::CompareFitMode::ActualSize;
             cmp.invalidate_caches();
@@ -1002,6 +1016,19 @@ impl<'a> PdfViewerApp<'a> {
     /// or in any page view when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
+        if self.is_markdown_tab() {
+            if let Some(w) = self.window.as_ref() {
+                let sz = w.inner_size();
+                let sf = self.effective_scale_factor(w.scale_factor());
+                let top_bars_h = self.top_bars_height_px(sf);
+                let status_bar_h = self.status_bar_height_px(sf);
+                let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
+                let max_s = self.md_max_scroll_y(canvas_h, sf);
+                self.scroll_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
+                self.request_redraw();
+            }
+            return true;
+        }
         if self.view_mode.is_page_view() {
             match self.effective_scroll_mode() {
                 ScrollMode::ContinuousVertical => {
@@ -1752,7 +1779,9 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .add_filter("Supported Documents (PDF, Markdown)", &["pdf", "md", "markdown"])
             .add_filter("PDF Document", &["pdf"])
+            .add_filter("Markdown Document", &["md", "markdown"])
             .pick_file()
         {
             let fname = path
@@ -1948,8 +1977,12 @@ impl<'a> PdfViewerApp<'a> {
         self.request_redraw();
     }
 
-    /// Exports the currently open PDF to a native Microsoft Word (`.docx`) document using pure Rust.
+    /// Exports the currently open PDF (or Markdown tab) to a native Microsoft Word (`.docx`) document using pure Rust.
     pub(super) fn export_docx_dialog(&mut self) {
+        if self.is_markdown_tab() {
+            self.run_markdown_docx_export();
+            return;
+        }
         if self.doc.is_none() {
             self.status_notice = Some("Open a PDF first to export to Word (.docx)".to_string());
             self.request_redraw();
@@ -2678,6 +2711,10 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Triggers Print Preview (`Ctrl/Cmd+P` or `File -> Print...`) of the current in-memory document.
     pub(super) fn trigger_print(&mut self) {
+        if self.is_markdown_tab() {
+            self.open_markdown_export_modal();
+            return;
+        }
         self.open_print_preview();
     }
 
@@ -3396,6 +3433,19 @@ impl<'a> PdfViewerApp<'a> {
             }
             return;
         }
+        // 0a5b. Export Markdown modal
+        if self.markdown_export_modal.is_some() {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.handle_markdown_export_click(super::markdown_export_modal::MarkdownExportHit::Cancel);
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.handle_markdown_export_click(super::markdown_export_modal::MarkdownExportHit::ExportPdf);
+                }
+                _ => {}
+            }
+            return;
+        }
         // 0a6. Split to Single-Page PDFs modal
         if self.split_pages_modal.is_some() {
             self.handle_split_pages_key(&logical_key, text);
@@ -3558,7 +3608,14 @@ impl<'a> PdfViewerApp<'a> {
             }
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    self.handle_header_footer_click(HeaderFooterHit::Cancel);
+                    if self.header_footer_modal.as_ref().is_some_and(|m| m.font_dropdown.open) {
+                        if let Some(m) = self.header_footer_modal.as_mut() {
+                            m.font_dropdown.close();
+                        }
+                        self.request_redraw();
+                    } else {
+                        self.handle_header_footer_click(HeaderFooterHit::Cancel);
+                    }
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.handle_header_footer_click(HeaderFooterHit::Apply);
@@ -3669,7 +3726,14 @@ impl<'a> PdfViewerApp<'a> {
             let total = self.total_pages().max(1);
             match logical_key {
                 Key::Named(NamedKey::Escape) => {
-                    self.handle_page_number_click(PageNumberHit::Cancel);
+                    if self.page_number_modal.as_ref().is_some_and(|m| m.font_dropdown.open) {
+                        if let Some(m) = self.page_number_modal.as_mut() {
+                            m.font_dropdown.close();
+                        }
+                        self.request_redraw();
+                    } else {
+                        self.handle_page_number_click(PageNumberHit::Cancel);
+                    }
                 }
                 Key::Named(NamedKey::Enter) => {
                     self.handle_page_number_click(PageNumberHit::Apply);
@@ -4539,30 +4603,61 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowRight) => {
                 if self.alt_pressed {
                     self.navigate_forward();
+                } else if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(step);
                 } else if !self.pan_horizontal(64.0) {
                     self.step_pages_forward();
                 }
             }
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
-                self.step_pages_forward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(step);
+                } else {
+                    self.step_pages_forward();
+                }
             }
             Key::Named(NamedKey::ArrowLeft) => {
                 if self.alt_pressed {
                     self.navigate_back();
+                } else if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(-step);
                 } else if !self.pan_horizontal(-64.0) {
                     self.step_pages_backward();
                 }
             }
             Key::Named(NamedKey::PageUp) => {
-                self.step_pages_backward();
+                if self.is_markdown_tab() {
+                    let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                    self.scroll_or_turn_page_vertical(-step);
+                } else {
+                    self.step_pages_backward();
+                }
             }
             Key::Named(NamedKey::Home) => {
-                self.navigate_to_page(0);
+                if self.is_markdown_tab() {
+                    self.scroll_y = 0.0;
+                    self.request_redraw();
+                } else {
+                    self.navigate_to_page(0);
+                }
             }
             Key::Named(NamedKey::End) => {
-                let total = self.total_pages();
-                if total > 0 {
-                    self.navigate_to_page(total - 1);
+                if self.is_markdown_tab() {
+                    if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = self.effective_scale_factor(w.scale_factor());
+                        let canvas_h = sz.height.saturating_sub(self.top_bars_height_px(sf) + self.status_bar_height_px(sf));
+                        self.scroll_y = self.md_max_scroll_y(canvas_h, sf);
+                        self.request_redraw();
+                    }
+                } else {
+                    let total = self.total_pages();
+                    if total > 0 {
+                        self.navigate_to_page(total - 1);
+                    }
                 }
             }
             Key::Character(ch) => {
@@ -4797,6 +4892,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ExportLatex => self.export_latex_dialog(),
                 PendingDialog::ExportDocx => self.export_docx_dialog(),
                 PendingDialog::ExportXlsx => self.export_xlsx_dialog(),
+                PendingDialog::ExportMdPdf => self.run_markdown_pdf_export(),
+                PendingDialog::ExportMdDocx => self.run_markdown_docx_export(),
                 PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
                 PendingDialog::ImportStampAssetPng => self.import_stamp_asset_png_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
@@ -4887,9 +4984,27 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                     return;
                 }
+                if Self::is_markdown_path(&dropped_path) {
+                    let fname = dropped_path
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("document.md")
+                        .to_string();
+                    match self.open_document_in_new_tab(dropped_path) {
+                        Ok(()) => {
+                            self.status_notice = Some(format!("Opened Markdown '{fname}'"));
+                        }
+                        Err(e) => {
+                            self.status_notice = Some(format!("Error opening '{fname}': {e}"));
+                        }
+                    }
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                }
                 if !ext.eq_ignore_ascii_case("pdf") {
                     self.status_notice = Some(format!(
-                        "Dropped file {:?} is not a .pdf, .txt, or .png/.jpg",
+                        "Dropped file {:?} is not a .pdf, .md, .txt, or .png/.jpg",
                         dropped_path
                     ));
                     self.update_title_bar();
@@ -5004,6 +5119,33 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.scroll_user_guide((-dy) as f32);
                     return;
                 }
+                if let Some(ref mut m) = self.header_footer_modal {
+                    if m.font_dropdown.open {
+                        if dy.abs() > 0.1 {
+                            m.font_dropdown.scroll_by(if dy < 0.0 { 2 } else { -2 });
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                }
+                if let Some(ref mut m) = self.page_number_modal {
+                    if m.font_dropdown.open {
+                        if dy.abs() > 0.1 {
+                            m.font_dropdown.scroll_by(if dy < 0.0 { 2 } else { -2 });
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                }
+                if let Some(ref mut m) = self.watermark_modal {
+                    if m.font_dropdown.open {
+                        if dy.abs() > 0.1 {
+                            m.font_dropdown.scroll_by(if dy < 0.0 { 2 } else { -2 });
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                }
                 if self.has_blocking_modal()
                     || self.open_menu.is_some()
                     || self.tab_context_menu.is_some()
@@ -5059,6 +5201,29 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                         return;
                     }
+                }
+
+                if self.is_markdown_tab() {
+                    if self.cmd_or_ctrl_pressed {
+                        if dy.abs() > 0.1 {
+                            let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 2.2);
+                            let pct = (self.zoom_level * 100.0).round() as u32;
+                            self.status_notice = Some(format!("Markdown Zoom: {pct}%"));
+                            self.update_title_bar();
+                            self.request_redraw();
+                        }
+                    } else if let Some(w) = self.window.as_ref() {
+                        let sz = w.inner_size();
+                        let sf = self.effective_scale_factor(w.scale_factor());
+                        let top_bars_h = self.top_bars_height_px(sf);
+                        let status_bar_h = self.status_bar_height_px(sf);
+                        let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
+                        let max_s = self.md_max_scroll_y(canvas_h, sf);
+                        self.scroll_y = (self.scroll_y - dy as f32).clamp(0.0, max_s);
+                        self.request_redraw();
+                    }
+                    return;
                 }
 
                 // Ctrl/Cmd + MouseWheel zooms around the cursor position (25%..=800%)
@@ -5271,6 +5436,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::ExcelExport(h));
                         }
                     }
+                } else if self.markdown_export_modal.is_some() {
+                    if let Some(h) = self.hit_test_markdown_export_modal(
+                        position.x.round() as i32,
+                        position.y.round() as i32,
+                        win_w,
+                        win_h,
+                        sf,
+                    ) {
+                        if h != super::markdown_export_modal::MarkdownExportHit::InsideModal {
+                            new_hover = Some(UiHit::MarkdownExport(h));
+                        }
+                    }
                 } else if self.split_pages_modal.is_some() {
                     if let Some(h) = self.hit_test_split_pages_modal(position.x, position.y, win_w, win_h, sf) {
                         if h != super::split_pages_modal::SplitPagesHit::InsideModal {
@@ -5279,6 +5456,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 } else if self.watermark_modal.is_some() {
                     if let Some(h) = self.hit_test_watermark_modal(position.x, position.y, win_w, win_h, sf) {
+                        if let Some(m) = self.watermark_modal.as_mut() {
+                            m.font_dropdown.hover_idx = match h {
+                                super::watermark_modal::WatermarkHit::FontDropdownPopup(
+                                    super::font_dropdown::FontDropdownHit::Row(idx),
+                                ) => Some(idx),
+                                _ => None,
+                            };
+                        }
                         if h != super::watermark_modal::WatermarkHit::InsideModal {
                             new_hover = Some(UiHit::Watermark(h));
                         }
@@ -5303,6 +5488,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         win_h,
                         sf,
                     ) {
+                        if let Some(m) = self.header_footer_modal.as_mut() {
+                            m.font_dropdown.hover_idx = match h {
+                                super::doc_tools_modal::HeaderFooterHit::FontDropdownPopup(
+                                    super::font_dropdown::FontDropdownHit::Row(idx),
+                                ) => Some(idx),
+                                _ => None,
+                            };
+                        }
                         if h != super::doc_tools_modal::HeaderFooterHit::InsideModal {
                             new_hover = Some(UiHit::HeaderFooter(h));
                         }
@@ -5315,6 +5508,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         win_h,
                         sf,
                     ) {
+                        if let Some(m) = self.page_number_modal.as_mut() {
+                            m.font_dropdown.hover_idx = match h {
+                                super::doc_tools_modal::PageNumberHit::FontDropdownPopup(
+                                    super::font_dropdown::FontDropdownHit::Row(idx),
+                                ) => Some(idx),
+                                _ => None,
+                            };
+                        }
                         if h != super::doc_tools_modal::PageNumberHit::InsideModal {
                             new_hover = Some(UiHit::PageNumber(h));
                         }
@@ -5471,9 +5672,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 SidebarHit::BookmarkRow { index, on_delete: false } => UiHit::SidebarRow(index),
                             });
                         }
-                    } else if new_hover.is_none() && self.doc.is_none() {
+                    } else if new_hover.is_none() && self.doc.is_none() && !self.is_markdown_tab() {
                         if let Some(oh) = self.hit_test_welcome(position.x, position.y, win_w, win_h, top_bars_h, status_bar_h, sf) {
                             new_hover = Some(UiHit::Overlay(oh));
+                        }
+                    } else if new_hover.is_none() && self.is_markdown_tab() {
+                        if let Some(mh) = self.hit_test_markdown_view(position.x, position.y) {
+                            new_hover = Some(UiHit::MarkdownView(mh));
                         }
                     } else if new_hover.is_none() && self.view_mode == ViewMode::TextView {
                         if let Some(th) = self.hit_test_text_view(position.x, position.y, sidebar_w, top_bars_h, win_w, sf) {
@@ -5767,6 +5972,26 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             Some(hit) => self.handle_excel_export_click(hit),
                             None => {
                                 self.excel_export_modal = None;
+                                self.request_redraw();
+                            }
+                        }
+                    }
+                    return;
+                }
+
+                // Export Markdown modal
+                if self.markdown_export_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        match self.hit_test_markdown_export_modal(
+                            self.cursor_pos.0.round() as i32,
+                            self.cursor_pos.1.round() as i32,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            Some(hit) => self.handle_markdown_export_click(hit),
+                            None => {
+                                self.markdown_export_modal = None;
                                 self.request_redraw();
                             }
                         }
@@ -6333,7 +6558,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // 0d. Welcome Screen clicks when no document is open
-                if self.doc.is_none() {
+                if self.doc.is_none() && !self.is_markdown_tab() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(oh) = self.hit_test_welcome(
                             self.cursor_pos.0,
@@ -6521,6 +6746,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
+                // 0d2. Markdown Reader View controls & links
+                if self.is_markdown_tab() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(hit) = self.hit_test_markdown_view(self.cursor_pos.0, self.cursor_pos.1) {
+                            self.handle_markdown_click(hit);
+                            return;
+                        }
+                    }
+                }
+
                 // 0d2. Reflowable Text View header controls
                 if self.view_mode == ViewMode::TextView {
                     if state == ElementState::Pressed && button == MouseButton::Left {
@@ -6642,6 +6877,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                             ));
                                             self.update_title_bar();
                                             self.request_redraw();
+                                        } else if self.is_markdown_tab() {
+                                            self.selected_bookmark = Some(bm_idx);
+                                            let block_idx = self.bookmarks[bm_idx].page_index;
+                                            self.scroll_to_md_heading(block_idx);
                                         } else {
                                             self.selected_bookmark = Some(bm_idx);
                                             let target_page =

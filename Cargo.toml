@@ -1,6 +1,6 @@
 [package]
 name = "micro_pdf"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2024"
 description = "Fast, ultra-lightweight, portable PDF viewer and power editor"
 authors = ["azam-data"]
@@ -18,6 +18,8 @@ ab_glyph = "0.2"
 ttf-parser = "0.25"
 flate2 = "1"
 rust_xlsxwriter = "0.84"
+pulldown-cmark = { version = "0.13", default-features = false }
+docx-rs = "0.4"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

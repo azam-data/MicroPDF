@@ -702,9 +702,9 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S) / Watermark Dialog"),
+            ("O / S / W", "Open PDF or Markdown (.md) / Save / Watermark Dialog"),
             ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
-            ("Ctrl+P", "Print Preview (10 Paper Sizes, Manual 2-Sided)"),
+            ("Ctrl+P", "Print Preview (or Export Markdown to PDF / Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
             ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
@@ -769,7 +769,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.4.0 — Portable PDF Viewer & Editor", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.5.0 — Portable PDF & Markdown Viewer & Editor", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);

@@ -1,12 +1,12 @@
 # MicroPDF
 
-**MicroPDF** is a fast, ultra-lightweight, portable PDF viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), and [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter).
+**MicroPDF** is a fast, ultra-lightweight, portable PDF & Markdown viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter), [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), and [`docx-rs`](https://crates.io/crates/docx-rs).
 
 **Zero GPU. Zero GUI toolkit. Zero installer.** Every menu, tab, toolbar, modal dialog, and live preview is CPU-rendered directly into the window frame buffer with minimal RAM and zero OS breadcrumbs.
 
 ---
 
-## Download & Portable Install (`v1.4.0`)
+## Download & Portable Install (`v1.5.0`)
 
 Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
 
@@ -30,13 +30,14 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
 
 ---
 
-## What's New in v1.4.0
+## What's New in v1.5.0
 
+- **Styled Markdown (`.md` / `.markdown`) Reader & Export (`PDF` + `.docx`):** Open Markdown files alongside PDFs via File → Open, drag-and-drop, or CLI. Features an editorial Light/Dark reading column, automatic `#`–`###` outline sidebar, GFM tables, code blocks with **Copy** button & horizontal scroll, clickable links, zoom (`Ctrl+`/`-`/`0`), live Reload, **Export to Styled PDF** (A4/Letter, repeated table headers, `Page X of Y`), and **Export to Styled Word (`.docx`)** via `docx-rs`.
+- **Scrollable System Font Dropdown:** Compact, scrollable dropdown across **Watermark**, **Header & Footer**, and **Page Numbering** dialogs with mouse-wheel scrolling and automatic system font scanning via `ttf-parser`.
 - **Hand Tool & Horizontal/Vertical Scrollbars (Normal & Compare Windows):** Click the **Hand** toolbar button (or **Hand** toggle in Compare Mode) to grab-and-pan zoomed pages in 2D, or drag the bottom horizontal and right vertical overlay scrollbars.
 - **Full Compare Mode Viewing Modes:** Compare Two PDFs now supports **Fit Page**, **Fit Width**, **100% Actual Size**, and custom zoom (`25%–400%`) with lockstep 2D scrolling, panning, page offset, pane swap, and CPU **Visual Diff** overlay.
 - **Split PDF to Single-Page PDFs:** Lossless folder export (`Tools -> Split to Single-Page PDFs...`) with All / Current / Custom Range and zero-padded `<prefix>_page_001.pdf` filenames.
-- **Shared System Font Picker:** Scans OS `.ttf`/`.otf` fonts via `ttf-parser` with clean human-readable names across **Watermark**, **Header & Footer**, and **Page Numbering** dialogs (plus built-in PDF font fallbacks).
-- **Detailed Watermark Dialog with Live Preview (`W`):** Real-time rotated & alpha-blended preview with System Font Picker, size, 6 colors, `-180°..+180°` rotation (`-45°/0°/+45°` presets), opacity (`5%–100%`), Centered / Custom Position / Tiled Grid coverage, and page range.
+- **Detailed Watermark Dialog with Live Preview (`W`):** Real-time rotated & alpha-blended preview with System Font Dropdown, size, 6 colors, `-180°..+180°` rotation (`-45°/0°/+45°` presets), opacity (`5%–100%`), Centered / Custom Position / Tiled Grid coverage, and page range.
 - **Portable Stamp & Signature Manager (`P`):** Embedded freehand **Signature Pad** (Black/Blue ink, Clear, Save PNG), 5 customizable preset stamps (`APPROVED`, `CONFIDENTIAL`, `DRAFT`, `REVIEWED`, `COPY`), custom text & PNG stamps, Rename/Delete, and click-and-drag placement — stored portably in `./micropdf_assets/`.
 - **Lightweight Matrix Page Deskew (`Page -> Deskew Page(s)...`):** Straighten tilted scans (`-15.0°..+15.0°`, `0.1°` step) with Draw Guideline auto-snap, alignment grid, and live preview using lossless 2D affine transforms (zero rasterization).
 - **Hybrid Lattice + Stream PDF-to-Excel Engine (`Export -> Export to Excel (.xlsx)...`):** Vector gridline & thin-rectangle extraction with connected-component isolation for side-by-side tables, merged-cell detection, Stream gutter fallback, `/Rotate 90/180/270` landscape page normalization, financial comma-decimal parsing, and native desktop Microsoft Excel output via `rust_xlsxwriter`.
