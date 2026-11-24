@@ -1964,8 +1964,12 @@ impl<'a> PdfViewerApp<'a> {
         self.request_redraw();
     }
 
-    /// Exports the currently open PDF to a native Microsoft Word (`.docx`) document using pure Rust.
+    /// Exports the currently open PDF (or Markdown tab) to a native Microsoft Word (`.docx`) document using pure Rust.
     pub(super) fn export_docx_dialog(&mut self) {
+        if self.is_markdown_tab() {
+            self.run_markdown_docx_export();
+            return;
+        }
         if self.doc.is_none() {
             self.status_notice = Some("Open a PDF first to export to Word (.docx)".to_string());
             self.request_redraw();

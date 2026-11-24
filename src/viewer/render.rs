@@ -1619,6 +1619,13 @@ impl<'a> PdfViewerApp<'a> {
         let total = self.total_pages();
         let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
 
+        if self.is_markdown_tab() {
+            let max_s = self.md_max_scroll_y(content_h, scale_factor);
+            self.scroll_y = (frac * max_s).clamp(0.0, max_s);
+            self.request_redraw();
+            return;
+        }
+
         if let Some(cmp_max_y) = self.compare_mode.as_ref().map(|c| c.max_scroll_y) {
             if cmp_max_y > 1.0 {
                 self.scroll_y = frac * cmp_max_y;

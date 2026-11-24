@@ -550,9 +550,13 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
         let s = sf as f32;
-        let max_col = (780.0 * s).round() as u32;
         let pad_x = (36.0 * s).round() as u32;
-        let col_w = canvas_w.saturating_sub(pad_x * 2).min(max_col).max(200);
+        let full_w = canvas_w.saturating_sub(pad_x * 2).max(200);
+        let col_w = if self.view_mode == ViewMode::FitPage {
+            full_w.min((780.0 * s).round() as u32).max(200)
+        } else {
+            full_w
+        };
         let zoom_bits = self.zoom_level.to_bits();
         let sf_bits = sf.to_bits();
         let doc_gen = self.md_doc_gen;
@@ -676,11 +680,8 @@ impl<'a> PdfViewerApp<'a> {
         let x0 = sidebar_w as i32;
         let y0 = top_bars_h as i32;
 
-        // Reading canvas background (slightly cleaner editorial tone than PDF desk)
-        let page_bg = match self.ui_theme_mode {
-            UiThemeMode::Dark => 0x001E_2128,
-            UiThemeMode::Light => 0x00FB_FCFE,
-        };
+        // Apply active ReadingFilter (Normal, E-Ink, Sepia, Sage, Dark, Night Amber) to the Markdown canvas
+        let (page_bg, content_theme) = md_reading_theme(theme, self.reading_filter, self.ui_theme_mode);
         fill_rect_clipped(buffer, buf_w, buf_h, x0, y0, canvas_w, canvas_h, page_bg);
 
         let max_scroll = self.md_max_scroll_y(canvas_h, sf);
@@ -711,7 +712,7 @@ impl<'a> PdfViewerApp<'a> {
                     view_top,
                     view_bot,
                     &cache.code_h_scroll,
-                    &theme,
+                    &content_theme,
                     &self.hovered_widget,
                     s,
                     &mut self.md_active_hits,
@@ -1155,6 +1156,86 @@ fn draw_wrapped_lines(
                 }
             }
             cx += w.w;
+        }
+    }
+}
+
+fn md_reading_theme(base: UiTheme, filter: ReadingFilter, mode: UiThemeMode) -> (u32, UiTheme) {
+    let mut t = base;
+    match filter {
+        ReadingFilter::Normal => {
+            let bg = match mode {
+                UiThemeMode::Dark => 0x001E_2128,
+                UiThemeMode::Light => 0x00FB_FCFE,
+            };
+            (bg, t)
+        }
+        ReadingFilter::PaperEInk => {
+            t.text_primary = 0x001C_1C1C;
+            t.text_secondary = 0x003D_3D3D;
+            t.text_muted = 0x0066_6666;
+            t.surface_bg = 0x00E8_E7E1;
+            t.sidebar_header_bg = 0x00DF_DED7;
+            t.input_bg = 0x00E5_E4DE;
+            t.border_subtle = 0x00C8_C7C0;
+            t.divider = 0x00D0_CFC8;
+            t.accent = 0x002B_59A2;
+            t.accent_soft_fg = 0x002B_59A2;
+            (0x00F2_F1EC, t)
+        }
+        ReadingFilter::WarmSepia => {
+            t.text_primary = 0x003B_2B1A;
+            t.text_secondary = 0x005A_442C;
+            t.text_muted = 0x007E_6548;
+            t.surface_bg = 0x00EC_DEC4;
+            t.sidebar_header_bg = 0x00E3_D2B3;
+            t.input_bg = 0x00E9_D9BC;
+            t.border_subtle = 0x00CF_BC9A;
+            t.divider = 0x00D8_C6A6;
+            t.accent = 0x009A_4B16;
+            t.accent_soft_fg = 0x008A_3F12;
+            (0x00F6_ECD8, t)
+        }
+        ReadingFilter::SageEyeCare => {
+            t.text_primary = 0x001E_2E24;
+            t.text_secondary = 0x0036_4D3E;
+            t.text_muted = 0x0056_7060;
+            t.surface_bg = 0x00DA_E7DA;
+            t.sidebar_header_bg = 0x00CE_DECE;
+            t.input_bg = 0x00D5_E4D5;
+            t.border_subtle = 0x00B4_C9B5;
+            t.divider = 0x00C0_D4C1;
+            t.accent = 0x001F_6F4A;
+            t.accent_soft_fg = 0x001B_6140;
+            (0x00E7_F0E7, t)
+        }
+        ReadingFilter::DarkInvert => {
+            t.text_primary = 0x00DC_E1EA;
+            t.text_secondary = 0x00B4_BDCC;
+            t.text_muted = 0x0085_90A3;
+            t.surface_bg = 0x0024_2832;
+            t.sidebar_header_bg = 0x002C_313D;
+            t.input_bg = 0x002A_2F3A;
+            t.border_subtle = 0x003C_4352;
+            t.divider = 0x0035_3B49;
+            t.accent = 0x0060_A5FA;
+            t.accent_soft_fg = 0x0093_C5FD;
+            t.hover_bg = 0x0033_3947;
+            (0x001B_1E24, t)
+        }
+        ReadingFilter::NightAmber => {
+            t.text_primary = 0x00E8_C28B;
+            t.text_secondary = 0x00C7_A06C;
+            t.text_muted = 0x0099_784D;
+            t.surface_bg = 0x0021_1A14;
+            t.sidebar_header_bg = 0x002A_2119;
+            t.input_bg = 0x0028_1F18;
+            t.border_subtle = 0x0042_3427;
+            t.divider = 0x003A_2D22;
+            t.accent = 0x00F5_9E0B;
+            t.accent_soft_fg = 0x00FB_BF24;
+            t.hover_bg = 0x0035_291F;
+            (0x0017_120E, t)
         }
     }
 }

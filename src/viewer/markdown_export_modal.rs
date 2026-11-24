@@ -234,7 +234,7 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    fn run_markdown_docx_export(&mut self) {
+    pub(super) fn run_markdown_docx_export(&mut self) {
         let Some(ref md) = self.markdown_doc else { return };
         let stem = self.file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("document");
         let default_name = format!("{stem}.docx");
