@@ -36,6 +36,7 @@ impl<'a> PdfViewerApp<'a> {
             slot.redacted = self.redacted;
             slot.has_unsaved_edits = self.has_unsaved_edits;
             slot.last_file_mtime = self.last_file_mtime;
+            slot.markdown_doc = self.markdown_doc.take();
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
@@ -48,6 +49,10 @@ impl<'a> PdfViewerApp<'a> {
             self.active_tab = index;
             let slot = &mut self.tabs[index];
             self.doc = slot.doc.take();
+            self.markdown_doc = slot.markdown_doc.take();
+            self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
+            self.md_layout = None;
+            self.md_active_hits.clear();
             self.file_path = slot.file_path.clone();
             self.current_page_index = slot.current_page_index;
             self.view_mode = slot.view_mode;
@@ -114,12 +119,169 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    pub(super) fn is_markdown_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+    }
+
+    fn markdown_headings_to_bookmarks(doc: &crate::markdown::MarkdownDoc) -> Vec<crate::engine::Bookmark> {
+        doc.headings
+            .iter()
+            .map(|h| crate::engine::Bookmark {
+                serial: String::new(),
+                title: h.title.clone(),
+                logical_page: format!("H{}", h.level),
+                page_index: h.block_idx,
+                level: h.level.saturating_sub(1),
+            })
+            .collect()
+    }
+
+    pub(super) fn reload_active_markdown(&mut self) -> bool {
+        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
+            return false;
+        }
+        let Ok(raw) = std::fs::read_to_string(&self.file_path) else {
+            return false;
+        };
+        let fallback = self
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Markdown");
+        let parsed = crate::markdown::parse_markdown(&raw, fallback);
+        let bms = Self::markdown_headings_to_bookmarks(&parsed);
+        let mtime = Self::read_file_mtime(&self.file_path);
+
+        self.markdown_doc = Some(parsed);
+        self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
+        self.md_layout = None;
+        self.bookmarks = bms;
+        self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
+        self.last_file_mtime = mtime;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].last_file_mtime = mtime;
+            self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+        }
+        self.status_notice = Some("Reloaded Markdown document".to_string());
+        self.update_title_bar();
+        self.request_redraw();
+        true
+    }
+
+    fn load_markdown_document(&mut self, path: PathBuf, new_tab: bool) -> Result<()> {
+        let raw = std::fs::read_to_string(&path)?;
+        let fallback = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Markdown");
+        let parsed = crate::markdown::parse_markdown(&raw, fallback);
+        let loaded_bookmarks = Self::markdown_headings_to_bookmarks(&parsed);
+        let file_mtime = Self::read_file_mtime(&path);
+
+        if new_tab && !self.tabs.is_empty() {
+            self.sync_active_tab_to_slot();
+        }
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+        self.doc = None;
+
+        self.file_path = path.clone();
+        self.current_page_index = 0;
+        self.zoom_level = 1.0;
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
+        self.deskew_bar = None;
+        self.roman_end = 0;
+        self.skip_pages = 0;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
+        self.redacted = false;
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = file_mtime;
+        self.flatten_confirm_at = None;
+        self.input_mode = InputMode::Normal;
+        self.drag_start = None;
+        self.grid_drag_page = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
+        self.grid_scroll_y = 0.0;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.incremental_search = None;
+        self.bookmarks = loaded_bookmarks.clone();
+        self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
+        self.bookmark_scroll_y = 0;
+        self.markdown_doc = Some(parsed);
+        self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
+        self.md_layout = None;
+        self.md_active_hits.clear();
+
+        self.record_recent_file(&path);
+
+        let slot = DocumentTab {
+            doc: None,
+            file_path: path,
+            current_page_index: 0,
+            view_mode: ViewMode::FitWidth,
+            last_page_view_mode: ViewMode::FitWidth,
+            scroll_mode: self.scroll_mode,
+            zoom_level: 1.0,
+            pan_x: 0.0,
+            scroll_y: 0.0,
+            scroll_x: 0.0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
+            roman_end: 0,
+            skip_pages: 0,
+            bookmarks: loaded_bookmarks,
+            selected_bookmark: self.selected_bookmark,
+            bookmark_scroll_y: 0,
+            grid_scroll_y: 0.0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
+            redacted: false,
+            has_unsaved_edits: false,
+            last_file_mtime: file_mtime,
+            markdown_doc: None,
+        };
+        if new_tab || self.tabs.is_empty() {
+            self.tabs.push(slot);
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab] = slot;
+        }
+
+        self.update_title_bar();
+        self.request_redraw();
+        Ok(())
+    }
+
     /// Loads `path` into the current tab using an optional `password` (never stored after loading).
     pub(super) fn load_document_with_password(
         &mut self,
         path: PathBuf,
         password: Option<&str>,
     ) -> Result<()> {
+        if Self::is_markdown_path(&path) {
+            return self.load_markdown_document(path, false);
+        }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
         let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
         let loaded_bookmarks =
@@ -130,6 +292,9 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
+        self.markdown_doc = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
 
         let file_mtime = Self::read_file_mtime(&path);
         let page_count = loaded.pages().len();
@@ -215,6 +380,7 @@ impl<'a> PdfViewerApp<'a> {
                 redacted: false,
                 has_unsaved_edits: false,
                 last_file_mtime: file_mtime,
+                markdown_doc: None,
             });
             self.active_tab = 0;
             self.tab_scroll_offset = 0;
@@ -284,6 +450,9 @@ impl<'a> PdfViewerApp<'a> {
         path: PathBuf,
         password: Option<&str>,
     ) -> Result<()> {
+        if Self::is_markdown_path(&path) {
+            return self.load_markdown_document(path, true);
+        }
         if self.tabs.is_empty() {
             return self.load_document_with_password(path, password);
         }
@@ -344,10 +513,14 @@ impl<'a> PdfViewerApp<'a> {
             redacted: false,
             has_unsaved_edits: false,
             last_file_mtime: file_mtime,
+            markdown_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
+        self.markdown_doc = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
         self.file_path = path;
         self.current_page_index = restored_page;
         self.view_mode = ViewMode::FitPage;
@@ -430,10 +603,14 @@ impl<'a> PdfViewerApp<'a> {
             redacted: false,
             has_unsaved_edits: true,
             last_file_mtime: None,
+            markdown_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
+        self.markdown_doc = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
         self.file_path = virtual_path;
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitPage;

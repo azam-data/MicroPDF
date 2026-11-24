@@ -625,6 +625,8 @@ pub(super) struct DocumentTab<'a> {
     pub(super) has_unsaved_edits: bool,
     /// Last observed disk modification time of `file_path` for 1s auto-reload polling.
     pub(super) last_file_mtime: Option<std::time::SystemTime>,
+    /// Parsed Markdown AST when this tab is a `.md` / `.markdown` document (zero bitmaps).
+    pub(super) markdown_doc: Option<crate::markdown::MarkdownDoc>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -758,6 +760,8 @@ pub(super) enum UiHit {
     UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
     TextView(TextViewHit),
+    MarkdownView(super::markdown_view::MarkdownHit),
+    MarkdownExport(super::markdown_export_modal::MarkdownExportHit),
     Overlay(OverlayHit),
     BookmarkFormatSaveSample,
     BookmarkFormatClose,
@@ -1038,6 +1042,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) tab_context_menu: Option<(usize, i32, i32)>,
     /// Active tab state mirrored directly for fast, conflict-free access.
     pub(super) doc: Option<PdfDocument<'a>>,
+    pub(super) markdown_doc: Option<crate::markdown::MarkdownDoc>,
+    pub(super) md_doc_gen: u64,
+    pub(super) md_layout: Option<super::markdown_view::MdLayoutCache>,
+    pub(super) md_active_hits: Vec<super::markdown_view::MdHitRect>,
     pub(super) file_path: PathBuf,
     pub(super) current_page_index: u16,
     pub(super) roman_end: usize,
@@ -1231,6 +1239,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) export_images_modal: Option<ExportImagesModalState>,
     /// Active `Export PDF to Excel (.xlsx)` options modal state (0 bytes when closed).
     pub(super) excel_export_modal: Option<ExcelExportModalState>,
+    pub(super) markdown_export_modal: Option<super::markdown_export_modal::MarkdownExportModalState>,
     /// Remembers last chosen Hybrid Lattice/Stream Excel export options for the session.
     pub(super) excel_export_opts: crate::export::ExcelExportOptions,
     /// Active `Split to Single-Page PDFs` modal state (0 bytes when closed).
@@ -1376,6 +1385,10 @@ impl<'a> PdfViewerApp<'a> {
             tab_list_scroll: 0,
             tab_context_menu: None,
             doc: None,
+            markdown_doc: None,
+            md_doc_gen: 0,
+            md_layout: None,
+            md_active_hits: Vec::new(),
             file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
@@ -1489,6 +1502,7 @@ impl<'a> PdfViewerApp<'a> {
             create_pdf_images_modal: None,
             export_images_modal: None,
             excel_export_modal: None,
+            markdown_export_modal: None,
             excel_export_opts: crate::export::ExcelExportOptions::default(),
             split_pages_modal: None,
             watermark_modal: None,
@@ -1539,6 +1553,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.create_pdf_images_modal.is_some()
             || self.export_images_modal.is_some()
             || self.excel_export_modal.is_some()
+            || self.markdown_export_modal.is_some()
             || self.split_pages_modal.is_some()
             || self.watermark_modal.is_some()
             || self.stamp_manager_modal.is_some()
@@ -2235,11 +2250,15 @@ impl<'a> PdfViewerApp<'a> {
         std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
     }
 
+    pub(super) fn is_markdown_tab(&self) -> bool {
+        self.markdown_doc.is_some()
+    }
+
     /// Checks if the active tab's file changed on disk (`mtime > self.last_file_mtime`).
     /// - If `self.has_unsaved_edits` is false, reloads the file from disk keeping `current_page_index` and `scroll_y`.
     /// - If `self.has_unsaved_edits` is true, shows a status-bar notice instead of reloading.
     pub(super) fn check_and_auto_reload_active_file(&mut self) -> bool {
-        if self.doc.is_none() || self.file_path.as_os_str().is_empty() {
+        if (self.doc.is_none() && self.markdown_doc.is_none()) || self.file_path.as_os_str().is_empty() {
             return false;
         }
         let Some(disk_mtime) = Self::read_file_mtime(&self.file_path) else {
@@ -2251,6 +2270,10 @@ impl<'a> PdfViewerApp<'a> {
         };
         if disk_mtime <= prev_mtime {
             return false;
+        }
+
+        if self.markdown_doc.is_some() {
+            return self.reload_active_markdown();
         }
 
         if self.has_unsaved_edits {

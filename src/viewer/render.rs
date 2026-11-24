@@ -1506,11 +1506,7 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         scale_factor: f64,
     ) -> Option<(i32, i32, u32, u32, i32, u32)> {
-        if self.doc.is_none() || self.is_presentation {
-            return None;
-        }
-        let total = self.total_pages();
-        if total == 0 {
+        if (self.doc.is_none() && !self.is_markdown_tab()) || self.is_presentation {
             return None;
         }
         let s = scale_factor as f32;
@@ -1519,6 +1515,29 @@ impl<'a> PdfViewerApp<'a> {
         let pad_v = (6.0 * s).round() as i32;
         let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
         if content_h < 40 {
+            return None;
+        }
+        if self.is_markdown_tab() {
+            let max_scroll = self.md_max_scroll_y(content_h, scale_factor);
+            if max_scroll <= 1.0 {
+                return None;
+            }
+            let hdr_h = self.md_header_bar_height_px(scale_factor) as i32;
+            let track_x = buf_w as i32 - track_w as i32 - pad_r;
+            let track_y = top_bars_h as i32 + hdr_h + pad_v;
+            let track_h = content_h.saturating_sub((hdr_h + pad_v * 2) as u32);
+            if track_h < 24 {
+                return None;
+            }
+            let total_h = (content_h as f32 - hdr_h as f32) + max_scroll;
+            let visible_ratio = ((content_h as f32 - hdr_h as f32) / total_h).clamp(0.08, 0.92);
+            let fraction = (self.scroll_y / max_scroll).clamp(0.0, 1.0);
+            let thumb_h = ((track_h as f32 * visible_ratio).round() as u32).clamp(24, track_h);
+            let thumb_y = track_y + ((track_h.saturating_sub(thumb_h)) as f32 * fraction).round() as i32;
+            return Some((track_x, track_y, track_w, track_h, thumb_y, thumb_h));
+        }
+        let total = self.total_pages();
+        if total == 0 {
             return None;
         }
         let track_x = buf_w as i32 - track_w as i32 - pad_r;
@@ -1808,7 +1827,7 @@ impl<'a> PdfViewerApp<'a> {
             .status_bar_height_px(scale_factor)
             .min(height.saturating_sub(top_bars_h + 16));
 
-        if self.compare_mode.is_none() {
+        if self.compare_mode.is_none() && !self.is_markdown_tab() {
             if self.view_mode.is_page_view() {
                 self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
                 self.ensure_deskew_preview_pixels();
@@ -1834,7 +1853,11 @@ impl<'a> PdfViewerApp<'a> {
             theme.canvas_bg
         });
 
-        if self.doc.is_none() {
+        if self.is_markdown_tab() {
+            self.draw_markdown_view(
+                buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+            );
+        } else if self.doc.is_none() {
             self.draw_welcome_screen(buffer, width, height, top_bars_h, status_bar_h, scale_factor);
         } else if self.compare_mode.is_some() {
             self.render_and_draw_compare_mode(
@@ -2213,6 +2236,11 @@ impl<'a> PdfViewerApp<'a> {
         // Export to Excel Options Modal
         if self.excel_export_modal.is_some() {
             self.draw_excel_export_modal(buffer, width, height, scale_factor);
+        }
+
+        // Export Markdown Modal
+        if self.markdown_export_modal.is_some() {
+            self.draw_markdown_export_modal(buffer, width, height, scale_factor);
         }
 
         // Split to Single-Page PDFs Modal

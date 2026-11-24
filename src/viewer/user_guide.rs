@@ -39,10 +39,10 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Paragraph(
                 "MicroPDF is a fast, private PDF reader and editor. Everything runs directly on your computer — your files are never uploaded to the internet, and nothing is installed into Windows or macOS.",
             ),
-            GuideBlock::Heading("How to Open a PDF (3 Easy Ways)"),
+            GuideBlock::Heading("How to Open a PDF or Markdown File (3 Easy Ways)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Drag and drop any PDF file from your computer right onto the MicroPDF window.",
+                text: "Drag and drop any PDF (.pdf) or Markdown (.md / .markdown) file right onto the MicroPDF window.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -50,7 +50,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick your file, and click Open.",
+                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick any PDF or Markdown file, and click Open.",
             },
             GuideBlock::Heading("How to Create a New PDF from Photos or Scanned Images"),
             GuideBlock::Step {
@@ -437,9 +437,9 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "Click 'Choose Folder & Export' to save numbered images straight into your chosen folder.",
             },
-            GuideBlock::Heading("Markdown (.md), LaTeX (.tex), Stamps, Signatures & Watermarks"),
+            GuideBlock::Heading("Markdown (.md) Reader, Export, Stamps & Watermarks"),
             GuideBlock::Paragraph(
-                "• Writers & students can export clean Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with System Font Picker, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
+                "• Markdown (.md / .markdown) Reader & Export: open any Markdown file to read it in a clean column with automatic outline headings, copyable code blocks, tables, and zoom (Ctrl+ / Ctrl-). Click 'Export / Print' (or press Ctrl+P) on a Markdown tab to export it as a Styled PDF (A4 or Letter) or a Styled Word (.docx) document!\n• Writers & students can also export PDF pages to Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with a scrollable System Font Dropdown, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
             ),
             GuideBlock::Tip(
                 "For the cleanest handwritten signature stamp, use a PNG image with a transparent background — MicroPDF preserves transparency automatically!",

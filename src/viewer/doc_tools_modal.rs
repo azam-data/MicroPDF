@@ -17,6 +17,7 @@ use crate::engine::{
 };
 use pdfium_render::prelude::*;
 
+use super::font_dropdown::*;
 use super::render::{blend_rect_rgba, fill_rect_clipped};
 use super::state::*;
 use super::ui_draw::*;
@@ -49,8 +50,9 @@ pub(super) enum HeaderFooterHit {
     FocusField(HfField),
     ScopeAll,
     ScopeCustom,
-    FontPrev,
-    FontNext,
+    FontDropdownToggle,
+    FontDropdownPopup(FontDropdownHit),
+    FontDropdownClose,
     FontMinus,
     FontPlus,
     MarginMinus,
@@ -81,6 +83,7 @@ pub(super) struct HeaderFooterModalState {
     pub(super) preview_cache: Option<(u16, u32, u32, u32, u32, Vec<u32>)>,
     /// Inline modal feedback banner: `Some((message, is_error))`.
     pub(super) status_msg: Option<(String, bool)>,
+    pub(super) font_dropdown: FontDropdownState,
 }
 
 impl HeaderFooterModalState {
@@ -99,6 +102,7 @@ impl HeaderFooterModalState {
             preview_page: current_page,
             preview_cache: None,
             status_msg: None,
+            font_dropdown: FontDropdownState::default(),
         }
     }
 
@@ -138,8 +142,9 @@ pub(super) enum PageNumberHit {
     RomanMinus,
     RomanPlus,
     FocusRoman,
-    FontPrev,
-    FontNext,
+    FontDropdownToggle,
+    FontDropdownPopup(FontDropdownHit),
+    FontDropdownClose,
     FontMinus,
     FontPlus,
     ColorGray,
@@ -158,6 +163,7 @@ pub(super) struct PageNumberModalState {
     /// `(page_idx, avail_w, avail_h, rw, rh, pixels)`
     pub(super) preview_cache: Option<(u16, u32, u32, u32, u32, Vec<u32>)>,
     pub(super) status_msg: Option<(String, bool)>,
+    pub(super) font_dropdown: FontDropdownState,
 }
 
 impl PageNumberModalState {
@@ -171,6 +177,7 @@ impl PageNumberModalState {
             preview_page: current_page,
             preview_cache: None,
             status_msg: None,
+            font_dropdown: FontDropdownState::default(),
         }
     }
 }
@@ -346,8 +353,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // 4b. System Font Picker row
         let sm_btn = (24.0 * s).round() as u32;
-        hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontPrev });
-        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: HeaderFooterHit::FontNext });
+        hits.push(ModalBox { x: ix, y: cy, w: iw, h: row_h, hit: HeaderFooterHit::FontDropdownToggle });
         cy += row_h as i32 + (4.0 * s).round() as i32;
 
         // 5. Font Size & Edge Margin row
@@ -389,8 +395,30 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn hit_test_header_footer_modal(&self, px: i32, py: i32, buf_w: u32, buf_h: u32, sf: f64) -> Option<HeaderFooterHit> {
-        self.header_footer_modal.as_ref()?;
+        let m = self.header_footer_modal.as_ref()?;
         let layout = self.layout_header_footer_modal(buf_w, buf_h, sf);
+        if m.font_dropdown.open {
+            if let Some(anchor) = layout.hits.iter().find(|h| h.hit == HeaderFooterHit::FontDropdownToggle) {
+                if let Some(pop_hit) = hit_test_font_dropdown_popup(
+                    px,
+                    py,
+                    anchor.x,
+                    anchor.y,
+                    anchor.w,
+                    anchor.h,
+                    buf_w,
+                    buf_h,
+                    sf,
+                    &m.font_dropdown,
+                ) {
+                    return Some(HeaderFooterHit::FontDropdownPopup(pop_hit));
+                }
+                if anchor.contains(px, py) {
+                    return Some(HeaderFooterHit::FontDropdownToggle);
+                }
+            }
+            return Some(HeaderFooterHit::FontDropdownClose);
+        }
         for h in &layout.hits {
             if h.contains(px, py) {
                 return Some(h.hit);
@@ -663,16 +691,23 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         // 4b. System Font Picker
-        if let (Some(fp_prev), Some(fp_next)) = (find(HeaderFooterHit::FontPrev), find(HeaderFooterHit::FontNext)) {
-            draw_pill(buffer, fp_prev, "<", false);
-            draw_pill(buffer, fp_next, ">", false);
-            let fx = fp_prev.x + fp_prev.w as i32 + 4;
-            let fw = (fp_next.x - fx - 4).max(40) as u32;
-            fill_rounded_rect(buffer, buf_w, buf_h, fx, fp_prev.y, fw, fp_prev.h, 5.0 * s, theme.input_bg);
-            stroke_rounded_rect(buffer, buf_w, buf_h, fx, fp_prev.y, fw, fp_prev.h, 5.0 * s, theme.border_subtle);
-            let lbl = format!("Font: {}", m.profile.font_name);
-            let clipped = truncate_ellipsis(&lbl, (fw.saturating_sub(12)) as f32, body_sz, false);
-            draw_text_vcenter(buffer, buf_w, buf_h, fx + 6, fp_prev.y, fp_prev.h, fx + fw as i32 - 4, &clipped, body_sz, theme.text_primary, false);
+        if let Some(r) = find(HeaderFooterHit::FontDropdownToggle) {
+            let hov = self.hovered_widget == Some(UiHit::HeaderFooter(HeaderFooterHit::FontDropdownToggle));
+            draw_font_dropdown_button(
+                buffer,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                &m.profile.font_name,
+                Some("Font: "),
+                m.font_dropdown.open,
+                hov,
+                &theme,
+                s,
+            );
         }
 
         // 5. Font Size & Edge Margin
@@ -755,6 +790,23 @@ impl<'a> PdfViewerApp<'a> {
         }
         if let Some(r) = find(HeaderFooterHit::Cancel) {
             draw_pill(buffer, r, "Cancel", false);
+        }
+        if m.font_dropdown.open {
+            if let Some(r) = find(HeaderFooterHit::FontDropdownToggle) {
+                draw_font_dropdown_popup(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
+                    sf,
+                    &m.font_dropdown,
+                    &m.profile.font_name,
+                    &theme,
+                );
+            }
         }
     }
 
@@ -910,14 +962,34 @@ impl<'a> PdfViewerApp<'a> {
                     m.select_all = false;
                 }
             }
-            HeaderFooterHit::FontPrev => {
+            HeaderFooterHit::FontDropdownToggle => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    m.profile.font_name = crate::fonts::step_font_name(&m.profile.font_name, -1);
+                    let cur = m.profile.font_name.clone();
+                    m.font_dropdown.toggle(&cur);
                 }
             }
-            HeaderFooterHit::FontNext => {
+            HeaderFooterHit::FontDropdownClose => {
                 if let Some(m) = self.header_footer_modal.as_mut() {
-                    m.profile.font_name = crate::fonts::step_font_name(&m.profile.font_name, 1);
+                    m.font_dropdown.close();
+                }
+            }
+            HeaderFooterHit::FontDropdownPopup(pop) => {
+                if let Some(m) = self.header_footer_modal.as_mut() {
+                    match pop {
+                        FontDropdownHit::Row(idx) => {
+                            if let Some(entry) = crate::fonts::global_system_fonts().get(idx) {
+                                m.profile.font_name = entry.display_name.clone();
+                            }
+                            m.font_dropdown.close();
+                        }
+                        FontDropdownHit::TrackPageUp => {
+                            m.font_dropdown.scroll_by(-(FONT_DROPDOWN_MAX_ROWS as isize));
+                        }
+                        FontDropdownHit::TrackPageDown => {
+                            m.font_dropdown.scroll_by(FONT_DROPDOWN_MAX_ROWS as isize);
+                        }
+                        FontDropdownHit::InsidePopup => {}
+                    }
                 }
             }
             HeaderFooterHit::FontMinus => {
@@ -1191,8 +1263,8 @@ impl<'a> PdfViewerApp<'a> {
         hits.push(ModalBox { x: ix, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontMinus });
         hits.push(ModalBox { x: ix + half_w as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPlus });
         let fx2 = ix + half_w as i32 + gap;
-        hits.push(ModalBox { x: fx2, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontPrev });
-        hits.push(ModalBox { x: ix + iw as i32 - sm_btn as i32, y: cy, w: sm_btn, h: row_h, hit: PageNumberHit::FontNext });
+        let fw2 = iw.saturating_sub(half_w + gap as u32);
+        hits.push(ModalBox { x: fx2, y: cy, w: fw2, h: row_h, hit: PageNumberHit::FontDropdownToggle });
         cy += row_h as i32 + sec_gap;
 
         // 5. Text Color
@@ -1217,8 +1289,30 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn hit_test_page_number_modal(&self, px: i32, py: i32, buf_w: u32, buf_h: u32, sf: f64) -> Option<PageNumberHit> {
-        self.page_number_modal.as_ref()?;
+        let m = self.page_number_modal.as_ref()?;
         let layout = self.layout_page_number_modal(buf_w, buf_h, sf);
+        if m.font_dropdown.open {
+            if let Some(anchor) = layout.hits.iter().find(|h| h.hit == PageNumberHit::FontDropdownToggle) {
+                if let Some(pop_hit) = hit_test_font_dropdown_popup(
+                    px,
+                    py,
+                    anchor.x,
+                    anchor.y,
+                    anchor.w,
+                    anchor.h,
+                    buf_w,
+                    buf_h,
+                    sf,
+                    &m.font_dropdown,
+                ) {
+                    return Some(PageNumberHit::FontDropdownPopup(pop_hit));
+                }
+                if anchor.contains(px, py) {
+                    return Some(PageNumberHit::FontDropdownToggle);
+                }
+            }
+            return Some(PageNumberHit::FontDropdownClose);
+        }
         for h in &layout.hits {
             if h.contains(px, py) {
                 return Some(h.hit);
@@ -1325,7 +1419,6 @@ impl<'a> PdfViewerApp<'a> {
         let title_sz = (14.0 * s).clamp(11.0, 22.0);
         let lbl_sz = (10.5 * s).clamp(9.0, 17.0);
         let body_sz = (11.5 * s).clamp(9.5, 18.0);
-        let small_sz = (10.0 * s).clamp(8.5, 16.0);
         let lbl_h = (15.0 * s).round() as i32;
         let pill_rad = (5.0 * s).clamp(3.0, 8.0);
         let ic_sz = (11.0 * s).round() as u32;
@@ -1442,16 +1535,24 @@ impl<'a> PdfViewerApp<'a> {
             let cx = fm.x + fm.w as i32 + (((fp.x - (fm.x + fm.w as i32)) as f32 - tw) * 0.5).round() as i32;
             draw_text_vcenter(buffer, buf_w, buf_h, cx, fm.y, fm.h, fp.x, &txt, body_sz, theme.text_primary, true);
         }
-        if let (Some(fprev), Some(fnext)) = (find(PageNumberHit::FontPrev), find(PageNumberHit::FontNext)) {
-            draw_text(buffer, buf_w, buf_h, fprev.x, fprev.y - lbl_h, "Font Family", lbl_sz, theme.text_muted, true);
-            draw_pill(buffer, fprev, "<", false);
-            draw_pill(buffer, fnext, ">", false);
-            let bx = fprev.x + fprev.w as i32 + 3;
-            let bw = (fnext.x - bx - 3).max(24) as u32;
-            fill_rounded_rect(buffer, buf_w, buf_h, bx, fprev.y, bw, fprev.h, 5.0 * s, theme.input_bg);
-            stroke_rounded_rect(buffer, buf_w, buf_h, bx, fprev.y, bw, fprev.h, 5.0 * s, theme.border_subtle);
-            let clipped = truncate_ellipsis(&m.config.font_name, (bw.saturating_sub(8)) as f32, small_sz, false);
-            draw_text_vcenter(buffer, buf_w, buf_h, bx + 4, fprev.y, fprev.h, bx + bw as i32 - 3, &clipped, small_sz, theme.text_primary, false);
+        if let Some(r) = find(PageNumberHit::FontDropdownToggle) {
+            draw_text(buffer, buf_w, buf_h, r.x, r.y - lbl_h, "Font Family", lbl_sz, theme.text_muted, true);
+            let hov = self.hovered_widget == Some(UiHit::PageNumber(PageNumberHit::FontDropdownToggle));
+            draw_font_dropdown_button(
+                buffer,
+                buf_w,
+                buf_h,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                &m.config.font_name,
+                None,
+                m.font_dropdown.open,
+                hov,
+                &theme,
+                s,
+            );
         }
 
         // 5. Color
@@ -1492,6 +1593,23 @@ impl<'a> PdfViewerApp<'a> {
         }
         if let Some(r) = find(PageNumberHit::Cancel) {
             draw_pill(buffer, r, "Cancel", false);
+        }
+        if m.font_dropdown.open {
+            if let Some(r) = find(PageNumberHit::FontDropdownToggle) {
+                draw_font_dropdown_popup(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    r.x,
+                    r.y,
+                    r.w,
+                    r.h,
+                    sf,
+                    &m.font_dropdown,
+                    &m.config.font_name,
+                    &theme,
+                );
+            }
         }
     }
 
@@ -1559,14 +1677,34 @@ impl<'a> PdfViewerApp<'a> {
                     m.config.roman_end = (m.config.roman_end + 1).min(max_r);
                 }
             }
-            PageNumberHit::FontPrev => {
+            PageNumberHit::FontDropdownToggle => {
                 if let Some(m) = self.page_number_modal.as_mut() {
-                    m.config.font_name = crate::fonts::step_font_name(&m.config.font_name, -1);
+                    let cur = m.config.font_name.clone();
+                    m.font_dropdown.toggle(&cur);
                 }
             }
-            PageNumberHit::FontNext => {
+            PageNumberHit::FontDropdownClose => {
                 if let Some(m) = self.page_number_modal.as_mut() {
-                    m.config.font_name = crate::fonts::step_font_name(&m.config.font_name, 1);
+                    m.font_dropdown.close();
+                }
+            }
+            PageNumberHit::FontDropdownPopup(pop) => {
+                if let Some(m) = self.page_number_modal.as_mut() {
+                    match pop {
+                        FontDropdownHit::Row(idx) => {
+                            if let Some(entry) = crate::fonts::global_system_fonts().get(idx) {
+                                m.config.font_name = entry.display_name.clone();
+                            }
+                            m.font_dropdown.close();
+                        }
+                        FontDropdownHit::TrackPageUp => {
+                            m.font_dropdown.scroll_by(-(FONT_DROPDOWN_MAX_ROWS as isize));
+                        }
+                        FontDropdownHit::TrackPageDown => {
+                            m.font_dropdown.scroll_by(FONT_DROPDOWN_MAX_ROWS as isize);
+                        }
+                        FontDropdownHit::InsidePopup => {}
+                    }
                 }
             }
             PageNumberHit::FontMinus => {

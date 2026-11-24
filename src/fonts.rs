@@ -229,6 +229,7 @@ pub fn global_system_fonts() -> &'static [SystemFontEntry] {
 }
 
 /// Steps to the previous (`delta = -1`) or next (`delta = +1`) font name in the shared catalog.
+#[cfg(test)]
 pub fn step_font_name(current: &str, delta: isize) -> String {
     let catalog = global_system_fonts();
     if catalog.is_empty() {

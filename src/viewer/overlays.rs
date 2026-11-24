@@ -702,9 +702,9 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF / Save (Ctrl+Shift+S) / Watermark Dialog"),
+            ("O / S / W", "Open PDF or Markdown (.md) / Save / Watermark Dialog"),
             ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
-            ("Ctrl+P", "Print Preview (10 Paper Sizes, Manual 2-Sided)"),
+            ("Ctrl+P", "Print Preview (or Export Markdown to PDF / Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
             ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
