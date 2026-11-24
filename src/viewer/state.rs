@@ -627,6 +627,9 @@ pub(super) struct DocumentTab<'a> {
     pub(super) last_file_mtime: Option<std::time::SystemTime>,
     /// Parsed Markdown AST when this tab is a `.md` / `.markdown` document (zero bitmaps).
     pub(super) markdown_doc: Option<crate::markdown::MarkdownDoc>,
+    /// Raw Markdown/LaTeX source text when editing or inspecting source.
+    pub(super) md_source: Option<String>,
+    pub(super) md_editor_mode: super::text_editor::MdEditorMode,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1045,6 +1048,9 @@ pub struct PdfViewerApp<'a> {
     /// Active tab state mirrored directly for fast, conflict-free access.
     pub(super) doc: Option<PdfDocument<'a>>,
     pub(super) markdown_doc: Option<crate::markdown::MarkdownDoc>,
+    pub(super) md_source: Option<String>,
+    pub(super) md_editor: Option<super::text_editor::TextEditorState>,
+    pub(super) md_editor_mode: super::text_editor::MdEditorMode,
     pub(super) md_doc_gen: u64,
     pub(super) md_layout: Option<super::markdown_view::MdLayoutCache>,
     pub(super) md_active_hits: Vec<super::markdown_view::MdHitRect>,
@@ -1388,6 +1394,9 @@ impl<'a> PdfViewerApp<'a> {
             tab_context_menu: None,
             doc: None,
             markdown_doc: None,
+            md_source: None,
+            md_editor: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
             md_doc_gen: 0,
             md_layout: None,
             md_active_hits: Vec::new(),

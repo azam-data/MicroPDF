@@ -34,6 +34,7 @@ pub enum InlineSpan {
     Strikethrough(String),
     Code(String),
     Link { text: String, url: String },
+    Math(String),
 }
 
 impl InlineSpan {
@@ -44,7 +45,8 @@ impl InlineSpan {
             | InlineSpan::Italic(s)
             | InlineSpan::BoldItalic(s)
             | InlineSpan::Strikethrough(s)
-            | InlineSpan::Code(s) => s,
+            | InlineSpan::Code(s)
+            | InlineSpan::Math(s) => s,
             InlineSpan::Link { text, .. } => text,
         }
     }
@@ -67,6 +69,11 @@ pub enum MdBlock {
     CodeBlock {
         lang: Option<String>,
         code: String,
+    },
+    MathBlock(String),
+    Image {
+        path: String,
+        caption: Option<String>,
     },
     Blockquote(Vec<MdBlock>),
     Table {

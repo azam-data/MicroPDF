@@ -64,6 +64,15 @@ fn add_inline_spans(mut p: Paragraph, spans: &[InlineSpan], base_size_half_pt: u
                 let hl = Hyperlink::new(url, HyperlinkType::External).add_run(r);
                 p = p.add_hyperlink(hl);
             }
+            InlineSpan::Math(tex) => {
+                let readable = crate::math_render::math_to_readable_text(tex);
+                let r = Run::new()
+                    .add_text(readable)
+                    .size(base_size_half_pt)
+                    .italic()
+                    .color("1E3A8A");
+                p = p.add_run(r);
+            }
         }
     }
     p
@@ -236,6 +245,22 @@ fn emit_blocks_to_docx(mut docx: Docx, blocks: &[MdBlock]) -> Docx {
                             .color("CBD5E1"),
                     ),
                 );
+                docx = docx.add_paragraph(p);
+            }
+            MdBlock::MathBlock(tex) => {
+                let readable = crate::math_render::math_to_readable_text(tex);
+                let mut p = Paragraph::new()
+                    .align(AlignmentType::Center)
+                    .line_spacing(LineSpacing::new().before(80).after(120));
+                p = with_para_shading(p, Shading::new().shd_type(ShdType::Clear).fill("F8FAFC"));
+                p = p.add_run(Run::new().add_text(readable).size(24).italic().color("1E3A8A"));
+                docx = docx.add_paragraph(p);
+            }
+            MdBlock::Image { path, .. } => {
+                let lbl = format!("[Image: {}]", std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path));
+                let p = Paragraph::new()
+                    .line_spacing(LineSpacing::new().before(40).after(100))
+                    .add_run(Run::new().add_text(lbl).size(20).italic().color("64748B"));
                 docx = docx.add_paragraph(p);
             }
         }

@@ -1518,6 +1518,9 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
         if self.is_markdown_tab() {
+            if self.md_editor_mode == super::text_editor::MdEditorMode::Edit {
+                return None;
+            }
             let max_scroll = self.md_max_scroll_y(content_h, scale_factor);
             if max_scroll <= 1.0 {
                 return None;
@@ -2449,7 +2452,7 @@ impl<'a> PdfViewerApp<'a> {
 }
 
 /// Fills a clipped rectangle in the `0x00RRGGBB` pixel buffer.
-pub(super) fn fill_rect_clipped(
+pub(crate) fn fill_rect_clipped(
     buffer: &mut [u32],
     buf_w: u32,
     buf_h: u32,
