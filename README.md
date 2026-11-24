@@ -6,7 +6,7 @@
 
 ---
 
-## Download & Portable Install (`v1.4.0`)
+## Download & Portable Install (`v1.5.0`)
 
 Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
 
@@ -30,7 +30,7 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
 
 ---
 
-## What's New in v1.4.0
+## What's New in v1.5.0
 
 - **Styled Markdown (`.md` / `.markdown`) Reader & Export (`PDF` + `.docx`):** Open Markdown files alongside PDFs via File → Open, drag-and-drop, or CLI. Features an editorial Light/Dark reading column, automatic `#`–`###` outline sidebar, GFM tables, code blocks with **Copy** button & horizontal scroll, clickable links, zoom (`Ctrl+`/`-`/`0`), live Reload, **Export to Styled PDF** (A4/Letter, repeated table headers, `Page X of Y`), and **Export to Styled Word (`.docx`)** via `docx-rs`.
 - **Scrollable System Font Dropdown:** Compact, scrollable dropdown across **Watermark**, **Header & Footer**, and **Page Numbering** dialogs with mouse-wheel scrolling and automatic system font scanning via `ttf-parser`.
