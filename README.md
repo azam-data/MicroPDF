@@ -1,12 +1,12 @@
 # MicroPDF
 
-**MicroPDF** is a fast, ultra-lightweight, portable PDF & Markdown viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter), [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), and [`docx-rs`](https://crates.io/crates/docx-rs).
+**MicroPDF** is a fast, ultra-lightweight, portable PDF, Markdown & LaTeX viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter), [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), and [`docx-rs`](https://crates.io/crates/docx-rs).
 
 **Zero GPU. Zero GUI toolkit. Zero installer.** Every menu, tab, toolbar, modal dialog, and live preview is CPU-rendered directly into the window frame buffer with minimal RAM and zero OS breadcrumbs.
 
 ---
 
-## Download & Portable Install (`v1.5.0`)
+## Download & Portable Install (`v1.6.0`)
 
 Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
 
@@ -30,8 +30,11 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
 
 ---
 
-## What's New in v1.5.0
+## What's New in v1.6.0
 
+- **Live Markdown (`.md`) & LaTeX (`.tex`) Editor (`Preview` | `Split` | `Edit`):** Edit `.md` and `.tex` files directly inside MicroPDF with a pure-Rust multi-line editor (selection, clipboard, `Ctrl+Z`/`Y` undo/redo, `Ctrl+S` save, unsaved-edits guard), **Split** live-preview mode, and all 6 Reading Modes.
+- **Portable LaTeX (`.tex`) Reader & Pure-Rust Math Renderer:** Open `.tex` articles with zero external TeX compiler (`pdflatex`/`xelatex` not required). Renders sections/outline, formatted prose, lists, `tabular` tables, `verbatim`/`lstlisting`, `\includegraphics` images, and inline/display math (`\frac`, `\sqrt`, `^`/`_`, Greek symbols, operators, `pmatrix`/`bmatrix`), plus Export to Styled PDF & Word (`.docx`).
+- **Complex-Graph Failsafe Guard:** Automatically scans `.tex` files before opening for unsupported vector-graph environments (`tikzpicture`, `pgfpicture`, `circuitikz`, `pspicture`, `asy`, `axis`/PGFPlots) and shows a clear warning without breaking the active tab.
 - **Styled Markdown (`.md` / `.markdown`) Reader & Export (`PDF` + `.docx`):** Open Markdown files alongside PDFs via File → Open, drag-and-drop, or CLI. Features an editorial Light/Dark reading column, automatic `#`–`###` outline sidebar, GFM tables, code blocks with **Copy** button & horizontal scroll, clickable links, zoom (`Ctrl+`/`-`/`0`), live Reload, **Export to Styled PDF** (A4/Letter, repeated table headers, `Page X of Y`), and **Export to Styled Word (`.docx`)** via `docx-rs`.
 - **Scrollable System Font Dropdown:** Compact, scrollable dropdown across **Watermark**, **Header & Footer**, and **Page Numbering** dialogs with mouse-wheel scrolling and automatic system font scanning via `ttf-parser`.
 - **Hand Tool & Horizontal/Vertical Scrollbars (Normal & Compare Windows):** Click the **Hand** toolbar button (or **Hand** toggle in Compare Mode) to grab-and-pan zoomed pages in 2D, or drag the bottom horizontal and right vertical overlay scrollbars.
@@ -102,7 +105,7 @@ Printing a 20-page 600-dpi scan adds ~25 MB at peak (one decoded scan image plus
 | `B` / `A` / `L` / `G` | Any / Normal | Bookmarks Sidebar (`B`), Add Bookmark (`A`), Import `.txt` (`L`), Smart Jump (`G`) |
 | `K` / `I` / `R` / `D` | Normal / Grid | Page B&W (`K`), Insert Blank (`I`), Rotate 90° (`R`), Delete Page (`D`) |
 | `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Normal | Undo / Redo up to 8 steps per tab |
-| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Print Preview (`Ctrl+P`), Open (`O`), Save (`S`), Save As (`Ctrl+Shift+S`) |
+| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Print Preview or Export `.md`/`.tex` (`Ctrl+P`), Open PDF/`.md`/`.tex` (`O`), Save (`S`/`Ctrl+S`), Save As (`Ctrl+Shift+S`) |
 | `?` / `F1` / `Help -> User Guide` | Any | Shortcut Sheet (`?` / `F1`) or 10-chapter Step-by-Step User Guide |
 
 ---

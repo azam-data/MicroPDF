@@ -1779,9 +1779,10 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Supported Documents (PDF, Markdown)", &["pdf", "md", "markdown"])
+            .add_filter("Supported Documents (PDF, Markdown, LaTeX)", &["pdf", "md", "markdown", "tex"])
             .add_filter("PDF Document", &["pdf"])
             .add_filter("Markdown Document", &["md", "markdown"])
+            .add_filter("LaTeX Document", &["tex"])
             .pick_file()
         {
             let fname = path
@@ -1805,7 +1806,235 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    fn handle_markdown_editor_key(&mut self, key: &winit::keyboard::Key, text: Option<&str>) -> bool {
+        use winit::keyboard::{Key, NamedKey};
+        self.ensure_md_editor_initialized();
+        let view_h = self
+            .window
+            .as_ref()
+            .map(|w| {
+                let sz = w.inner_size();
+                let sf = self.effective_scale_factor(w.scale_factor());
+                sz.height.saturating_sub(
+                    self.top_bars_height_px(sf)
+                        + self.status_bar_height_px(sf)
+                        + self.md_header_bar_height_px(sf),
+                ) as f32
+            })
+            .unwrap_or(500.0);
+        let sf = self
+            .window
+            .as_ref()
+            .map(|w| self.effective_scale_factor(w.scale_factor()))
+            .unwrap_or(1.0);
+
+        if self.cmd_or_ctrl_pressed {
+            if let Key::Character(ch) = key {
+                let s = ch.as_str();
+                if s.eq_ignore_ascii_case("s") {
+                    self.save_active_markdown();
+                    return true;
+                } else if s.eq_ignore_ascii_case("a") {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.select_all();
+                    }
+                    self.request_redraw();
+                    return true;
+                } else if s.eq_ignore_ascii_case("c") {
+                    if let Some(sel) = self.md_editor.as_ref().and_then(|e| e.selected_text()) {
+                        let _ = Self::copy_text_to_os_clipboard(&sel);
+                    }
+                    return true;
+                } else if s.eq_ignore_ascii_case("x") {
+                    let mut changed = false;
+                    if let Some(ref mut ed) = self.md_editor {
+                        if let Some(sel) = ed.selected_text() {
+                            let _ = Self::copy_text_to_os_clipboard(&sel);
+                            changed = ed.delete_selection();
+                            ed.ensure_cursor_visible(view_h, sf);
+                        }
+                    }
+                    if changed {
+                        self.sync_markdown_from_editor();
+                    }
+                    return true;
+                } else if s.eq_ignore_ascii_case("v") {
+                    if let Ok(clip) = Self::read_text_from_os_clipboard() {
+                        if !clip.is_empty() {
+                            if let Some(ref mut ed) = self.md_editor {
+                                ed.insert_str(&clip);
+                                ed.ensure_cursor_visible(view_h, sf);
+                            }
+                            self.sync_markdown_from_editor();
+                        }
+                    }
+                    return true;
+                } else if s.eq_ignore_ascii_case("z") {
+                    let changed = if let Some(ref mut ed) = self.md_editor {
+                        let ok = if self.shift_pressed || s == "Z" { ed.redo() } else { ed.undo() };
+                        ed.ensure_cursor_visible(view_h, sf);
+                        ok
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.sync_markdown_from_editor();
+                    }
+                    return true;
+                } else if s.eq_ignore_ascii_case("y") {
+                    let changed = if let Some(ref mut ed) = self.md_editor {
+                        let ok = ed.redo();
+                        ed.ensure_cursor_visible(view_h, sf);
+                        ok
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.sync_markdown_from_editor();
+                    }
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        if self.alt_pressed {
+            return false;
+        }
+
+        let shift = self.shift_pressed;
+        match key {
+            Key::Named(NamedKey::Escape)
+            | Key::Named(NamedKey::F1)
+            | Key::Named(NamedKey::F3)
+            | Key::Named(NamedKey::F5)
+            | Key::Named(NamedKey::F11) => return false,
+            Key::Named(NamedKey::ArrowUp) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(-1, 0, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(1, 0, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::ArrowLeft) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(0, -1, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::ArrowRight) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(0, 1, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::Home) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_home(shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::End) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_end(shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::PageUp) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(-15, 0, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::PageDown) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.move_cursor(15, 0, shift);
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.request_redraw();
+                return true;
+            }
+            Key::Named(NamedKey::Enter) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.insert_str("\n");
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.sync_markdown_from_editor();
+                return true;
+            }
+            Key::Named(NamedKey::Tab) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.insert_str("  ");
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.sync_markdown_from_editor();
+                return true;
+            }
+            Key::Named(NamedKey::Backspace) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.backspace();
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.sync_markdown_from_editor();
+                return true;
+            }
+            Key::Named(NamedKey::Delete) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.delete_forward();
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.sync_markdown_from_editor();
+                return true;
+            }
+            Key::Named(NamedKey::Space) => {
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.insert_str(" ");
+                    ed.ensure_cursor_visible(view_h, sf);
+                }
+                self.sync_markdown_from_editor();
+                return true;
+            }
+            _ => {
+                if let Some(t) = text {
+                    let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+                    if !clean.is_empty() {
+                        if let Some(ref mut ed) = self.md_editor {
+                            ed.insert_str(&clean);
+                            ed.ensure_cursor_visible(view_h, sf);
+                        }
+                        self.sync_markdown_from_editor();
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn save_file_dialog(&mut self) {
+        if self.is_markdown_tab() {
+            self.save_active_markdown();
+            return;
+        }
         if self.doc.is_none() {
             return;
         }
@@ -4379,6 +4608,17 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
 
+        // 2b. Markdown / LaTeX live editor (Split or Edit mode)
+        if self.is_markdown_tab()
+            && self.md_editor_mode != super::text_editor::MdEditorMode::Preview
+            && self.open_menu.is_none()
+            && !self.show_help_overlay
+        {
+            if self.handle_markdown_editor_key(&logical_key, text) {
+                return;
+            }
+        }
+
         // 3. OS-native modifier shortcuts: Cmd/Ctrl + Z/C/F/G/P/S/W/0/+/-/Tab/1..9.
         // Any unrecognized Ctrl/Cmd or Alt+Character combo returns early so e.g. Ctrl+D NEVER triggers bare 'D' (Delete Page)!
         if self.cmd_or_ctrl_pressed {
@@ -4984,7 +5224,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                     return;
                 }
-                if Self::is_markdown_path(&dropped_path) {
+                if Self::is_doc_reader_path(&dropped_path) {
                     let fname = dropped_path
                         .file_name()
                         .and_then(|s| s.to_str())
@@ -5218,6 +5458,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let sf = self.effective_scale_factor(w.scale_factor());
                         let top_bars_h = self.top_bars_height_px(sf);
                         let status_bar_h = self.status_bar_height_px(sf);
+                        let sidebar_w = self.sidebar_width_px(sf).min(sz.width.saturating_sub(64));
+                        let cx = self.cursor_pos.0.round() as i32;
+                        let cy = self.cursor_pos.1.round() as i32;
+                        if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, sf) {
+                            if cx >= ex && cx < ex + ew as i32 && cy >= ey && cy < ey + eh as i32 {
+                                if let Some(ref mut ed) = self.md_editor {
+                                    let max_s = ed.max_scroll_y(eh as f32, sf);
+                                    ed.scroll_y = (ed.scroll_y - dy as f32).clamp(0.0, max_s);
+                                    self.request_redraw();
+                                }
+                                return;
+                            }
+                        }
                         let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
                         let max_s = self.md_max_scroll_y(canvas_h, sf);
                         self.scroll_y = (self.scroll_y - dy as f32).clamp(0.0, max_s);
@@ -5340,6 +5593,15 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if self.hscrollbar_drag {
                     self.scroll_to_hscrollbar_x(position.x, win_w, win_h, status_bar_h, sf);
+                    return;
+                }
+                if self.md_editor.as_ref().is_some_and(|e| e.dragging) {
+                    if let Some((ex, ey, _, _)) = self.md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, sf) {
+                        if let Some(ref mut ed) = self.md_editor {
+                            ed.cursor = ed.hit_pos(position.x.round() as i32, position.y.round() as i32, ex, ey, sf);
+                            self.request_redraw();
+                        }
+                    }
                     return;
                 }
                 if let Some((lx, ly)) = self.hand_pan_drag_last {
@@ -5818,6 +6080,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if state == ElementState::Released && self.hscrollbar_drag {
                     self.hscrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.md_editor.as_ref().is_some_and(|e| e.dragging) {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.dragging = false;
+                    }
                     self.request_redraw();
                     return;
                 }
@@ -6746,12 +7015,29 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
-                // 0d2. Markdown Reader View controls & links
+                // 0d2. Markdown Reader View controls, links & live editor clicks
                 if self.is_markdown_tab() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(hit) = self.hit_test_markdown_view(self.cursor_pos.0, self.cursor_pos.1) {
                             self.handle_markdown_click(hit);
                             return;
+                        }
+                        if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, scale_factor) {
+                            let px = self.cursor_pos.0.round() as i32;
+                            let py = self.cursor_pos.1.round() as i32;
+                            if px >= ex && px < ex + ew as i32 && py >= ey && py < ey + eh as i32 {
+                                self.ensure_md_editor_initialized();
+                                let shift = self.shift_pressed;
+                                if let Some(ref mut ed) = self.md_editor {
+                                    let old = ed.cursor;
+                                    let pos = ed.hit_pos(px, py, ex, ey, scale_factor);
+                                    ed.cursor = pos;
+                                    ed.sel_anchor = if shift { ed.sel_anchor.or(Some(old)) } else { Some(pos) };
+                                    ed.dragging = true;
+                                }
+                                self.request_redraw();
+                                return;
+                            }
                         }
                     }
                 }

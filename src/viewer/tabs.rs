@@ -37,6 +37,9 @@ impl<'a> PdfViewerApp<'a> {
             slot.has_unsaved_edits = self.has_unsaved_edits;
             slot.last_file_mtime = self.last_file_mtime;
             slot.markdown_doc = self.markdown_doc.take();
+            slot.md_source = self.md_source.take();
+            slot.md_editor_mode = self.md_editor_mode;
+            self.md_editor = None;
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
@@ -50,6 +53,9 @@ impl<'a> PdfViewerApp<'a> {
             let slot = &mut self.tabs[index];
             self.doc = slot.doc.take();
             self.markdown_doc = slot.markdown_doc.take();
+            self.md_source = slot.md_source.take();
+            self.md_editor_mode = slot.md_editor_mode;
+            self.md_editor = None;
             self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
             self.md_layout = None;
             self.md_active_hits.clear();
@@ -125,6 +131,16 @@ impl<'a> PdfViewerApp<'a> {
             .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
     }
 
+    pub(super) fn is_latex_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
+    }
+
+    pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
+        Self::is_markdown_path(path) || Self::is_latex_path(path)
+    }
+
     fn markdown_headings_to_bookmarks(doc: &crate::markdown::MarkdownDoc) -> Vec<crate::engine::Bookmark> {
         doc.headings
             .iter()
@@ -136,6 +152,74 @@ impl<'a> PdfViewerApp<'a> {
                 level: h.level.saturating_sub(1),
             })
             .collect()
+    }
+
+    pub(super) fn sync_markdown_from_editor(&mut self) {
+        let Some(ref ed) = self.md_editor else { return };
+        let new_src = ed.to_text();
+        let fallback = self
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Markdown");
+        let parsed = if Self::is_latex_path(&self.file_path) {
+            crate::latex::parse_latex(&new_src, fallback, self.file_path.parent())
+        } else {
+            crate::markdown::parse_markdown(&new_src, fallback)
+        };
+        let bms = Self::markdown_headings_to_bookmarks(&parsed);
+        self.md_source = Some(new_src);
+        self.markdown_doc = Some(parsed);
+        self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
+        self.md_layout = None;
+        self.bookmarks = bms;
+        if let Some(sel) = self.selected_bookmark {
+            if sel >= self.bookmarks.len() {
+                self.selected_bookmark = self.bookmarks.len().checked_sub(1);
+            }
+        }
+        self.has_unsaved_edits = true;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].has_unsaved_edits = true;
+            self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    pub(super) fn save_active_markdown(&mut self) {
+        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
+            return;
+        }
+        let text = if let Some(ref ed) = self.md_editor {
+            let s = ed.to_text();
+            self.md_source = Some(s.clone());
+            s
+        } else {
+            self.md_source.clone().unwrap_or_default()
+        };
+        match std::fs::write(&self.file_path, text.as_bytes()) {
+            Ok(()) => {
+                let mtime = Self::read_file_mtime(&self.file_path);
+                self.has_unsaved_edits = false;
+                self.last_file_mtime = mtime;
+                if self.active_tab < self.tabs.len() {
+                    self.tabs[self.active_tab].has_unsaved_edits = false;
+                    self.tabs[self.active_tab].last_file_mtime = mtime;
+                }
+                let fname = self
+                    .file_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("document.md");
+                self.status_notice = Some(format!("Saved '{fname}'"));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("Save failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
     }
 
     pub(super) fn reload_active_markdown(&mut self) -> bool {
@@ -150,10 +234,27 @@ impl<'a> PdfViewerApp<'a> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("Markdown");
-        let parsed = crate::markdown::parse_markdown(&raw, fallback);
+        let is_tex = Self::is_latex_path(&self.file_path);
+        if is_tex {
+            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                self.status_notice = Some(format!(
+                    "Cannot reload '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                ));
+                self.request_redraw();
+                return false;
+            }
+        }
+        let parsed = if is_tex {
+            crate::latex::parse_latex(&raw, fallback, self.file_path.parent())
+        } else {
+            crate::markdown::parse_markdown(&raw, fallback)
+        };
         let bms = Self::markdown_headings_to_bookmarks(&parsed);
         let mtime = Self::read_file_mtime(&self.file_path);
 
+        self.md_source = Some(raw);
+        self.md_editor = None;
+        self.has_unsaved_edits = false;
         self.markdown_doc = Some(parsed);
         self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
         self.md_layout = None;
@@ -163,8 +264,13 @@ impl<'a> PdfViewerApp<'a> {
         if self.active_tab < self.tabs.len() {
             self.tabs[self.active_tab].last_file_mtime = mtime;
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
+            self.tabs[self.active_tab].has_unsaved_edits = false;
         }
-        self.status_notice = Some("Reloaded Markdown document".to_string());
+        self.status_notice = Some(if is_tex {
+            "Reloaded LaTeX document".to_string()
+        } else {
+            "Reloaded Markdown document".to_string()
+        });
         self.update_title_bar();
         self.request_redraw();
         true
@@ -176,7 +282,19 @@ impl<'a> PdfViewerApp<'a> {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("Markdown");
-        let parsed = crate::markdown::parse_markdown(&raw, fallback);
+        let is_tex = Self::is_latex_path(&path);
+        if is_tex {
+            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                return Err(anyhow::anyhow!(
+                    "Cannot open '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                ));
+            }
+        }
+        let parsed = if is_tex {
+            crate::latex::parse_latex(&raw, fallback, path.parent())
+        } else {
+            crate::markdown::parse_markdown(&raw, fallback)
+        };
         let loaded_bookmarks = Self::markdown_headings_to_bookmarks(&parsed);
         let file_mtime = Self::read_file_mtime(&path);
 
@@ -228,6 +346,9 @@ impl<'a> PdfViewerApp<'a> {
         self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
         self.bookmark_scroll_y = 0;
         self.markdown_doc = Some(parsed);
+        self.md_source = Some(raw);
+        self.md_editor = None;
+        self.md_editor_mode = super::text_editor::MdEditorMode::Preview;
         self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
         self.md_layout = None;
         self.md_active_hits.clear();
@@ -262,6 +383,8 @@ impl<'a> PdfViewerApp<'a> {
             has_unsaved_edits: false,
             last_file_mtime: file_mtime,
             markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
         };
         if new_tab || self.tabs.is_empty() {
             self.tabs.push(slot);
@@ -281,7 +404,7 @@ impl<'a> PdfViewerApp<'a> {
         path: PathBuf,
         password: Option<&str>,
     ) -> Result<()> {
-        if Self::is_markdown_path(&path) {
+        if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, false);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
@@ -383,6 +506,8 @@ impl<'a> PdfViewerApp<'a> {
                 has_unsaved_edits: false,
                 last_file_mtime: file_mtime,
                 markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
             });
             self.active_tab = 0;
             self.tab_scroll_offset = 0;
@@ -452,7 +577,7 @@ impl<'a> PdfViewerApp<'a> {
         path: PathBuf,
         password: Option<&str>,
     ) -> Result<()> {
-        if Self::is_markdown_path(&path) {
+        if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, true);
         }
         if self.tabs.is_empty() {
@@ -516,6 +641,8 @@ impl<'a> PdfViewerApp<'a> {
             has_unsaved_edits: false,
             last_file_mtime: file_mtime,
             markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
         });
 
         self.active_tab = new_idx;
@@ -606,6 +733,8 @@ impl<'a> PdfViewerApp<'a> {
             has_unsaved_edits: true,
             last_file_mtime: None,
             markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
         });
 
         self.active_tab = new_idx;

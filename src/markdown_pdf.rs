@@ -124,6 +124,21 @@ fn spans_to_pdf_words(spans: &[InlineSpan], size_pt: f32, force_bold: bool, base
             InlineSpan::Strikethrough(t) => (t.as_str(), MdPdfFontRole::Sans, (120, 125, 135), true, false, false),
             InlineSpan::Code(t) => (t.as_str(), MdPdfFontRole::Mono, (160, 45, 70), false, false, true),
             InlineSpan::Link { text, .. } => (text.as_str(), MdPdfFontRole::Sans, (29, 78, 216), false, true, false),
+            InlineSpan::Math(t) => {
+                let readable = crate::math_render::math_to_readable_text(t);
+                let fs = size_pt;
+                let w = approx_text_w(&readable, fs, MdPdfFontRole::SansItalic) + 2.0;
+                out.push(PdfWord {
+                    text: readable,
+                    role: MdPdfFontRole::SansItalic,
+                    color: (30, 58, 138),
+                    strike: false,
+                    underline: false,
+                    code_bg: false,
+                    w,
+                });
+                continue;
+            }
         };
         if force_bold && !code_bg {
             role = match role {
@@ -577,6 +592,45 @@ impl Paginator {
                         width: 0.75,
                     });
                     self.cur_y += 14.0;
+                }
+                MdBlock::MathBlock(tex) => {
+                    let readable = crate::math_render::math_to_readable_text(tex);
+                    let size_pt = 11.5;
+                    let h = 28.0;
+                    self.ensure_space(h);
+                    self.cur_cmds.push(PdfDrawCmd::Rect {
+                        x,
+                        y_top: self.cur_y,
+                        w: max_w,
+                        h,
+                        fill: Some((248, 250, 252)),
+                        stroke: Some((203, 213, 225)),
+                        stroke_w: 0.5,
+                    });
+                    let tw = approx_text_w(&readable, size_pt, MdPdfFontRole::SansItalic);
+                    let tx = x + ((max_w - tw) * 0.5).max(8.0);
+                    self.cur_cmds.push(PdfDrawCmd::Text {
+                        x: tx,
+                        baseline_y_top: self.cur_y + 18.0,
+                        text: readable,
+                        font: MdPdfFontRole::SansItalic,
+                        size_pt,
+                        color: (30, 58, 138),
+                    });
+                    self.cur_y += h + 10.0;
+                }
+                MdBlock::Image { path, .. } => {
+                    let label = format!("[Image: {}]", std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path));
+                    self.ensure_space(20.0);
+                    self.cur_cmds.push(PdfDrawCmd::Text {
+                        x,
+                        baseline_y_top: self.cur_y + 12.0,
+                        text: label,
+                        font: MdPdfFontRole::SansItalic,
+                        size_pt: 9.5,
+                        color: (100, 116, 139),
+                    });
+                    self.cur_y += 20.0;
                 }
             }
         }

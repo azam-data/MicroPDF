@@ -8,11 +8,16 @@ use std::collections::HashMap;
 
 use super::render::fill_rect_clipped;
 use super::state::*;
+use super::text_editor::{MdEditorMode, TextEditorState};
 use super::theme::{UiTheme, UiThemeMode};
 use super::ui_draw::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum MarkdownHit {
+    ModePreview,
+    ModeSplit,
+    ModeEdit,
+    Save,
     Reload,
     ZoomOut,
     ZoomReset,
@@ -46,6 +51,7 @@ struct StyledWord {
     italic: bool,
     strike: bool,
     code: bool,
+    math: bool,
     link_idx: Option<usize>,
     w: f32,
 }
@@ -112,6 +118,22 @@ enum LaidOutBlock {
         y: f32,
         h: f32,
     },
+    MathBlock {
+        y: f32,
+        h: f32,
+        tex: String,
+        font_sz: f32,
+    },
+    Image {
+        y: f32,
+        h: f32,
+        img_idx: usize,
+        w_px: u32,
+        h_px: u32,
+        caption: Option<String>,
+        fallback_path: String,
+        font_sz: f32,
+    },
 }
 
 #[derive(Clone)]
@@ -132,24 +154,41 @@ pub(super) struct MdLayoutCache {
     pub(super) links: Vec<String>,
     pub(super) code_blocks: Vec<String>,
     pub(super) code_h_scroll: Vec<f32>,
+    pub(super) images: Vec<Option<(u32, u32, Vec<u32>)>>,
 }
 
 fn tokenize_spans(spans: &[InlineSpan], font_sz: f32, links: &mut Vec<String>) -> Vec<StyledWord> {
     let mut out = Vec::new();
     for sp in spans {
-        let (txt, bold, italic, strike, code, link_idx) = match sp {
-            InlineSpan::Text(t) => (t.as_str(), false, false, false, false, None),
-            InlineSpan::Bold(t) => (t.as_str(), true, false, false, false, None),
-            InlineSpan::Italic(t) => (t.as_str(), false, true, false, false, None),
-            InlineSpan::BoldItalic(t) => (t.as_str(), true, true, false, false, None),
-            InlineSpan::Strikethrough(t) => (t.as_str(), false, false, true, false, None),
-            InlineSpan::Code(t) => (t.as_str(), false, false, false, true, None),
+        let (txt, bold, italic, strike, code, math, link_idx) = match sp {
+            InlineSpan::Text(t) => (t.as_str(), false, false, false, false, false, None),
+            InlineSpan::Bold(t) => (t.as_str(), true, false, false, false, false, None),
+            InlineSpan::Italic(t) => (t.as_str(), false, true, false, false, false, None),
+            InlineSpan::BoldItalic(t) => (t.as_str(), true, true, false, false, false, None),
+            InlineSpan::Strikethrough(t) => (t.as_str(), false, false, true, false, false, None),
+            InlineSpan::Code(t) => (t.as_str(), false, false, false, true, false, None),
+            InlineSpan::Math(t) => (t.as_str(), false, false, false, false, true, None),
             InlineSpan::Link { text, url } => {
                 let idx = links.len();
                 links.push(url.clone());
-                (text.as_str(), false, false, false, false, Some(idx))
+                (text.as_str(), false, false, false, false, false, Some(idx))
             }
         };
+        if math {
+            let nodes = crate::math_render::parse_math_nodes(txt);
+            let (mw, _, _) = crate::math_render::measure_math_nodes(&nodes, font_sz);
+            out.push(StyledWord {
+                text: txt.to_string(),
+                bold: false,
+                italic: false,
+                strike: false,
+                code: false,
+                math: true,
+                link_idx,
+                w: mw + font_sz * 0.15,
+            });
+            continue;
+        }
         if code {
             let w = measure_text(txt, font_sz * 0.92, false) + font_sz * 0.65;
             out.push(StyledWord {
@@ -158,6 +197,7 @@ fn tokenize_spans(spans: &[InlineSpan], font_sz: f32, links: &mut Vec<String>) -
                 italic: false,
                 strike: false,
                 code: true,
+                math: false,
                 link_idx,
                 w,
             });
@@ -177,6 +217,7 @@ fn tokenize_spans(spans: &[InlineSpan], font_sz: f32, links: &mut Vec<String>) -
                         italic,
                         strike,
                         code: false,
+                        math: false,
                         link_idx,
                         w,
                     });
@@ -197,6 +238,7 @@ fn tokenize_spans(spans: &[InlineSpan], font_sz: f32, links: &mut Vec<String>) -
                     italic,
                     strike,
                     code: false,
+                    math: false,
                     link_idx,
                     w,
                 });
@@ -214,6 +256,7 @@ fn tokenize_spans(spans: &[InlineSpan], font_sz: f32, links: &mut Vec<String>) -
                 italic,
                 strike,
                 code: false,
+                math: false,
                 link_idx,
                 w,
             });
@@ -279,6 +322,7 @@ fn layout_blocks(
     mut y: f32,
     links: &mut Vec<String>,
     code_blocks: &mut Vec<String>,
+    images: &mut Vec<Option<(u32, u32, Vec<u32>)>>,
     block_y_by_ast_idx: Option<&mut HashMap<usize, f32>>,
 ) -> (Vec<LaidOutBlock>, f32) {
     let mut out = Vec::new();
@@ -377,6 +421,7 @@ fn layout_blocks(
                     y + 8.0 * s,
                     links,
                     code_blocks,
+                    images,
                     None,
                 );
                 let h = (end_y - y).max(24.0 * s);
@@ -468,6 +513,60 @@ fn layout_blocks(
                 let h = 18.0 * s;
                 out.push(LaidOutBlock::HorizontalRule { y, h });
                 y += h + 8.0 * s;
+            }
+            MdBlock::MathBlock(tex) => {
+                let fs = base_fs * 1.15;
+                let nodes = crate::math_render::parse_math_nodes(tex);
+                let (_, asc, desc) = crate::math_render::measure_math_nodes(&nodes, fs);
+                let h = (asc + desc + 22.0 * s).max(36.0 * s);
+                out.push(LaidOutBlock::MathBlock {
+                    y,
+                    h,
+                    tex: tex.clone(),
+                    font_sz: fs,
+                });
+                y += h + 10.0 * s;
+            }
+            MdBlock::Image { path, caption } => {
+                let img_idx = images.len();
+                let decoded = image::open(path).ok().map(|im| {
+                    let rgb = im.to_rgb8();
+                    let (w, h) = rgb.dimensions();
+                    let mut px = Vec::with_capacity((w * h) as usize);
+                    for p in rgb.pixels() {
+                        let [r, g, b] = p.0;
+                        px.push(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+                    }
+                    (w, h, px)
+                });
+                let (w_px, h_px) = if let Some((iw, ih, _)) = &decoded {
+                    let nat_w = (*iw as f32) * s;
+                    let nat_h = (*ih as f32) * s;
+                    let mut dw = nat_w.min(col_w);
+                    let mut dh = if nat_w > 0.0 { nat_h * (dw / nat_w) } else { 44.0 * s };
+                    let max_h = 520.0 * s;
+                    if dh > max_h && dh > 0.0 {
+                        dw *= max_h / dh;
+                        dh = max_h;
+                    }
+                    (dw.round().max(1.0) as u32, dh.round().max(1.0) as u32)
+                } else {
+                    (col_w.min(420.0 * s).round().max(120.0) as u32, (44.0 * s).round() as u32)
+                };
+                images.push(decoded);
+                let cap_h = if caption.is_some() { 22.0 * s } else { 0.0 };
+                let h = h_px as f32 + cap_h + 8.0 * s;
+                out.push(LaidOutBlock::Image {
+                    y,
+                    h,
+                    img_idx,
+                    w_px,
+                    h_px,
+                    caption: caption.clone(),
+                    fallback_path: path.clone(),
+                    font_sz: base_fs * 0.88,
+                });
+                y += h + 10.0 * s;
             }
         }
     }
@@ -574,6 +673,7 @@ impl<'a> PdfViewerApp<'a> {
         let base_fs = (14.5 * s * self.zoom_level).clamp(9.0, 34.0);
         let mut links = Vec::new();
         let mut code_blocks = Vec::new();
+        let mut images = Vec::new();
         let mut block_y_by_ast_idx = HashMap::new();
         let (blocks, end_y) = layout_blocks(
             &doc.blocks,
@@ -583,6 +683,7 @@ impl<'a> PdfViewerApp<'a> {
             24.0 * s,
             &mut links,
             &mut code_blocks,
+            &mut images,
             Some(&mut block_y_by_ast_idx),
         );
         let code_h_scroll = vec![0.0f32; code_blocks.len()];
@@ -597,6 +698,7 @@ impl<'a> PdfViewerApp<'a> {
             links,
             code_blocks,
             code_h_scroll,
+            images,
         });
     }
 
@@ -618,6 +720,42 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    pub(super) fn md_editor_rect(
+        &self,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        win_w: u32,
+        win_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        if !self.is_markdown_tab() || self.md_editor_mode == MdEditorMode::Preview {
+            return None;
+        }
+        let canvas_w = win_w.saturating_sub(sidebar_w);
+        let canvas_h = win_h.saturating_sub(top_bars_h + status_bar_h);
+        let hdr_h = self.md_header_bar_height_px(sf);
+        let content_h = canvas_h.saturating_sub(hdr_h);
+        if canvas_w == 0 || content_h == 0 {
+            return None;
+        }
+        let ex = sidebar_w as i32;
+        let ey = (top_bars_h + hdr_h) as i32;
+        let ew = match self.md_editor_mode {
+            MdEditorMode::Edit => canvas_w,
+            MdEditorMode::Split => canvas_w / 2,
+            MdEditorMode::Preview => return None,
+        };
+        Some((ex, ey, ew, content_h))
+    }
+
+    pub(super) fn ensure_md_editor_initialized(&mut self) {
+        if self.md_editor.is_none() {
+            let src = self.md_source.as_deref().unwrap_or("");
+            self.md_editor = Some(TextEditorState::from_text(src));
+        }
+    }
+
     fn collect_md_header_hits(
         &self,
         sidebar_w: u32,
@@ -634,25 +772,43 @@ impl<'a> PdfViewerApp<'a> {
         let by = y0 + ((hdr_h.saturating_sub(btn_h)) / 2) as i32;
         let mut rx = x0 + cw as i32 - (12.0 * s).round() as i32;
 
-        let mut hits = Vec::with_capacity(8);
-        let export_w = (118.0 * s).round() as u32;
+        let mut hits = Vec::with_capacity(12);
+        let export_w = (108.0 * s).round() as u32;
         rx -= export_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: export_w, h: btn_h, hit: MarkdownHit::ExportMenu });
 
-        rx -= (8.0 * s).round() as i32;
-        let reload_w = (68.0 * s).round() as u32;
+        rx -= (6.0 * s).round() as i32;
+        let reload_w = (60.0 * s).round() as u32;
         rx -= reload_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: reload_w, h: btn_h, hit: MarkdownHit::Reload });
 
-        rx -= (10.0 * s).round() as i32;
-        let zbtn_w = (24.0 * s).round() as u32;
-        let zlbl_w = (46.0 * s).round() as u32;
+        if self.has_unsaved_edits || self.md_editor_mode != MdEditorMode::Preview {
+            rx -= (6.0 * s).round() as i32;
+            let save_w = (54.0 * s).round() as u32;
+            rx -= save_w as i32;
+            hits.push(MdHitRect { x: rx, y: by, w: save_w, h: btn_h, hit: MarkdownHit::Save });
+        }
+
+        rx -= (8.0 * s).round() as i32;
+        let zbtn_w = (22.0 * s).round() as u32;
+        let zlbl_w = (44.0 * s).round() as u32;
         rx -= zbtn_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: zbtn_w, h: btn_h, hit: MarkdownHit::ZoomIn });
         rx -= zlbl_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: zlbl_w, h: btn_h, hit: MarkdownHit::ZoomReset });
         rx -= zbtn_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: zbtn_w, h: btn_h, hit: MarkdownHit::ZoomOut });
+
+        rx -= (10.0 * s).round() as i32;
+        let mode_w = (54.0 * s).round() as u32;
+        let split_w = (44.0 * s).round() as u32;
+        let edit_w = (42.0 * s).round() as u32;
+        rx -= edit_w as i32;
+        hits.push(MdHitRect { x: rx, y: by, w: edit_w, h: btn_h, hit: MarkdownHit::ModeEdit });
+        rx -= (split_w as i32) + 2;
+        hits.push(MdHitRect { x: rx, y: by, w: split_w, h: btn_h, hit: MarkdownHit::ModeSplit });
+        rx -= (mode_w as i32) + 2;
+        hits.push(MdHitRect { x: rx, y: by, w: mode_w, h: btn_h, hit: MarkdownHit::ModePreview });
 
         hits
     }
@@ -672,7 +828,14 @@ impl<'a> PdfViewerApp<'a> {
         if canvas_w == 0 || canvas_h == 0 {
             return;
         }
-        self.ensure_md_layout(canvas_w, sf);
+        let preview_w = match self.md_editor_mode {
+            MdEditorMode::Preview => canvas_w,
+            MdEditorMode::Split => canvas_w.saturating_sub(canvas_w / 2 + 1).max(160),
+            MdEditorMode::Edit => 0,
+        };
+        if preview_w > 0 {
+            self.ensure_md_layout(preview_w, sf);
+        }
 
         let theme = self.ui_theme();
         let s = sf as f32;
@@ -684,39 +847,56 @@ impl<'a> PdfViewerApp<'a> {
         let (page_bg, content_theme) = md_reading_theme(theme, self.reading_filter, self.ui_theme_mode);
         fill_rect_clipped(buffer, buf_w, buf_h, x0, y0, canvas_w, canvas_h, page_bg);
 
-        let max_scroll = self.md_max_scroll_y(canvas_h, sf);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
-        let scroll_y = self.scroll_y;
-
         let content_top = y0 + hdr_h as i32;
         let content_bottom = y0 + canvas_h as i32;
 
         self.md_active_hits.clear();
 
-        if let Some(ref cache) = self.md_layout {
-            let col_x = x0 + ((canvas_w.saturating_sub(cache.col_w)) / 2) as i32;
-            let view_top = scroll_y;
-            let view_bot = scroll_y + (content_bottom - content_top) as f32;
+        if preview_w > 0 {
+            let max_scroll = self.md_max_scroll_y(canvas_h, sf);
+            self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+            let scroll_y = self.scroll_y;
+            let preview_x0 = match self.md_editor_mode {
+                MdEditorMode::Split => x0 + (canvas_w / 2) as i32 + 1,
+                _ => x0,
+            };
 
-            for blk in &cache.blocks {
-                draw_laid_out_block(
-                    buffer,
-                    buf_w,
-                    buf_h,
-                    blk,
-                    col_x,
-                    cache.col_w as f32,
-                    content_top,
-                    content_bottom,
-                    scroll_y,
-                    view_top,
-                    view_bot,
-                    &cache.code_h_scroll,
-                    &content_theme,
-                    &self.hovered_widget,
-                    s,
-                    &mut self.md_active_hits,
-                );
+            if let Some(ref cache) = self.md_layout {
+                let col_x = preview_x0 + ((preview_w.saturating_sub(cache.col_w)) / 2) as i32;
+                let view_top = scroll_y;
+                let view_bot = scroll_y + (content_bottom - content_top) as f32;
+
+                for blk in &cache.blocks {
+                    draw_laid_out_block(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        blk,
+                        col_x,
+                        cache.col_w as f32,
+                        content_top,
+                        content_bottom,
+                        scroll_y,
+                        view_top,
+                        view_bot,
+                        &cache.code_h_scroll,
+                        &cache.images,
+                        &content_theme,
+                        &self.hovered_widget,
+                        s,
+                        &mut self.md_active_hits,
+                    );
+                }
+            }
+        }
+
+        if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, buf_w, buf_h, status_bar_h, sf) {
+            self.ensure_md_editor_initialized();
+            if let Some(ref mut ed) = self.md_editor {
+                ed.draw(buffer, buf_w, buf_h, ex, ey, ew, eh, page_bg, &content_theme, sf);
+            }
+            if self.md_editor_mode == MdEditorMode::Split {
+                fill_rect_clipped(buffer, buf_w, buf_h, ex + ew as i32, ey, 1, eh, theme.divider);
             }
         }
 
@@ -736,6 +916,11 @@ impl<'a> PdfViewerApp<'a> {
         let badge_h = (18.0 * s).round() as u32;
         let badge_y = y0 + ((hdr_h.saturating_sub(badge_h)) / 2) as i32;
         fill_rounded_rect(buffer, buf_w, buf_h, x0 + 12, badge_y, badge_w, badge_h, 4.0 * s, theme.accent_soft_bg);
+        let badge_label = if Self::is_latex_path(&self.file_path) {
+            "TEX"
+        } else {
+            "MD"
+        };
         draw_text_vcenter(
             buffer,
             buf_w,
@@ -744,7 +929,7 @@ impl<'a> PdfViewerApp<'a> {
             badge_y,
             badge_h,
             x0 + 12 + badge_w as i32,
-            "MD",
+            badge_label,
             10.5 * s,
             theme.accent_soft_fg,
             true,
@@ -769,20 +954,39 @@ impl<'a> PdfViewerApp<'a> {
         let zoom_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
         for h in &hdr_hits {
             let hov = self.hovered_widget == Some(UiHit::MarkdownView(h.hit));
-            let is_primary = h.hit == MarkdownHit::ExportMenu;
+            let is_primary = h.hit == MarkdownHit::ExportMenu
+                || (h.hit == MarkdownHit::Save && self.has_unsaved_edits);
+            let is_active = match h.hit {
+                MarkdownHit::ModePreview => self.md_editor_mode == MdEditorMode::Preview,
+                MarkdownHit::ModeSplit => self.md_editor_mode == MdEditorMode::Split,
+                MarkdownHit::ModeEdit => self.md_editor_mode == MdEditorMode::Edit,
+                _ => false,
+            };
             let bg = if is_primary {
                 if hov { theme.accent_hover } else { theme.accent }
+            } else if is_active {
+                theme.accent_soft_bg
             } else if hov {
                 theme.hover_bg
             } else {
                 theme.input_bg
             };
-            let fg = if is_primary { theme.text_on_accent } else { theme.text_primary };
+            let fg = if is_primary {
+                theme.text_on_accent
+            } else if is_active {
+                theme.accent_soft_fg
+            } else {
+                theme.text_primary
+            };
             fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 5.0 * s, bg);
             if !is_primary {
-                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 5.0 * s, theme.border_subtle);
+                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 5.0 * s, if is_active { theme.accent } else { theme.border_subtle });
             }
             let lbl = match h.hit {
+                MarkdownHit::ModePreview => "Preview",
+                MarkdownHit::ModeSplit => "Split",
+                MarkdownHit::ModeEdit => "Edit",
+                MarkdownHit::Save => "Save",
                 MarkdownHit::ExportMenu => "Export / Print",
                 MarkdownHit::Reload => "Reload",
                 MarkdownHit::ZoomOut => "-",
@@ -791,9 +995,9 @@ impl<'a> PdfViewerApp<'a> {
                 _ => "",
             };
             let fs = 11.0 * s;
-            let tw = measure_text(lbl, fs, is_primary);
+            let tw = measure_text(lbl, fs, is_primary || is_active);
             let tx = h.x + ((h.w as f32 - tw) * 0.5).round() as i32;
-            draw_text_vcenter(buffer, buf_w, buf_h, tx, h.y, h.h, h.x + h.w as i32 - 2, lbl, fs, fg, is_primary);
+            draw_text_vcenter(buffer, buf_w, buf_h, tx, h.y, h.h, h.x + h.w as i32 - 2, lbl, fs, fg, is_primary || is_active);
         }
 
         self.md_active_hits.extend(hdr_hits);
@@ -813,6 +1017,25 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn handle_markdown_click(&mut self, hit: MarkdownHit) {
         match hit {
+            MarkdownHit::ModePreview => {
+                self.md_editor_mode = MdEditorMode::Preview;
+                self.md_layout = None;
+                self.request_redraw();
+            }
+            MarkdownHit::ModeSplit => {
+                self.md_editor_mode = MdEditorMode::Split;
+                self.ensure_md_editor_initialized();
+                self.md_layout = None;
+                self.request_redraw();
+            }
+            MarkdownHit::ModeEdit => {
+                self.md_editor_mode = MdEditorMode::Edit;
+                self.ensure_md_editor_initialized();
+                self.request_redraw();
+            }
+            MarkdownHit::Save => {
+                self.save_active_markdown();
+            }
             MarkdownHit::Reload => {
                 self.reload_active_markdown();
             }
@@ -893,6 +1116,7 @@ fn draw_laid_out_block(
     view_top: f32,
     view_bot: f32,
     code_h_scroll: &[f32],
+    images: &[Option<(u32, u32, Vec<u32>)>],
     theme: &UiTheme,
     hovered: &Option<UiHit>,
     s: f32,
@@ -991,7 +1215,7 @@ fn draw_laid_out_block(
                 fill_rect_clipped(buffer, buf_w, buf_h, col_x, draw_y0, (3.0 * s).round().max(2.0) as u32, (draw_y1 - draw_y0) as u32, theme.accent);
             }
             for child in inner {
-                draw_laid_out_block(buffer, buf_w, buf_h, child, col_x + (16.0 * s).round() as i32, col_w - 24.0 * s, clip_top, clip_bot, scroll_y, view_top, view_bot, code_h_scroll, theme, hovered, s, hits);
+                draw_laid_out_block(buffer, buf_w, buf_h, child, col_x + (16.0 * s).round() as i32, col_w - 24.0 * s, clip_top, clip_bot, scroll_y, view_top, view_bot, code_h_scroll, images, theme, hovered, s, hits);
             }
         }
         LaidOutBlock::Table { y, h, col_widths, alignments, headers, header_h, rows, line_h, font_sz } => {
@@ -1078,6 +1302,82 @@ fn draw_laid_out_block(
                 fill_rect_clipped(buffer, buf_w, buf_h, col_x, sy, col_w.round() as u32, 1, theme.divider);
             }
         }
+        LaidOutBlock::MathBlock { y, h, tex, font_sz } => {
+            if y + h < view_top || *y > view_bot {
+                return;
+            }
+            let sy = clip_top + (*y - scroll_y).round() as i32;
+            let box_h = h.round().max(1.0) as u32;
+            let draw_y0 = sy.max(clip_top);
+            let draw_y1 = (sy + box_h as i32).min(clip_bot);
+            if draw_y1 > draw_y0 {
+                fill_rounded_rect(buffer, buf_w, buf_h, col_x, draw_y0, col_w.round().max(1.0) as u32, (draw_y1 - draw_y0) as u32, 6.0 * s, theme.surface_bg);
+            }
+            let nodes = crate::math_render::parse_math_nodes(tex);
+            let (mw, asc, _) = crate::math_render::measure_math_nodes(&nodes, *font_sz);
+            let mx = col_x as f32 + ((col_w - mw) * 0.5).max(8.0 * s);
+            let baseline_y = sy as f32 + 11.0 * s + asc;
+            crate::math_render::draw_math_nodes(
+                buffer,
+                buf_w,
+                buf_h,
+                mx,
+                baseline_y,
+                &nodes,
+                *font_sz,
+                theme.text_primary,
+                clip_top,
+                clip_bot,
+            );
+        }
+        LaidOutBlock::Image { y, h, img_idx, w_px, h_px, caption, fallback_path, font_sz } => {
+            if y + h < view_top || *y > view_bot {
+                return;
+            }
+            let sy = clip_top + (*y - scroll_y).round() as i32;
+            let ix = col_x + ((col_w - *w_px as f32) * 0.5).max(0.0).round() as i32;
+            if let Some(Some((sw, sh, src_px))) = images.get(*img_idx) {
+                let dw = (*w_px).max(1);
+                let dh = (*h_px).max(1);
+                for dy in 0..dh {
+                    let py = sy + dy as i32;
+                    if py < clip_top || py >= clip_bot || py >= buf_h as i32 {
+                        continue;
+                    }
+                    let src_y = ((dy as u64 * *sh as u64) / dh as u64).min(*sh as u64 - 1) as usize;
+                    let row_off = py as usize * buf_w as usize;
+                    let src_row = src_y * (*sw as usize);
+                    for dx in 0..dw {
+                        let px_x = ix + dx as i32;
+                        if px_x < 0 || px_x >= buf_w as i32 {
+                            continue;
+                        }
+                        let src_x = ((dx as u64 * *sw as u64) / dw as u64).min(*sw as u64 - 1) as usize;
+                        buffer[row_off + px_x as usize] = src_px[src_row + src_x];
+                    }
+                }
+            } else {
+                let draw_y0 = sy.max(clip_top);
+                let draw_y1 = (sy + *h_px as i32).min(clip_bot);
+                if draw_y1 > draw_y0 {
+                    fill_rounded_rect(buffer, buf_w, buf_h, ix, draw_y0, *w_px, (draw_y1 - draw_y0) as u32, 6.0 * s, theme.surface_bg);
+                    stroke_rounded_rect(buffer, buf_w, buf_h, ix, draw_y0, *w_px, (draw_y1 - draw_y0) as u32, 6.0 * s, theme.border_subtle);
+                }
+                if sy >= clip_top && sy + (*h_px as i32) <= clip_bot {
+                    let msg = format!("[Image: {}]", fallback_path);
+                    let clipped = truncate_ellipsis(&msg, (*w_px as f32 - 20.0 * s).max(40.0), *font_sz, false);
+                    draw_text_vcenter(buffer, buf_w, buf_h, ix + (10.0 * s).round() as i32, sy, *h_px, ix + *w_px as i32 - 8, &clipped, *font_sz, theme.text_muted, false);
+                }
+            }
+            if let Some(cap) = caption {
+                let cap_y = sy + *h_px as i32 + (6.0 * s).round() as i32;
+                if cap_y >= clip_top && cap_y + (*font_sz * 1.4).round() as i32 <= clip_bot {
+                    let tw = measure_text(cap, *font_sz, false);
+                    let tx = col_x + ((col_w - tw) * 0.5).max(0.0).round() as i32;
+                    draw_text_clipped(buffer, buf_w, buf_h, tx, cap_y, col_x + col_w.round() as i32, cap, *font_sz, theme.text_secondary, false);
+                }
+            }
+        }
     }
 }
 
@@ -1111,6 +1411,23 @@ fn draw_wrapped_lines(
         };
         let mut cx = x as f32 + align_dx;
         for w in &line.spans {
+            if w.math {
+                let nodes = crate::math_render::parse_math_nodes(&w.text);
+                crate::math_render::draw_math_nodes(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    cx,
+                    ly as f32 + font_sz * 0.85,
+                    &nodes,
+                    font_sz,
+                    base_color,
+                    clip_top,
+                    clip_bot,
+                );
+                cx += w.w;
+                continue;
+            }
             if w.code {
                 let pw = w.w.round() as u32;
                 let ph = (font_sz * 1.25).round() as u32;

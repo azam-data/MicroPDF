@@ -623,6 +623,10 @@ impl<'a> PdfViewerApp<'a> {
                 self.pending_dialog = Some(PendingDialog::Open);
             }
             ToolbarAction::Save => {
+                if self.is_markdown_tab() {
+                    self.save_active_markdown();
+                    return;
+                }
                 if self.doc.is_some() {
                     self.pending_dialog = Some(PendingDialog::Save);
                 }

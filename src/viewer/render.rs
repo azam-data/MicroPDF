@@ -2449,7 +2449,7 @@ impl<'a> PdfViewerApp<'a> {
 }
 
 /// Fills a clipped rectangle in the `0x00RRGGBB` pixel buffer.
-pub(super) fn fill_rect_clipped(
+pub(crate) fn fill_rect_clipped(
     buffer: &mut [u32],
     buf_w: u32,
     buf_h: u32,
