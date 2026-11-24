@@ -1518,6 +1518,9 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
         if self.is_markdown_tab() {
+            if self.md_editor_mode == super::text_editor::MdEditorMode::Edit {
+                return None;
+            }
             let max_scroll = self.md_max_scroll_y(content_h, scale_factor);
             if max_scroll <= 1.0 {
                 return None;

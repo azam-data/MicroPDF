@@ -1809,24 +1809,24 @@ impl<'a> PdfViewerApp<'a> {
     fn handle_markdown_editor_key(&mut self, key: &winit::keyboard::Key, text: Option<&str>) -> bool {
         use winit::keyboard::{Key, NamedKey};
         self.ensure_md_editor_initialized();
-        let view_h = self
-            .window
-            .as_ref()
-            .map(|w| {
-                let sz = w.inner_size();
-                let sf = self.effective_scale_factor(w.scale_factor());
-                sz.height.saturating_sub(
-                    self.top_bars_height_px(sf)
-                        + self.status_bar_height_px(sf)
-                        + self.md_header_bar_height_px(sf),
-                ) as f32
-            })
-            .unwrap_or(500.0);
         let sf = self
             .window
             .as_ref()
             .map(|w| self.effective_scale_factor(w.scale_factor()))
             .unwrap_or(1.0);
+        let (ew, view_h) = self
+            .window
+            .as_ref()
+            .and_then(|w| {
+                let sz = w.inner_size();
+                let top_bars_h = self.top_bars_height_px(sf);
+                let status_bar_h = self.status_bar_height_px(sf);
+                let sidebar_w = self.sidebar_width_px(sf).min(sz.width.saturating_sub(64));
+                self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, sf)
+                    .map(|(_, _, w_px, h_px)| (w_px, h_px as f32))
+            })
+            .unwrap_or((600, 500.0));
+        let zoom = self.zoom_level;
 
         if self.cmd_or_ctrl_pressed {
             if let Key::Character(ch) = key {
@@ -1851,7 +1851,7 @@ impl<'a> PdfViewerApp<'a> {
                         if let Some(sel) = ed.selected_text() {
                             let _ = Self::copy_text_to_os_clipboard(&sel);
                             changed = ed.delete_selection();
-                            ed.ensure_cursor_visible(view_h, sf);
+                            ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                         }
                     }
                     if changed {
@@ -1863,7 +1863,7 @@ impl<'a> PdfViewerApp<'a> {
                         if !clip.is_empty() {
                             if let Some(ref mut ed) = self.md_editor {
                                 ed.insert_str(&clip);
-                                ed.ensure_cursor_visible(view_h, sf);
+                                ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                             }
                             self.sync_markdown_from_editor();
                         }
@@ -1872,7 +1872,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if s.eq_ignore_ascii_case("z") {
                     let changed = if let Some(ref mut ed) = self.md_editor {
                         let ok = if self.shift_pressed || s == "Z" { ed.redo() } else { ed.undo() };
-                        ed.ensure_cursor_visible(view_h, sf);
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                         ok
                     } else {
                         false
@@ -1884,7 +1884,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if s.eq_ignore_ascii_case("y") {
                     let changed = if let Some(ref mut ed) = self.md_editor {
                         let ok = ed.redo();
-                        ed.ensure_cursor_visible(view_h, sf);
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                         ok
                     } else {
                         false
@@ -1912,7 +1912,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowUp) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(-1, 0, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1920,7 +1920,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowDown) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(1, 0, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1928,7 +1928,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowLeft) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(0, -1, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1936,7 +1936,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowRight) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(0, 1, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1944,7 +1944,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Home) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_home(shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1952,7 +1952,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::End) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_end(shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1960,7 +1960,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::PageUp) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(-15, 0, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1968,7 +1968,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::PageDown) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.move_cursor(15, 0, shift);
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.request_redraw();
                 return true;
@@ -1976,7 +1976,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Enter) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.insert_str("\n");
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
                 return true;
@@ -1984,7 +1984,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Tab) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.insert_str("  ");
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
                 return true;
@@ -1992,7 +1992,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Backspace) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.backspace();
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
                 return true;
@@ -2000,7 +2000,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Delete) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.delete_forward();
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
                 return true;
@@ -2008,7 +2008,7 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::Space) => {
                 if let Some(ref mut ed) = self.md_editor {
                     ed.insert_str(" ");
-                    ed.ensure_cursor_visible(view_h, sf);
+                    ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
                 return true;
@@ -2019,7 +2019,7 @@ impl<'a> PdfViewerApp<'a> {
                     if !clean.is_empty() {
                         if let Some(ref mut ed) = self.md_editor {
                             ed.insert_str(&clean);
-                            ed.ensure_cursor_visible(view_h, sf);
+                            ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                         }
                         self.sync_markdown_from_editor();
                         return true;
@@ -5463,8 +5463,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let cy = self.cursor_pos.1.round() as i32;
                         if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, sf) {
                             if cx >= ex && cx < ex + ew as i32 && cy >= ey && cy < ey + eh as i32 {
+                                let zoom = self.zoom_level;
                                 if let Some(ref mut ed) = self.md_editor {
-                                    let max_s = ed.max_scroll_y(eh as f32, sf);
+                                    let max_s = ed.max_scroll_y(ew, eh as f32, sf, zoom);
                                     ed.scroll_y = (ed.scroll_y - dy as f32).clamp(0.0, max_s);
                                     self.request_redraw();
                                 }
@@ -5595,10 +5596,21 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.scroll_to_hscrollbar_x(position.x, win_w, win_h, status_bar_h, sf);
                     return;
                 }
-                if self.md_editor.as_ref().is_some_and(|e| e.dragging) {
-                    if let Some((ex, ey, _, _)) = self.md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, sf) {
+                if self.md_editor.as_ref().is_some_and(|e| e.scrollbar_drag) {
+                    if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, sf) {
+                        let zoom = self.zoom_level;
                         if let Some(ref mut ed) = self.md_editor {
-                            ed.cursor = ed.hit_pos(position.x.round() as i32, position.y.round() as i32, ex, ey, sf);
+                            ed.scroll_to_scrollbar_y(position.y, ex, ey, ew, eh, sf, zoom);
+                            self.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                if self.md_editor.as_ref().is_some_and(|e| e.dragging) {
+                    if let Some((ex, ey, ew, _)) = self.md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, sf) {
+                        let zoom = self.zoom_level;
+                        if let Some(ref mut ed) = self.md_editor {
+                            ed.cursor = ed.hit_pos(position.x.round() as i32, position.y.round() as i32, ex, ey, ew, sf, zoom);
                             self.request_redraw();
                         }
                     }
@@ -6083,9 +6095,10 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.request_redraw();
                     return;
                 }
-                if state == ElementState::Released && self.md_editor.as_ref().is_some_and(|e| e.dragging) {
+                if state == ElementState::Released && self.md_editor.as_ref().is_some_and(|e| e.dragging || e.scrollbar_drag) {
                     if let Some(ref mut ed) = self.md_editor {
                         ed.dragging = false;
+                        ed.scrollbar_drag = false;
                     }
                     self.request_redraw();
                     return;
@@ -7028,12 +7041,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             if px >= ex && px < ex + ew as i32 && py >= ey && py < ey + eh as i32 {
                                 self.ensure_md_editor_initialized();
                                 let shift = self.shift_pressed;
+                                let zoom = self.zoom_level;
+                                let py_f = self.cursor_pos.1;
                                 if let Some(ref mut ed) = self.md_editor {
-                                    let old = ed.cursor;
-                                    let pos = ed.hit_pos(px, py, ex, ey, scale_factor);
-                                    ed.cursor = pos;
-                                    ed.sel_anchor = if shift { ed.sel_anchor.or(Some(old)) } else { Some(pos) };
-                                    ed.dragging = true;
+                                    if ed.hit_scrollbar(px, py, ex, ey, ew, eh, scale_factor, zoom) {
+                                        ed.scrollbar_drag = true;
+                                        ed.scroll_to_scrollbar_y(py_f, ex, ey, ew, eh, scale_factor, zoom);
+                                    } else {
+                                        let old = ed.cursor;
+                                        let pos = ed.hit_pos(px, py, ex, ey, ew, scale_factor, zoom);
+                                        ed.cursor = pos;
+                                        ed.sel_anchor = if shift { ed.sel_anchor.or(Some(old)) } else { Some(pos) };
+                                        ed.dragging = true;
+                                    }
                                 }
                                 self.request_redraw();
                                 return;

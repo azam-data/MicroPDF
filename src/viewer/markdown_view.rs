@@ -892,8 +892,14 @@ impl<'a> PdfViewerApp<'a> {
 
         if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, buf_w, buf_h, status_bar_h, sf) {
             self.ensure_md_editor_initialized();
+            let syntax = if Self::is_latex_path(&self.file_path) {
+                super::text_editor::EditorSyntax::LaTeX
+            } else {
+                super::text_editor::EditorSyntax::Markdown
+            };
+            let zoom = self.zoom_level;
             if let Some(ref mut ed) = self.md_editor {
-                ed.draw(buffer, buf_w, buf_h, ex, ey, ew, eh, page_bg, &content_theme, sf);
+                ed.draw(buffer, buf_w, buf_h, ex, ey, ew, eh, page_bg, &content_theme, sf, zoom, syntax);
             }
             if self.md_editor_mode == MdEditorMode::Split {
                 fill_rect_clipped(buffer, buf_w, buf_h, ex + ew as i32, ey, 1, eh, theme.divider);
