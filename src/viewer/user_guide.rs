@@ -112,11 +112,11 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Choosing How Pages Scroll (Independent of Page Layout)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Click View -> Scroll: Single Page, Continuous Vertical (5), Continuous Horizontal Book, or Magazine / Book.",
+                text: "Click the Scroll Mode pill on the bottom bar (or View -> Scroll: Single Page, Continuous Vertical (5), Continuous Horizontal Book, or Magazine / Book) to pick a reading flow from the popup menu.",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — displaying a crisp two-page open book spread with a spine crease and a smooth 220 ms page-turn animation.",
+                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and customizable page-turn animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
             },
             GuideBlock::Heading("Zooming In & Out"),
             GuideBlock::Step {

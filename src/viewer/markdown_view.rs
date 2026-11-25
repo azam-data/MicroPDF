@@ -14,15 +14,6 @@ use super::ui_draw::*;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum MarkdownHit {
-    ModePreview,
-    ModeSplit,
-    ModeEdit,
-    Save,
-    Reload,
-    ZoomOut,
-    ZoomReset,
-    ZoomIn,
-    ExportMenu,
     CopyCode(usize),
     CodeScrollLeft(usize),
     CodeScrollRight(usize),
@@ -662,8 +653,8 @@ fn layout_list_items(
 }
 
 impl<'a> PdfViewerApp<'a> {
-    pub(super) fn md_header_bar_height_px(&self, sf: f64) -> u32 {
-        (36.0 * sf as f32).round() as u32
+    pub(super) fn md_header_bar_height_px(&self, _sf: f64) -> u32 {
+        0
     }
 
     pub(super) fn ensure_md_layout(&mut self, canvas_w: u32, sf: f64) {
@@ -758,12 +749,12 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     /// Returns `(left_page_1based, right_page_1based_opt, total_pages)` when in MagazineBook mode.
+    /// Spread 0 is Cover Page 1 alone (`(1, None, total)`), and spreads 1..N are `2–3`, `4–5`, ...
     pub(super) fn md_magazine_page_info(&self, canvas_h: u32, sf: f64) -> Option<(usize, Option<usize>, usize)> {
         let cache = self.md_layout.as_ref()?;
         let page_inner_h = self.md_magazine_page_inner_h(canvas_h, sf);
         let pages = md_paginate_blocks(&cache.blocks, page_inner_h);
         let total = pages.len().max(1);
-        let num_spreads = (total + 1) / 2;
         let mut page_idx = 0usize;
         for (i, &sy) in pages.iter().enumerate() {
             if sy <= self.scroll_y + 2.0 {
@@ -772,14 +763,9 @@ impl<'a> PdfViewerApp<'a> {
                 break;
             }
         }
-        let spread_idx = (page_idx / 2).min(num_spreads.saturating_sub(1));
-        let left_idx = spread_idx * 2;
-        let right_opt = if left_idx + 1 < total {
-            Some(left_idx + 2)
-        } else {
-            None
-        };
-        Some((left_idx + 1, right_opt, total))
+        let spread_idx = md_magazine_spread_for_page(page_idx);
+        let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total);
+        Some((left_idx + 1, right_idx_opt.map(|r| r + 1), total))
     }
 
     pub(super) fn step_md_magazine_spread(&mut self, dir: i8, buf_w: u32, canvas_h: u32, sf: f64) {
@@ -792,7 +778,7 @@ impl<'a> PdfViewerApp<'a> {
         let page_inner_h = self.md_magazine_page_inner_h(canvas_h, sf);
         let pages = md_paginate_blocks(&cache.blocks, page_inner_h);
         let total = pages.len().max(1);
-        let num_spreads = (total + 1) / 2;
+        let num_spreads = md_magazine_total_spreads(total);
         let mut page_idx = 0usize;
         for (i, &sy) in pages.iter().enumerate() {
             if sy <= self.scroll_y + 2.0 {
@@ -801,14 +787,15 @@ impl<'a> PdfViewerApp<'a> {
                 break;
             }
         }
-        let cur_spread = (page_idx / 2).min(num_spreads.saturating_sub(1));
+        let cur_spread = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
         let next_spread = if dir > 0 {
             (cur_spread + 1).min(num_spreads.saturating_sub(1))
         } else {
             cur_spread.saturating_sub(1)
         };
         if next_spread != cur_spread {
-            self.scroll_y = pages[next_spread * 2];
+            let (target_left_idx, _) = md_magazine_pages_for_spread(next_spread, total);
+            self.scroll_y = pages[target_left_idx.min(pages.len().saturating_sub(1))];
             self.trigger_page_turn_anim(dir);
             self.request_redraw();
         }
@@ -857,66 +844,6 @@ impl<'a> PdfViewerApp<'a> {
             let src = self.md_source.as_deref().unwrap_or("");
             self.md_editor = Some(TextEditorState::from_text(src));
         }
-    }
-
-    fn collect_md_header_hits(
-        &self,
-        sidebar_w: u32,
-        top_bars_h: u32,
-        win_w: u32,
-        sf: f64,
-    ) -> Vec<MdHitRect> {
-        let s = sf as f32;
-        let hdr_h = self.md_header_bar_height_px(sf);
-        let x0 = sidebar_w as i32;
-        let y0 = top_bars_h as i32;
-        let cw = win_w.saturating_sub(sidebar_w);
-        let btn_h = (24.0 * s).round() as u32;
-        let by = y0 + ((hdr_h.saturating_sub(btn_h)) / 2) as i32;
-        let mut rx = x0 + cw as i32 - (12.0 * s).round() as i32;
-
-        let mut hits = Vec::with_capacity(12);
-        let export_w = (108.0 * s).round() as u32;
-        rx -= export_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: export_w, h: btn_h, hit: MarkdownHit::ExportMenu });
-
-        rx -= (6.0 * s).round() as i32;
-        let reload_w = (60.0 * s).round() as u32;
-        rx -= reload_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: reload_w, h: btn_h, hit: MarkdownHit::Reload });
-
-        let is_epub = Self::is_epub_path(&self.file_path);
-        if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != MdEditorMode::Preview) {
-            rx -= (6.0 * s).round() as i32;
-            let save_w = (54.0 * s).round() as u32;
-            rx -= save_w as i32;
-            hits.push(MdHitRect { x: rx, y: by, w: save_w, h: btn_h, hit: MarkdownHit::Save });
-        }
-
-        rx -= (8.0 * s).round() as i32;
-        let zbtn_w = (22.0 * s).round() as u32;
-        let zlbl_w = (44.0 * s).round() as u32;
-        rx -= zbtn_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: zbtn_w, h: btn_h, hit: MarkdownHit::ZoomIn });
-        rx -= zlbl_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: zlbl_w, h: btn_h, hit: MarkdownHit::ZoomReset });
-        rx -= zbtn_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: zbtn_w, h: btn_h, hit: MarkdownHit::ZoomOut });
-
-        if !is_epub {
-            rx -= (10.0 * s).round() as i32;
-            let mode_w = (54.0 * s).round() as u32;
-            let split_w = (44.0 * s).round() as u32;
-            let edit_w = (42.0 * s).round() as u32;
-            rx -= edit_w as i32;
-            hits.push(MdHitRect { x: rx, y: by, w: edit_w, h: btn_h, hit: MarkdownHit::ModeEdit });
-            rx -= (split_w as i32) + 2;
-            hits.push(MdHitRect { x: rx, y: by, w: split_w, h: btn_h, hit: MarkdownHit::ModeSplit });
-            rx -= (mode_w as i32) + 2;
-            hits.push(MdHitRect { x: rx, y: by, w: mode_w, h: btn_h, hit: MarkdownHit::ModePreview });
-        }
-
-        hits
     }
 
     pub(super) fn draw_markdown_view(
@@ -976,39 +903,17 @@ impl<'a> PdfViewerApp<'a> {
                 let spread_h = avail_h.saturating_sub((24.0 * s).round() as u32).max(140);
                 let spread_y = content_top + ((avail_h - spread_h) / 2) as i32;
                 let spread_w = preview_w.saturating_sub((36.0 * s).round() as u32).min((1240.0 * s).round() as u32).max(300);
-                let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
-                let spine_x = spread_x + (spread_w / 2) as i32;
-
-                draw_soft_shadow(
-                    buffer,
-                    buf_w,
-                    buf_h,
-                    spread_x,
-                    spread_y,
-                    spread_w,
-                    spread_h,
-                    3.0 * s,
-                    (12.0 * s).round().max(4.0) as i32,
-                    (5.0 * s).round().max(2.0) as i32,
-                    (0, 0, 0),
-                    68,
-                );
-                fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, page_bg);
-                // Crisp 1px outer book border
-                fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, 1, content_theme.border_subtle);
-                fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y + spread_h as i32 - 1, spread_w, 1, content_theme.border_subtle);
-                fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, 1, spread_h, content_theme.border_subtle);
-                fill_rect_clipped(buffer, buf_w, buf_h, spread_x + spread_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
-
                 let page_pad_y = (22.0 * s).round() as i32;
                 let page_top = spread_y + page_pad_y;
                 let page_bot = (spread_y + spread_h as i32 - page_pad_y - (18.0 * s).round() as i32).max(page_top + 40);
                 let page_inner_h = (page_bot - page_top) as f32;
 
+                let mut anim_rect = (preview_x0, spread_y, spread_w, spread_h);
+
                 if let Some(ref cache) = self.md_layout {
                     let pages = md_paginate_blocks(&cache.blocks, page_inner_h);
                     let total_pages = pages.len().max(1);
-                    let num_spreads = (total_pages + 1) / 2;
+                    let num_spreads = md_magazine_total_spreads(total_pages);
                     let mut page_idx = 0usize;
                     for (i, &sy) in pages.iter().enumerate() {
                         if sy <= scroll_y + 2.0 {
@@ -1017,99 +922,115 @@ impl<'a> PdfViewerApp<'a> {
                             break;
                         }
                     }
-                    let spread_idx = (page_idx / 2).min(num_spreads.saturating_sub(1));
-                    let left_idx = spread_idx * 2;
-                    let right_idx = left_idx + 1;
-                    let half_w = (spread_w / 2) as i32;
-                    let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(12);
-                    let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(12);
-
-                    let left_start = pages[left_idx];
-                    let left_end = pages.get(left_idx + 1).copied().unwrap_or(f32::MAX);
-                    for blk in &cache.blocks {
-                        let (by, _) = md_block_y_h(blk);
-                        if by >= left_start - 0.5 && by < left_end - 0.5 {
-                            draw_laid_out_block(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                blk,
-                                left_col_x,
-                                cache.col_w as f32,
-                                page_top,
-                                page_bot,
-                                left_start,
-                                left_start,
-                                left_end,
-                                &cache.code_h_scroll,
-                                &cache.images,
-                                &content_theme,
-                                &self.hovered_widget,
-                                s,
-                                &mut self.md_active_hits,
-                            );
-                        }
-                    }
-
+                    let spread_idx = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
+                    let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total_pages);
                     let num_sz = (10.5 * s).clamp(9.0, 18.0);
                     let num_y = spread_y + spread_h as i32 - (20.0 * s).round() as i32;
-                    let l_lbl = format!("{}", left_idx + 1);
-                    draw_text(buffer, buf_w, buf_h, spread_x + (18.0 * s).round() as i32, num_y, &l_lbl, num_sz, content_theme.text_muted, false);
 
-                    if right_idx < total_pages {
-                        let right_start = pages[right_idx];
-                        let right_end = pages.get(right_idx + 1).copied().unwrap_or(f32::MAX);
+                    if spread_idx == 0 {
+                        // Front Cover (Page 1 alone, centered single page)
+                        let cover_w = (spread_w / 2).max(cache.col_w + (32.0 * s).round() as u32).min(preview_w.saturating_sub(24));
+                        let cover_x = preview_x0 + ((preview_w.saturating_sub(cover_w)) / 2) as i32;
+                        anim_rect = (cover_x, spread_y, cover_w, spread_h);
+
+                        draw_soft_shadow(
+                            buffer, buf_w, buf_h,
+                            cover_x, spread_y, cover_w, spread_h,
+                            3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
+                            (0, 0, 0), 72,
+                        );
+                        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, page_bg);
+                        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, 1, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y + spread_h as i32 - 1, cover_w, 1, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, 1, spread_h, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, cover_x + cover_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
+
+                        let col_x = cover_x + ((cover_w as i32 - cache.col_w as i32) / 2).max(12);
+                        let start_y = pages[0];
+                        let end_y = pages.get(1).copied().unwrap_or(f32::MAX);
                         for blk in &cache.blocks {
                             let (by, _) = md_block_y_h(blk);
-                            if by >= right_start - 0.5 && by < right_end - 0.5 {
+                            if by >= start_y - 0.5 && by < end_y - 0.5 {
                                 draw_laid_out_block(
-                                    buffer,
-                                    buf_w,
-                                    buf_h,
-                                    blk,
-                                    right_col_x,
-                                    cache.col_w as f32,
-                                    page_top,
-                                    page_bot,
-                                    right_start,
-                                    right_start,
-                                    right_end,
-                                    &cache.code_h_scroll,
-                                    &cache.images,
-                                    &content_theme,
-                                    &self.hovered_widget,
-                                    s,
-                                    &mut self.md_active_hits,
+                                    buffer, buf_w, buf_h, blk, col_x, cache.col_w as f32,
+                                    page_top, page_bot, start_y, start_y, end_y,
+                                    &cache.code_h_scroll, &cache.images, &content_theme,
+                                    &self.hovered_widget, s, &mut self.md_active_hits,
                                 );
                             }
                         }
-                        let r_lbl = format!("{}", right_idx + 1);
-                        let rw = measure_text(&r_lbl, num_sz, false);
-                        draw_text(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (18.0 * s).round() as i32 - rw.round() as i32, num_y, &r_lbl, num_sz, content_theme.text_muted, false);
+                        let lbl = "1";
+                        let lw = measure_text(lbl, num_sz, false);
+                        draw_text(buffer, buf_w, buf_h, cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32, num_y, lbl, num_sz, content_theme.text_muted, false);
+                    } else {
+                        // Two-page open book spread (Pages 2–3, 4–5, ...)
+                        let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
+                        let spine_x = spread_x + (spread_w / 2) as i32;
+                        anim_rect = (spread_x, spread_y, spread_w, spread_h);
+
+                        draw_soft_shadow(
+                            buffer, buf_w, buf_h,
+                            spread_x, spread_y, spread_w, spread_h,
+                            3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
+                            (0, 0, 0), 68,
+                        );
+                        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, page_bg);
+                        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, 1, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y + spread_h as i32 - 1, spread_w, 1, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, 1, spread_h, content_theme.border_subtle);
+                        fill_rect_clipped(buffer, buf_w, buf_h, spread_x + spread_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
+
+                        let half_w = (spread_w / 2) as i32;
+                        let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(12);
+                        let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(12);
+
+                        let left_start = pages[left_idx];
+                        let left_end = pages.get(left_idx + 1).copied().unwrap_or(f32::MAX);
+                        for blk in &cache.blocks {
+                            let (by, _) = md_block_y_h(blk);
+                            if by >= left_start - 0.5 && by < left_end - 0.5 {
+                                draw_laid_out_block(
+                                    buffer, buf_w, buf_h, blk, left_col_x, cache.col_w as f32,
+                                    page_top, page_bot, left_start, left_start, left_end,
+                                    &cache.code_h_scroll, &cache.images, &content_theme,
+                                    &self.hovered_widget, s, &mut self.md_active_hits,
+                                );
+                            }
+                        }
+                        let l_lbl = format!("{}", left_idx + 1);
+                        draw_text(buffer, buf_w, buf_h, spread_x + (18.0 * s).round() as i32, num_y, &l_lbl, num_sz, content_theme.text_muted, false);
+
+                        if let Some(right_idx) = right_idx_opt {
+                            let right_start = pages[right_idx];
+                            let right_end = pages.get(right_idx + 1).copied().unwrap_or(f32::MAX);
+                            for blk in &cache.blocks {
+                                let (by, _) = md_block_y_h(blk);
+                                if by >= right_start - 0.5 && by < right_end - 0.5 {
+                                    draw_laid_out_block(
+                                        buffer, buf_w, buf_h, blk, right_col_x, cache.col_w as f32,
+                                        page_top, page_bot, right_start, right_start, right_end,
+                                        &cache.code_h_scroll, &cache.images, &content_theme,
+                                        &self.hovered_widget, s, &mut self.md_active_hits,
+                                    );
+                                }
+                            }
+                            let r_lbl = format!("{}", right_idx + 1);
+                            let rw = measure_text(&r_lbl, num_sz, false);
+                            draw_text(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (18.0 * s).round() as i32 - rw.round() as i32, num_y, &r_lbl, num_sz, content_theme.text_muted, false);
+                        }
+
+                        draw_book_spine_crease(
+                            buffer, buf_w, buf_h, spine_x, spread_y, spread_h,
+                            (16.0 * s).round().max(6.0) as i32,
+                        );
                     }
                 }
 
-                draw_book_spine_crease(
-                    buffer,
-                    buf_w,
-                    buf_h,
-                    spine_x,
-                    spread_y,
-                    spread_h,
-                    (16.0 * s).round().max(6.0) as i32,
-                );
                 if let Some((eased, dir)) = self.page_turn_anim_progress() {
                     draw_magazine_page_turn_overlay(
-                        buffer,
-                        buf_w,
-                        buf_h,
-                        spread_x,
-                        spread_y,
-                        spread_w,
-                        spread_h,
-                        eased,
-                        dir,
-                        s,
+                        buffer, buf_w, buf_h,
+                        anim_rect.0, anim_rect.1, anim_rect.2, anim_rect.3,
+                        eased, dir, s,
                     );
                 }
             } else if let Some(ref cache) = self.md_layout {
@@ -1156,117 +1077,11 @@ impl<'a> PdfViewerApp<'a> {
                 fill_rect_clipped(buffer, buf_w, buf_h, ex + ew as i32, ey, 1, eh, theme.divider);
             }
         }
-
-        // Top inline Markdown bar (drawn after scrolling content so it cleanly clips above)
-        fill_rect_clipped(buffer, buf_w, buf_h, x0, y0, canvas_w, hdr_h, theme.surface_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, x0, y0 + hdr_h as i32 - 1, canvas_w, 1, theme.divider);
-
-        let hdr_hits = self.collect_md_header_hits(sidebar_w, top_bars_h, buf_w, sf);
-        let min_btn_x = hdr_hits.iter().map(|h| h.x).min().unwrap_or(x0 + canvas_w as i32);
-
-        let title = self
-            .markdown_doc
-            .as_ref()
-            .map(|d| d.title.as_str())
-            .unwrap_or("Markdown");
-        let is_epub = Self::is_epub_path(&self.file_path);
-        let badge_w = (if is_epub { 44.0 } else { 36.0 } * s).round() as u32;
-        let badge_h = (18.0 * s).round() as u32;
-        let badge_y = y0 + ((hdr_h.saturating_sub(badge_h)) / 2) as i32;
-        fill_rounded_rect(buffer, buf_w, buf_h, x0 + 12, badge_y, badge_w, badge_h, 4.0 * s, theme.accent_soft_bg);
-        let badge_label = if is_epub {
-            "EPUB"
-        } else if Self::is_latex_path(&self.file_path) {
-            "TEX"
-        } else {
-            "MD"
-        };
-        draw_text_vcenter(
-            buffer,
-            buf_w,
-            buf_h,
-            x0 + 18,
-            badge_y,
-            badge_h,
-            x0 + 12 + badge_w as i32,
-            badge_label,
-            10.5 * s,
-            theme.accent_soft_fg,
-            true,
-        );
-        let title_x = x0 + 12 + badge_w as i32 + 8;
-        let title_max_w = (min_btn_x - title_x - 10).max(20) as f32;
-        let clipped_title = truncate_ellipsis(title, title_max_w, 12.0 * s, true);
-        draw_text_vcenter(
-            buffer,
-            buf_w,
-            buf_h,
-            title_x,
-            y0,
-            hdr_h,
-            min_btn_x - 6,
-            &clipped_title,
-            12.0 * s,
-            theme.text_primary,
-            true,
-        );
-
-        let zoom_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
-        for h in &hdr_hits {
-            let hov = self.hovered_widget == Some(UiHit::MarkdownView(h.hit));
-            let is_primary = h.hit == MarkdownHit::ExportMenu
-                || (h.hit == MarkdownHit::Save && self.has_unsaved_edits);
-            let is_active = match h.hit {
-                MarkdownHit::ModePreview => self.md_editor_mode == MdEditorMode::Preview,
-                MarkdownHit::ModeSplit => self.md_editor_mode == MdEditorMode::Split,
-                MarkdownHit::ModeEdit => self.md_editor_mode == MdEditorMode::Edit,
-                _ => false,
-            };
-            let bg = if is_primary {
-                if hov { theme.accent_hover } else { theme.accent }
-            } else if is_active {
-                theme.accent_soft_bg
-            } else if hov {
-                theme.hover_bg
-            } else {
-                theme.input_bg
-            };
-            let fg = if is_primary {
-                theme.text_on_accent
-            } else if is_active {
-                theme.accent_soft_fg
-            } else {
-                theme.text_primary
-            };
-            fill_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 5.0 * s, bg);
-            if !is_primary {
-                stroke_rounded_rect(buffer, buf_w, buf_h, h.x, h.y, h.w, h.h, 5.0 * s, if is_active { theme.accent } else { theme.border_subtle });
-            }
-            let lbl = match h.hit {
-                MarkdownHit::ModePreview => "Preview",
-                MarkdownHit::ModeSplit => "Split",
-                MarkdownHit::ModeEdit => "Edit",
-                MarkdownHit::Save => "Save",
-                MarkdownHit::ExportMenu => "Export / Print",
-                MarkdownHit::Reload => "Reload",
-                MarkdownHit::ZoomOut => "-",
-                MarkdownHit::ZoomReset => zoom_pct.as_str(),
-                MarkdownHit::ZoomIn => "+",
-                _ => "",
-            };
-            let fs = 11.0 * s;
-            let tw = measure_text(lbl, fs, is_primary || is_active);
-            let tx = h.x + ((h.w as f32 - tw) * 0.5).round() as i32;
-            draw_text_vcenter(buffer, buf_w, buf_h, tx, h.y, h.h, h.x + h.w as i32 - 2, lbl, fs, fg, is_primary || is_active);
-        }
-
-        self.md_active_hits.extend(hdr_hits);
     }
 
     pub(super) fn hit_test_markdown_view(&self, mx: f64, my: f64) -> Option<MarkdownHit> {
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
-        // Reverse order so top bar hits take precedence over scrolled content
         for h in self.md_active_hits.iter().rev() {
             if h.contains(ix, iy) {
                 return Some(h.hit);
@@ -1277,46 +1092,6 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn handle_markdown_click(&mut self, hit: MarkdownHit) {
         match hit {
-            MarkdownHit::ModePreview => {
-                self.md_editor_mode = MdEditorMode::Preview;
-                self.md_layout = None;
-                self.request_redraw();
-            }
-            MarkdownHit::ModeSplit => {
-                self.md_editor_mode = MdEditorMode::Split;
-                self.ensure_md_editor_initialized();
-                self.md_layout = None;
-                self.request_redraw();
-            }
-            MarkdownHit::ModeEdit => {
-                self.md_editor_mode = MdEditorMode::Edit;
-                self.ensure_md_editor_initialized();
-                self.request_redraw();
-            }
-            MarkdownHit::Save => {
-                self.save_active_markdown();
-            }
-            MarkdownHit::Reload => {
-                self.reload_active_markdown();
-            }
-            MarkdownHit::ZoomOut => {
-                self.zoom_level = (self.zoom_level - 0.1).clamp(0.6, 3.0);
-                self.update_title_bar();
-                self.request_redraw();
-            }
-            MarkdownHit::ZoomReset => {
-                self.zoom_level = 1.0;
-                self.update_title_bar();
-                self.request_redraw();
-            }
-            MarkdownHit::ZoomIn => {
-                self.zoom_level = (self.zoom_level + 0.1).clamp(0.6, 3.0);
-                self.update_title_bar();
-                self.request_redraw();
-            }
-            MarkdownHit::ExportMenu => {
-                self.open_markdown_export_modal();
-            }
             MarkdownHit::CopyCode(idx) => {
                 if let Some(ref cache) = self.md_layout {
                     if let Some(code) = cache.code_blocks.get(idx) {
@@ -1969,6 +1744,38 @@ fn split_math_eq_no(tex: &str) -> (&str, Option<&str>) {
     }
     (tex, None)
 }
+
+/// Cover page (index 0) is Spread 0 alone; remaining pages pair up as `(1,2)`, `(3,4)`, ...
+fn md_magazine_total_spreads(total_pages: usize) -> usize {
+    if total_pages <= 1 {
+        1
+    } else {
+        1 + total_pages / 2
+    }
+}
+
+fn md_magazine_spread_for_page(page_idx: usize) -> usize {
+    if page_idx == 0 {
+        0
+    } else {
+        1 + (page_idx - 1) / 2
+    }
+}
+
+fn md_magazine_pages_for_spread(spread_idx: usize, total_pages: usize) -> (usize, Option<usize>) {
+    if spread_idx == 0 || total_pages <= 1 {
+        (0, None)
+    } else {
+        let left = (2 * spread_idx - 1).min(total_pages - 1);
+        let right = if left + 1 < total_pages {
+            Some(left + 1)
+        } else {
+            None
+        };
+        (left, right)
+    }
+}
+
 
 
 

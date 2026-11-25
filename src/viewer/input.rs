@@ -793,9 +793,24 @@ impl<'a> PdfViewerApp<'a> {
         if total == 0 {
             return;
         }
-        let step = if self.view_mode == ViewMode::TwoPageSpread
-            || self.effective_scroll_mode() == ScrollMode::MagazineBook
-        {
+        if self.effective_scroll_mode() == ScrollMode::MagazineBook {
+            if self.current_page_index == 0 {
+                if total > 1 {
+                    self.navigate_to_page(1);
+                }
+            } else {
+                let left = if self.current_page_index % 2 == 0 {
+                    self.current_page_index - 1
+                } else {
+                    self.current_page_index
+                };
+                if left + 2 < total {
+                    self.navigate_to_page(left + 2);
+                }
+            }
+            return;
+        }
+        let step = if self.view_mode == ViewMode::TwoPageSpread {
             2
         } else {
             1
@@ -808,9 +823,23 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn step_pages_backward(&mut self) {
-        let step = if self.view_mode == ViewMode::TwoPageSpread
-            || self.effective_scroll_mode() == ScrollMode::MagazineBook
-        {
+        if self.effective_scroll_mode() == ScrollMode::MagazineBook {
+            if self.current_page_index == 0 {
+                return;
+            }
+            let left = if self.current_page_index % 2 == 0 {
+                self.current_page_index - 1
+            } else {
+                self.current_page_index
+            };
+            if left <= 1 {
+                self.navigate_to_page(0);
+            } else {
+                self.navigate_to_page(left - 2);
+            }
+            return;
+        }
+        let step = if self.view_mode == ViewMode::TwoPageSpread {
             2
         } else {
             1
@@ -3221,6 +3250,21 @@ impl<'a> PdfViewerApp<'a> {
                     ));
                 }
             }
+            InputMode::PageTurnSpeed { input } => {
+                let trimmed = input.trim();
+                match trimmed.parse::<u64>() {
+                    Ok(ms) => {
+                        self.set_page_turn_anim_ms(ms);
+                        return;
+                    }
+                    Err(_) => {
+                        self.status_notice = Some(format!(
+                            "Invalid animation time '{}' — enter milliseconds (0 to 3000)",
+                            trimmed
+                        ));
+                    }
+                }
+            }
             InputMode::PageNumbers { input } => {
                 let trimmed = input.trim();
                 let roman_end = if trimmed.is_empty() {
@@ -4266,7 +4310,8 @@ impl<'a> PdfViewerApp<'a> {
                                             }
                                         }
                                     }
-                                    InputMode::PageNumbers { input } => {
+                                    InputMode::PageNumbers { input }
+                                    | InputMode::PageTurnSpeed { input } => {
                                         for c in clean.chars() {
                                             if c.is_ascii_digit() {
                                                 input.push(c);
@@ -4335,6 +4380,7 @@ impl<'a> PdfViewerApp<'a> {
                         match &mut self.input_mode {
                             InputMode::SearchText { query_input } => query_input.clear(),
                             InputMode::JumpToPage { input }
+                            | InputMode::PageTurnSpeed { input }
                             | InputMode::PageNumbers { input }
                             | InputMode::ClearMargins { input }
                             | InputMode::Watermark { input }
@@ -4387,6 +4433,7 @@ impl<'a> PdfViewerApp<'a> {
                     match &mut self.input_mode {
                         InputMode::SearchText { query_input } => query_input.clear(),
                         InputMode::JumpToPage { input }
+                        | InputMode::PageTurnSpeed { input }
                         | InputMode::PageNumbers { input }
                         | InputMode::ClearMargins { input }
                         | InputMode::Watermark { input }
@@ -4416,6 +4463,7 @@ impl<'a> PdfViewerApp<'a> {
                             query_input.pop();
                         }
                         InputMode::JumpToPage { input }
+                        | InputMode::PageTurnSpeed { input }
                         | InputMode::PageNumbers { input }
                         | InputMode::ClearMargins { input }
                         | InputMode::Watermark { input }
@@ -4543,9 +4591,10 @@ impl<'a> PdfViewerApp<'a> {
                                     }
                                 }
                             }
-                            InputMode::PageNumbers { input } => {
+                            InputMode::PageNumbers { input }
+                            | InputMode::PageTurnSpeed { input } => {
                                 for c in typed.chars() {
-                                    if c.is_ascii_digit() {
+                                    if c.is_ascii_digit() && input.len() < 4 {
                                         input.push(c);
                                     }
                                 }
@@ -4891,6 +4940,9 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.show_reading_mode_popover {
                     self.show_reading_mode_popover = false;
+                    self.request_redraw();
+                } else if self.show_scroll_mode_popover {
+                    self.show_scroll_mode_popover = false;
                     self.request_redraw();
                 } else if self.show_notifications {
                     self.show_notifications = false;
@@ -5539,6 +5591,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     || self.tab_context_menu.is_some()
                     || self.thumb_context_menu.is_some()
                     || self.show_reading_mode_popover
+                    || self.show_scroll_mode_popover
                     || self.show_notifications
                 {
                     return;
@@ -6033,6 +6086,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::ReadingModeOption(mode));
                         }
                     }
+                    if new_hover.is_none() && self.show_scroll_mode_popover {
+                        if let Some(Some(mode)) = self.hit_test_scroll_mode_popover(
+                            position.x,
+                            position.y,
+                            win_w,
+                            win_h,
+                            status_bar_h,
+                            sf,
+                        ) {
+                            new_hover = Some(UiHit::ScrollModeOption(mode));
+                        }
+                    }
                     if new_hover.is_none() && self.show_notifications {
                         if let Some(on_clear) = self.hit_test_notification_board(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                             if on_clear {
@@ -6083,6 +6148,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 TabBarHit::ScrollLeft => UiHit::TabScrollLeft,
                                 TabBarHit::ScrollRight => UiHit::TabScrollRight,
                                 TabBarHit::SwitchTab(i) => UiHit::Tab(i),
+                                TabBarHit::FavoriteTab(i) => UiHit::TabFavorite(i),
                                 TabBarHit::CloseTab(i) => UiHit::TabClose(i),
                                 TabBarHit::NewTab => UiHit::TabNew,
                                 TabBarHit::TabListToggle => UiHit::TabListToggle,
@@ -6861,6 +6927,32 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
+                // 0a0b. Scroll Mode picker popover clicks
+                if self.show_scroll_mode_popover && state == ElementState::Pressed && button == MouseButton::Left {
+                    if let Some(opt_mode) = self.hit_test_scroll_mode_popover(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) {
+                        if let Some(mode) = opt_mode {
+                            self.show_scroll_mode_popover = false;
+                            self.set_scroll_mode(mode);
+                        }
+                        return;
+                    }
+                    let clicking_toggle = status_bar_h > 0
+                        && (self.cursor_pos.1 as i32) >= win_h.saturating_sub(status_bar_h) as i32
+                        && self.hit_test_bottom_bar(self.cursor_pos.0, self.cursor_pos.1, win_w, win_h, status_bar_h, scale_factor)
+                            == Some(super::bottom_bar::BottomBarAction::Continuous);
+                    if !clicking_toggle {
+                        self.show_scroll_mode_popover = false;
+                        self.request_redraw();
+                    }
+                }
+
                 // 0a1. Session Notification Board popover clicks
                 if self.show_notifications && state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(on_clear) = self.hit_test_notification_board(
@@ -6955,6 +7047,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 TabBarHit::SwitchTab(idx) => {
                                     self.switch_to_tab(idx);
                                 }
+                                TabBarHit::FavoriteTab(idx) => {
+                                    if idx != self.active_tab && idx < self.tabs.len() {
+                                        self.switch_to_tab(idx);
+                                    }
+                                    self.open_favorites_modal();
+                                }
                                 TabBarHit::CloseTab(idx) => {
                                     if !self.tabs.is_empty() {
                                         let _ = self.request_close_action(
@@ -6975,7 +7073,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                     } else if state == ElementState::Pressed && button == MouseButton::Right {
                         if !self.tabs.is_empty() {
-                            if let Some(TabBarHit::SwitchTab(idx) | TabBarHit::CloseTab(idx)) =
+                            if let Some(TabBarHit::SwitchTab(idx) | TabBarHit::FavoriteTab(idx) | TabBarHit::CloseTab(idx)) =
                                 self.hit_test_tab_bar(
                                     self.cursor_pos.0,
                                     self.cursor_pos.1,

@@ -85,6 +85,20 @@ impl FavoritesTree {
         false
     }
 
+    pub(crate) fn all_docs(&self) -> Vec<(String, PathBuf)> {
+        let mut out = Vec::new();
+        fn walk(nodes: &[FavNode], out: &mut Vec<(String, PathBuf)>) {
+            for n in nodes {
+                match n {
+                    FavNode::Doc { title, path, .. } => out.push((title.clone(), path.clone())),
+                    FavNode::Folder { children, .. } => walk(children, out),
+                }
+            }
+        }
+        walk(&self.root, &mut out);
+        out
+    }
+
     pub(crate) fn find_node(&self, id: u64) -> Option<&FavNode> {
         Self::find_node_in(&self.root, id)
     }

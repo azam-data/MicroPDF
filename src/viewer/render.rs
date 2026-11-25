@@ -924,7 +924,17 @@ impl<'a> PdfViewerApp<'a> {
             .max(1) as f32;
             let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
 
-            let left_idx = self.current_page_index;
+            let left_idx = if is_magazine {
+                if self.current_page_index == 0 {
+                    0
+                } else if self.current_page_index % 2 == 0 {
+                    self.current_page_index - 1
+                } else {
+                    self.current_page_index
+                }
+            } else {
+                self.current_page_index
+            };
             let left_rot = self.page_rotation_degrees(left_idx);
             let need_left = self.cached_page.as_ref().map_or(true, |c| {
                 c.page_index != left_idx
@@ -951,7 +961,9 @@ impl<'a> PdfViewerApp<'a> {
                 )?);
             }
 
-            let right_idx_opt = if left_idx + 1 < total {
+            let right_idx_opt = if is_magazine && left_idx == 0 {
+                None
+            } else if left_idx + 1 < total {
                 Some(left_idx + 1)
             } else {
                 None
@@ -2201,6 +2213,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_reading_mode_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
+        // Scroll Mode Picker Popover (Single / Vert / Book / Magazine)
+        if chrome_visible && self.show_scroll_mode_popover {
+            self.draw_scroll_mode_popover(buffer, width, height, status_bar_h, scale_factor);
+        }
+
         // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu/prompt is open)
         if chrome_visible
             && !self.has_blocking_modal()
@@ -2413,6 +2430,9 @@ impl<'a> PdfViewerApp<'a> {
                     return;
                 }
                 if self.show_reading_mode_popover && act == super::bottom_bar::BottomBarAction::ReadingFilter {
+                    return;
+                }
+                if self.show_scroll_mode_popover && act == super::bottom_bar::BottomBarAction::Continuous {
                     return;
                 }
                 let Some(rect) = self.bottom_bar_widget_rect(act, buf_w, buf_h, status_bar_h, sf) else {

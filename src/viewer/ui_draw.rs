@@ -1331,8 +1331,8 @@ pub fn draw_magazine_page_turn_overlay(
     } else {
         spread_x as f32 + spread_w as f32 * eased_t
     };
-    let fold_w = (32.0 * s).max(16.0);
-    let intensity = (1.0 - (eased_t - 0.5).abs() * 1.35).clamp(0.25, 1.0);
+    let fold_w = (48.0 * s).max(24.0);
+    let intensity = (1.0 - (eased_t - 0.5).abs() * 1.25).clamp(0.30, 1.0);
     let x0 = ((sweep_x - fold_w).floor() as i32).max(spread_x.max(0));
     let x1 = ((sweep_x + fold_w).ceil() as i32).min((spread_x + spread_w as i32).min(buf_w as i32));
     if x1 <= x0 {
@@ -1341,9 +1341,9 @@ pub fn draw_magazine_page_turn_overlay(
     for x in x0..x1 {
         let dx = x as f32 - sweep_x;
         let abs_d = dx.abs();
-        if abs_d <= 3.0 * s {
+        if abs_d <= 4.0 * s {
             // Bright specular paper-curl highlight along the turning crease
-            let a = ((1.0 - abs_d / (3.0 * s)) * 95.0 * intensity).round() as u32;
+            let a = ((1.0 - abs_d / (4.0 * s)) * 110.0 * intensity).round() as u32;
             let inv = 255 - a;
             for y in y0..y1 {
                 let idx = y as usize * buf_w as usize + x as usize;
@@ -1355,7 +1355,7 @@ pub fn draw_magazine_page_turn_overlay(
             }
         } else {
             // Trailing page-curl drop shadow
-            let a = ((1.0 - abs_d / fold_w).powf(1.6) * 68.0 * intensity).round() as u32;
+            let a = ((1.0 - abs_d / fold_w).powf(1.5) * 86.0 * intensity).round() as u32;
             if a == 0 {
                 continue;
             }

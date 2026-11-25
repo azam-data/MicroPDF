@@ -1260,8 +1260,9 @@ impl<'a> PdfViewerApp<'a> {
             let is_active = idx == self.active_tab;
             let is_tab_hov = matches!(
                 self.hovered_widget,
-                Some(UiHit::Tab(i)) | Some(UiHit::TabClose(i)) if i == idx
+                Some(UiHit::Tab(i)) | Some(UiHit::TabFavorite(i)) | Some(UiHit::TabClose(i)) if i == idx
             );
+            let is_fav_hov = self.hovered_widget == Some(UiHit::TabFavorite(idx));
             let is_close_hov = self.hovered_widget == Some(UiHit::TabClose(idx));
 
             if is_active {
@@ -1295,6 +1296,15 @@ impl<'a> PdfViewerApp<'a> {
                 self.tabs.get(idx).map(|t| t.has_unsaved_edits).unwrap_or(false)
             };
 
+            let tab_path = if is_active {
+                &self.file_path
+            } else if let Some(slot) = self.tabs.get(idx) {
+                &slot.file_path
+            } else {
+                &self.file_path
+            };
+            let is_starred = !tab_path.as_os_str().is_empty() && self.favorites.is_starred(tab_path);
+
             let fname = if is_active {
                 self.filename_display()
             } else if let Some(slot) = self.tabs.get(idx) {
@@ -1321,8 +1331,12 @@ impl<'a> PdfViewerApp<'a> {
             let show_close = !self.tabs.is_empty();
             let close_x = cur_x + tab_w as i32 - close_sz as i32 - (6.0 * s).round() as i32;
             let close_y = tab_y + ((tab_h.saturating_sub(close_sz)) / 2) as i32;
+            let star_sz = close_sz;
+            let star_ic = (11.0 * s).round() as u32;
+            let star_x = close_x - star_sz as i32 - (2.0 * s).round() as i32;
+            let star_y = close_y;
 
-            let label_right = if show_close { close_x - 2 } else { cur_x + tab_w as i32 - 6 };
+            let label_right = if show_close { star_x - 3 } else { cur_x + tab_w as i32 - 6 };
             let label_budget = (label_right - text_x - (2.0 * s).round() as i32).max(20) as f32;
             let label = super::ui_draw::truncate_ellipsis(&fname, label_budget, font_sz, is_active);
             let text_col = if is_active { theme.text_primary } else { theme.text_secondary };
@@ -1331,6 +1345,26 @@ impl<'a> PdfViewerApp<'a> {
             );
 
             if show_close {
+                if is_fav_hov {
+                    super::ui_draw::fill_rounded_rect(
+                        buffer, buf_w, buf_h, star_x, star_y, star_sz, star_sz, (star_sz as f32) * 0.5, theme.hover_bg,
+                    );
+                }
+                let star_col = if is_starred {
+                    0x00F5_9E0B
+                } else if is_fav_hov {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                };
+                super::ui_draw::draw_icon(
+                    buffer, buf_w, buf_h, super::ui_draw::UiIcon::Star,
+                    star_x + ((star_sz.saturating_sub(star_ic)) / 2) as i32,
+                    star_y + ((star_sz.saturating_sub(star_ic)) / 2) as i32,
+                    star_ic,
+                    star_col,
+                );
+
                 if is_close_hov {
                     super::ui_draw::fill_rounded_rect(
                         buffer, buf_w, buf_h, close_x, close_y, close_sz, close_sz, (close_sz as f32) * 0.5, theme.danger_soft_bg,
@@ -1451,13 +1485,16 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         let tab_gap = (3.0 * s).round() as i32;
-        let close_sz = (18.0 * s).round() as i32;
+        let close_sz = (16.0 * s).round() as i32;
         let mut cur_x = strip_x;
         for idx in vis_start..vis_end {
             if ix >= cur_x && ix < cur_x + tab_w as i32 {
                 let close_x = cur_x + tab_w as i32 - close_sz - (6.0 * s).round() as i32;
+                let star_x = close_x - close_sz - (2.0 * s).round() as i32;
                 if !self.tabs.is_empty() && ix >= close_x {
                     return Some(TabBarHit::CloseTab(idx));
+                } else if !self.tabs.is_empty() && ix >= star_x {
+                    return Some(TabBarHit::FavoriteTab(idx));
                 } else {
                     return Some(TabBarHit::SwitchTab(idx));
                 }

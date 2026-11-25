@@ -113,6 +113,23 @@ impl<'a> PdfViewerApp<'a> {
                     list.push(format!("Recent {}: {}", idx + 1, fname));
                 }
             }
+        } else if cat == MenuCategory::View {
+            if let Some(slot) = list.get_mut(8) {
+                *slot = if self.page_turn_anim_ms == 0 {
+                    "Magazine Page-Turn Speed... (Off)".to_string()
+                } else {
+                    format!("Magazine Page-Turn Speed... ({} ms)", self.page_turn_anim_ms)
+                };
+            }
+        } else if cat == MenuCategory::Favorites {
+            let docs = self.favorites.all_docs();
+            if docs.is_empty() {
+                list.push("Saved Favorites: (none yet)".to_string());
+            } else {
+                for (title, _) in docs.into_iter().take(12) {
+                    list.push(format!("★ {}", title));
+                }
+            }
         }
         list
     }
@@ -128,13 +145,13 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 5) => self.effective_scroll_mode() == ScrollMode::ContinuousVertical,
             (MenuCategory::View, 6) => self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal,
             (MenuCategory::View, 7) => self.effective_scroll_mode() == ScrollMode::MagazineBook,
-            (MenuCategory::View, 8) => self.view_mode == ViewMode::TextView,
-            (MenuCategory::View, 12) => self.view_mode == ViewMode::ThumbnailGrid,
-            (MenuCategory::View, 13) => self.show_bookmarks,
-            (MenuCategory::View, 15) => self.is_fullscreen && !self.is_presentation,
-            (MenuCategory::View, 16) => self.is_presentation,
-            (MenuCategory::View, 17) => self.show_toolbar,
-            (MenuCategory::View, 22) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
+            (MenuCategory::View, 9) => self.view_mode == ViewMode::TextView,
+            (MenuCategory::View, 13) => self.view_mode == ViewMode::ThumbnailGrid,
+            (MenuCategory::View, 14) => self.show_bookmarks,
+            (MenuCategory::View, 16) => self.is_fullscreen && !self.is_presentation,
+            (MenuCategory::View, 17) => self.is_presentation,
+            (MenuCategory::View, 18) => self.show_toolbar,
+            (MenuCategory::View, 23) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
             (MenuCategory::Edit, 3) => self.mouse_mode == MouseMode::Select,
             (MenuCategory::Edit, 4) => self.mouse_mode == MouseMode::Highlight,
             (MenuCategory::Edit, 5) => self.mouse_mode == MouseMode::Underline,
@@ -437,9 +454,6 @@ impl<'a> PdfViewerApp<'a> {
                 self.update_title_bar();
                 self.request_redraw();
             }
-            (MenuCategory::File, 12) => {
-                self.open_favorites_modal();
-            }
             (MenuCategory::File, idx) if idx >= MenuCategory::File.items().len() => {
                 let recent_idx = idx - MenuCategory::File.items().len();
                 if let Some(rpath) = self.recent_files.get(recent_idx).cloned() {
@@ -448,7 +462,7 @@ impl<'a> PdfViewerApp<'a> {
                         .and_then(|s| s.to_str())
                         .unwrap_or("document.pdf")
                         .to_string();
-                    let res = if self.doc.is_none() {
+                    let res = if self.doc.is_none() && !self.is_markdown_tab() {
                         self.load_document(rpath)
                     } else {
                         self.open_document_in_new_tab(rpath)
@@ -481,17 +495,22 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
             (MenuCategory::View, 8) => {
+                self.input_mode = InputMode::PageTurnSpeed {
+                    input: self.page_turn_anim_ms.to_string(),
+                };
+            }
+            (MenuCategory::View, 9) => {
                 if self.view_mode == ViewMode::TextView {
                     self.set_view_mode(self.last_page_view_mode);
                 } else {
                     self.set_view_mode(ViewMode::TextView);
                 }
             }
-            (MenuCategory::View, 9) => self.zoom_by_step(1.25),
-            (MenuCategory::View, 10) => self.zoom_by_step(0.8),
-            (MenuCategory::View, 11) => self.reset_zoom(),
-            (MenuCategory::View, 12) => self.toggle_view_mode(),
-            (MenuCategory::View, 13) => {
+            (MenuCategory::View, 10) => self.zoom_by_step(1.25),
+            (MenuCategory::View, 11) => self.zoom_by_step(0.8),
+            (MenuCategory::View, 12) => self.reset_zoom(),
+            (MenuCategory::View, 13) => self.toggle_view_mode(),
+            (MenuCategory::View, 14) => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
                 self.status_notice = Some(if self.show_bookmarks {
@@ -500,19 +519,19 @@ impl<'a> PdfViewerApp<'a> {
                     "Bookmarks Sidebar OFF".to_string()
                 });
             }
-            (MenuCategory::View, 14) => {
+            (MenuCategory::View, 15) => {
                 self.set_reading_filter(self.reading_filter.next());
                 return;
             }
-            (MenuCategory::View, 15) => self.toggle_fullscreen(),
-            (MenuCategory::View, 16) => {
+            (MenuCategory::View, 16) => self.toggle_fullscreen(),
+            (MenuCategory::View, 17) => {
                 if self.is_presentation {
                     self.exit_presentation_or_fullscreen();
                 } else {
                     self.enter_presentation_mode();
                 }
             }
-            (MenuCategory::View, 17) => {
+            (MenuCategory::View, 18) => {
                 self.show_toolbar = !self.show_toolbar;
                 self.save_session_to_ini();
                 self.status_notice = Some(if self.show_toolbar {
@@ -521,22 +540,22 @@ impl<'a> PdfViewerApp<'a> {
                     "Toolbar hidden (re-enable via View -> Show Toolbar)".to_string()
                 });
             }
-            (MenuCategory::View, 18) => {
+            (MenuCategory::View, 19) => {
                 self.show_customize_toolbar = true;
             }
-            (MenuCategory::View, 19) => {
+            (MenuCategory::View, 20) => {
                 self.adjust_ui_scale(0.10);
                 return;
             }
-            (MenuCategory::View, 20) => {
+            (MenuCategory::View, 21) => {
                 self.adjust_ui_scale(-0.10);
                 return;
             }
-            (MenuCategory::View, 21) => {
+            (MenuCategory::View, 22) => {
                 self.reset_ui_scale();
                 return;
             }
-            (MenuCategory::View, 22) => {
+            (MenuCategory::View, 23) => {
                 self.ui_theme_mode = self.ui_theme_mode.toggle();
                 self.save_session_to_ini();
                 self.status_notice = Some(format!("UI Theme: {}", self.ui_theme_mode.label()));
@@ -756,6 +775,30 @@ impl<'a> PdfViewerApp<'a> {
                     self.pending_dialog = Some(PendingDialog::ExportEpub);
                 } else {
                     self.status_notice = Some("Open a PDF, Markdown, or LaTeX file first to export as EPUB".to_string());
+                }
+            }
+
+            // Favorites menu
+            (MenuCategory::Favorites, 0) => {
+                self.open_favorites_modal();
+                return;
+            }
+            (MenuCategory::Favorites, 1) => {
+                self.star_current_document(None);
+                return;
+            }
+            (MenuCategory::Favorites, idx) if idx >= MenuCategory::Favorites.items().len() => {
+                let fav_idx = idx - MenuCategory::Favorites.items().len();
+                let docs = self.favorites.all_docs();
+                if let Some((fname, path)) = docs.get(fav_idx).cloned() {
+                    let res = if self.doc.is_none() && !self.is_markdown_tab() {
+                        self.load_document(path)
+                    } else {
+                        self.open_document_in_new_tab(path)
+                    };
+                    if let Err(e) = res {
+                        self.status_notice = Some(format!("Failed to open favorite '{fname}': {e}"));
+                    }
                 }
             }
 

@@ -22,6 +22,7 @@ pub(super) enum OverlayHit {
     OptimizeColor(u8),
     OptimizeToggleClean,
     OptimizeTogglePreview,
+    PageTurnPreset(u16),
     PromptSubmit,
     PromptCancel,
     InsideModal,
@@ -495,8 +496,9 @@ impl<'a> PdfViewerApp<'a> {
 
     fn layout_generic_prompt_card(&self, buf_w: u32, top_bars_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
-        let cw = ((480.0 * s).round() as u32).min(buf_w.saturating_sub(24));
-        let ch = (128.0 * s).round() as u32;
+        let is_speed = matches!(self.input_mode, InputMode::PageTurnSpeed { .. });
+        let cw = ((if is_speed { 510.0 } else { 480.0 } * s).round() as u32).min(buf_w.saturating_sub(24));
+        let ch = ((if is_speed { 164.0 } else { 128.0 }) * s).round() as u32;
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = top_bars_h as i32 + (18.0 * s).round() as i32;
         let pad = (16.0 * s).round() as i32;
@@ -506,10 +508,23 @@ impl<'a> PdfViewerApp<'a> {
         let ok_w = (96.0 * s).round() as u32;
         let cancel_x = cx + cw as i32 - pad - cancel_w as i32;
         let ok_x = cancel_x - ok_w as i32 - (6.0 * s).round() as i32;
-        let hits = vec![
+        let mut hits = vec![
             BoxHit { x: ok_x, y: by, w: ok_w, h: btn_h, hit: OverlayHit::PromptSubmit },
             BoxHit { x: cancel_x, y: by, w: cancel_w, h: btn_h, hit: OverlayHit::PromptCancel },
         ];
+        if is_speed {
+            let presets: [u16; 6] = [0, 220, 450, 700, 1000, 1400];
+            let py = cy + (88.0 * s).round() as i32;
+            let ph = (24.0 * s).round() as u32;
+            let gap = (6.0 * s).round() as i32;
+            let total_w = cw.saturating_sub((pad * 2) as u32) as i32;
+            let pw = ((total_w - gap * (presets.len() as i32 - 1)) / presets.len() as i32).max(40) as u32;
+            let mut px = cx + pad;
+            for ms in presets {
+                hits.push(BoxHit { x: px, y: py, w: pw, h: ph, hit: OverlayHit::PageTurnPreset(ms) });
+                px += pw as i32 + gap;
+            }
+        }
         ((cx, cy, cw, ch), hits)
     }
 
@@ -524,6 +539,13 @@ impl<'a> PdfViewerApp<'a> {
 
         let (title, hint, value, ok_lbl, is_confirm_only) = match &self.input_mode {
             InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump", false),
+            InputMode::PageTurnSpeed { input } => (
+                "Magazine Page-Turn Animation Speed",
+                "Enter duration in milliseconds (0 = Off, up to 3000 ms) or pick a preset:",
+                input.clone(),
+                "Apply",
+                false,
+            ),
             InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply", false),
             InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next", false),
             InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next", false),
@@ -621,6 +643,29 @@ impl<'a> PdfViewerApp<'a> {
             stroke_rounded_rect(buffer, buf_w, buf_h, cx + pad, inp_y, inp_w, inp_h, (6.0 * s).max(4.0), theme.input_focus_border);
             let txt = format!("{value}|");
             draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
+        }
+
+        // Optional preset pills (used by Magazine Page-Turn Speed)
+        let pill_sz = (10.5 * s).clamp(9.0, 18.0);
+        for hb in hits.iter().skip(2) {
+            if let OverlayHit::PageTurnPreset(ms) = hb.hit {
+                let active = self.page_turn_anim_ms == ms as u64;
+                let hov = self.hovered_widget == Some(UiHit::Overlay(hb.hit));
+                let bg = if active {
+                    theme.accent_soft_bg
+                } else if hov {
+                    theme.hover_bg
+                } else {
+                    theme.surface_elevated
+                };
+                let bd = if active { theme.accent } else { theme.border_subtle };
+                let fg = if active { theme.accent_soft_fg } else { theme.text_primary };
+                fill_rounded_rect(buffer, buf_w, buf_h, hb.x, hb.y, hb.w, hb.h, (5.0 * s).max(3.0), bg);
+                stroke_rounded_rect(buffer, buf_w, buf_h, hb.x, hb.y, hb.w, hb.h, (5.0 * s).max(3.0), bd);
+                let lbl = if ms == 0 { "Off".to_string() } else { format!("{ms}ms") };
+                let lw = measure_text(&lbl, pill_sz, active);
+                draw_text_vcenter(buffer, buf_w, buf_h, hb.x + ((hb.w as f32 - lw) * 0.5).round() as i32, hb.y, hb.h, hb.x + hb.w as i32 - 2, &lbl, pill_sz, fg, active);
+            }
         }
 
         let ok_b = hits[0];
@@ -939,6 +984,14 @@ impl<'a> PdfViewerApp<'a> {
                         None => self.invalidate_page_caches(),
                     }
                 }
+            }
+            OverlayHit::PageTurnPreset(ms) => {
+                if let InputMode::PageTurnSpeed { input } = &mut self.input_mode {
+                    *input = ms.to_string();
+                }
+                self.set_page_turn_anim_ms(ms as u64);
+                self.input_mode = InputMode::Normal;
+                return;
             }
             OverlayHit::PromptSubmit => {
                 self.handle_prompt_submission();
