@@ -915,9 +915,11 @@ impl<'a> PdfViewerApp<'a> {
             return Ok(());
         }
 
-        if self.view_mode == ViewMode::TwoPageSpread {
+        let is_magazine = self.effective_scroll_mode() == ScrollMode::MagazineBook;
+        if self.view_mode == ViewMode::TwoPageSpread || is_magazine {
+            let spread_gap = if is_magazine { 0 } else { SPREAD_GAP_PX };
             let avail_w = (content_w
-                .saturating_sub(PAGE_MARGIN_PX * 2 + SPREAD_GAP_PX)
+                .saturating_sub(PAGE_MARGIN_PX * 2 + spread_gap)
                 / 2)
             .max(1) as f32;
             let avail_h = content_h.saturating_sub(PAGE_MARGIN_PX * 2).max(1) as f32;
@@ -989,7 +991,7 @@ impl<'a> PdfViewerApp<'a> {
                 let lw = left_bmp.bitmap_width;
                 let lh = left_bmp.bitmap_height;
                 let lx = if self.cached_second_page.is_some() {
-                    center_x - (SPREAD_GAP_PX as i32 / 2) - (lw as i32) - (self.pan_x.round() as i32)
+                    center_x - (spread_gap as i32 / 2) - (lw as i32) - (self.pan_x.round() as i32)
                 } else {
                     center_x - (lw as i32 / 2) - (self.pan_x.round() as i32)
                 };
@@ -1006,7 +1008,7 @@ impl<'a> PdfViewerApp<'a> {
             if let Some(right_bmp) = &self.cached_second_page {
                 let rw = right_bmp.bitmap_width;
                 let rh = right_bmp.bitmap_height;
-                let rx = center_x + (SPREAD_GAP_PX as i32 / 2) - (self.pan_x.round() as i32);
+                let rx = center_x + (spread_gap as i32 / 2) - (self.pan_x.round() as i32);
                 let ry = if rh > content_h {
                     (top_bars_h as i32) - (self.scroll_y.round() as i32)
                 } else {
@@ -1933,7 +1935,8 @@ impl<'a> PdfViewerApp<'a> {
                     );
                 }
 
-                if self.view_mode == ViewMode::TwoPageSpread {
+                let is_magazine = self.effective_scroll_mode() == ScrollMode::MagazineBook;
+                if self.view_mode == ViewMode::TwoPageSpread || is_magazine {
                     if let (Some(second_cache), Some(second_rect)) =
                         (&self.cached_second_page, self.second_page_draw_rect)
                     {
@@ -1948,6 +1951,46 @@ impl<'a> PdfViewerApp<'a> {
                         );
                         self.draw_text_selection_overlays_on_page(
                             buffer, width, height, top_bars_h, status_bar_h, second_cache.page_index, second_rect,
+                        );
+                    }
+                }
+
+                if is_magazine {
+                    let s = scale_factor as f32;
+                    let bottom_limit = height.saturating_sub(status_bar_h);
+                    let r1 = self.page_draw_rect;
+                    let (spread_x, spread_y, spread_w, spread_h) = if let Some(r2) = self.second_page_draw_rect {
+                        let spine_x = r2.0;
+                        let top_y = r1.1.min(r2.1).max(top_bars_h as i32);
+                        let bot_y = (r1.1 + r1.3 as i32).max(r2.1 + r2.3 as i32).min(bottom_limit as i32);
+                        let sh = (bot_y - top_y).max(0) as u32;
+                        super::ui_draw::draw_book_spine_crease(
+                            buffer,
+                            width,
+                            bottom_limit,
+                            spine_x,
+                            top_y,
+                            sh,
+                            (14.0 * s).round().max(6.0) as i32,
+                        );
+                        (r1.0, top_y, (r2.0 + r2.2 as i32 - r1.0).max(0) as u32, sh)
+                    } else {
+                        let top_y = r1.1.max(top_bars_h as i32);
+                        let bot_y = (r1.1 + r1.3 as i32).min(bottom_limit as i32);
+                        (r1.0, top_y, r1.2, (bot_y - top_y).max(0) as u32)
+                    };
+                    if let Some((eased, dir)) = self.page_turn_anim_progress() {
+                        super::ui_draw::draw_magazine_page_turn_overlay(
+                            buffer,
+                            width,
+                            bottom_limit,
+                            spread_x,
+                            spread_y,
+                            spread_w,
+                            spread_h,
+                            eased,
+                            dir,
+                            s,
                         );
                     }
                 }

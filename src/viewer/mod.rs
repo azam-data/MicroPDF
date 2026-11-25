@@ -2818,6 +2818,7 @@ mod tests {
             ScrollMode::SinglePage,
             ScrollMode::ContinuousVertical,
             ScrollMode::ContinuousHorizontal,
+            ScrollMode::MagazineBook,
         ];
         for expected in seen {
             assert_eq!(sm, expected);

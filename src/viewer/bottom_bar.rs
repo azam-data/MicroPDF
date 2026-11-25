@@ -94,7 +94,39 @@ impl<'a> PdfViewerApp<'a> {
         let sep_pad = (6.0 * s).round().max(4.0) as i32;
         let font_sz = (11.0 * s).clamp(9.0, 22.0);
 
-        let page_txt = if self.doc.is_some() {
+        let page_txt = if self.is_markdown_tab() {
+            let words = self.md_layout.as_ref().map(|c| c.word_count).unwrap_or(0);
+            let mins = (words / 230).max(1);
+            if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
+            {
+                if let Some((l_p, r_opt, tot_p)) = self.md_magazine_page_info(buf_h, sf) {
+                    let p_str = match r_opt {
+                        Some(r_p) => format!("{l_p}–{r_p}/{tot_p}"),
+                        None => format!("{l_p}/{tot_p}"),
+                    };
+                    if words > 0 {
+                        format!("{p_str} · {words}w · ~{mins}m")
+                    } else {
+                        p_str
+                    }
+                } else {
+                    "— / —".to_string()
+                }
+            } else {
+                let max_scroll = self.md_max_scroll_y(buf_h, sf);
+                let pct = if max_scroll > 1.0 {
+                    ((self.scroll_y / max_scroll) * 100.0).round().clamp(0.0, 100.0) as u32
+                } else {
+                    100
+                };
+                if words > 0 {
+                    format!("{pct}% · {words}w · ~{mins}m")
+                } else {
+                    format!("{pct}%")
+                }
+            }
+        } else if self.doc.is_some() {
             let phys = self.current_page_index + 1;
             let total = self.total_pages();
             if self.roman_end > 0 || self.skip_pages > 0 {
@@ -292,6 +324,18 @@ impl<'a> PdfViewerApp<'a> {
 
         fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, buf_w, bar_h, theme.statusbar_bg);
         fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, buf_w, 1, theme.divider);
+        if self.is_markdown_tab() {
+            let max_scroll = self.md_max_scroll_y(buf_h, sf);
+            let ratio = if max_scroll > 1.0 {
+                (self.scroll_y / max_scroll).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let fill_w = (buf_w as f32 * ratio).round() as u32;
+            if fill_w > 0 {
+                fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, fill_w, 2, theme.accent);
+            }
+        }
 
         let layout = self.compute_bottom_bar_layout(buf_w, buf_h, bar_h, sf);
         let font_sz = (11.0 * s).clamp(9.0, 22.0);

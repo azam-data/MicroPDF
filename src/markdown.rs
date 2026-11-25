@@ -157,7 +157,10 @@ pub fn spans_to_plain_text(spans: &[InlineSpan]) -> String {
 }
 
 pub fn parse_markdown(src: &str, fallback_title: &str) -> MarkdownDoc {
-    let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_MATH;
     let parser = Parser::new_ext(src, opts);
 
     let mut blocks: Vec<MdBlock> = Vec::new();
@@ -471,6 +474,35 @@ pub fn parse_markdown(src: &str, fallback_title: &str) -> MarkdownDoc {
                     cur_spans.push(InlineSpan::Code(code.to_string()));
                 }
             }
+            Event::InlineMath(tex) => {
+                if inline.link_url.is_some() {
+                    inline.link_text.push_str(&tex);
+                } else {
+                    cur_spans.push(InlineSpan::Math(tex.to_string()));
+                }
+            }
+            Event::DisplayMath(tex) => {
+                if !cur_spans.is_empty() && list_stack.is_empty() {
+                    let spans = std::mem::take(&mut cur_spans);
+                    push_block(
+                        MdBlock::Paragraph(spans),
+                        &mut blocks,
+                        &mut blockquote_stack,
+                        &mut headings,
+                        &mut first_h1,
+                    );
+                }
+                let trimmed = tex.trim().to_string();
+                if !trimmed.is_empty() {
+                    push_block(
+                        MdBlock::MathBlock(trimmed),
+                        &mut blocks,
+                        &mut blockquote_stack,
+                        &mut headings,
+                        &mut first_h1,
+                    );
+                }
+            }
             Event::SoftBreak => {
                 if in_code_block.is_none() {
                     inline.push_text(&mut cur_spans, " ");
@@ -561,5 +593,20 @@ fn main() { println!(\"hi\"); }
             .blocks
             .iter()
             .any(|b| matches!(b, MdBlock::HorizontalRule)));
+    }
+
+    #[test]
+    fn test_parse_markdown_inline_and_display_math() {
+        let md = "Pythagoras says $a^2 + b^2 = c^2$ in a triangle.\n\n$$\n\\int_0^1 x\\,dx = \\frac{1}{2}\n$$\n";
+        let doc = parse_markdown(md, "math.md");
+        let has_inline = doc.blocks.iter().any(|b| {
+            matches!(b, MdBlock::Paragraph(spans) if spans.iter().any(|s| matches!(s, InlineSpan::Math(t) if t == "a^2 + b^2 = c^2")))
+        });
+        let has_display = doc
+            .blocks
+            .iter()
+            .any(|b| matches!(b, MdBlock::MathBlock(t) if t.contains("\\frac{1}{2}")));
+        assert!(has_inline, "expected InlineSpan::Math in paragraph");
+        assert!(has_display, "expected MdBlock::MathBlock for $$...$$");
     }
 }

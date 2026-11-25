@@ -1262,3 +1262,113 @@ pub fn draw_icon(
         }
     }
 }
+
+/// Draws a subtle vertical book-spine crease shadow centered at `spine_x` over `[top_y, top_y + height)`.
+pub fn draw_book_spine_crease(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    spine_x: i32,
+    top_y: i32,
+    height: u32,
+    half_w: i32,
+) {
+    if height == 0 || half_w <= 0 {
+        return;
+    }
+    let y0 = top_y.max(0);
+    let y1 = (top_y + height as i32).min(buf_h as i32);
+    if y1 <= y0 {
+        return;
+    }
+    let x0 = (spine_x - half_w).max(0);
+    let x1 = (spine_x + half_w).min(buf_w as i32);
+    if x1 <= x0 {
+        return;
+    }
+    for x in x0..x1 {
+        let dist = (x - spine_x).abs() as f32 / half_w as f32;
+        let alpha = ((1.0 - dist).powf(2.2) * 52.0).round() as u32;
+        if alpha == 0 {
+            continue;
+        }
+        let inv = 255 - alpha;
+        for y in y0..y1 {
+            let idx = y as usize * buf_w as usize + x as usize;
+            let dst = buffer[idx];
+            let r = (((dst >> 16) & 0xFF) * inv) / 255;
+            let g = (((dst >> 8) & 0xFF) * inv) / 255;
+            let b = ((dst & 0xFF) * inv) / 255;
+            buffer[idx] = (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+/// Draws a 220 ms animated page-turn fold shadow & paper highlight sweeping across an open spread.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_magazine_page_turn_overlay(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    spread_x: i32,
+    spread_y: i32,
+    spread_w: u32,
+    spread_h: u32,
+    eased_t: f32,
+    direction: i8,
+    s: f32,
+) {
+    if spread_w == 0 || spread_h == 0 {
+        return;
+    }
+    let y0 = spread_y.max(0);
+    let y1 = (spread_y + spread_h as i32).min(buf_h as i32);
+    if y1 <= y0 {
+        return;
+    }
+    let sweep_x = if direction >= 0 {
+        spread_x as f32 + spread_w as f32 * (1.0 - eased_t)
+    } else {
+        spread_x as f32 + spread_w as f32 * eased_t
+    };
+    let fold_w = (32.0 * s).max(16.0);
+    let intensity = (1.0 - (eased_t - 0.5).abs() * 1.35).clamp(0.25, 1.0);
+    let x0 = ((sweep_x - fold_w).floor() as i32).max(spread_x.max(0));
+    let x1 = ((sweep_x + fold_w).ceil() as i32).min((spread_x + spread_w as i32).min(buf_w as i32));
+    if x1 <= x0 {
+        return;
+    }
+    for x in x0..x1 {
+        let dx = x as f32 - sweep_x;
+        let abs_d = dx.abs();
+        if abs_d <= 3.0 * s {
+            // Bright specular paper-curl highlight along the turning crease
+            let a = ((1.0 - abs_d / (3.0 * s)) * 95.0 * intensity).round() as u32;
+            let inv = 255 - a;
+            for y in y0..y1 {
+                let idx = y as usize * buf_w as usize + x as usize;
+                let dst = buffer[idx];
+                let r = (((dst >> 16) & 0xFF) * inv + 255 * a) / 255;
+                let g = (((dst >> 8) & 0xFF) * inv + 255 * a) / 255;
+                let b = ((dst & 0xFF) * inv + 255 * a) / 255;
+                buffer[idx] = (r << 16) | (g << 8) | b;
+            }
+        } else {
+            // Trailing page-curl drop shadow
+            let a = ((1.0 - abs_d / fold_w).powf(1.6) * 68.0 * intensity).round() as u32;
+            if a == 0 {
+                continue;
+            }
+            let inv = 255 - a;
+            for y in y0..y1 {
+                let idx = y as usize * buf_w as usize + x as usize;
+                let dst = buffer[idx];
+                let r = (((dst >> 16) & 0xFF) * inv) / 255;
+                let g = (((dst >> 8) & 0xFF) * inv) / 255;
+                let b = ((dst & 0xFF) * inv) / 255;
+                buffer[idx] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+

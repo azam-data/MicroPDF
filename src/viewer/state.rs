@@ -130,6 +130,7 @@ impl MenuCategory {
                 "Scroll: Single Page",
                 "Scroll: Continuous Vertical (5)",
                 "Scroll: Continuous Horizontal Book",
+                "Scroll: Magazine / Book",
                 "Text View — Reflowable Reader (T)",
                 "Zoom In (+ / Ctrl+Wheel Up)",
                 "Zoom Out (- / Ctrl+Wheel Down)",
@@ -371,6 +372,8 @@ pub enum ScrollMode {
     ContinuousVertical,
     /// Smooth continuous horizontal "book ribbon" scroll across all pages left-to-right.
     ContinuousHorizontal,
+    /// Two-page open Magazine / Book spread with spine crease and 220 ms page-turn animation (PDF, EPUB, MD, LaTeX).
+    MagazineBook,
 }
 
 impl ScrollMode {
@@ -378,7 +381,8 @@ impl ScrollMode {
         match self {
             Self::SinglePage => Self::ContinuousVertical,
             Self::ContinuousVertical => Self::ContinuousHorizontal,
-            Self::ContinuousHorizontal => Self::SinglePage,
+            Self::ContinuousHorizontal => Self::MagazineBook,
+            Self::MagazineBook => Self::SinglePage,
         }
     }
 
@@ -387,6 +391,7 @@ impl ScrollMode {
             Self::SinglePage => "Single",
             Self::ContinuousVertical => "Vert",
             Self::ContinuousHorizontal => "Book",
+            Self::MagazineBook => "Mag",
         }
     }
 
@@ -395,6 +400,7 @@ impl ScrollMode {
             Self::SinglePage => "Single Page",
             Self::ContinuousVertical => "Continuous Vertical Scroll",
             Self::ContinuousHorizontal => "Continuous Horizontal Book Scroll",
+            Self::MagazineBook => "Magazine / Book Mode",
         }
     }
 
@@ -403,6 +409,7 @@ impl ScrollMode {
             Self::SinglePage => "SinglePage",
             Self::ContinuousVertical => "ContinuousVertical",
             Self::ContinuousHorizontal => "ContinuousHorizontal",
+            Self::MagazineBook => "MagazineBook",
         }
     }
 
@@ -410,9 +417,19 @@ impl ScrollMode {
         match s.trim() {
             "ContinuousVertical" => Self::ContinuousVertical,
             "ContinuousHorizontal" => Self::ContinuousHorizontal,
+            "MagazineBook" | "magazinebook" | "magazine" => Self::MagazineBook,
             _ => Self::SinglePage,
         }
     }
+}
+
+/// 220 ms page-turn animation state for Magazine / Book mode.
+#[derive(Clone, Debug)]
+pub(super) struct PageTurnAnim {
+    pub(super) started_at: Instant,
+    pub(super) duration_ms: u64,
+    /// `+1` for turning forward (next page/spread), `-1` for turning backward.
+    pub(super) direction: i8,
 }
 
 /// Page, Text & Grid View Modes (`1`, `2`, `3`, `4`, `5`, `T`, and `Tab`).
@@ -1215,6 +1232,8 @@ pub struct PdfViewerApp<'a> {
     /// Debounce timer & accumulator for MouseWheel page turning.
     pub(super) last_wheel_turn: Option<Instant>,
     pub(super) wheel_accum_y: f64,
+    /// Active 220 ms page-turn animation for Magazine / Book mode.
+    pub(super) page_turn_anim: Option<PageTurnAnim>,
     pub(super) shift_pressed: bool,
     pub(super) cmd_or_ctrl_pressed: bool,
     pub(super) ctrl_pressed: bool,
@@ -1363,7 +1382,11 @@ impl<'a> PdfViewerApp<'a> {
 
     /// True when rendering continuous vertical or continuous horizontal scrolling page flow.
     pub(super) fn is_continuous_scroll(&self) -> bool {
-        self.view_mode.is_page_view() && self.effective_scroll_mode() != ScrollMode::SinglePage
+        self.view_mode.is_page_view()
+            && matches!(
+                self.effective_scroll_mode(),
+                ScrollMode::ContinuousVertical | ScrollMode::ContinuousHorizontal
+            )
     }
 
     pub(super) fn set_scroll_mode(&mut self, mode: ScrollMode) {
@@ -1380,10 +1403,36 @@ impl<'a> PdfViewerApp<'a> {
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.pan_x = 0.0;
+        self.page_turn_anim = None;
         self.invalidate_page_caches();
         self.status_notice = Some(format!("Scroll Mode: {}", mode.status_label()));
         self.save_session_to_ini();
         self.request_redraw();
+    }
+
+    pub(super) fn trigger_page_turn_anim(&mut self, direction: i8) {
+        if self.effective_scroll_mode() == ScrollMode::MagazineBook {
+            self.page_turn_anim = Some(PageTurnAnim {
+                started_at: Instant::now(),
+                duration_ms: 220,
+                direction,
+            });
+        }
+    }
+
+    /// Returns `Some((eased_t, direction))` while the 220 ms page-turn animation is active,
+    /// or `None` once finished.
+    pub(super) fn page_turn_anim_progress(&mut self) -> Option<(f32, i8)> {
+        let anim = self.page_turn_anim.as_ref()?;
+        let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
+        let t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            self.page_turn_anim = None;
+            None
+        } else {
+            let eased = 1.0 - (1.0 - t).powi(3);
+            Some((eased, anim.direction))
+        }
     }
 
     pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
@@ -1442,6 +1491,7 @@ impl<'a> PdfViewerApp<'a> {
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
             scroll_mode: ScrollMode::SinglePage,
+            page_turn_anim: None,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
@@ -1951,15 +2001,30 @@ impl<'a> PdfViewerApp<'a> {
     /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
         // Record active and inactive tab reading positions into the 50-entry LRU table
+        let encode_pos = |p: &std::path::Path, pg: u16, sy: f32| -> u16 {
+            if Self::is_markdown_path(p) || Self::is_latex_path(p) || Self::is_epub_path(p) {
+                sy.round().clamp(0.0, 65535.0) as u16
+            } else {
+                pg
+            }
+        };
         let tab_positions: Vec<(PathBuf, u16, f32)> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
                 if i == self.active_tab {
-                    (self.file_path.clone(), self.current_page_index, self.zoom_level)
+                    (
+                        self.file_path.clone(),
+                        encode_pos(&self.file_path, self.current_page_index, self.scroll_y),
+                        self.zoom_level,
+                    )
                 } else {
-                    (tab.file_path.clone(), tab.current_page_index, tab.zoom_level)
+                    (
+                        tab.file_path.clone(),
+                        encode_pos(&tab.file_path, tab.current_page_index, tab.scroll_y),
+                        tab.zoom_level,
+                    )
                 }
             })
             .collect();
@@ -1968,7 +2033,8 @@ impl<'a> PdfViewerApp<'a> {
         }
         if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() {
             let p = self.file_path.clone();
-            self.record_last_position(&p, self.current_page_index, self.zoom_level);
+            let pg = encode_pos(&p, self.current_page_index, self.scroll_y);
+            self.record_last_position(&p, pg, self.zoom_level);
         }
 
         let mut saved_tabs = Vec::new();

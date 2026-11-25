@@ -37,9 +37,19 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
     let mut manifest: HashMap<String, (String, String, String)> = HashMap::new();
     let mut nav_path: Option<String> = None;
     let mut ncx_path: Option<String> = None;
+    let mut cover_path: Option<String> = None;
+    let mut epub2_cover_id: Option<String> = None;
 
     for tag in iter_tags(&opf_xml) {
-        if tag.name.eq_ignore_ascii_case("item") {
+        if tag.name.eq_ignore_ascii_case("meta") {
+            if get_attr(&tag.raw, "name").is_some_and(|n| n.eq_ignore_ascii_case("cover")) {
+                if let Some(cid) = get_attr(&tag.raw, "content") {
+                    if !cid.trim().is_empty() {
+                        epub2_cover_id = Some(cid);
+                    }
+                }
+            }
+        } else if tag.name.eq_ignore_ascii_case("item") {
             let id = get_attr(&tag.raw, "id").unwrap_or_default();
             let href = get_attr(&tag.raw, "href").unwrap_or_default();
             let media = get_attr(&tag.raw, "media-type").unwrap_or_default();
@@ -49,10 +59,20 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
                 if props.split_whitespace().any(|p| p == "nav") {
                     nav_path = Some(resolved.clone());
                 }
+                if props.split_whitespace().any(|p| p == "cover-image") {
+                    cover_path = Some(resolved.clone());
+                }
                 if media.eq_ignore_ascii_case("application/x-dtbncx+xml") {
                     ncx_path = Some(resolved.clone());
                 }
                 manifest.insert(id, (resolved, media, props));
+            }
+        }
+    }
+    if cover_path.is_none() {
+        if let Some(cid) = epub2_cover_id {
+            if let Some((href, _, _)) = manifest.get(&cid) {
+                cover_path = Some(href.clone());
             }
         }
     }
@@ -91,6 +111,16 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
     let mut blocks: Vec<MdBlock> = Vec::new();
     let mut headings: Vec<MdHeading> = Vec::new();
     let mut embedded_images: HashMap<String, Vec<u8>> = HashMap::new();
+
+    if let Some(ref cp) = cover_path {
+        if let Ok(cbytes) = zip.read_file(cp) {
+            embedded_images.insert(cp.clone(), cbytes);
+            blocks.push(MdBlock::Image {
+                path: cp.clone(),
+                caption: None,
+            });
+        }
+    }
 
     if let Some(auth) = author {
         blocks.push(MdBlock::Paragraph(vec![InlineSpan::Italic(format!("By {auth}"))]));

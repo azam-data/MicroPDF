@@ -127,13 +127,14 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::View, 4) => self.effective_scroll_mode() == ScrollMode::SinglePage,
             (MenuCategory::View, 5) => self.effective_scroll_mode() == ScrollMode::ContinuousVertical,
             (MenuCategory::View, 6) => self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal,
-            (MenuCategory::View, 7) => self.view_mode == ViewMode::TextView,
-            (MenuCategory::View, 11) => self.view_mode == ViewMode::ThumbnailGrid,
-            (MenuCategory::View, 12) => self.show_bookmarks,
-            (MenuCategory::View, 14) => self.is_fullscreen && !self.is_presentation,
-            (MenuCategory::View, 15) => self.is_presentation,
-            (MenuCategory::View, 16) => self.show_toolbar,
-            (MenuCategory::View, 21) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
+            (MenuCategory::View, 7) => self.effective_scroll_mode() == ScrollMode::MagazineBook,
+            (MenuCategory::View, 8) => self.view_mode == ViewMode::TextView,
+            (MenuCategory::View, 12) => self.view_mode == ViewMode::ThumbnailGrid,
+            (MenuCategory::View, 13) => self.show_bookmarks,
+            (MenuCategory::View, 15) => self.is_fullscreen && !self.is_presentation,
+            (MenuCategory::View, 16) => self.is_presentation,
+            (MenuCategory::View, 17) => self.show_toolbar,
+            (MenuCategory::View, 22) => self.ui_theme_mode == super::theme::UiThemeMode::Dark,
             (MenuCategory::Edit, 3) => self.mouse_mode == MouseMode::Select,
             (MenuCategory::Edit, 4) => self.mouse_mode == MouseMode::Highlight,
             (MenuCategory::Edit, 5) => self.mouse_mode == MouseMode::Underline,
@@ -476,17 +477,21 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
             (MenuCategory::View, 7) => {
+                self.set_scroll_mode(ScrollMode::MagazineBook);
+                return;
+            }
+            (MenuCategory::View, 8) => {
                 if self.view_mode == ViewMode::TextView {
                     self.set_view_mode(self.last_page_view_mode);
                 } else {
                     self.set_view_mode(ViewMode::TextView);
                 }
             }
-            (MenuCategory::View, 8) => self.zoom_by_step(1.25),
-            (MenuCategory::View, 9) => self.zoom_by_step(0.8),
-            (MenuCategory::View, 10) => self.reset_zoom(),
-            (MenuCategory::View, 11) => self.toggle_view_mode(),
-            (MenuCategory::View, 12) => {
+            (MenuCategory::View, 9) => self.zoom_by_step(1.25),
+            (MenuCategory::View, 10) => self.zoom_by_step(0.8),
+            (MenuCategory::View, 11) => self.reset_zoom(),
+            (MenuCategory::View, 12) => self.toggle_view_mode(),
+            (MenuCategory::View, 13) => {
                 self.show_bookmarks = !self.show_bookmarks;
                 self.invalidate_page_caches();
                 self.status_notice = Some(if self.show_bookmarks {
@@ -495,19 +500,19 @@ impl<'a> PdfViewerApp<'a> {
                     "Bookmarks Sidebar OFF".to_string()
                 });
             }
-            (MenuCategory::View, 13) => {
+            (MenuCategory::View, 14) => {
                 self.set_reading_filter(self.reading_filter.next());
                 return;
             }
-            (MenuCategory::View, 14) => self.toggle_fullscreen(),
-            (MenuCategory::View, 15) => {
+            (MenuCategory::View, 15) => self.toggle_fullscreen(),
+            (MenuCategory::View, 16) => {
                 if self.is_presentation {
                     self.exit_presentation_or_fullscreen();
                 } else {
                     self.enter_presentation_mode();
                 }
             }
-            (MenuCategory::View, 16) => {
+            (MenuCategory::View, 17) => {
                 self.show_toolbar = !self.show_toolbar;
                 self.save_session_to_ini();
                 self.status_notice = Some(if self.show_toolbar {
@@ -516,22 +521,22 @@ impl<'a> PdfViewerApp<'a> {
                     "Toolbar hidden (re-enable via View -> Show Toolbar)".to_string()
                 });
             }
-            (MenuCategory::View, 17) => {
+            (MenuCategory::View, 18) => {
                 self.show_customize_toolbar = true;
             }
-            (MenuCategory::View, 18) => {
+            (MenuCategory::View, 19) => {
                 self.adjust_ui_scale(0.10);
                 return;
             }
-            (MenuCategory::View, 19) => {
+            (MenuCategory::View, 20) => {
                 self.adjust_ui_scale(-0.10);
                 return;
             }
-            (MenuCategory::View, 20) => {
+            (MenuCategory::View, 21) => {
                 self.reset_ui_scale();
                 return;
             }
-            (MenuCategory::View, 21) => {
+            (MenuCategory::View, 22) => {
                 self.ui_theme_mode = self.ui_theme_mode.toggle();
                 self.save_session_to_ini();
                 self.status_notice = Some(format!("UI Theme: {}", self.ui_theme_mode.label()));

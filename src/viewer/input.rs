@@ -76,6 +76,7 @@ impl<'a> PdfViewerApp<'a> {
                 ScrollMode::SinglePage => "",
                 ScrollMode::ContinuousVertical => " + Continuous Vertical",
                 ScrollMode::ContinuousHorizontal => " + Book Horizontal Scroll",
+                ScrollMode::MagazineBook => " + Magazine / Book",
             };
             self.status_notice = Some(match mode {
                 ViewMode::FitPage => format!("View Mode: Fit Full Page (1){flow_suffix}"),
@@ -775,10 +776,12 @@ impl<'a> PdfViewerApp<'a> {
         }
         let clamped = new_index.min(total - 1);
         if clamped != self.current_page_index {
+            let dir = if clamped > self.current_page_index { 1 } else { -1 };
             self.current_page_index = clamped;
             self.scroll_y = 0.0;
             self.scroll_x = 0.0;
             self.invalidate_page_caches();
+            self.trigger_page_turn_anim(dir);
             self.status_notice = None;
             self.update_title_bar();
             self.request_redraw();
@@ -790,7 +793,9 @@ impl<'a> PdfViewerApp<'a> {
         if total == 0 {
             return;
         }
-        let step = if self.view_mode == ViewMode::TwoPageSpread {
+        let step = if self.view_mode == ViewMode::TwoPageSpread
+            || self.effective_scroll_mode() == ScrollMode::MagazineBook
+        {
             2
         } else {
             1
@@ -803,7 +808,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn step_pages_backward(&mut self) {
-        let step = if self.view_mode == ViewMode::TwoPageSpread {
+        let step = if self.view_mode == ViewMode::TwoPageSpread
+            || self.effective_scroll_mode() == ScrollMode::MagazineBook
+        {
             2
         } else {
             1
@@ -910,7 +917,7 @@ impl<'a> PdfViewerApp<'a> {
                     }
                     self.scroll_y = ((top_bars_h + PAGE_MARGIN_PX) as f32) - new_draw_y;
                 }
-                ScrollMode::SinglePage => {
+                ScrollMode::SinglePage | ScrollMode::MagazineBook => {
                     if new_w > content_w as f32 {
                         self.pan_x = ((sidebar_w as f32) - new_draw_x)
                             .clamp(0.0, (new_w - content_w as f32).max(0.0));
@@ -943,7 +950,7 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn zoom_by_step(&mut self, factor: f32) {
         if self.is_markdown_tab() {
-            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 2.2);
+            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 3.0);
             let pct = (self.zoom_level * 100.0).round() as u32;
             self.status_notice = Some(format!("Markdown Zoom: {pct}%"));
             self.update_title_bar();
@@ -1023,9 +1030,16 @@ impl<'a> PdfViewerApp<'a> {
                 let top_bars_h = self.top_bars_height_px(sf);
                 let status_bar_h = self.status_bar_height_px(sf);
                 let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
-                let max_s = self.md_max_scroll_y(canvas_h, sf);
-                self.scroll_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
-                self.request_redraw();
+                if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                    && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
+                {
+                    let dir = if scroll_delta_px > 0.0 { 1 } else { -1 };
+                    self.step_md_magazine_spread(dir, sz.width, canvas_h, sf);
+                } else {
+                    let max_s = self.md_max_scroll_y(canvas_h, sf);
+                    self.scroll_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
+                    self.request_redraw();
+                }
             }
             return true;
         }
@@ -1041,7 +1055,7 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                     return true;
                 }
-                ScrollMode::SinglePage => {}
+                ScrollMode::SinglePage | ScrollMode::MagazineBook => {}
             }
         }
         if self.view_mode == ViewMode::TextView {
@@ -1894,13 +1908,74 @@ impl<'a> PdfViewerApp<'a> {
                         self.sync_markdown_from_editor();
                     }
                     return true;
+                } else if s.eq_ignore_ascii_case("d") && self.shift_pressed {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.duplicate_line();
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
+                } else if s.eq_ignore_ascii_case("b") {
+                    let is_tex = Self::is_latex_path(&self.file_path);
+                    if let Some(ref mut ed) = self.md_editor {
+                        if is_tex {
+                            ed.wrap_selection("\\textbf{", "}");
+                        } else {
+                            ed.wrap_selection("**", "**");
+                        }
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
+                } else if s.eq_ignore_ascii_case("i") {
+                    let is_tex = Self::is_latex_path(&self.file_path);
+                    if let Some(ref mut ed) = self.md_editor {
+                        if is_tex {
+                            ed.wrap_selection("\\textit{", "}");
+                        } else {
+                            ed.wrap_selection("*", "*");
+                        }
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
+                } else if s == "/" {
+                    let syntax = if Self::is_latex_path(&self.file_path) {
+                        super::text_editor::EditorSyntax::LaTeX
+                    } else {
+                        super::text_editor::EditorSyntax::Markdown
+                    };
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.toggle_comment(syntax);
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
                 }
             }
             return false;
         }
 
         if self.alt_pressed {
-            return false;
+            match key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.move_line(-1);
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.move_line(1);
+                        ed.ensure_cursor_visible(ew, view_h, sf, zoom);
+                    }
+                    self.sync_markdown_from_editor();
+                    return true;
+                }
+                _ => return false,
+            }
         }
 
         let shift = self.shift_pressed;
@@ -1976,7 +2051,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             Key::Named(NamedKey::Enter) => {
                 if let Some(ref mut ed) = self.md_editor {
-                    ed.insert_str("\n");
+                    ed.insert_newline_auto_indent();
                     ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
@@ -1984,7 +2059,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             Key::Named(NamedKey::Tab) => {
                 if let Some(ref mut ed) = self.md_editor {
-                    ed.insert_str("  ");
+                    ed.indent_or_outdent(shift);
                     ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                 }
                 self.sync_markdown_from_editor();
@@ -2019,7 +2094,12 @@ impl<'a> PdfViewerApp<'a> {
                     let clean: String = t.chars().filter(|c| !c.is_control()).collect();
                     if !clean.is_empty() {
                         if let Some(ref mut ed) = self.md_editor {
-                            ed.insert_str(&clean);
+                            let mut chars = clean.chars();
+                            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                                ed.insert_char_smart(ch);
+                            } else {
+                                ed.insert_str(&clean);
+                            }
                             ed.ensure_cursor_visible(ew, view_h, sf, zoom);
                         }
                         self.sync_markdown_from_editor();
@@ -5156,6 +5236,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             if still_searching {
                 event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
             }
+        } else if self.page_turn_anim.is_some() {
+            self.request_redraw();
+            event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                Instant::now() + Duration::from_millis(16),
+            ));
         } else if sending_to_lp && self.optimize_job.is_none() && !printing {
             // `lp` is still running: check it again soon.
             event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
@@ -5510,7 +5595,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     if self.cmd_or_ctrl_pressed {
                         if dy.abs() > 0.1 {
                             let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 2.2);
+                            self.zoom_level = (self.zoom_level * factor).clamp(0.6, 3.0);
                             let pct = (self.zoom_level * 100.0).round() as u32;
                             self.status_notice = Some(format!("Markdown Zoom: {pct}%"));
                             self.update_title_bar();
@@ -5536,9 +5621,25 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                         let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
-                        let max_s = self.md_max_scroll_y(canvas_h, sf);
-                        self.scroll_y = (self.scroll_y - dy as f32).clamp(0.0, max_s);
-                        self.request_redraw();
+                        if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                            && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
+                        {
+                            if dy.abs() > 4.0 {
+                                let now = Instant::now();
+                                let ok = self
+                                    .last_wheel_turn
+                                    .map_or(true, |t| now.duration_since(t) >= Duration::from_millis(180));
+                                if ok {
+                                    self.last_wheel_turn = Some(now);
+                                    let dir = if dy < 0.0 { 1 } else { -1 };
+                                    self.step_md_magazine_spread(dir, sz.width, canvas_h, sf);
+                                }
+                            }
+                        } else {
+                            let max_s = self.md_max_scroll_y(canvas_h, sf);
+                            self.scroll_y = (self.scroll_y - dy as f32).clamp(0.0, max_s);
+                            self.request_redraw();
+                        }
                     }
                     return;
                 }

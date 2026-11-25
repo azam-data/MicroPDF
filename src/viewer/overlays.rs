@@ -702,24 +702,24 @@ impl<'a> PdfViewerApp<'a> {
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book/Mag)"),
             ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
-            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 / Ctrl+0 resets)"),
+            ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
             ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
             ("G", "Smart Jump to Page (5, iii, or #5)"),
-            ("Alt+Arrows", "Navigation History Back / Forward"),
+            ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
             ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
             ("O / S / W", "Open PDF/.md/.tex/.epub / Save / Watermark Dialog"),
-            ("Ctrl+D / W", "Favorites Library (Folders) / Close Tab"),
+            ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
             ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
-            ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
+            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup Line (Shift+D) / Comment (/)"),
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
             ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),

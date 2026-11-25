@@ -43,7 +43,12 @@ impl<'a> PdfViewerApp<'a> {
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
-            self.record_last_position(&path, self.current_page_index, self.zoom_level);
+            let pos = if self.is_markdown_tab() {
+                self.scroll_y.round().clamp(0.0, 65535.0) as u16
+            } else {
+                self.current_page_index
+            };
+            self.record_last_position(&path, pos, self.zoom_level);
         }
     }
 
@@ -341,13 +346,17 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
 
+        let restored = self.lookup_last_position(&path);
+        let restored_zoom = restored.map(|(_, z)| z.clamp(0.6, 3.0)).unwrap_or(1.0);
+        let restored_scroll = restored.map(|(p, _)| p as f32).unwrap_or(0.0);
+
         self.file_path = path.clone();
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitWidth;
         self.last_page_view_mode = ViewMode::FitWidth;
-        self.zoom_level = 1.0;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
-        self.scroll_y = 0.0;
+        self.scroll_y = restored_scroll;
         self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
@@ -397,9 +406,9 @@ impl<'a> PdfViewerApp<'a> {
             view_mode: ViewMode::FitWidth,
             last_page_view_mode: ViewMode::FitWidth,
             scroll_mode: self.scroll_mode,
-            zoom_level: 1.0,
+            zoom_level: restored_zoom,
             pan_x: 0.0,
-            scroll_y: 0.0,
+            scroll_y: restored_scroll,
             scroll_x: 0.0,
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
@@ -933,9 +942,18 @@ impl<'a> PdfViewerApp<'a> {
         self.sync_active_tab_to_slot();
         let closed_path = self.tabs[close_idx].file_path.clone();
         let closed_page = self.tabs[close_idx].current_page_index;
+        let closed_scroll = self.tabs[close_idx].scroll_y;
         let closed_zoom = self.tabs[close_idx].zoom_level;
         if !closed_path.as_os_str().is_empty() {
-            self.record_last_position(&closed_path, closed_page, closed_zoom);
+            let closed_is_md = Self::is_markdown_path(&closed_path)
+                || Self::is_latex_path(&closed_path)
+                || Self::is_epub_path(&closed_path);
+            let pos = if closed_is_md {
+                closed_scroll.round().clamp(0.0, 65535.0) as u16
+            } else {
+                closed_page
+            };
+            self.record_last_position(&closed_path, pos, closed_zoom);
         }
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();

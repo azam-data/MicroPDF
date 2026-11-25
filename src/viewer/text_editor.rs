@@ -587,6 +587,210 @@ impl TextEditorState {
         self.cursor = (last_r, last_c);
     }
 
+    pub(super) fn insert_newline_auto_indent(&mut self) {
+        self.push_undo();
+        self.delete_selection();
+        let (r, c) = self.cursor;
+        let line = &self.lines[r];
+        let before = &line[..c];
+        let indent_len = before.bytes().take_while(|b| *b == b' ' || *b == b'\t').count();
+        let indent = before[..indent_len].to_string();
+        let after_indent = &before[indent_len..];
+        let list_prefix = if after_indent.starts_with("- [ ] ") || after_indent.starts_with("- [x] ") {
+            Some("- [ ] ")
+        } else if after_indent.starts_with("- ") {
+            Some("- ")
+        } else if after_indent.starts_with("* ") {
+            Some("* ")
+        } else if after_indent.starts_with("+ ") {
+            Some("+ ")
+        } else {
+            None
+        };
+        if let Some(pfx) = list_prefix {
+            if after_indent.trim() == pfx.trim() && c == line.len() {
+                // Empty bullet line -> clear bullet on Enter
+                self.lines[r].truncate(indent_len);
+                self.cursor = (r, indent_len);
+                self.bump_gen();
+                return;
+            }
+            let tail = self.lines[r][c..].to_string();
+            self.lines[r].truncate(c);
+            let new_line = format!("{indent}{pfx}{tail}");
+            let new_c = indent.len() + pfx.len();
+            self.lines.insert(r + 1, new_line);
+            self.cursor = (r + 1, new_c);
+        } else {
+            let tail = self.lines[r][c..].to_string();
+            self.lines[r].truncate(c);
+            let new_line = format!("{indent}{tail}");
+            let new_c = indent.len();
+            self.lines.insert(r + 1, new_line);
+            self.cursor = (r + 1, new_c);
+        }
+        self.bump_gen();
+    }
+
+    pub(super) fn indent_or_outdent(&mut self, outdent: bool) {
+        self.push_undo();
+        let (r0, r1) = if let Some(((sr, _), (er, ec))) = self.selected_range() {
+            let end_row = if er > sr && ec == 0 { er - 1 } else { er };
+            (sr, end_row)
+        } else {
+            (self.cursor.0, self.cursor.0)
+        };
+        if !outdent && self.sel_anchor.is_none() {
+            let (r, c) = self.cursor;
+            self.lines[r].insert_str(c, "  ");
+            self.cursor = (r, c + 2);
+            self.bump_gen();
+            return;
+        }
+        for r in r0..=r1 {
+            if outdent {
+                let remove = if self.lines[r].starts_with("  ") {
+                    2
+                } else if self.lines[r].starts_with(' ') || self.lines[r].starts_with('\t') {
+                    1
+                } else {
+                    0
+                };
+                if remove > 0 {
+                    self.lines[r].drain(..remove);
+                    if self.cursor.0 == r {
+                        self.cursor.1 = self.cursor.1.saturating_sub(remove);
+                    }
+                    if let Some((ar, ac)) = self.sel_anchor {
+                        if ar == r {
+                            self.sel_anchor = Some((ar, ac.saturating_sub(remove)));
+                        }
+                    }
+                }
+            } else {
+                self.lines[r].insert_str(0, "  ");
+                if self.cursor.0 == r {
+                    self.cursor.1 += 2;
+                }
+                if let Some((ar, ac)) = self.sel_anchor {
+                    if ar == r {
+                        self.sel_anchor = Some((ar, ac + 2));
+                    }
+                }
+            }
+        }
+        self.bump_gen();
+    }
+
+    pub(super) fn insert_char_smart(&mut self, ch: char) {
+        let pair = match ch {
+            '(' => Some(('(', ')')),
+            '[' => Some(('[', ']')),
+            '{' => Some(('{', '}')),
+            '"' => Some(('"', '"')),
+            '`' => Some(('`', '`')),
+            '$' => Some(('$', '$')),
+            _ => None,
+        };
+        if let Some((open, close)) = pair {
+            if let Some(sel) = self.selected_text() {
+                let wrapped = format!("{open}{sel}{close}");
+                self.insert_str(&wrapped);
+                return;
+            }
+            let (r, c) = self.cursor;
+            if open == close && self.lines[r][c..].starts_with(close) {
+                self.cursor = (r, c + close.len_utf8());
+                return;
+            }
+            self.push_undo();
+            let s = format!("{open}{close}");
+            self.lines[r].insert_str(c, &s);
+            self.cursor = (r, c + open.len_utf8());
+            self.bump_gen();
+        } else {
+            let (r, c) = self.cursor;
+            if matches!(ch, ')' | ']' | '}') && self.sel_anchor.is_none() && self.lines[r][c..].starts_with(ch) {
+                self.cursor = (r, c + ch.len_utf8());
+                return;
+            }
+            let mut buf = [0u8; 4];
+            self.insert_str(ch.encode_utf8(&mut buf));
+        }
+    }
+
+    pub(super) fn duplicate_line(&mut self) {
+        self.push_undo();
+        let (r, c) = self.cursor;
+        let dup = self.lines[r].clone();
+        self.lines.insert(r + 1, dup);
+        self.cursor = (r + 1, c);
+        self.sel_anchor = None;
+        self.bump_gen();
+    }
+
+    pub(super) fn move_line(&mut self, dir: isize) {
+        let r = self.cursor.0;
+        if dir < 0 && r > 0 {
+            self.push_undo();
+            self.lines.swap(r, r - 1);
+            self.cursor.0 = r - 1;
+            self.sel_anchor = None;
+            self.bump_gen();
+        } else if dir > 0 && r + 1 < self.lines.len() {
+            self.push_undo();
+            self.lines.swap(r, r + 1);
+            self.cursor.0 = r + 1;
+            self.sel_anchor = None;
+            self.bump_gen();
+        }
+    }
+
+    pub(super) fn wrap_selection(&mut self, before: &str, after: &str) {
+        if let Some(sel) = self.selected_text() {
+            self.insert_str(&format!("{before}{sel}{after}"));
+        } else {
+            self.push_undo();
+            let (r, c) = self.cursor;
+            self.lines[r].insert_str(c, &format!("{before}{after}"));
+            self.cursor = (r, c + before.len());
+            self.bump_gen();
+        }
+    }
+
+    pub(super) fn toggle_comment(&mut self, syntax: EditorSyntax) {
+        self.push_undo();
+        let r = self.cursor.0;
+        match syntax {
+            EditorSyntax::LaTeX => {
+                if self.lines[r].starts_with("% ") {
+                    self.lines[r].drain(..2);
+                    self.cursor.1 = self.cursor.1.saturating_sub(2);
+                } else if self.lines[r].starts_with('%') {
+                    self.lines[r].drain(..1);
+                    self.cursor.1 = self.cursor.1.saturating_sub(1);
+                } else {
+                    self.lines[r].insert_str(0, "% ");
+                    self.cursor.1 += 2;
+                }
+            }
+            EditorSyntax::Markdown => {
+                let trimmed = self.lines[r].trim();
+                if trimmed.starts_with("<!-- ") && trimmed.ends_with(" -->") && trimmed.len() >= 9 {
+                    let inner = trimmed[5..trimmed.len() - 4].to_string();
+                    self.lines[r] = inner;
+                    self.cursor.1 = self.cursor.1.min(self.lines[r].len());
+                } else {
+                    let cur = self.lines[r].clone();
+                    self.lines[r] = format!("<!-- {cur} -->");
+                    self.cursor.1 += 5;
+                }
+            }
+        }
+        self.sel_anchor = None;
+        self.bump_gen();
+    }
+
     fn ensure_wrapped(&mut self, ew: u32, sf: f64, zoom: f32) -> EditorMetrics {
         let m = compute_metrics(sf, zoom);
         let key = (ew, m.font_sz.to_bits(), self.content_gen);
@@ -1089,5 +1293,41 @@ mod tests {
         assert!(toks.iter().any(|&(s, e, c)| &tex[s..e] == "{" && c == pal.brace));
         assert!(toks.iter().any(|&(_, _, c)| c == pal.math));
         assert!(toks.iter().any(|&(s, e, c)| tex[s..e].starts_with('%') && c == pal.comment));
+    }
+
+    #[test]
+    fn test_text_editor_power_ups() {
+        let mut ed = TextEditorState::from_text("  - item one");
+        ed.cursor = (0, "  - item one".len());
+        ed.insert_newline_auto_indent();
+        assert_eq!(ed.to_text(), "  - item one\n  - ");
+
+        // Empty bullet cleared on Enter
+        ed.insert_newline_auto_indent();
+        assert_eq!(ed.to_text(), "  - item one\n  ");
+
+        // Auto-pair and wrap selection
+        let mut ed2 = TextEditorState::from_text("alpha");
+        ed2.select_all();
+        ed2.wrap_selection("**", "**");
+        assert_eq!(ed2.to_text(), "**alpha**");
+
+        ed2.duplicate_line();
+        assert_eq!(ed2.to_text(), "**alpha**\n**alpha**");
+
+        ed2.lines[1] = "beta".to_string();
+        ed2.cursor = (1, 0);
+        ed2.move_line(-1);
+        assert_eq!(ed2.to_text(), "beta\n**alpha**");
+
+        ed2.toggle_comment(EditorSyntax::LaTeX);
+        assert_eq!(ed2.lines[0], "% beta");
+        ed2.toggle_comment(EditorSyntax::LaTeX);
+        assert_eq!(ed2.lines[0], "beta");
+
+        ed2.indent_or_outdent(false);
+        assert_eq!(ed2.lines[0], "  beta");
+        ed2.indent_or_outdent(true);
+        assert_eq!(ed2.lines[0], "beta");
     }
 }
