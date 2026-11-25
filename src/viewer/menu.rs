@@ -119,6 +119,7 @@ impl<'a> PdfViewerApp<'a> {
 
     fn menu_item_checked(&self, cat: MenuCategory, idx: usize) -> bool {
         match (cat, idx) {
+            (MenuCategory::File, 11) => self.encrypt_config,
             (MenuCategory::View, 0) => self.effective_layout_mode() == ViewMode::FitPage && self.view_mode.is_page_view(),
             (MenuCategory::View, 1) => self.effective_layout_mode() == ViewMode::FitWidth && self.view_mode.is_page_view(),
             (MenuCategory::View, 2) => self.effective_layout_mode() == ViewMode::FitTextWidth && self.view_mode.is_page_view(),
@@ -243,7 +244,7 @@ impl<'a> PdfViewerApp<'a> {
         for (idx, item_str) in items.iter().enumerate() {
             let ry = drop_y + pad_v + (idx as i32) * (row_h as i32);
             // Draw subtle group separators between logical menu sections
-            if (cat == MenuCategory::File && (idx == 3 || idx == 5 || idx == 6 || idx == file_base_len))
+            if (cat == MenuCategory::File && (idx == 3 || idx == 5 || idx == 6 || idx == 11 || idx == file_base_len))
                 || (cat == MenuCategory::View && (idx == 4 || idx == 7 || idx == 8 || idx == 11 || idx == 14 || idx == 16 || idx == 18))
                 || (cat == MenuCategory::Edit && (idx == 3 || idx == 13))
                 || (cat == MenuCategory::Page && (idx == 2 || idx == 5))
@@ -423,6 +424,20 @@ impl<'a> PdfViewerApp<'a> {
                     super::doc_props_modal::PendingCloseAction::CloseAllTabs,
                 );
                 return;
+            }
+            (MenuCategory::File, 11) => {
+                self.encrypt_config = !self.encrypt_config;
+                self.save_session_to_ini();
+                self.status_notice = Some(if self.encrypt_config {
+                    "Encrypted micropdf.ini enabled (MicroPDF opens it automatically)".to_string()
+                } else {
+                    "Plain-text micropdf.ini enabled".to_string()
+                });
+                self.update_title_bar();
+                self.request_redraw();
+            }
+            (MenuCategory::File, 12) => {
+                self.open_favorites_modal();
             }
             (MenuCategory::File, idx) if idx >= MenuCategory::File.items().len() => {
                 let recent_idx = idx - MenuCategory::File.items().len();
@@ -728,6 +743,15 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::Export, 4) => {
                 self.open_export_images_modal();
                 return;
+            }
+            (MenuCategory::Export, 5) => {
+                if self.is_markdown_tab() {
+                    self.pending_dialog = Some(PendingDialog::ExportMdEpub);
+                } else if self.doc.is_some() {
+                    self.pending_dialog = Some(PendingDialog::ExportEpub);
+                } else {
+                    self.status_notice = Some("Open a PDF, Markdown, or LaTeX file first to export as EPUB".to_string());
+                }
             }
 
             // Help menu

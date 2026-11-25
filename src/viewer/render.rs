@@ -2203,6 +2203,11 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_user_guide_modal(buffer, width, height, scale_factor);
         }
 
+        // Favorites Library Modal (`File -> Favorites Library... (Ctrl+D)`)
+        if self.favorites_modal.is_some() {
+            self.draw_favorites_modal(buffer, width, height, scale_factor);
+        }
+
         // Help Overlay (`?` / `F1`)
         if self.show_help_overlay {
             self.draw_themed_help_overlay(buffer, width, height, scale_factor);

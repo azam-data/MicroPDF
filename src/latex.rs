@@ -499,6 +499,7 @@ pub fn parse_latex(src: &str, fallback_title: &str, base_dir: Option<&Path>) -> 
         title: doc_title.unwrap_or_else(|| fallback_title.to_string()),
         blocks,
         headings,
+        embedded_images: std::collections::HashMap::new(),
     }
 }
 

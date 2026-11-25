@@ -9,6 +9,7 @@ use super::ui_draw::*;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum OverlayHit {
     WelcomeOpen,
+    WelcomeFavorites,
     WelcomeRecent(usize),
     WelcomeRestoreSession,
     WelcomeDismissSession,
@@ -64,11 +65,15 @@ impl<'a> PdfViewerApp<'a> {
         let pad = (22.0 * s).round() as i32;
         let mut cur_y = cy + (132.0 * s).round() as i32;
 
-        // Primary "Open PDF" button
+        // Primary "Open PDF" + "Favorites" buttons
         let btn_w = (140.0 * s).round() as u32;
+        let fav_w = (136.0 * s).round() as u32;
+        let btn_gap = (10.0 * s).round() as i32;
+        let total_bw = btn_w + fav_w + btn_gap as u32;
         let btn_h = (34.0 * s).round() as u32;
-        let btn_x = cx + ((cw.saturating_sub(btn_w)) / 2) as i32;
+        let btn_x = cx + ((cw.saturating_sub(total_bw)) / 2) as i32;
         hits.push(BoxHit { x: btn_x, y: cur_y, w: btn_w, h: btn_h, hit: OverlayHit::WelcomeOpen });
+        hits.push(BoxHit { x: btn_x + btn_w as i32 + btn_gap, y: cur_y, w: fav_w, h: btn_h, hit: OverlayHit::WelcomeFavorites });
         cur_y += btn_h as i32 + (18.0 * s).round() as i32;
 
         if has_restore {
@@ -145,13 +150,21 @@ impl<'a> PdfViewerApp<'a> {
         let sw = measure_text(sub, sub_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - sw) * 0.5).round() as i32, cy + (107.0 * s).round() as i32, sub, sub_sz, theme.text_muted, false);
 
-        // Open PDF button
+        // Open PDF & Favorites buttons
         if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeOpen) {
             let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeOpen));
             fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.accent_hover } else { theme.accent });
             let lbl = "Open PDF  (O)";
             let lw = measure_text(lbl, sub_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_on_accent, true);
+        }
+        if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeFavorites) {
+            let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeFavorites));
+            fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.hover_bg } else { theme.surface_elevated });
+            stroke_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), theme.border_subtle);
+            let lbl = "Favorites  (Ctrl+D)";
+            let lw = measure_text(lbl, sub_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_primary, false);
         }
 
         // Optional Restore Session banner
@@ -702,9 +715,9 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF, .md, or .tex / Save / Watermark Dialog"),
-            ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
-            ("Ctrl+P", "Print Preview (or Export .md/.tex to PDF / Word)"),
+            ("O / S / W", "Open PDF/.md/.tex/.epub / Save / Watermark Dialog"),
+            ("Ctrl+D / W", "Favorites Library (Folders) / Close Tab"),
+            ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
             ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
@@ -769,7 +782,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.6.0 — Portable PDF, Markdown & LaTeX Viewer & Editor", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.7.0 — Portable PDF, Markdown, LaTeX & EPUB Suite", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
@@ -788,6 +801,9 @@ impl<'a> PdfViewerApp<'a> {
         match hit {
             OverlayHit::WelcomeOpen => {
                 self.pending_dialog = Some(PendingDialog::Open);
+            }
+            OverlayHit::WelcomeFavorites => {
+                self.open_favorites_modal();
             }
             OverlayHit::WelcomeRecent(idx) => {
                 if let Some(path) = self.recent_files.get(idx).cloned() {

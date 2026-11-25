@@ -1,12 +1,12 @@
 # MicroPDF
 
-**MicroPDF** is a fast, ultra-lightweight, portable PDF, Markdown & LaTeX viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter), [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), and [`docx-rs`](https://crates.io/crates/docx-rs).
+**MicroPDF** is a fast, ultra-lightweight, portable PDF, Markdown, LaTeX & EPUB viewer and power editor written in Rust using [`winit`](https://crates.io/crates/winit), [`softbuffer`](https://crates.io/crates/softbuffer), [`pdfium-render`](https://crates.io/crates/pdfium-render), [`lopdf`](https://crates.io/crates/lopdf), [`image`](https://crates.io/crates/image), [`ttf-parser`](https://crates.io/crates/ttf-parser), [`rust_xlsxwriter`](https://crates.io/crates/rust_xlsxwriter), [`pulldown-cmark`](https://crates.io/crates/pulldown-cmark), and [`docx-rs`](https://crates.io/crates/docx-rs).
 
 **Zero GPU. Zero GUI toolkit. Zero installer.** Every menu, tab, toolbar, modal dialog, and live preview is CPU-rendered directly into the window frame buffer with minimal RAM and zero OS breadcrumbs.
 
 ---
 
-## Download & Portable Install (`v1.6.0`)
+## Download & Portable Install (`v1.7.0`)
 
 Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
 
@@ -30,9 +30,13 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
 
 ---
 
-## What's New in v1.6.0
+## What's New in v1.7.0
 
-- **Live Markdown (`.md`) & LaTeX (`.tex`) Editor (`Preview` | `Split` | `Edit`):** Edit `.md` and `.tex` files directly inside MicroPDF with a pure-Rust multi-line editor (selection, clipboard, `Ctrl+Z`/`Y` undo/redo, `Ctrl+S` save, unsaved-edits guard), **Split** live-preview mode, and all 6 Reading Modes.
+- **Portable EPUB (`.epub`) Reader:** Open EPUB 2 & EPUB 3 e-books via File → Open, drag-and-drop, CLI, or Favorites with zero temp files — renders chapters, automatic Outline sidebar, tables, lists, and in-memory embedded images across all 6 Eye-Care Reading Modes.
+- **Export to EPUB (`.epub`):** Convert any PDF (`Export -> Export as EPUB (.epub)...`), Markdown, or LaTeX document into a spec-compliant EPUB 3 e-book with chapter splitting and clean typography.
+- **Favorites Library with Nested Folders & Subfolders (`Ctrl+D` / Toolbar `★`):** Organize your favorite PDFs, Markdown, LaTeX, and EPUB documents into unlimited nested folders & subfolders, search/filter, rename, move, and open in one click.
+- **Optional Encrypted Portable Config (`File -> Encrypt Portable Config (micropdf.ini)`):** Authenticated ChaCha20 + HMAC-SHA256 encryption so `micropdf.ini` (including Favorites, recent files, and session tabs) cannot be read in Notepad by anyone else while MicroPDF opens it automatically.
+- **Live Markdown (`.md`) & LaTeX (`.tex`) Editor (`Preview` | `Split` | `Edit`):** Edit `.md` and `.tex` files directly inside MicroPDF with soft word wrap, zoom scaling, vertical scrollbar, LaTeX/Markdown syntax highlighting, `Ctrl+Z`/`Y` undo/redo, `Ctrl+S` save, and **Split** live preview.
 - **Portable LaTeX (`.tex`) Reader & Pure-Rust Math Renderer:** Open `.tex` articles with zero external TeX compiler (`pdflatex`/`xelatex` not required). Renders sections/outline, formatted prose, lists, `tabular` tables, `verbatim`/`lstlisting`, `\includegraphics` images, and inline/display math (`\frac`, `\sqrt`, `^`/`_`, Greek symbols, operators, `pmatrix`/`bmatrix`), plus Export to Styled PDF & Word (`.docx`).
 - **Complex-Graph Failsafe Guard:** Automatically scans `.tex` files before opening for unsupported vector-graph environments (`tikzpicture`, `pgfpicture`, `circuitikz`, `pspicture`, `asy`, `axis`/PGFPlots) and shows a clear warning without breaking the active tab.
 - **Styled Markdown (`.md` / `.markdown`) Reader & Export (`PDF` + `.docx`):** Open Markdown files alongside PDFs via File → Open, drag-and-drop, or CLI. Features an editorial Light/Dark reading column, automatic `#`–`###` outline sidebar, GFM tables, code blocks with **Copy** button & horizontal scroll, clickable links, zoom (`Ctrl+`/`-`/`0`), live Reload, **Export to Styled PDF** (A4/Letter, repeated table headers, `Page X of Y`), and **Export to Styled Word (`.docx`)** via `docx-rs`.

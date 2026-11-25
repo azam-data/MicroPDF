@@ -6,6 +6,7 @@ mod deskew;
 mod doc_props_modal;
 mod doc_tools_modal;
 mod excel_export_modal;
+mod favorites_modal;
 mod font_dropdown;
 mod grid;
 mod image_tools_modal;

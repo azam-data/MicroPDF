@@ -323,6 +323,7 @@ fn layout_blocks(
     links: &mut Vec<String>,
     code_blocks: &mut Vec<String>,
     images: &mut Vec<Option<(u32, u32, Vec<u32>)>>,
+    embedded_images: &HashMap<String, Vec<u8>>,
     block_y_by_ast_idx: Option<&mut HashMap<usize, f32>>,
 ) -> (Vec<LaidOutBlock>, f32) {
     let mut out = Vec::new();
@@ -422,6 +423,7 @@ fn layout_blocks(
                     links,
                     code_blocks,
                     images,
+                    embedded_images,
                     None,
                 );
                 let h = (end_y - y).max(24.0 * s);
@@ -529,7 +531,11 @@ fn layout_blocks(
             }
             MdBlock::Image { path, caption } => {
                 let img_idx = images.len();
-                let decoded = image::open(path).ok().map(|im| {
+                let decoded_img = embedded_images
+                    .get(path)
+                    .and_then(|bytes| image::load_from_memory(bytes).ok())
+                    .or_else(|| image::open(path).ok());
+                let decoded = decoded_img.map(|im| {
                     let rgb = im.to_rgb8();
                     let (w, h) = rgb.dimensions();
                     let mut px = Vec::with_capacity((w * h) as usize);
@@ -684,6 +690,7 @@ impl<'a> PdfViewerApp<'a> {
             &mut links,
             &mut code_blocks,
             &mut images,
+            &doc.embedded_images,
             Some(&mut block_y_by_ast_idx),
         );
         let code_h_scroll = vec![0.0f32; code_blocks.len()];
@@ -782,7 +789,8 @@ impl<'a> PdfViewerApp<'a> {
         rx -= reload_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: reload_w, h: btn_h, hit: MarkdownHit::Reload });
 
-        if self.has_unsaved_edits || self.md_editor_mode != MdEditorMode::Preview {
+        let is_epub = Self::is_epub_path(&self.file_path);
+        if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != MdEditorMode::Preview) {
             rx -= (6.0 * s).round() as i32;
             let save_w = (54.0 * s).round() as u32;
             rx -= save_w as i32;
@@ -799,16 +807,18 @@ impl<'a> PdfViewerApp<'a> {
         rx -= zbtn_w as i32;
         hits.push(MdHitRect { x: rx, y: by, w: zbtn_w, h: btn_h, hit: MarkdownHit::ZoomOut });
 
-        rx -= (10.0 * s).round() as i32;
-        let mode_w = (54.0 * s).round() as u32;
-        let split_w = (44.0 * s).round() as u32;
-        let edit_w = (42.0 * s).round() as u32;
-        rx -= edit_w as i32;
-        hits.push(MdHitRect { x: rx, y: by, w: edit_w, h: btn_h, hit: MarkdownHit::ModeEdit });
-        rx -= (split_w as i32) + 2;
-        hits.push(MdHitRect { x: rx, y: by, w: split_w, h: btn_h, hit: MarkdownHit::ModeSplit });
-        rx -= (mode_w as i32) + 2;
-        hits.push(MdHitRect { x: rx, y: by, w: mode_w, h: btn_h, hit: MarkdownHit::ModePreview });
+        if !is_epub {
+            rx -= (10.0 * s).round() as i32;
+            let mode_w = (54.0 * s).round() as u32;
+            let split_w = (44.0 * s).round() as u32;
+            let edit_w = (42.0 * s).round() as u32;
+            rx -= edit_w as i32;
+            hits.push(MdHitRect { x: rx, y: by, w: edit_w, h: btn_h, hit: MarkdownHit::ModeEdit });
+            rx -= (split_w as i32) + 2;
+            hits.push(MdHitRect { x: rx, y: by, w: split_w, h: btn_h, hit: MarkdownHit::ModeSplit });
+            rx -= (mode_w as i32) + 2;
+            hits.push(MdHitRect { x: rx, y: by, w: mode_w, h: btn_h, hit: MarkdownHit::ModePreview });
+        }
 
         hits
     }
@@ -918,11 +928,14 @@ impl<'a> PdfViewerApp<'a> {
             .as_ref()
             .map(|d| d.title.as_str())
             .unwrap_or("Markdown");
-        let badge_w = (36.0 * s).round() as u32;
+        let is_epub = Self::is_epub_path(&self.file_path);
+        let badge_w = (if is_epub { 44.0 } else { 36.0 } * s).round() as u32;
         let badge_h = (18.0 * s).round() as u32;
         let badge_y = y0 + ((hdr_h.saturating_sub(badge_h)) / 2) as i32;
         fill_rounded_rect(buffer, buf_w, buf_h, x0 + 12, badge_y, badge_w, badge_h, 4.0 * s, theme.accent_soft_bg);
-        let badge_label = if Self::is_latex_path(&self.file_path) {
+        let badge_label = if is_epub {
+            "EPUB"
+        } else if Self::is_latex_path(&self.file_path) {
             "TEX"
         } else {
             "MD"

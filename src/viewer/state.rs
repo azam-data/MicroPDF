@@ -119,6 +119,8 @@ impl MenuCategory {
                 "Close Tab (Ctrl+W)",
                 "Close Other Tabs",
                 "Close All Tabs",
+                "Encrypt Portable Config (micropdf.ini)",
+                "Favorites Library... (Ctrl+D)",
             ],
             MenuCategory::View => &[
                 "Fit Full Page (1)",
@@ -191,6 +193,7 @@ impl MenuCategory {
                 "Export as Markdown (.md)...",
                 "Export as LaTeX (.tex)...",
                 "Export Pages as Images (PNG/JPG)...",
+                "Export as EPUB (.epub)...",
             ],
             MenuCategory::Help => &[
                 "User Guide (How to Use)",
@@ -497,6 +500,8 @@ pub(super) struct SessionConfig {
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
+    pub(super) encrypt_config: bool,
+    pub(super) favorites: crate::favorites::FavoritesTree,
 }
 
 impl Default for SessionConfig {
@@ -513,6 +518,8 @@ impl Default for SessionConfig {
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
+            encrypt_config: false,
+            favorites: crate::favorites::FavoritesTree::default(),
         }
     }
 }
@@ -1021,6 +1028,8 @@ pub(super) enum PendingDialog {
     ExportXlsx,
     ExportMdPdf,
     ExportMdDocx,
+    ExportEpub,
+    ExportMdEpub,
     #[allow(dead_code)]
     PickStampImage,
     ImportStampAssetPng,
@@ -1030,6 +1039,7 @@ pub(super) enum PendingDialog {
     ExportBookmarksTxt,
     SaveBookmarkSampleTxt,
     SaveUserGuideTxt,
+    AddFavoriteFile,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -1131,6 +1141,12 @@ pub struct PdfViewerApp<'a> {
     pub(super) pending_restore_active_tab: usize,
     /// Optional custom path override for `micropdf.ini` (used by unit tests).
     pub(super) custom_session_ini_path: Option<PathBuf>,
+    /// When true, `micropdf.ini` is written using `config_crypto` authenticated encryption.
+    pub(super) encrypt_config: bool,
+    /// User's hierarchical Favorites Library (persisted in `micropdf.ini`).
+    pub(super) favorites: crate::favorites::FavoritesTree,
+    /// Open Favorites Library modal (0 KB RAM when closed).
+    pub(super) favorites_modal: Option<super::favorites_modal::FavoritesModal>,
     /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Accepted single-instance connections whose request line has not fully arrived yet.
@@ -1446,6 +1462,9 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_tabs: Vec::new(),
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
+            encrypt_config: false,
+            favorites: crate::favorites::FavoritesTree::default(),
+            favorites_modal: None,
             single_instance_listener: None,
             pending_ipc: Vec::new(),
             queued_ipc_paths: VecDeque::new(),
@@ -1570,6 +1589,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.stamp_manager_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
+            || self.favorites_modal.is_some()
             || self.show_customize_toolbar
             || self.show_help_overlay
             || self.show_bookmark_format_overlay
@@ -1739,6 +1759,7 @@ impl<'a> PdfViewerApp<'a> {
         out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
         out.push_str(&format!("reading_filter={}\n", cfg.reading_filter.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
+        out.push_str(&format!("encrypt_config={}\n", if cfg.encrypt_config { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
             out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
@@ -1772,14 +1793,23 @@ impl<'a> PdfViewerApp<'a> {
                 ));
             }
         }
+        for fl in cfg.favorites.to_ini_lines() {
+            out.push_str(&fl);
+            out.push('\n');
+        }
         out
     }
 
     pub(super) fn parse_session_ini(content: &str) -> SessionConfig {
         let mut cfg = SessionConfig::default();
+        let mut fav_lines: Vec<&str> = Vec::new();
         for raw_line in content.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with("fav_folder=") || line.starts_with("fav_doc=") {
+                fav_lines.push(line);
                 continue;
             }
             if let Some(val) = line.strip_prefix("ui_theme=") {
@@ -1797,6 +1827,9 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("encrypt_config=") {
+                let v = val.trim();
+                cfg.encrypt_config = v == "1" || v.eq_ignore_ascii_case("true");
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("hf_profile=") {
@@ -1860,6 +1893,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
         }
+        cfg.favorites = crate::favorites::FavoritesTree::from_ini_entries(&fav_lines);
         cfg
     }
 
@@ -1993,11 +2027,18 @@ impl<'a> PdfViewerApp<'a> {
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
             hf_profiles: self.hf_profiles.clone(),
+            encrypt_config: self.encrypt_config,
+            favorites: self.favorites.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
+        let payload = if self.encrypt_config {
+            crate::config_crypto::encrypt_config(&ini_text)
+        } else {
+            ini_text
+        };
         let primary_path = self.portable_session_ini_path();
 
-        if std::fs::write(&primary_path, ini_text.as_bytes()).is_ok() {
+        if std::fs::write(&primary_path, payload.as_bytes()).is_ok() {
             return;
         }
 
@@ -2006,7 +2047,7 @@ impl<'a> PdfViewerApp<'a> {
         if let Some(parent) = fallback_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&fallback_path, ini_text.as_bytes()).is_ok() {
+        if std::fs::write(&fallback_path, payload.as_bytes()).is_ok() {
             self.status_notice = Some(format!(
                 "Exe folder not writable — saved micropdf.ini to OS config folder ({})",
                 fallback_path.display()
@@ -2020,12 +2061,25 @@ impl<'a> PdfViewerApp<'a> {
         let primary_path = self.portable_session_ini_path();
         let fallback_path = Self::fallback_os_config_ini_path();
 
-        let (content, used_fallback) = if let Ok(s) = std::fs::read_to_string(&primary_path) {
+        let (raw_content, used_fallback) = if let Ok(s) = std::fs::read_to_string(&primary_path) {
             (s, false)
         } else if let Ok(s) = std::fs::read_to_string(&fallback_path) {
             (s, true)
         } else {
             return;
+        };
+
+        let was_encrypted = crate::config_crypto::is_encrypted_config(&raw_content);
+        let content = if was_encrypted {
+            match crate::config_crypto::decrypt_config(&raw_content) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    self.status_notice = Some(format!("Could not decrypt micropdf.ini: {e}"));
+                    return;
+                }
+            }
+        } else {
+            raw_content
         };
 
         let cfg = Self::parse_session_ini(&content);
@@ -2034,6 +2088,8 @@ impl<'a> PdfViewerApp<'a> {
         self.scroll_mode = cfg.scroll_mode;
         self.reading_filter = cfg.reading_filter;
         self.show_toolbar = cfg.show_toolbar;
+        self.encrypt_config = was_encrypted || cfg.encrypt_config;
+        self.favorites = cfg.favorites;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
         self.last_positions = cfg.last_positions;

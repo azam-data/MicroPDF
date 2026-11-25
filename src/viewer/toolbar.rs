@@ -158,6 +158,7 @@ pub enum ToolbarAction {
     ToggleSidebar,
     ToggleGrid,
     Open,
+    Favorites,
     Save,
     SaveAs,
     Print,
@@ -189,6 +190,7 @@ impl ToolbarAction {
             Self::ToggleSidebar => "Bookmarks Sidebar (B)",
             Self::ToggleGrid => "Thumbnail Grid (Tab)",
             Self::Open => "Open PDF (O)",
+            Self::Favorites => "Favorites Library (Ctrl+D)",
             Self::Save => "Save PDF (S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview (Ctrl+P)",
@@ -399,6 +401,10 @@ impl<'a> PdfViewerApp<'a> {
         }
         if self.toolbar_config.is_enabled(ToolbarItem::Open) {
             if try_push(mk_ic(ToolbarAction::Open, UiIcon::Open, false, false), &mut cur_x, &mut widgets) {
+                g1 += 1;
+            }
+            let starred = self.favorites.is_starred(&self.file_path);
+            if try_push(mk_ic(ToolbarAction::Favorites, UiIcon::Star, starred, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
@@ -621,6 +627,9 @@ impl<'a> PdfViewerApp<'a> {
             }
             ToolbarAction::Open => {
                 self.pending_dialog = Some(PendingDialog::Open);
+            }
+            ToolbarAction::Favorites => {
+                self.open_favorites_modal();
             }
             ToolbarAction::Save => {
                 if self.is_markdown_tab() {

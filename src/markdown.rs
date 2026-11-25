@@ -102,6 +102,7 @@ pub struct MarkdownDoc {
     pub title: String,
     pub blocks: Vec<MdBlock>,
     pub headings: Vec<MdHeading>,
+    pub embedded_images: std::collections::HashMap<String, Vec<u8>>,
 }
 
 #[derive(Default)]
@@ -505,6 +506,7 @@ pub fn parse_markdown(src: &str, fallback_title: &str) -> MarkdownDoc {
         title: first_h1.unwrap_or_else(|| fallback_title.to_string()),
         blocks,
         headings,
+        embedded_images: std::collections::HashMap::new(),
     }
 }
 

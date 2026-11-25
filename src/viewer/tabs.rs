@@ -137,8 +137,14 @@ impl<'a> PdfViewerApp<'a> {
             .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
     }
 
+    pub(super) fn is_epub_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+    }
+
     pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
-        Self::is_markdown_path(path) || Self::is_latex_path(path)
+        Self::is_markdown_path(path) || Self::is_latex_path(path) || Self::is_epub_path(path)
     }
 
     fn markdown_headings_to_bookmarks(doc: &crate::markdown::MarkdownDoc) -> Vec<crate::engine::Bookmark> {
@@ -188,7 +194,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_active_markdown(&mut self) {
-        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
+        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() || Self::is_epub_path(&self.file_path) {
             return;
         }
         let text = if let Some(ref ed) = self.md_editor {
@@ -226,33 +232,50 @@ impl<'a> PdfViewerApp<'a> {
         if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
             return false;
         }
-        let Ok(raw) = std::fs::read_to_string(&self.file_path) else {
-            return false;
-        };
         let fallback = self
             .file_path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("Markdown");
+            .unwrap_or("Document");
+        let is_epub = Self::is_epub_path(&self.file_path);
         let is_tex = Self::is_latex_path(&self.file_path);
-        if is_tex {
-            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
-                self.status_notice = Some(format!(
-                    "Cannot reload '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
-                ));
-                self.request_redraw();
+
+        let (raw_opt, parsed) = if is_epub {
+            let Ok(bytes) = std::fs::read(&self.file_path) else {
                 return false;
+            };
+            match crate::epub::parse_epub_bytes(&bytes, fallback) {
+                Ok(doc) => (None, doc),
+                Err(e) => {
+                    self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                    self.request_redraw();
+                    return false;
+                }
             }
-        }
-        let parsed = if is_tex {
-            crate::latex::parse_latex(&raw, fallback, self.file_path.parent())
         } else {
-            crate::markdown::parse_markdown(&raw, fallback)
+            let Ok(raw) = std::fs::read_to_string(&self.file_path) else {
+                return false;
+            };
+            if is_tex {
+                if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                    self.status_notice = Some(format!(
+                        "Cannot reload '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                    ));
+                    self.request_redraw();
+                    return false;
+                }
+            }
+            let doc = if is_tex {
+                crate::latex::parse_latex(&raw, fallback, self.file_path.parent())
+            } else {
+                crate::markdown::parse_markdown(&raw, fallback)
+            };
+            (Some(raw), doc)
         };
         let bms = Self::markdown_headings_to_bookmarks(&parsed);
         let mtime = Self::read_file_mtime(&self.file_path);
 
-        self.md_source = Some(raw);
+        self.md_source = raw_opt;
         self.md_editor = None;
         self.has_unsaved_edits = false;
         self.markdown_doc = Some(parsed);
@@ -266,7 +289,9 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].has_unsaved_edits = false;
         }
-        self.status_notice = Some(if is_tex {
+        self.status_notice = Some(if is_epub {
+            "Reloaded EPUB document".to_string()
+        } else if is_tex {
             "Reloaded LaTeX document".to_string()
         } else {
             "Reloaded Markdown document".to_string()
@@ -277,24 +302,34 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn load_markdown_document(&mut self, path: PathBuf, new_tab: bool) -> Result<()> {
-        let raw = std::fs::read_to_string(&path)?;
         let fallback = path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("Markdown");
+            .unwrap_or("Document");
+        let is_epub = Self::is_epub_path(&path);
         let is_tex = Self::is_latex_path(&path);
-        if is_tex {
-            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
-                return Err(anyhow::anyhow!(
-                    "Cannot open '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
-                ));
-            }
-        }
-        let parsed = if is_tex {
-            crate::latex::parse_latex(&raw, fallback, path.parent())
+
+        let (raw_opt, parsed) = if is_epub {
+            let bytes = std::fs::read(&path)?;
+            let doc = crate::epub::parse_epub_bytes(&bytes, fallback)?;
+            (None, doc)
         } else {
-            crate::markdown::parse_markdown(&raw, fallback)
+            let raw = std::fs::read_to_string(&path)?;
+            if is_tex {
+                if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                    return Err(anyhow::anyhow!(
+                        "Cannot open '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                    ));
+                }
+            }
+            let doc = if is_tex {
+                crate::latex::parse_latex(&raw, fallback, path.parent())
+            } else {
+                crate::markdown::parse_markdown(&raw, fallback)
+            };
+            (Some(raw), doc)
         };
+        let raw = raw_opt.unwrap_or_default();
         let loaded_bookmarks = Self::markdown_headings_to_bookmarks(&parsed);
         let file_mtime = Self::read_file_mtime(&path);
 

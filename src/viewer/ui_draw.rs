@@ -877,6 +877,7 @@ pub enum UiIcon {
     Plus,
     Check,
     Document,
+    Star,
 }
 
 /// Draws `icon` inside the square `(x, y, size, size)` with stroke scaled proportionally.
@@ -1120,6 +1121,25 @@ pub fn draw_icon(
             line(buffer, 0.60, 0.30, 0.78, 0.30);
             line(buffer, 0.34, 0.48, 0.66, 0.48);
             line(buffer, 0.34, 0.64, 0.66, 0.64);
+        }
+        UiIcon::Star => {
+            let pts = [
+                (0.50f32, 0.12f32),
+                (0.61, 0.37),
+                (0.88, 0.40),
+                (0.68, 0.59),
+                (0.73, 0.86),
+                (0.50, 0.72),
+                (0.27, 0.86),
+                (0.32, 0.59),
+                (0.12, 0.40),
+                (0.39, 0.37),
+            ];
+            for i in 0..pts.len() {
+                let (x0, y0) = pts[i];
+                let (x1, y1) = pts[(i + 1) % pts.len()];
+                line(buffer, x0, y0, x1, y1);
+            }
         }
         UiIcon::SaveAs => {
             // Floppy outline + small '+' badge on bottom-right

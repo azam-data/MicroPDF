@@ -1779,8 +1779,9 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("Supported Documents (PDF, Markdown, LaTeX)", &["pdf", "md", "markdown", "tex"])
+            .add_filter("Supported Documents (PDF, Markdown, LaTeX, EPUB)", &["pdf", "md", "markdown", "tex", "epub"])
             .add_filter("PDF Document", &["pdf"])
+            .add_filter("EPUB E-Book", &["epub"])
             .add_filter("Markdown Document", &["md", "markdown"])
             .add_filter("LaTeX Document", &["tex"])
             .pick_file()
@@ -2200,6 +2201,54 @@ impl<'a> PdfViewerApp<'a> {
             }
             Err(e) => {
                 self.status_notice = Some(format!("LaTeX export failed: {e}"));
+            }
+        }
+        self.update_title_bar();
+        self.request_redraw();
+    }
+
+    /// Exports the currently open PDF (or Markdown/LaTeX tab) to an EPUB 3 (`.epub`) e-book.
+    pub(super) fn export_epub_dialog(&mut self) {
+        if self.is_markdown_tab() {
+            self.run_markdown_epub_export();
+            return;
+        }
+        let Some(doc) = self.doc.as_ref() else {
+            self.status_notice = Some("Open a PDF first to export as EPUB (.epub)".to_string());
+            self.request_redraw();
+            return;
+        };
+        let stem = self
+            .file_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("document")
+            .to_string();
+        let default_name = format!("{stem}.epub");
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export PDF as EPUB E-Book (.epub)")
+            .add_filter("EPUB E-Book", &["epub"])
+            .set_file_name(&default_name);
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dialog = dialog.set_directory(parent);
+            }
+        }
+        let Some(save_path) = dialog.save_file() else {
+            return;
+        };
+        let md = crate::export::export_document_to_markdown(doc);
+        let parsed = crate::markdown::parse_markdown(&md, &stem);
+        match crate::epub_export::export_markdown_doc_to_epub(&parsed, &save_path) {
+            Ok(()) => {
+                let fname = save_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("export.epub");
+                self.status_notice = Some(format!("Exported EPUB to '{fname}'"));
+            }
+            Err(e) => {
+                self.status_notice = Some(format!("EPUB export failed: {e}"));
             }
         }
         self.update_title_bar();
@@ -4053,6 +4102,10 @@ impl<'a> PdfViewerApp<'a> {
             }
             return;
         }
+        if self.favorites_modal.is_some() {
+            let _ = self.handle_favorites_key(&logical_key, text);
+            return;
+        }
         if let Some(g) = self.user_guide_modal {
             match logical_key {
                 Key::Named(NamedKey::Escape) => self.close_user_guide_modal(),
@@ -4671,6 +4724,8 @@ impl<'a> PdfViewerApp<'a> {
                         } else {
                             self.pending_dialog = Some(PendingDialog::Save);
                         }
+                    } else if s.eq_ignore_ascii_case("d") {
+                        self.open_favorites_modal();
                     } else if s.eq_ignore_ascii_case("w") {
                         if !self.tabs.is_empty() {
                             let _ = self.request_close_action(
@@ -5134,6 +5189,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ExportXlsx => self.export_xlsx_dialog(),
                 PendingDialog::ExportMdPdf => self.run_markdown_pdf_export(),
                 PendingDialog::ExportMdDocx => self.run_markdown_docx_export(),
+                PendingDialog::ExportEpub => self.export_epub_dialog(),
+                PendingDialog::ExportMdEpub => self.run_markdown_epub_export(),
                 PendingDialog::PickStampImage => self.pick_stamp_image_dialog(),
                 PendingDialog::ImportStampAssetPng => self.import_stamp_asset_png_dialog(),
                 PendingDialog::Split(spec) => self.execute_split_range(&spec),
@@ -5144,6 +5201,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 PendingDialog::ExportBookmarksTxt => self.export_bookmarks_txt_dialog(),
                 PendingDialog::SaveBookmarkSampleTxt => self.save_bookmark_sample_txt_dialog(),
                 PendingDialog::SaveUserGuideTxt => self.save_user_guide_txt_dialog(),
+                PendingDialog::AddFavoriteFile => self.add_favorite_file_dialog(),
             }
         }
     }
@@ -5355,6 +5413,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     MouseScrollDelta::LineDelta(x, y) => ((x as f64) * 36.0, (y as f64) * 36.0),
                     MouseScrollDelta::PixelDelta(pos) => (pos.x, pos.y),
                 };
+                if let Some(ref mut fav_m) = self.favorites_modal {
+                    fav_m.scroll_y = (fav_m.scroll_y - dy as f32).max(0.0);
+                    self.request_redraw();
+                    return;
+                }
                 if self.user_guide_modal.is_some() {
                     self.scroll_user_guide((-dy) as f32);
                     return;
@@ -6412,6 +6475,20 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         ) {
                             self.handle_page_number_click(hit);
                         }
+                    }
+                    return;
+                }
+
+                // Favorites Library modal (`File -> Favorites Library... (Ctrl+D)`)
+                if self.favorites_modal.is_some() {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        self.handle_favorites_click(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        );
                     }
                     return;
                 }
