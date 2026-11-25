@@ -94,10 +94,57 @@ impl<'a> PdfViewerApp<'a> {
         let sep_pad = (6.0 * s).round().max(4.0) as i32;
         let font_sz = (11.0 * s).clamp(9.0, 22.0);
 
-        let page_txt = if self.doc.is_some() {
+        let page_txt = if self.is_markdown_tab() {
+            let words = self.md_layout.as_ref().map(|c| c.word_count).unwrap_or(0);
+            let mins = (words / 230).max(1);
+            if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
+            {
+                if let Some((l_p, r_opt, tot_p)) = self.md_magazine_page_info(buf_h, sf) {
+                    let p_str = match r_opt {
+                        Some(r_p) => format!("{l_p}–{r_p}/{tot_p}"),
+                        None => format!("{l_p}/{tot_p}"),
+                    };
+                    if words > 0 {
+                        format!("{p_str} · {words}w · ~{mins}m")
+                    } else {
+                        p_str
+                    }
+                } else {
+                    "— / —".to_string()
+                }
+            } else {
+                let max_scroll = self.md_max_scroll_y(buf_h, sf);
+                let pct = if max_scroll > 1.0 {
+                    ((self.scroll_y / max_scroll) * 100.0).round().clamp(0.0, 100.0) as u32
+                } else {
+                    100
+                };
+                if words > 0 {
+                    format!("{pct}% · {words}w · ~{mins}m")
+                } else {
+                    format!("{pct}%")
+                }
+            }
+        } else if self.doc.is_some() {
             let phys = self.current_page_index + 1;
             let total = self.total_pages();
-            if self.roman_end > 0 || self.skip_pages > 0 {
+            if self.effective_scroll_mode() == ScrollMode::MagazineBook && self.view_mode.is_page_view() {
+                if self.current_page_index == 0 {
+                    format!("1/{total}")
+                } else {
+                    let l_idx = if self.current_page_index % 2 == 0 {
+                        self.current_page_index - 1
+                    } else {
+                        self.current_page_index
+                    };
+                    if l_idx + 1 < total {
+                        format!("{}–{}/{total}", l_idx + 1, l_idx + 2)
+                    } else {
+                        format!("{}/{total}", l_idx + 1)
+                    }
+                }
+            } else if self.roman_end > 0 || self.skip_pages > 0 {
                 let logical = crate::engine::PdfEngine::format_logical_page_label_with_skip(
                     self.current_page_index as usize,
                     self.skip_pages,
@@ -175,7 +222,13 @@ impl<'a> PdfViewerApp<'a> {
             mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, on_page_view && layout_mode == ViewMode::FitWidth),
             mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, on_page_view && layout_mode == ViewMode::FitTextWidth),
             mk_icon(sq_w, BottomBarAction::TwoPage, UiIcon::TwoPage, on_page_view && layout_mode == ViewMode::TwoPageSpread),
-            mk_lbl(scroll_pill_w, BottomBarAction::Continuous, scroll_txt, Some(UiIcon::Continuous), scroll_mode != ScrollMode::SinglePage),
+            mk_lbl(
+                scroll_pill_w,
+                BottomBarAction::Continuous,
+                scroll_txt,
+                Some(UiIcon::Continuous),
+                scroll_mode != ScrollMode::SinglePage || self.show_scroll_mode_popover,
+            ),
             mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
         ];
         // Group 4: Reading Filter picker pill
@@ -292,6 +345,18 @@ impl<'a> PdfViewerApp<'a> {
 
         fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, buf_w, bar_h, theme.statusbar_bg);
         fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, buf_w, 1, theme.divider);
+        if self.is_markdown_tab() {
+            let max_scroll = self.md_max_scroll_y(buf_h, sf);
+            let ratio = if max_scroll > 1.0 {
+                (self.scroll_y / max_scroll).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let fill_w = (buf_w as f32 * ratio).round() as u32;
+            if fill_w > 0 {
+                fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, fill_w, 2, theme.accent);
+            }
+        }
 
         let layout = self.compute_bottom_bar_layout(buf_w, buf_h, bar_h, sf);
         let font_sz = (11.0 * s).clamp(9.0, 22.0);
@@ -530,8 +595,9 @@ impl<'a> PdfViewerApp<'a> {
             BottomBarAction::FitTextWidth => self.set_view_mode(ViewMode::FitTextWidth),
             BottomBarAction::TwoPage => self.set_view_mode(ViewMode::TwoPageSpread),
             BottomBarAction::Continuous => {
-                self.set_scroll_mode(self.effective_scroll_mode().next());
-                return;
+                self.show_scroll_mode_popover = !self.show_scroll_mode_popover;
+                self.show_reading_mode_popover = false;
+                self.show_notifications = false;
             }
             BottomBarAction::TextView => {
                 if self.view_mode == ViewMode::TextView {
@@ -542,6 +608,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             BottomBarAction::ReadingFilter => {
                 self.show_reading_mode_popover = !self.show_reading_mode_popover;
+                self.show_scroll_mode_popover = false;
                 self.show_notifications = false;
             }
             BottomBarAction::Fullscreen => {
@@ -557,6 +624,7 @@ impl<'a> PdfViewerApp<'a> {
             BottomBarAction::NotificationBoard => {
                 self.show_notifications = !self.show_notifications;
                 self.show_reading_mode_popover = false;
+                self.show_scroll_mode_popover = false;
             }
         }
         self.update_title_bar();
@@ -802,6 +870,136 @@ impl<'a> PdfViewerApp<'a> {
         if iy >= list_top {
             let idx = ((iy - list_top) / (row_h as i32)) as usize;
             if let Some(&mode) = ReadingFilter::ALL.get(idx) {
+                return Some(Some(mode));
+            }
+        }
+        Some(None)
+    }
+
+    // -------------------------------------------------------------------------
+    // Scroll Mode Option Menu Popover (Single / Vert / Book / Magazine)
+    // -------------------------------------------------------------------------
+
+    pub(super) fn scroll_mode_popover_geometry(
+        &self,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> (i32, i32, u32, u32, u32, u32) {
+        let s = sf as f32;
+        let pw = (292.0 * s).round().min(buf_w.saturating_sub(20) as f32).max(220.0) as u32;
+        let hdr_h = (28.0 * s).round() as u32;
+        let row_h = (38.0 * s).round() as u32;
+        let ph = hdr_h + (ScrollMode::ALL.len() as u32) * row_h + (10.0 * s).round() as u32;
+        let anchor_cx = self
+            .bottom_bar_widget_rect(BottomBarAction::Continuous, buf_w, buf_h, status_bar_h, sf)
+            .map(|r| r.0 + (r.2 as i32) / 2)
+            .unwrap_or((buf_w / 2) as i32);
+        let max_px = (buf_w as i32 - pw as i32 - 8).max(8);
+        let px = (anchor_cx - (pw as i32) / 2).clamp(8, max_px);
+        let py = (buf_h.saturating_sub(status_bar_h + ph) as i32 - (8.0 * s).round() as i32).max(40);
+        (px, py, pw, ph, hdr_h, row_h)
+    }
+
+    pub(super) fn draw_scroll_mode_popover(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) {
+        if !self.show_scroll_mode_popover || self.is_fullscreen || self.is_presentation {
+            return;
+        }
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let (px, py, pw, ph, hdr_h, row_h) =
+            self.scroll_mode_popover_geometry(buf_w, buf_h, status_bar_h, sf);
+        let rad = (8.0 * s).clamp(5.0, 12.0);
+        let hdr_sz = (11.5 * s).clamp(9.5, 19.0);
+        let title_sz = (11.5 * s).clamp(9.5, 19.0);
+        let hint_sz = (9.8 * s).clamp(8.5, 16.0);
+
+        draw_soft_shadow(
+            buffer, buf_w, buf_h, px, py, pw, ph, rad,
+            (12.0 * s).round() as i32, (4.0 * s).round() as i32,
+            theme.shadow_rgb, theme.shadow_max_alpha,
+        );
+        fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.border_subtle);
+
+        draw_text_vcenter(
+            buffer, buf_w, buf_h,
+            px + (12.0 * s).round() as i32, py, hdr_h, px + pw as i32 - 8,
+            "Scroll & Page Flow Mode", hdr_sz, theme.text_muted, true,
+        );
+        fill_rect_clipped(buffer, buf_w, buf_h, px + 1, py + hdr_h as i32, pw.saturating_sub(2), 1, theme.divider);
+
+        let sw_w = (28.0 * s).round() as u32;
+        let sw_h = (22.0 * s).round() as u32;
+        let sw_rad = (4.0 * s).clamp(3.0, 7.0);
+        let sw_sz = (10.5 * s).clamp(8.5, 17.0);
+        let row_pad = (6.0 * s).round() as i32;
+        let cur_mode = self.effective_scroll_mode();
+
+        for (i, &mode) in ScrollMode::ALL.iter().enumerate() {
+            let ry = py + hdr_h as i32 + (4.0 * s).round() as i32 + (i as i32) * (row_h as i32);
+            let active = cur_mode == mode;
+            let hovered = self.hovered_widget == Some(UiHit::ScrollModeOption(mode));
+            if active || hovered {
+                let bg = if active { theme.accent_soft_bg } else { theme.hover_bg };
+                fill_rounded_rect(buffer, buf_w, buf_h, px + row_pad, ry + 1, pw.saturating_sub((row_pad * 2) as u32), row_h.saturating_sub(2), sw_rad, bg);
+                if active {
+                    stroke_rounded_rect(buffer, buf_w, buf_h, px + row_pad, ry + 1, pw.saturating_sub((row_pad * 2) as u32), row_h.saturating_sub(2), sw_rad, theme.accent);
+                }
+            }
+            let sw_x = px + (12.0 * s).round() as i32;
+            let sw_y = ry + ((row_h.saturating_sub(sw_h)) / 2) as i32;
+            let badge_bg = if active { theme.accent } else { theme.surface_elevated };
+            let badge_fg = if active { theme.text_on_accent } else { theme.text_primary };
+            fill_rounded_rect(buffer, buf_w, buf_h, sw_x, sw_y, sw_w, sw_h, sw_rad, badge_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, sw_x, sw_y, sw_w, sw_h, sw_rad, if active { theme.accent } else { theme.border_subtle });
+            let lbl = mode.badge_label();
+            let bw = measure_text(lbl, sw_sz, true);
+            draw_text_vcenter(buffer, buf_w, buf_h, sw_x + ((sw_w as f32 - bw) * 0.5).round() as i32, sw_y, sw_h, sw_x + sw_w as i32, lbl, sw_sz, badge_fg, true);
+
+            let tx = sw_x + sw_w as i32 + (10.0 * s).round() as i32;
+            let max_tx = px + pw as i32 - (10.0 * s).round() as i32;
+            let title_fg = if active { theme.accent_soft_fg } else { theme.text_primary };
+            let title_txt = truncate_ellipsis(mode.picker_title(), (max_tx - tx).max(40) as f32, title_sz, active);
+            draw_text(buffer, buf_w, buf_h, tx, ry + (5.0 * s).round() as i32, &title_txt, title_sz, title_fg, active);
+            let hint_txt = truncate_ellipsis(mode.picker_hint(), (max_tx - tx).max(40) as f32, hint_sz, false);
+            draw_text(buffer, buf_w, buf_h, tx, ry + (20.0 * s).round() as i32, &hint_txt, hint_sz, theme.text_muted, false);
+        }
+    }
+
+    /// Returns `Some(Some(mode))` if clicking a scroll mode row, `Some(None)` if inside header/border, `None` if outside.
+    pub(super) fn hit_test_scroll_mode_popover(
+        &self,
+        mx: f64,
+        my: f64,
+        buf_w: u32,
+        buf_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<Option<ScrollMode>> {
+        if !self.show_scroll_mode_popover {
+            return None;
+        }
+        let s = sf as f32;
+        let (px, py, pw, ph, hdr_h, row_h) =
+            self.scroll_mode_popover_geometry(buf_w, buf_h, status_bar_h, sf);
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < px || ix >= px + pw as i32 || iy < py || iy >= py + ph as i32 {
+            return None;
+        }
+        let list_top = py + hdr_h as i32 + (4.0 * s).round() as i32;
+        if iy >= list_top {
+            let idx = ((iy - list_top) / (row_h as i32)) as usize;
+            if let Some(&mode) = ScrollMode::ALL.get(idx) {
                 return Some(Some(mode));
             }
         }

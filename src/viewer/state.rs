@@ -79,17 +79,19 @@ pub enum MenuCategory {
     Page,
     Tools,
     Export,
+    Favorites,
     Help,
 }
 
 impl MenuCategory {
-    pub const ALL: [MenuCategory; 7] = [
+    pub const ALL: [MenuCategory; 8] = [
         MenuCategory::File,
         MenuCategory::View,
         MenuCategory::Edit,
         MenuCategory::Page,
         MenuCategory::Tools,
         MenuCategory::Export,
+        MenuCategory::Favorites,
         MenuCategory::Help,
     ];
 
@@ -101,6 +103,7 @@ impl MenuCategory {
             MenuCategory::Page => "Page",
             MenuCategory::Tools => "Tools",
             MenuCategory::Export => "Export",
+            MenuCategory::Favorites => "Favorites",
             MenuCategory::Help => "Help",
         }
     }
@@ -119,6 +122,7 @@ impl MenuCategory {
                 "Close Tab (Ctrl+W)",
                 "Close Other Tabs",
                 "Close All Tabs",
+                "Encrypt Portable Config (micropdf.ini)",
             ],
             MenuCategory::View => &[
                 "Fit Full Page (1)",
@@ -128,6 +132,8 @@ impl MenuCategory {
                 "Scroll: Single Page",
                 "Scroll: Continuous Vertical (5)",
                 "Scroll: Continuous Horizontal Book",
+                "Scroll: Magazine / Book",
+                "Magazine Page-Turn Speed...",
                 "Text View — Reflowable Reader (T)",
                 "Zoom In (+ / Ctrl+Wheel Up)",
                 "Zoom Out (- / Ctrl+Wheel Down)",
@@ -191,6 +197,11 @@ impl MenuCategory {
                 "Export as Markdown (.md)...",
                 "Export as LaTeX (.tex)...",
                 "Export Pages as Images (PNG/JPG)...",
+                "Export as EPUB (.epub)...",
+            ],
+            MenuCategory::Favorites => &[
+                "Open Favorites Library... (Ctrl+D)",
+                "Add Current Document to Favorites",
             ],
             MenuCategory::Help => &[
                 "User Guide (How to Use)",
@@ -368,6 +379,8 @@ pub enum ScrollMode {
     ContinuousVertical,
     /// Smooth continuous horizontal "book ribbon" scroll across all pages left-to-right.
     ContinuousHorizontal,
+    /// Two-page open Magazine / Book spread with spine crease and 220 ms page-turn animation (PDF, EPUB, MD, LaTeX).
+    MagazineBook,
 }
 
 impl ScrollMode {
@@ -375,7 +388,8 @@ impl ScrollMode {
         match self {
             Self::SinglePage => Self::ContinuousVertical,
             Self::ContinuousVertical => Self::ContinuousHorizontal,
-            Self::ContinuousHorizontal => Self::SinglePage,
+            Self::ContinuousHorizontal => Self::MagazineBook,
+            Self::MagazineBook => Self::SinglePage,
         }
     }
 
@@ -384,6 +398,7 @@ impl ScrollMode {
             Self::SinglePage => "Single",
             Self::ContinuousVertical => "Vert",
             Self::ContinuousHorizontal => "Book",
+            Self::MagazineBook => "Mag",
         }
     }
 
@@ -392,6 +407,7 @@ impl ScrollMode {
             Self::SinglePage => "Single Page",
             Self::ContinuousVertical => "Continuous Vertical Scroll",
             Self::ContinuousHorizontal => "Continuous Horizontal Book Scroll",
+            Self::MagazineBook => "Magazine / Book Mode",
         }
     }
 
@@ -400,6 +416,41 @@ impl ScrollMode {
             Self::SinglePage => "SinglePage",
             Self::ContinuousVertical => "ContinuousVertical",
             Self::ContinuousHorizontal => "ContinuousHorizontal",
+            Self::MagazineBook => "MagazineBook",
+        }
+    }
+
+    pub const ALL: [Self; 4] = [
+        Self::SinglePage,
+        Self::ContinuousVertical,
+        Self::ContinuousHorizontal,
+        Self::MagazineBook,
+    ];
+
+    pub fn picker_title(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Single Page",
+            Self::ContinuousVertical => "Continuous Vertical",
+            Self::ContinuousHorizontal => "Continuous Horizontal",
+            Self::MagazineBook => "Magazine / Book",
+        }
+    }
+
+    pub fn picker_hint(self) -> &'static str {
+        match self {
+            Self::SinglePage => "Discrete page-by-page turning",
+            Self::ContinuousVertical => "Smooth top-to-bottom scroll (5)",
+            Self::ContinuousHorizontal => "Side-by-side horizontal ribbon",
+            Self::MagazineBook => "Cover page + 2-page spreads & flip",
+        }
+    }
+
+    pub fn badge_label(self) -> &'static str {
+        match self {
+            Self::SinglePage => "1P",
+            Self::ContinuousVertical => "↕",
+            Self::ContinuousHorizontal => "↔",
+            Self::MagazineBook => "2P",
         }
     }
 
@@ -407,9 +458,19 @@ impl ScrollMode {
         match s.trim() {
             "ContinuousVertical" => Self::ContinuousVertical,
             "ContinuousHorizontal" => Self::ContinuousHorizontal,
+            "MagazineBook" | "magazinebook" | "magazine" => Self::MagazineBook,
             _ => Self::SinglePage,
         }
     }
+}
+
+/// 220 ms page-turn animation state for Magazine / Book mode.
+#[derive(Clone, Debug)]
+pub(super) struct PageTurnAnim {
+    pub(super) started_at: Instant,
+    pub(super) duration_ms: u64,
+    /// `+1` for turning forward (next page/spread), `-1` for turning backward.
+    pub(super) direction: i8,
 }
 
 /// Page, Text & Grid View Modes (`1`, `2`, `3`, `4`, `5`, `T`, and `Tab`).
@@ -493,10 +554,13 @@ pub(super) struct SessionConfig {
     pub(super) ui_theme: UiThemeMode,
     pub(super) ui_scale: f32,
     pub(super) scroll_mode: ScrollMode,
+    pub(super) page_turn_anim_ms: u64,
     pub(super) reading_filter: ReadingFilter,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
+    pub(super) encrypt_config: bool,
+    pub(super) favorites: crate::favorites::FavoritesTree,
 }
 
 impl Default for SessionConfig {
@@ -509,10 +573,13 @@ impl Default for SessionConfig {
             ui_theme: UiThemeMode::Light,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
+            page_turn_anim_ms: 450,
             reading_filter: ReadingFilter::Normal,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
+            encrypt_config: false,
+            favorites: crate::favorites::FavoritesTree::default(),
         }
     }
 }
@@ -637,6 +704,7 @@ pub(super) enum TabBarHit {
     ScrollLeft,
     ScrollRight,
     SwitchTab(usize),
+    FavoriteTab(usize),
     CloseTab(usize),
     NewTab,
     TabListToggle,
@@ -720,6 +788,7 @@ pub(super) enum UiHit {
     Toolbar(ToolbarAction),
     BottomBar(BottomBarAction),
     Tab(usize),
+    TabFavorite(usize),
     TabClose(usize),
     TabScrollLeft,
     TabScrollRight,
@@ -762,6 +831,7 @@ pub(super) enum UiHit {
     MeasureBar(MeasureBarHit),
     UserGuide(UserGuideHit),
     ReadingModeOption(ReadingFilter),
+    ScrollModeOption(ScrollMode),
     TextView(TextViewHit),
     MarkdownView(super::markdown_view::MarkdownHit),
     MarkdownExport(super::markdown_export_modal::MarkdownExportHit),
@@ -801,6 +871,9 @@ pub(super) enum InputMode {
         query_input: String,
     },
     JumpToPage {
+        input: String,
+    },
+    PageTurnSpeed {
         input: String,
     },
     #[allow(dead_code)]
@@ -1021,6 +1094,8 @@ pub(super) enum PendingDialog {
     ExportXlsx,
     ExportMdPdf,
     ExportMdDocx,
+    ExportEpub,
+    ExportMdEpub,
     #[allow(dead_code)]
     PickStampImage,
     ImportStampAssetPng,
@@ -1030,6 +1105,7 @@ pub(super) enum PendingDialog {
     ExportBookmarksTxt,
     SaveBookmarkSampleTxt,
     SaveUserGuideTxt,
+    AddFavoriteFile,
 }
 
 pub struct PdfViewerApp<'a> {
@@ -1131,6 +1207,12 @@ pub struct PdfViewerApp<'a> {
     pub(super) pending_restore_active_tab: usize,
     /// Optional custom path override for `micropdf.ini` (used by unit tests).
     pub(super) custom_session_ini_path: Option<PathBuf>,
+    /// When true, `micropdf.ini` is written using `config_crypto` authenticated encryption.
+    pub(super) encrypt_config: bool,
+    /// User's hierarchical Favorites Library (persisted in `micropdf.ini`).
+    pub(super) favorites: crate::favorites::FavoritesTree,
+    /// Open Favorites Library modal (0 KB RAM when closed).
+    pub(super) favorites_modal: Option<super::favorites_modal::FavoritesModal>,
     /// Local loopback listener `(TcpListener, token, lock_file_path)` for single-instance tab forwarding.
     pub(super) single_instance_listener: Option<(std::net::TcpListener, String, PathBuf)>,
     /// Accepted single-instance connections whose request line has not fully arrived yet.
@@ -1161,6 +1243,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) reading_filter: ReadingFilter,
     /// True when the bottom-bar Reading Mode picker popover is open.
     pub(super) show_reading_mode_popover: bool,
+    /// True when the bottom-bar Scroll Mode picker popover is open.
+    pub(super) show_scroll_mode_popover: bool,
     /// Active text search state (`Ctrl+F` / `Cmd+F`, `F3` / `Shift+F3` / `Ctrl+G`).
     pub(super) search_query: String,
     pub(super) search_case_sensitive: bool,
@@ -1199,6 +1283,10 @@ pub struct PdfViewerApp<'a> {
     /// Debounce timer & accumulator for MouseWheel page turning.
     pub(super) last_wheel_turn: Option<Instant>,
     pub(super) wheel_accum_y: f64,
+    /// Active page-turn animation for Magazine / Book mode.
+    pub(super) page_turn_anim: Option<PageTurnAnim>,
+    /// User-configurable Magazine / Book page-turn animation duration in ms (`0..=3000`, default `450`).
+    pub(super) page_turn_anim_ms: u64,
     pub(super) shift_pressed: bool,
     pub(super) cmd_or_ctrl_pressed: bool,
     pub(super) ctrl_pressed: bool,
@@ -1347,10 +1435,15 @@ impl<'a> PdfViewerApp<'a> {
 
     /// True when rendering continuous vertical or continuous horizontal scrolling page flow.
     pub(super) fn is_continuous_scroll(&self) -> bool {
-        self.view_mode.is_page_view() && self.effective_scroll_mode() != ScrollMode::SinglePage
+        self.view_mode.is_page_view()
+            && matches!(
+                self.effective_scroll_mode(),
+                ScrollMode::ContinuousVertical | ScrollMode::ContinuousHorizontal
+            )
     }
 
     pub(super) fn set_scroll_mode(&mut self, mode: ScrollMode) {
+        self.show_scroll_mode_popover = false;
         if self.view_mode == ViewMode::ContinuousScroll {
             self.view_mode = ViewMode::FitWidth;
             self.last_page_view_mode = ViewMode::FitWidth;
@@ -1364,10 +1457,49 @@ impl<'a> PdfViewerApp<'a> {
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
         self.pan_x = 0.0;
+        self.page_turn_anim = None;
         self.invalidate_page_caches();
         self.status_notice = Some(format!("Scroll Mode: {}", mode.status_label()));
         self.save_session_to_ini();
         self.request_redraw();
+    }
+
+    pub(super) fn set_page_turn_anim_ms(&mut self, ms: u64) {
+        let clamped = ms.min(3000);
+        self.page_turn_anim_ms = clamped;
+        self.page_turn_anim = None;
+        self.status_notice = Some(if clamped == 0 {
+            "Magazine Page-Turn Animation: Off (0 ms)".to_string()
+        } else {
+            format!("Magazine Page-Turn Speed: {clamped} ms")
+        });
+        self.save_session_to_ini();
+        self.request_redraw();
+    }
+
+    pub(super) fn trigger_page_turn_anim(&mut self, direction: i8) {
+        if self.effective_scroll_mode() == ScrollMode::MagazineBook && self.page_turn_anim_ms > 0 {
+            self.page_turn_anim = Some(PageTurnAnim {
+                started_at: Instant::now(),
+                duration_ms: self.page_turn_anim_ms,
+                direction,
+            });
+        }
+    }
+
+    /// Returns `Some((eased_t, direction))` while the page-turn animation is active,
+    /// or `None` once finished.
+    pub(super) fn page_turn_anim_progress(&mut self) -> Option<(f32, i8)> {
+        let anim = self.page_turn_anim.as_ref()?;
+        let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
+        let t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+        if t >= 1.0 {
+            self.page_turn_anim = None;
+            None
+        } else {
+            let eased = 1.0 - (1.0 - t).powi(3);
+            Some((eased, anim.direction))
+        }
     }
 
     pub(super) fn set_reading_filter(&mut self, filter: ReadingFilter) {
@@ -1426,6 +1558,8 @@ impl<'a> PdfViewerApp<'a> {
             view_mode: ViewMode::FitPage,
             last_page_view_mode: ViewMode::FitPage,
             scroll_mode: ScrollMode::SinglePage,
+            page_turn_anim: None,
+            page_turn_anim_ms: 450,
             zoom_level: 1.0,
             pan_x: 0.0,
             scroll_y: 0.0,
@@ -1446,6 +1580,9 @@ impl<'a> PdfViewerApp<'a> {
             pending_restore_tabs: Vec::new(),
             pending_restore_active_tab: 0,
             custom_session_ini_path: None,
+            encrypt_config: false,
+            favorites: crate::favorites::FavoritesTree::default(),
+            favorites_modal: None,
             single_instance_listener: None,
             pending_ipc: Vec::new(),
             queued_ipc_paths: VecDeque::new(),
@@ -1461,6 +1598,7 @@ impl<'a> PdfViewerApp<'a> {
             pending_stamp_image: None,
             reading_filter: ReadingFilter::Normal,
             show_reading_mode_popover: false,
+            show_scroll_mode_popover: false,
             search_query: String::new(),
             search_case_sensitive: false,
             search_whole_word: false,
@@ -1570,6 +1708,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.stamp_manager_modal.is_some()
             || self.doc_props_modal.is_some()
             || self.user_guide_modal.is_some()
+            || self.favorites_modal.is_some()
             || self.show_customize_toolbar
             || self.show_help_overlay
             || self.show_bookmark_format_overlay
@@ -1585,6 +1724,7 @@ impl<'a> PdfViewerApp<'a> {
             || self.thumb_context_menu.is_some()
             || self.annot_context_menu.is_some()
             || self.show_reading_mode_popover
+            || self.show_scroll_mode_popover
             || self.show_notifications
     }
 
@@ -1596,6 +1736,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumb_context_menu = None;
         self.annot_context_menu = None;
         self.show_reading_mode_popover = false;
+        self.show_scroll_mode_popover = false;
         self.show_notifications = false;
         self.active_note_popover = None;
     }
@@ -1737,8 +1878,10 @@ impl<'a> PdfViewerApp<'a> {
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
         out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
         out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
+        out.push_str(&format!("page_turn_anim_ms={}\n", cfg.page_turn_anim_ms.min(3000)));
         out.push_str(&format!("reading_filter={}\n", cfg.reading_filter.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
+        out.push_str(&format!("encrypt_config={}\n", if cfg.encrypt_config { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
             out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
@@ -1772,14 +1915,23 @@ impl<'a> PdfViewerApp<'a> {
                 ));
             }
         }
+        for fl in cfg.favorites.to_ini_lines() {
+            out.push_str(&fl);
+            out.push('\n');
+        }
         out
     }
 
     pub(super) fn parse_session_ini(content: &str) -> SessionConfig {
         let mut cfg = SessionConfig::default();
+        let mut fav_lines: Vec<&str> = Vec::new();
         for raw_line in content.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line.starts_with("fav_folder=") || line.starts_with("fav_doc=") {
+                fav_lines.push(line);
                 continue;
             }
             if let Some(val) = line.strip_prefix("ui_theme=") {
@@ -1792,11 +1944,18 @@ impl<'a> PdfViewerApp<'a> {
                 }
             } else if let Some(val) = line.strip_prefix("scroll_mode=") {
                 cfg.scroll_mode = ScrollMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("page_turn_anim_ms=") {
+                if let Ok(ms) = val.trim().parse::<u64>() {
+                    cfg.page_turn_anim_ms = ms.min(3000);
+                }
             } else if let Some(val) = line.strip_prefix("reading_filter=") {
                 cfg.reading_filter = ReadingFilter::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("show_toolbar=") {
                 let v = val.trim();
                 cfg.show_toolbar = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("encrypt_config=") {
+                let v = val.trim();
+                cfg.encrypt_config = v == "1" || v.eq_ignore_ascii_case("true");
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("hf_profile=") {
@@ -1860,6 +2019,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
         }
+        cfg.favorites = crate::favorites::FavoritesTree::from_ini_entries(&fav_lines);
         cfg
     }
 
@@ -1917,15 +2077,30 @@ impl<'a> PdfViewerApp<'a> {
     /// so saving preferences mid-session (e.g. toggling theme or UI scale) leaves the active PDF intact!
     pub(super) fn save_session_to_ini(&mut self) {
         // Record active and inactive tab reading positions into the 50-entry LRU table
+        let encode_pos = |p: &std::path::Path, pg: u16, sy: f32| -> u16 {
+            if Self::is_markdown_path(p) || Self::is_latex_path(p) || Self::is_epub_path(p) {
+                sy.round().clamp(0.0, 65535.0) as u16
+            } else {
+                pg
+            }
+        };
         let tab_positions: Vec<(PathBuf, u16, f32)> = self
             .tabs
             .iter()
             .enumerate()
             .map(|(i, tab)| {
                 if i == self.active_tab {
-                    (self.file_path.clone(), self.current_page_index, self.zoom_level)
+                    (
+                        self.file_path.clone(),
+                        encode_pos(&self.file_path, self.current_page_index, self.scroll_y),
+                        self.zoom_level,
+                    )
                 } else {
-                    (tab.file_path.clone(), tab.current_page_index, tab.zoom_level)
+                    (
+                        tab.file_path.clone(),
+                        encode_pos(&tab.file_path, tab.current_page_index, tab.scroll_y),
+                        tab.zoom_level,
+                    )
                 }
             })
             .collect();
@@ -1934,7 +2109,8 @@ impl<'a> PdfViewerApp<'a> {
         }
         if self.tabs.is_empty() && !self.file_path.as_os_str().is_empty() {
             let p = self.file_path.clone();
-            self.record_last_position(&p, self.current_page_index, self.zoom_level);
+            let pg = encode_pos(&p, self.current_page_index, self.scroll_y);
+            self.record_last_position(&p, pg, self.zoom_level);
         }
 
         let mut saved_tabs = Vec::new();
@@ -1989,15 +2165,23 @@ impl<'a> PdfViewerApp<'a> {
             ui_theme: self.ui_theme_mode,
             ui_scale: self.ui_scale,
             scroll_mode: self.scroll_mode,
+            page_turn_anim_ms: self.page_turn_anim_ms,
             reading_filter: self.reading_filter,
             show_toolbar: self.show_toolbar,
             toolbar_config: self.toolbar_config.clone(),
             hf_profiles: self.hf_profiles.clone(),
+            encrypt_config: self.encrypt_config,
+            favorites: self.favorites.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
+        let payload = if self.encrypt_config {
+            crate::config_crypto::encrypt_config(&ini_text)
+        } else {
+            ini_text
+        };
         let primary_path = self.portable_session_ini_path();
 
-        if std::fs::write(&primary_path, ini_text.as_bytes()).is_ok() {
+        if std::fs::write(&primary_path, payload.as_bytes()).is_ok() {
             return;
         }
 
@@ -2006,7 +2190,7 @@ impl<'a> PdfViewerApp<'a> {
         if let Some(parent) = fallback_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if std::fs::write(&fallback_path, ini_text.as_bytes()).is_ok() {
+        if std::fs::write(&fallback_path, payload.as_bytes()).is_ok() {
             self.status_notice = Some(format!(
                 "Exe folder not writable — saved micropdf.ini to OS config folder ({})",
                 fallback_path.display()
@@ -2020,7 +2204,7 @@ impl<'a> PdfViewerApp<'a> {
         let primary_path = self.portable_session_ini_path();
         let fallback_path = Self::fallback_os_config_ini_path();
 
-        let (content, used_fallback) = if let Ok(s) = std::fs::read_to_string(&primary_path) {
+        let (raw_content, used_fallback) = if let Ok(s) = std::fs::read_to_string(&primary_path) {
             (s, false)
         } else if let Ok(s) = std::fs::read_to_string(&fallback_path) {
             (s, true)
@@ -2028,12 +2212,28 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
 
+        let was_encrypted = crate::config_crypto::is_encrypted_config(&raw_content);
+        let content = if was_encrypted {
+            match crate::config_crypto::decrypt_config(&raw_content) {
+                Ok(plain) => plain,
+                Err(e) => {
+                    self.status_notice = Some(format!("Could not decrypt micropdf.ini: {e}"));
+                    return;
+                }
+            }
+        } else {
+            raw_content
+        };
+
         let cfg = Self::parse_session_ini(&content);
         self.ui_theme_mode = cfg.ui_theme;
         self.ui_scale = cfg.ui_scale;
         self.scroll_mode = cfg.scroll_mode;
+        self.page_turn_anim_ms = cfg.page_turn_anim_ms;
         self.reading_filter = cfg.reading_filter;
         self.show_toolbar = cfg.show_toolbar;
+        self.encrypt_config = was_encrypted || cfg.encrypt_config;
+        self.favorites = cfg.favorites;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
         self.last_positions = cfg.last_positions;

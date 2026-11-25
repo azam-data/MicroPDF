@@ -39,18 +39,27 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Paragraph(
                 "MicroPDF is a fast, private PDF reader and editor. Everything runs directly on your computer — your files are never uploaded to the internet, and nothing is installed into Windows or macOS.",
             ),
-            GuideBlock::Heading("How to Open a PDF, Markdown, or LaTeX File (3 Easy Ways)"),
+            GuideBlock::Heading("How to Open a PDF, Markdown, LaTeX, or EPUB File (3 Easy Ways)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Drag and drop any PDF (.pdf), Markdown (.md / .markdown), or LaTeX (.tex) file right onto the MicroPDF window.",
+                text: "Drag and drop any PDF (.pdf), Markdown (.md / .markdown), LaTeX (.tex), or EPUB (.epub) file right onto the MicroPDF window.",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Or click the blue 'Open PDF (O)' button on the Welcome Screen (or click any file under Recent Files).",
+                text: "Or click the blue 'Open PDF (O)' button (or 'Favorites (Ctrl+D)' for your starred folders) on the Welcome Screen.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick any PDF, Markdown, or LaTeX file, and click Open.",
+                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
+            },
+            GuideBlock::Heading("Organizing Favorites & Protecting Portable Settings"),
+            GuideBlock::Step {
+                number: 1,
+                text: "Click the Favorites menu on the top menu bar, click the ★ star right beside any open tab's filename, or press Ctrl+D to save favorite documents into custom folders and subfolders.",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Optional Privacy: click File -> Encrypt Portable Config (micropdf.ini) so your saved tabs, recent files, and favorites cannot be read in Notepad by anyone else (MicroPDF opens it automatically).",
             },
             GuideBlock::Heading("How to Create a New PDF from Photos or Scanned Images"),
             GuideBlock::Step {
@@ -103,16 +112,16 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Choosing How Pages Scroll (Independent of Page Layout)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Click View -> Scroll: Single Page, Continuous Vertical (5), or Continuous Horizontal Book.",
+                text: "Click the Scroll Mode pill on the bottom bar (or View -> Scroll: Single Page, Continuous Vertical (5), Continuous Horizontal Book, or Magazine / Book) to pick a reading flow from the popup menu.",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "You can mix and match! For example, choose Two-Page Side-by-Side (4) together with Continuous Vertical (5), or flip horizontally like a book.",
+                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and customizable page-turn animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
             },
             GuideBlock::Heading("Zooming In & Out"),
             GuideBlock::Step {
                 number: 1,
-                text: "Hold Ctrl (or Cmd on Mac) and roll your mouse wheel up to zoom in, or down to zoom out (25% to 800%).",
+                text: "Hold Ctrl (or Cmd on Mac) and roll your mouse wheel up to zoom in, or down to zoom out (25%–800% for PDFs, 60%–300% uniformly for EPUB, Markdown & LaTeX).",
             },
             GuideBlock::Step {
                 number: 2,
@@ -437,9 +446,9 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "Click 'Choose Folder & Export' to save numbered images straight into your chosen folder.",
             },
-            GuideBlock::Heading("Markdown (.md) & LaTeX (.tex) Reader, Live Editor, Stamps & Watermarks"),
+            GuideBlock::Heading("Markdown (.md), LaTeX (.tex) & EPUB (.epub) Reader, Editor & Export"),
             GuideBlock::Paragraph(
-                "• Markdown (.md) & LaTeX (.tex) Reader & Live Editor: open any Markdown or LaTeX file to read it in a clean column with automatic outline headings, math formulas (fractions, roots, Greek symbols, powers), tables, images, and zoom (Ctrl+ / Ctrl-). Use the Preview | Split | Edit buttons at the top to edit your file side-by-side with live updates, press Ctrl+S (or click Save) to save changes, and press Ctrl+P (or click Export / Print) to export as a Styled PDF or Styled Word (.docx) document!\n• Portable LaTeX Safety Guard: MicroPDF reads standard LaTeX articles, math, tables, and images with zero external software required. If a .tex file contains complex vector diagrams (like TikZ or PGFPlots), MicroPDF will warn you instead of showing a broken page.\n• Writers & students can also export PDF pages to Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with a scrollable System Font Dropdown, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
+                "• EPUB (.epub) Reader & Export: open any EPUB e-book to read chapters with a book-cover drop shadow, crisp resampled images, automatic outline navigation, reading progress %, word count, estimated reading time, and automatic last-position memory. Click Export -> Export as EPUB (.epub)... (or Export EPUB (.epub)... from Markdown/LaTeX) to turn any PDF, Markdown, or LaTeX file into a portable EPUB e-book!\n• Markdown (.md) & LaTeX (.tex) Reader & Live Editor: open any Markdown or LaTeX file for automatic outline headings, inline/display math ($...$, $$...$$), numbered LaTeX equations with \\eqref/\\ref, tables, images, and uniform 60%–300% zoom (Ctrl+ / Ctrl-). Use the contextual Preview | Split | Edit, Zoom, Save, Reload, and Export buttons on the top toolbar to edit side-by-side with auto-indent, Tab/Shift+Tab, bracket/quote pairing, Ctrl+B/I, Ctrl+Shift+D (duplicate line), Alt+Up/Down (move line), and Ctrl+/ (comment).\n• Portable LaTeX Safety Guard: MicroPDF reads standard LaTeX articles, math, tables, and images with zero external software required. If a .tex file contains complex vector diagrams (like TikZ or PGFPlots), MicroPDF will warn you instead of showing a broken page.\n• Writers & students can also export PDF pages to Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with a scrollable System Font Dropdown, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
             ),
             GuideBlock::Tip(
                 "For the cleanest handwritten signature stamp, use a PNG image with a transparent background — MicroPDF preserves transparency automatically!",

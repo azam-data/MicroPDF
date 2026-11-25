@@ -43,7 +43,12 @@ impl<'a> PdfViewerApp<'a> {
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
-            self.record_last_position(&path, self.current_page_index, self.zoom_level);
+            let pos = if self.is_markdown_tab() {
+                self.scroll_y.round().clamp(0.0, 65535.0) as u16
+            } else {
+                self.current_page_index
+            };
+            self.record_last_position(&path, pos, self.zoom_level);
         }
     }
 
@@ -137,8 +142,14 @@ impl<'a> PdfViewerApp<'a> {
             .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
     }
 
+    pub(super) fn is_epub_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+    }
+
     pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
-        Self::is_markdown_path(path) || Self::is_latex_path(path)
+        Self::is_markdown_path(path) || Self::is_latex_path(path) || Self::is_epub_path(path)
     }
 
     fn markdown_headings_to_bookmarks(doc: &crate::markdown::MarkdownDoc) -> Vec<crate::engine::Bookmark> {
@@ -188,7 +199,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_active_markdown(&mut self) {
-        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
+        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() || Self::is_epub_path(&self.file_path) {
             return;
         }
         let text = if let Some(ref ed) = self.md_editor {
@@ -226,33 +237,50 @@ impl<'a> PdfViewerApp<'a> {
         if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() {
             return false;
         }
-        let Ok(raw) = std::fs::read_to_string(&self.file_path) else {
-            return false;
-        };
         let fallback = self
             .file_path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("Markdown");
+            .unwrap_or("Document");
+        let is_epub = Self::is_epub_path(&self.file_path);
         let is_tex = Self::is_latex_path(&self.file_path);
-        if is_tex {
-            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
-                self.status_notice = Some(format!(
-                    "Cannot reload '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
-                ));
-                self.request_redraw();
+
+        let (raw_opt, parsed) = if is_epub {
+            let Ok(bytes) = std::fs::read(&self.file_path) else {
                 return false;
+            };
+            match crate::epub::parse_epub_bytes(&bytes, fallback) {
+                Ok(doc) => (None, doc),
+                Err(e) => {
+                    self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                    self.request_redraw();
+                    return false;
+                }
             }
-        }
-        let parsed = if is_tex {
-            crate::latex::parse_latex(&raw, fallback, self.file_path.parent())
         } else {
-            crate::markdown::parse_markdown(&raw, fallback)
+            let Ok(raw) = std::fs::read_to_string(&self.file_path) else {
+                return false;
+            };
+            if is_tex {
+                if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                    self.status_notice = Some(format!(
+                        "Cannot reload '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                    ));
+                    self.request_redraw();
+                    return false;
+                }
+            }
+            let doc = if is_tex {
+                crate::latex::parse_latex(&raw, fallback, self.file_path.parent())
+            } else {
+                crate::markdown::parse_markdown(&raw, fallback)
+            };
+            (Some(raw), doc)
         };
         let bms = Self::markdown_headings_to_bookmarks(&parsed);
         let mtime = Self::read_file_mtime(&self.file_path);
 
-        self.md_source = Some(raw);
+        self.md_source = raw_opt;
         self.md_editor = None;
         self.has_unsaved_edits = false;
         self.markdown_doc = Some(parsed);
@@ -266,7 +294,9 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab].bookmarks = self.bookmarks.clone();
             self.tabs[self.active_tab].has_unsaved_edits = false;
         }
-        self.status_notice = Some(if is_tex {
+        self.status_notice = Some(if is_epub {
+            "Reloaded EPUB document".to_string()
+        } else if is_tex {
             "Reloaded LaTeX document".to_string()
         } else {
             "Reloaded Markdown document".to_string()
@@ -277,24 +307,34 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn load_markdown_document(&mut self, path: PathBuf, new_tab: bool) -> Result<()> {
-        let raw = std::fs::read_to_string(&path)?;
         let fallback = path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or("Markdown");
+            .unwrap_or("Document");
+        let is_epub = Self::is_epub_path(&path);
         let is_tex = Self::is_latex_path(&path);
-        if is_tex {
-            if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
-                return Err(anyhow::anyhow!(
-                    "Cannot open '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
-                ));
-            }
-        }
-        let parsed = if is_tex {
-            crate::latex::parse_latex(&raw, fallback, path.parent())
+
+        let (raw_opt, parsed) = if is_epub {
+            let bytes = std::fs::read(&path)?;
+            let doc = crate::epub::parse_epub_bytes(&bytes, fallback)?;
+            (None, doc)
         } else {
-            crate::markdown::parse_markdown(&raw, fallback)
+            let raw = std::fs::read_to_string(&path)?;
+            if is_tex {
+                if let Some(kind) = crate::latex::check_latex_complex_graphs(&raw) {
+                    return Err(anyhow::anyhow!(
+                        "Cannot open '{fallback}': contains complex LaTeX graphs ({kind}) not supported in portable mode."
+                    ));
+                }
+            }
+            let doc = if is_tex {
+                crate::latex::parse_latex(&raw, fallback, path.parent())
+            } else {
+                crate::markdown::parse_markdown(&raw, fallback)
+            };
+            (Some(raw), doc)
         };
+        let raw = raw_opt.unwrap_or_default();
         let loaded_bookmarks = Self::markdown_headings_to_bookmarks(&parsed);
         let file_mtime = Self::read_file_mtime(&path);
 
@@ -306,13 +346,17 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
 
+        let restored = self.lookup_last_position(&path);
+        let restored_zoom = restored.map(|(_, z)| z.clamp(0.6, 3.0)).unwrap_or(1.0);
+        let restored_scroll = restored.map(|(p, _)| p as f32).unwrap_or(0.0);
+
         self.file_path = path.clone();
         self.current_page_index = 0;
         self.view_mode = ViewMode::FitWidth;
         self.last_page_view_mode = ViewMode::FitWidth;
-        self.zoom_level = 1.0;
+        self.zoom_level = restored_zoom;
         self.pan_x = 0.0;
-        self.scroll_y = 0.0;
+        self.scroll_y = restored_scroll;
         self.scroll_x = 0.0;
         self.nav_back_stack.clear();
         self.nav_forward_stack.clear();
@@ -362,9 +406,9 @@ impl<'a> PdfViewerApp<'a> {
             view_mode: ViewMode::FitWidth,
             last_page_view_mode: ViewMode::FitWidth,
             scroll_mode: self.scroll_mode,
-            zoom_level: 1.0,
+            zoom_level: restored_zoom,
             pan_x: 0.0,
-            scroll_y: 0.0,
+            scroll_y: restored_scroll,
             scroll_x: 0.0,
             nav_back_stack: VecDeque::new(),
             nav_forward_stack: Vec::new(),
@@ -898,9 +942,18 @@ impl<'a> PdfViewerApp<'a> {
         self.sync_active_tab_to_slot();
         let closed_path = self.tabs[close_idx].file_path.clone();
         let closed_page = self.tabs[close_idx].current_page_index;
+        let closed_scroll = self.tabs[close_idx].scroll_y;
         let closed_zoom = self.tabs[close_idx].zoom_level;
         if !closed_path.as_os_str().is_empty() {
-            self.record_last_position(&closed_path, closed_page, closed_zoom);
+            let closed_is_md = Self::is_markdown_path(&closed_path)
+                || Self::is_latex_path(&closed_path)
+                || Self::is_epub_path(&closed_path);
+            let pos = if closed_is_md {
+                closed_scroll.round().clamp(0.0, 65535.0) as u16
+            } else {
+                closed_page
+            };
+            self.record_last_position(&closed_path, pos, closed_zoom);
         }
         self.invalidate_page_caches();
         self.thumbnail_cache.clear();
@@ -1207,8 +1260,9 @@ impl<'a> PdfViewerApp<'a> {
             let is_active = idx == self.active_tab;
             let is_tab_hov = matches!(
                 self.hovered_widget,
-                Some(UiHit::Tab(i)) | Some(UiHit::TabClose(i)) if i == idx
+                Some(UiHit::Tab(i)) | Some(UiHit::TabFavorite(i)) | Some(UiHit::TabClose(i)) if i == idx
             );
+            let is_fav_hov = self.hovered_widget == Some(UiHit::TabFavorite(idx));
             let is_close_hov = self.hovered_widget == Some(UiHit::TabClose(idx));
 
             if is_active {
@@ -1242,6 +1296,15 @@ impl<'a> PdfViewerApp<'a> {
                 self.tabs.get(idx).map(|t| t.has_unsaved_edits).unwrap_or(false)
             };
 
+            let tab_path = if is_active {
+                &self.file_path
+            } else if let Some(slot) = self.tabs.get(idx) {
+                &slot.file_path
+            } else {
+                &self.file_path
+            };
+            let is_starred = !tab_path.as_os_str().is_empty() && self.favorites.is_starred(tab_path);
+
             let fname = if is_active {
                 self.filename_display()
             } else if let Some(slot) = self.tabs.get(idx) {
@@ -1268,8 +1331,12 @@ impl<'a> PdfViewerApp<'a> {
             let show_close = !self.tabs.is_empty();
             let close_x = cur_x + tab_w as i32 - close_sz as i32 - (6.0 * s).round() as i32;
             let close_y = tab_y + ((tab_h.saturating_sub(close_sz)) / 2) as i32;
+            let star_sz = close_sz;
+            let star_ic = (11.0 * s).round() as u32;
+            let star_x = close_x - star_sz as i32 - (2.0 * s).round() as i32;
+            let star_y = close_y;
 
-            let label_right = if show_close { close_x - 2 } else { cur_x + tab_w as i32 - 6 };
+            let label_right = if show_close { star_x - 3 } else { cur_x + tab_w as i32 - 6 };
             let label_budget = (label_right - text_x - (2.0 * s).round() as i32).max(20) as f32;
             let label = super::ui_draw::truncate_ellipsis(&fname, label_budget, font_sz, is_active);
             let text_col = if is_active { theme.text_primary } else { theme.text_secondary };
@@ -1278,6 +1345,26 @@ impl<'a> PdfViewerApp<'a> {
             );
 
             if show_close {
+                if is_fav_hov {
+                    super::ui_draw::fill_rounded_rect(
+                        buffer, buf_w, buf_h, star_x, star_y, star_sz, star_sz, (star_sz as f32) * 0.5, theme.hover_bg,
+                    );
+                }
+                let star_col = if is_starred {
+                    0x00F5_9E0B
+                } else if is_fav_hov {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                };
+                super::ui_draw::draw_icon(
+                    buffer, buf_w, buf_h, super::ui_draw::UiIcon::Star,
+                    star_x + ((star_sz.saturating_sub(star_ic)) / 2) as i32,
+                    star_y + ((star_sz.saturating_sub(star_ic)) / 2) as i32,
+                    star_ic,
+                    star_col,
+                );
+
                 if is_close_hov {
                     super::ui_draw::fill_rounded_rect(
                         buffer, buf_w, buf_h, close_x, close_y, close_sz, close_sz, (close_sz as f32) * 0.5, theme.danger_soft_bg,
@@ -1398,13 +1485,16 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         let tab_gap = (3.0 * s).round() as i32;
-        let close_sz = (18.0 * s).round() as i32;
+        let close_sz = (16.0 * s).round() as i32;
         let mut cur_x = strip_x;
         for idx in vis_start..vis_end {
             if ix >= cur_x && ix < cur_x + tab_w as i32 {
                 let close_x = cur_x + tab_w as i32 - close_sz - (6.0 * s).round() as i32;
+                let star_x = close_x - close_sz - (2.0 * s).round() as i32;
                 if !self.tabs.is_empty() && ix >= close_x {
                     return Some(TabBarHit::CloseTab(idx));
+                } else if !self.tabs.is_empty() && ix >= star_x {
+                    return Some(TabBarHit::FavoriteTab(idx));
                 } else {
                     return Some(TabBarHit::SwitchTab(idx));
                 }

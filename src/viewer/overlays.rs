@@ -9,6 +9,7 @@ use super::ui_draw::*;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) enum OverlayHit {
     WelcomeOpen,
+    WelcomeFavorites,
     WelcomeRecent(usize),
     WelcomeRestoreSession,
     WelcomeDismissSession,
@@ -21,6 +22,7 @@ pub(super) enum OverlayHit {
     OptimizeColor(u8),
     OptimizeToggleClean,
     OptimizeTogglePreview,
+    PageTurnPreset(u16),
     PromptSubmit,
     PromptCancel,
     InsideModal,
@@ -64,11 +66,15 @@ impl<'a> PdfViewerApp<'a> {
         let pad = (22.0 * s).round() as i32;
         let mut cur_y = cy + (132.0 * s).round() as i32;
 
-        // Primary "Open PDF" button
+        // Primary "Open PDF" + "Favorites" buttons
         let btn_w = (140.0 * s).round() as u32;
+        let fav_w = (136.0 * s).round() as u32;
+        let btn_gap = (10.0 * s).round() as i32;
+        let total_bw = btn_w + fav_w + btn_gap as u32;
         let btn_h = (34.0 * s).round() as u32;
-        let btn_x = cx + ((cw.saturating_sub(btn_w)) / 2) as i32;
+        let btn_x = cx + ((cw.saturating_sub(total_bw)) / 2) as i32;
         hits.push(BoxHit { x: btn_x, y: cur_y, w: btn_w, h: btn_h, hit: OverlayHit::WelcomeOpen });
+        hits.push(BoxHit { x: btn_x + btn_w as i32 + btn_gap, y: cur_y, w: fav_w, h: btn_h, hit: OverlayHit::WelcomeFavorites });
         cur_y += btn_h as i32 + (18.0 * s).round() as i32;
 
         if has_restore {
@@ -145,13 +151,21 @@ impl<'a> PdfViewerApp<'a> {
         let sw = measure_text(sub, sub_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - sw) * 0.5).round() as i32, cy + (107.0 * s).round() as i32, sub, sub_sz, theme.text_muted, false);
 
-        // Open PDF button
+        // Open PDF & Favorites buttons
         if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeOpen) {
             let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeOpen));
             fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.accent_hover } else { theme.accent });
             let lbl = "Open PDF  (O)";
             let lw = measure_text(lbl, sub_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_on_accent, true);
+        }
+        if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeFavorites) {
+            let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeFavorites));
+            fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.hover_bg } else { theme.surface_elevated });
+            stroke_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), theme.border_subtle);
+            let lbl = "Favorites  (Ctrl+D)";
+            let lw = measure_text(lbl, sub_sz, false);
+            draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_primary, false);
         }
 
         // Optional Restore Session banner
@@ -482,8 +496,9 @@ impl<'a> PdfViewerApp<'a> {
 
     fn layout_generic_prompt_card(&self, buf_w: u32, top_bars_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
-        let cw = ((480.0 * s).round() as u32).min(buf_w.saturating_sub(24));
-        let ch = (128.0 * s).round() as u32;
+        let is_speed = matches!(self.input_mode, InputMode::PageTurnSpeed { .. });
+        let cw = ((if is_speed { 510.0 } else { 480.0 } * s).round() as u32).min(buf_w.saturating_sub(24));
+        let ch = ((if is_speed { 164.0 } else { 128.0 }) * s).round() as u32;
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = top_bars_h as i32 + (18.0 * s).round() as i32;
         let pad = (16.0 * s).round() as i32;
@@ -493,10 +508,23 @@ impl<'a> PdfViewerApp<'a> {
         let ok_w = (96.0 * s).round() as u32;
         let cancel_x = cx + cw as i32 - pad - cancel_w as i32;
         let ok_x = cancel_x - ok_w as i32 - (6.0 * s).round() as i32;
-        let hits = vec![
+        let mut hits = vec![
             BoxHit { x: ok_x, y: by, w: ok_w, h: btn_h, hit: OverlayHit::PromptSubmit },
             BoxHit { x: cancel_x, y: by, w: cancel_w, h: btn_h, hit: OverlayHit::PromptCancel },
         ];
+        if is_speed {
+            let presets: [u16; 6] = [0, 220, 450, 700, 1000, 1400];
+            let py = cy + (88.0 * s).round() as i32;
+            let ph = (24.0 * s).round() as u32;
+            let gap = (6.0 * s).round() as i32;
+            let total_w = cw.saturating_sub((pad * 2) as u32) as i32;
+            let pw = ((total_w - gap * (presets.len() as i32 - 1)) / presets.len() as i32).max(40) as u32;
+            let mut px = cx + pad;
+            for ms in presets {
+                hits.push(BoxHit { x: px, y: py, w: pw, h: ph, hit: OverlayHit::PageTurnPreset(ms) });
+                px += pw as i32 + gap;
+            }
+        }
         ((cx, cy, cw, ch), hits)
     }
 
@@ -511,6 +539,13 @@ impl<'a> PdfViewerApp<'a> {
 
         let (title, hint, value, ok_lbl, is_confirm_only) = match &self.input_mode {
             InputMode::JumpToPage { input } => ("Jump to Page", "Logical '5', Roman 'ii', or Physical '#5'", input.clone(), "Jump", false),
+            InputMode::PageTurnSpeed { input } => (
+                "Magazine Page-Turn Animation Speed",
+                "Enter duration in milliseconds (0 = Off, up to 3000 ms) or pick a preset:",
+                input.clone(),
+                "Apply",
+                false,
+            ),
             InputMode::PageNumbers { input } => ("Page Numbering", "Last Roman page # (e.g. '5' or '0' for all Arabic)", input.clone(), "Apply", false),
             InputMode::HeaderFooterRange { range_input } => ("Header / Footer (1 of 3)", "Page range (e.g. '1-5' or 'all')", range_input.clone(), "Next", false),
             InputMode::HeaderFooterPosition { pos_input, .. } => ("Header / Footer (2 of 3)", "Position: HL, HC, HR, FL, FC, or FR", pos_input.clone(), "Next", false),
@@ -610,6 +645,29 @@ impl<'a> PdfViewerApp<'a> {
             draw_text_vcenter(buffer, buf_w, buf_h, cx + pad + (8.0 * s).round() as i32, inp_y, inp_h, cx + pad + inp_w as i32 - 6, &txt, body_sz, theme.text_primary, false);
         }
 
+        // Optional preset pills (used by Magazine Page-Turn Speed)
+        let pill_sz = (10.5 * s).clamp(9.0, 18.0);
+        for hb in hits.iter().skip(2) {
+            if let OverlayHit::PageTurnPreset(ms) = hb.hit {
+                let active = self.page_turn_anim_ms == ms as u64;
+                let hov = self.hovered_widget == Some(UiHit::Overlay(hb.hit));
+                let bg = if active {
+                    theme.accent_soft_bg
+                } else if hov {
+                    theme.hover_bg
+                } else {
+                    theme.surface_elevated
+                };
+                let bd = if active { theme.accent } else { theme.border_subtle };
+                let fg = if active { theme.accent_soft_fg } else { theme.text_primary };
+                fill_rounded_rect(buffer, buf_w, buf_h, hb.x, hb.y, hb.w, hb.h, (5.0 * s).max(3.0), bg);
+                stroke_rounded_rect(buffer, buf_w, buf_h, hb.x, hb.y, hb.w, hb.h, (5.0 * s).max(3.0), bd);
+                let lbl = if ms == 0 { "Off".to_string() } else { format!("{ms}ms") };
+                let lw = measure_text(&lbl, pill_sz, active);
+                draw_text_vcenter(buffer, buf_w, buf_h, hb.x + ((hb.w as f32 - lw) * 0.5).round() as i32, hb.y, hb.h, hb.x + hb.w as i32 - 2, &lbl, pill_sz, fg, active);
+            }
+        }
+
         let ok_b = hits[0];
         let ok_hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::PromptSubmit));
         fill_rounded_rect(buffer, buf_w, buf_h, ok_b.x, ok_b.y, ok_b.w, ok_b.h, (6.0 * s).max(4.0), if ok_hov { theme.accent_hover } else { theme.accent });
@@ -689,24 +747,24 @@ impl<'a> PdfViewerApp<'a> {
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book/Mag)"),
             ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
-            ("Ctrl+Wheel", "Zoom 25%–800% around cursor (0 / Ctrl+0 resets)"),
+            ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
             ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
             ("G", "Smart Jump to Page (5, iii, or #5)"),
-            ("Alt+Arrows", "Navigation History Back / Forward"),
+            ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
             ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF, .md, or .tex / Save / Watermark Dialog"),
-            ("Ctrl+W", "Close Tab (with Unsaved Changes guard)"),
-            ("Ctrl+P", "Print Preview (or Export .md/.tex to PDF / Word)"),
+            ("O / S / W", "Open PDF/.md/.tex/.epub / Save / Watermark Dialog"),
+            ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
+            ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
-            ("Ctrl+C", "Copy Selected Text (Click Form Fields to fill)"),
+            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup Line (Shift+D) / Comment (/)"),
             ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
             ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
@@ -769,7 +827,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.6.0 — Portable PDF, Markdown & LaTeX Viewer & Editor", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.7.0 — Portable PDF, Markdown, LaTeX & EPUB Suite", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);
@@ -788,6 +846,9 @@ impl<'a> PdfViewerApp<'a> {
         match hit {
             OverlayHit::WelcomeOpen => {
                 self.pending_dialog = Some(PendingDialog::Open);
+            }
+            OverlayHit::WelcomeFavorites => {
+                self.open_favorites_modal();
             }
             OverlayHit::WelcomeRecent(idx) => {
                 if let Some(path) = self.recent_files.get(idx).cloned() {
@@ -923,6 +984,14 @@ impl<'a> PdfViewerApp<'a> {
                         None => self.invalidate_page_caches(),
                     }
                 }
+            }
+            OverlayHit::PageTurnPreset(ms) => {
+                if let InputMode::PageTurnSpeed { input } = &mut self.input_mode {
+                    *input = ms.to_string();
+                }
+                self.set_page_turn_anim_ms(ms as u64);
+                self.input_mode = InputMode::Normal;
+                return;
             }
             OverlayHit::PromptSubmit => {
                 self.handle_prompt_submission();

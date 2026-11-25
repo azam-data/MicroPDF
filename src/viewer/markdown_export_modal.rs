@@ -15,6 +15,7 @@ pub(super) enum MarkdownExportHit {
     ToggleOpenInNewTab,
     ExportPdf,
     ExportDocx,
+    ExportEpub,
     Cancel,
     InsideModal,
 }
@@ -69,7 +70,7 @@ impl<'a> PdfViewerApp<'a> {
     ) -> (i32, i32, u32, u32, Vec<MdExpBox>) {
         let s = sf as f32;
         let mw = ((420.0 * s).round() as u32).min(buf_w.saturating_sub(24));
-        let mh = ((258.0 * s).round() as u32).min(buf_h.saturating_sub(24));
+        let mh = ((298.0 * s).round() as u32).min(buf_h.saturating_sub(24));
         let mx = (buf_w.saturating_sub(mw) / 2) as i32;
         let my = (buf_h.saturating_sub(mh) / 2) as i32;
         let p = (16.0 * s).round() as i32;
@@ -77,7 +78,7 @@ impl<'a> PdfViewerApp<'a> {
         let iw = mw.saturating_sub((p * 2) as u32);
         let row_h = (28.0 * s).round() as u32;
         let gap = (8.0 * s).round() as i32;
-        let mut hits = Vec::with_capacity(8);
+        let mut hits = Vec::with_capacity(9);
 
         let mut cy = my + (56.0 * s).round() as i32;
         let half_w = (iw.saturating_sub(gap as u32)) / 2;
@@ -86,11 +87,13 @@ impl<'a> PdfViewerApp<'a> {
         cy += row_h as i32 + (14.0 * s).round() as i32;
 
         hits.push(MdExpBox { x: ix, y: cy, w: iw, h: row_h, hit: MarkdownExportHit::ToggleOpenInNewTab });
-        cy += row_h as i32 + (16.0 * s).round() as i32;
+        cy += row_h as i32 + (14.0 * s).round() as i32;
 
         let btn_h = (32.0 * s).round() as u32;
         hits.push(MdExpBox { x: ix, y: cy, w: half_w, h: btn_h, hit: MarkdownExportHit::ExportPdf });
         hits.push(MdExpBox { x: ix + half_w as i32 + gap, y: cy, w: iw - half_w - gap as u32, h: btn_h, hit: MarkdownExportHit::ExportDocx });
+        cy += btn_h as i32 + (8.0 * s).round() as i32;
+        hits.push(MdExpBox { x: ix, y: cy, w: iw, h: btn_h, hit: MarkdownExportHit::ExportEpub });
 
         let cancel_w = (90.0 * s).round() as u32;
         let cancel_y = my + mh as i32 - p - (28.0 * s).round() as i32;
@@ -190,6 +193,9 @@ impl<'a> PdfViewerApp<'a> {
         if let Some(b) = find(MarkdownExportHit::ExportDocx) {
             draw_btn(buffer, b, "Export Word (.docx)...", false, false);
         }
+        if let Some(b) = find(MarkdownExportHit::ExportEpub) {
+            draw_btn(buffer, b, "Export EPUB (.epub)...", false, false);
+        }
         if let Some((ref msg, is_err)) = st.status_msg {
             let col = if is_err { theme.danger } else { theme.success };
             let clipped = truncate_ellipsis(msg, (mw as i32 - p * 2 - 96).max(60) as f32, 10.5 * s, true);
@@ -230,6 +236,43 @@ impl<'a> PdfViewerApp<'a> {
             }
             MarkdownExportHit::ExportDocx => {
                 self.pending_dialog = Some(PendingDialog::ExportMdDocx);
+            }
+            MarkdownExportHit::ExportEpub => {
+                self.pending_dialog = Some(PendingDialog::ExportMdEpub);
+            }
+        }
+    }
+
+    pub(super) fn run_markdown_epub_export(&mut self) {
+        let Some(ref md) = self.markdown_doc else { return };
+        let stem = self.file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("document");
+        let default_name = format!("{stem}.epub");
+        let mut dlg = rfd::FileDialog::new()
+            .set_title("Export Document as EPUB E-Book (.epub)")
+            .add_filter("EPUB E-Book", &["epub"])
+            .set_file_name(&default_name);
+        if let Some(parent) = self.file_path.parent() {
+            if !parent.as_os_str().is_empty() && parent.exists() {
+                dlg = dlg.set_directory(parent);
+            }
+        }
+        let Some(save_path) = dlg.save_file() else {
+            return;
+        };
+
+        match crate::epub_export::export_markdown_doc_to_epub(md, &save_path) {
+            Ok(()) => {
+                self.markdown_export_modal = None;
+                let fname = save_path.file_name().and_then(|s| s.to_str()).unwrap_or(&default_name).to_string();
+                self.status_notice = Some(format!("Exported EPUB '{fname}'"));
+                self.update_title_bar();
+                self.request_redraw();
+            }
+            Err(e) => {
+                if let Some(m) = self.markdown_export_modal.as_mut() {
+                    m.status_msg = Some((format!("EPUB export failed: {e}"), true));
+                }
+                self.request_redraw();
             }
         }
     }

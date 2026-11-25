@@ -177,6 +177,15 @@ pub enum ToolbarAction {
     ToolStamp,
     RotatePage,
     FindText,
+    MdModePreview,
+    MdModeSplit,
+    MdModeEdit,
+    MdSave,
+    MdZoomOut,
+    MdZoomReset,
+    MdZoomIn,
+    MdReload,
+    MdExportPrint,
     UiScaleDown,
     UiScaleReset,
     UiScaleUp,
@@ -188,10 +197,10 @@ impl ToolbarAction {
         match self {
             Self::ToggleSidebar => "Bookmarks Sidebar (B)",
             Self::ToggleGrid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open PDF (O)",
-            Self::Save => "Save PDF (S)",
+            Self::Open => "Open PDF / MD / LaTeX / EPUB (O)",
+            Self::Save => "Save (S / Ctrl+S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
-            Self::Print => "Print Preview (Ctrl+P)",
+            Self::Print => "Print Preview / Export (Ctrl+P)",
             Self::ToolSelect => "Select Text Tool (default)",
             Self::ToolHand => "Hand Tool (click & drag to pan)",
             Self::ToolHighlight => "Highlight Text (drag across text)",
@@ -208,6 +217,15 @@ impl ToolbarAction {
             Self::ToolStamp => "Stamp Signature / Image (P)",
             Self::RotatePage => "Rotate Page 90° (R)",
             Self::FindText => "Find Text (Ctrl+F)",
+            Self::MdModePreview => "Preview Mode",
+            Self::MdModeSplit => "Split Editor & Live Preview",
+            Self::MdModeEdit => "Source Editor Mode",
+            Self::MdSave => "Save Document (Ctrl+S)",
+            Self::MdZoomOut => "Zoom Out (-)",
+            Self::MdZoomReset => "Reset Zoom to 100% (0)",
+            Self::MdZoomIn => "Zoom In (+)",
+            Self::MdReload => "Reload File from Disk",
+            Self::MdExportPrint => "Export to PDF / Word / EPUB or Print (Ctrl+P)",
             Self::UiScaleDown => "Shrink Interface Scale (-10%)",
             Self::UiScaleReset => "Reset Interface Scale to 100%",
             Self::UiScaleUp => "Enlarge Interface Scale (+10%)",
@@ -407,83 +425,149 @@ impl<'a> PdfViewerApp<'a> {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::SaveAs) {
+        if self.toolbar_config.is_enabled(ToolbarItem::SaveAs) && !self.is_markdown_tab() {
             if try_push(mk_ic(ToolbarAction::SaveAs, UiIcon::SaveAs, false, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Print) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Print) && !self.is_markdown_tab() {
             if try_push(mk_ic(ToolbarAction::Print, UiIcon::Print, self.print_preview.is_some(), false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
 
-        // Group 2: Select + Full Annotations Suite + Color Swatch
-        let mut g2 = 0usize;
-        if self.toolbar_config.is_enabled(ToolbarItem::Annotations) {
-            push_sep(&mut cur_x, &mut seps, g1);
-            let ann_btns = [
-                (ToolbarAction::ToolSelect, UiIcon::Select, self.mouse_mode == MouseMode::Select),
-                (ToolbarAction::ToolHand, UiIcon::Hand, self.mouse_mode == MouseMode::Hand),
-                (ToolbarAction::ToolHighlight, UiIcon::Highlight, self.mouse_mode == MouseMode::Highlight),
-                (ToolbarAction::ToolUnderline, UiIcon::Underline, self.mouse_mode == MouseMode::Underline),
-                (ToolbarAction::ToolStrikethrough, UiIcon::Strikethrough, self.mouse_mode == MouseMode::Strikethrough),
-                (ToolbarAction::ToolStickyNote, UiIcon::Note, self.mouse_mode == MouseMode::StickyNote),
-                (ToolbarAction::ToolInkPen, UiIcon::Pen, self.mouse_mode == MouseMode::InkPen),
-                (ToolbarAction::ToolFreeText, UiIcon::TextBox, self.mouse_mode == MouseMode::FreeText),
-                (ToolbarAction::ToolRectShape, UiIcon::RectShape, self.mouse_mode == MouseMode::RectShape),
-                (ToolbarAction::ToolArrowShape, UiIcon::ArrowShape, self.mouse_mode == MouseMode::ArrowShape),
-            ];
-            for (act, ic, active) in ann_btns {
-                if try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets) {
-                    g2 += 1;
-                }
-            }
-            // Clickable Annotation Color Swatch button
-            if try_push(
-                ToolbarWidgetRect {
-                    x: 0,
-                    y: btn_y,
-                    w: sq_w,
-                    h: btn_h,
-                    action: ToolbarAction::CycleAnnotationColor,
-                    icon: None,
-                    label: None,
-                    swatch_rgb: Some(self.annotation_color.u32_rgb()),
-                    active: false,
-                    accent_dot: false,
-                },
-                &mut cur_x,
-                &mut widgets,
-            ) {
-                g2 += 1;
-            }
-        }
+        if self.is_markdown_tab() {
+            // Contextual Document Section — active and visible ONLY for Markdown (.md), LaTeX (.tex), and EPUB (.epub)
+            let is_epub = Self::is_epub_path(&self.file_path);
+            let mk_pill = |action: ToolbarAction, label: String, w: u32, active: bool, accent_dot: bool| ToolbarWidgetRect {
+                x: 0,
+                y: btn_y,
+                w,
+                h: btn_h,
+                action,
+                icon: None,
+                label: Some(label),
+                swatch_rgb: None,
+                active,
+                accent_dot,
+            };
 
-        // Group 3: Edit Tools (Redact, Crop, Stamp) + Rotate + Search
-        let want_g3 = self.toolbar_config.is_enabled(ToolbarItem::EditTools)
-            || self.toolbar_config.is_enabled(ToolbarItem::Rotate)
-            || self.toolbar_config.is_enabled(ToolbarItem::Search);
-        if want_g3 {
-            push_sep(&mut cur_x, &mut seps, g1 + g2);
-            if self.toolbar_config.is_enabled(ToolbarItem::EditTools) {
-                for (act, ic, active) in [
-                    (ToolbarAction::ToolRedact, UiIcon::Redact, self.mouse_mode == MouseMode::Redact),
-                    (ToolbarAction::ToolCrop, UiIcon::Crop, self.mouse_mode == MouseMode::Crop),
-                    (ToolbarAction::ToolStamp, UiIcon::Stamp, self.mouse_mode == MouseMode::StampImage),
-                ] {
-                    try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets);
+            push_sep(&mut cur_x, &mut seps, g1);
+            let mut g_md = 0usize;
+            if !is_epub {
+                let modes = [
+                    (ToolbarAction::MdModePreview, "Preview", (52.0 * s).round() as u32, self.md_editor_mode == super::text_editor::MdEditorMode::Preview),
+                    (ToolbarAction::MdModeSplit, "Split", (38.0 * s).round() as u32, self.md_editor_mode == super::text_editor::MdEditorMode::Split),
+                    (ToolbarAction::MdModeEdit, "Edit", (36.0 * s).round() as u32, self.md_editor_mode == super::text_editor::MdEditorMode::Edit),
+                ];
+                for (act, lbl, pw, active) in modes {
+                    if try_push(mk_pill(act, lbl.to_string(), pw, active, false), &mut cur_x, &mut widgets) {
+                        g_md += 1;
+                    }
+                }
+                push_sep(&mut cur_x, &mut seps, g_md);
+            }
+
+            let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
+            let zbtn_w = (22.0 * s).round() as u32;
+            let zlbl_w = (42.0 * s).round() as u32;
+            let mut g_zoom = 0usize;
+            for (act, lbl, pw) in [
+                (ToolbarAction::MdZoomOut, "-".to_string(), zbtn_w),
+                (ToolbarAction::MdZoomReset, z_pct, zlbl_w),
+                (ToolbarAction::MdZoomIn, "+".to_string(), zbtn_w),
+            ] {
+                if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
+                    g_zoom += 1;
                 }
             }
-            if self.toolbar_config.is_enabled(ToolbarItem::Rotate) {
-                try_push(mk_ic(ToolbarAction::RotatePage, UiIcon::Rotate, false, false), &mut cur_x, &mut widgets);
-            }
-            if self.toolbar_config.is_enabled(ToolbarItem::Search) {
+            push_sep(&mut cur_x, &mut seps, g_zoom);
+
+            if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
                 try_push(
-                    mk_ic(ToolbarAction::FindText, UiIcon::Search, matches!(self.input_mode, InputMode::SearchText { .. }), false),
+                    mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
                     &mut cur_x,
                     &mut widgets,
                 );
+            }
+            try_push(
+                mk_pill(ToolbarAction::MdReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
+                &mut cur_x,
+                &mut widgets,
+            );
+            try_push(
+                mk_pill(ToolbarAction::MdExportPrint, "Export / Print".to_string(), (90.0 * s).round() as u32, false, false),
+                &mut cur_x,
+                &mut widgets,
+            );
+        } else {
+            // Group 2: Select + Full Annotations Suite + Color Swatch (PDF tabs only)
+            let mut g2 = 0usize;
+            if self.toolbar_config.is_enabled(ToolbarItem::Annotations) {
+                push_sep(&mut cur_x, &mut seps, g1);
+                let ann_btns = [
+                    (ToolbarAction::ToolSelect, UiIcon::Select, self.mouse_mode == MouseMode::Select),
+                    (ToolbarAction::ToolHand, UiIcon::Hand, self.mouse_mode == MouseMode::Hand),
+                    (ToolbarAction::ToolHighlight, UiIcon::Highlight, self.mouse_mode == MouseMode::Highlight),
+                    (ToolbarAction::ToolUnderline, UiIcon::Underline, self.mouse_mode == MouseMode::Underline),
+                    (ToolbarAction::ToolStrikethrough, UiIcon::Strikethrough, self.mouse_mode == MouseMode::Strikethrough),
+                    (ToolbarAction::ToolStickyNote, UiIcon::Note, self.mouse_mode == MouseMode::StickyNote),
+                    (ToolbarAction::ToolInkPen, UiIcon::Pen, self.mouse_mode == MouseMode::InkPen),
+                    (ToolbarAction::ToolFreeText, UiIcon::TextBox, self.mouse_mode == MouseMode::FreeText),
+                    (ToolbarAction::ToolRectShape, UiIcon::RectShape, self.mouse_mode == MouseMode::RectShape),
+                    (ToolbarAction::ToolArrowShape, UiIcon::ArrowShape, self.mouse_mode == MouseMode::ArrowShape),
+                ];
+                for (act, ic, active) in ann_btns {
+                    if try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets) {
+                        g2 += 1;
+                    }
+                }
+                // Clickable Annotation Color Swatch button
+                if try_push(
+                    ToolbarWidgetRect {
+                        x: 0,
+                        y: btn_y,
+                        w: sq_w,
+                        h: btn_h,
+                        action: ToolbarAction::CycleAnnotationColor,
+                        icon: None,
+                        label: None,
+                        swatch_rgb: Some(self.annotation_color.u32_rgb()),
+                        active: false,
+                        accent_dot: false,
+                    },
+                    &mut cur_x,
+                    &mut widgets,
+                ) {
+                    g2 += 1;
+                }
+            }
+
+            // Group 3: Edit Tools (Redact, Crop, Stamp) + Rotate + Search
+            let want_g3 = self.toolbar_config.is_enabled(ToolbarItem::EditTools)
+                || self.toolbar_config.is_enabled(ToolbarItem::Rotate)
+                || self.toolbar_config.is_enabled(ToolbarItem::Search);
+            if want_g3 {
+                push_sep(&mut cur_x, &mut seps, g1 + g2);
+                if self.toolbar_config.is_enabled(ToolbarItem::EditTools) {
+                    for (act, ic, active) in [
+                        (ToolbarAction::ToolRedact, UiIcon::Redact, self.mouse_mode == MouseMode::Redact),
+                        (ToolbarAction::ToolCrop, UiIcon::Crop, self.mouse_mode == MouseMode::Crop),
+                        (ToolbarAction::ToolStamp, UiIcon::Stamp, self.mouse_mode == MouseMode::StampImage),
+                    ] {
+                        try_push(mk_ic(act, ic, active, false), &mut cur_x, &mut widgets);
+                    }
+                }
+                if self.toolbar_config.is_enabled(ToolbarItem::Rotate) {
+                    try_push(mk_ic(ToolbarAction::RotatePage, UiIcon::Rotate, false, false), &mut cur_x, &mut widgets);
+                }
+                if self.toolbar_config.is_enabled(ToolbarItem::Search) {
+                    try_push(
+                        mk_ic(ToolbarAction::FindText, UiIcon::Search, matches!(self.input_mode, InputMode::SearchText { .. }), false),
+                        &mut cur_x,
+                        &mut widgets,
+                    );
+                }
             }
         }
 
@@ -517,11 +601,32 @@ impl<'a> PdfViewerApp<'a> {
 
         for w in &widgets {
             let is_hov = self.hovered_widget == Some(UiHit::Toolbar(w.action));
-            if w.active {
+            let is_primary = w.action == ToolbarAction::MdExportPrint;
+            let is_md_pill = matches!(
+                w.action,
+                ToolbarAction::MdModePreview
+                    | ToolbarAction::MdModeSplit
+                    | ToolbarAction::MdModeEdit
+                    | ToolbarAction::MdSave
+                    | ToolbarAction::MdZoomOut
+                    | ToolbarAction::MdZoomReset
+                    | ToolbarAction::MdZoomIn
+                    | ToolbarAction::MdReload
+            );
+            if is_primary {
+                let bg = if is_hov { theme.accent_hover } else { theme.accent };
+                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, bg);
+            } else if w.active {
                 fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.accent_soft_bg);
                 stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.accent);
             } else if is_hov {
                 fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.hover_bg);
+                if is_md_pill {
+                    stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.border_subtle);
+                }
+            } else if is_md_pill {
+                fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.surface_elevated);
+                stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.border_subtle);
             }
 
             if let Some(swatch) = w.swatch_rgb {
@@ -533,9 +638,11 @@ impl<'a> PdfViewerApp<'a> {
                 continue;
             }
 
-            let fg = if w.active {
+            let fg = if is_primary {
+                theme.text_on_accent
+            } else if w.active {
                 theme.accent_soft_fg
-            } else if is_hov {
+            } else if is_hov || is_md_pill {
                 theme.text_primary
             } else {
                 theme.text_secondary
@@ -546,9 +653,10 @@ impl<'a> PdfViewerApp<'a> {
                 let iy = w.y + ((w.h.saturating_sub(icon_sz)) / 2) as i32;
                 draw_icon(buffer, buf_w, buf_h, ic, ix, iy, icon_sz, fg);
             } else if let Some(ref lbl) = w.label {
-                let lw = measure_text(lbl, font_sz, w.active);
+                let bold = w.active || is_primary;
+                let lw = measure_text(lbl, font_sz, bold);
                 let tx = w.x + ((w.w as f32 - lw) * 0.5).round() as i32;
-                draw_text_vcenter(buffer, buf_w, buf_h, tx, w.y, w.h, w.x + w.w as i32 - 2, lbl, font_sz, fg, w.active);
+                draw_text_vcenter(buffer, buf_w, buf_h, tx, w.y, w.h, w.x + w.w as i32 - 2, lbl, font_sz, fg, bold);
             }
 
             if w.accent_dot {
@@ -738,6 +846,47 @@ impl<'a> PdfViewerApp<'a> {
                         query_input: self.search_query.clone(),
                     };
                 }
+            }
+            ToolbarAction::MdModePreview => {
+                self.md_editor_mode = super::text_editor::MdEditorMode::Preview;
+                self.md_layout = None;
+            }
+            ToolbarAction::MdModeSplit => {
+                if !Self::is_epub_path(&self.file_path) {
+                    self.md_editor_mode = super::text_editor::MdEditorMode::Split;
+                    self.ensure_md_editor_initialized();
+                    self.md_layout = None;
+                }
+            }
+            ToolbarAction::MdModeEdit => {
+                if !Self::is_epub_path(&self.file_path) {
+                    self.md_editor_mode = super::text_editor::MdEditorMode::Edit;
+                    self.ensure_md_editor_initialized();
+                }
+            }
+            ToolbarAction::MdSave => {
+                self.save_active_markdown();
+                return;
+            }
+            ToolbarAction::MdZoomOut => {
+                self.zoom_level = (self.zoom_level - 0.1).clamp(0.6, 3.0);
+                self.md_layout = None;
+            }
+            ToolbarAction::MdZoomReset => {
+                self.zoom_level = 1.0;
+                self.md_layout = None;
+            }
+            ToolbarAction::MdZoomIn => {
+                self.zoom_level = (self.zoom_level + 0.1).clamp(0.6, 3.0);
+                self.md_layout = None;
+            }
+            ToolbarAction::MdReload => {
+                self.reload_active_markdown();
+                return;
+            }
+            ToolbarAction::MdExportPrint => {
+                self.open_markdown_export_modal();
+                return;
             }
             ToolbarAction::UiScaleDown => {
                 self.adjust_ui_scale(-0.10);

@@ -1,8 +1,12 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod config_crypto;
 mod engine;
+mod epub;
+mod epub_export;
 mod export;
+mod favorites;
 mod fonts;
 mod latex;
 mod markdown;
@@ -12,6 +16,7 @@ mod math_render;
 mod optimize;
 mod print;
 mod viewer;
+mod zip_mini;
 
 use anyhow::Result;
 use engine::PdfEngine;

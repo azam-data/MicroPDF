@@ -16,6 +16,10 @@ impl<'a> PdfViewerApp<'a> {
                 "JUMP TO PAGE (Logical '5', Roman 'ii', or Physical '#5'): {}_  (Enter confirm, Esc cancel)",
                 input
             )),
+            InputMode::PageTurnSpeed { input } => Some(format!(
+                "MAGAZINE PAGE-TURN SPEED (0-3000 ms): {}_  (Enter apply, Esc cancel)",
+                input
+            )),
             InputMode::PageNumbers { input } => Some(format!(
                 "PAGE NUMBERS: Last Roman page # (e.g. '5' for i..v then 1..N, or '0' all Arabic): {}_",
                 input

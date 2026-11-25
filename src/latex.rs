@@ -215,7 +215,11 @@ fn parse_inline_tex(src: &str) -> Vec<InlineSpan> {
                 }
                 "cite" | "ref" | "eqref" | "label" => {
                     if let Some((arg, next_i)) = extract_braced_at(src, after_cmd) {
-                        if cmd != "label" {
+                        if cmd == "eqref" {
+                            buf.push_str(&format!("\u{27E8}eqref:{arg}\u{27E9}"));
+                        } else if cmd == "ref" {
+                            buf.push_str(&format!("\u{27E8}ref:{arg}\u{27E9}"));
+                        } else if cmd != "label" {
                             buf.push('[');
                             buf.push_str(&arg);
                             buf.push(']');
@@ -243,17 +247,55 @@ fn parse_inline_tex(src: &str) -> Vec<InlineSpan> {
     out
 }
 
-fn parse_env_block(env: &str, body: &str, base_dir: Option<&Path>) -> Option<MdBlock> {
+fn strip_and_record_eq_labels(
+    body: &str,
+    eq_num: usize,
+    labels: &mut std::collections::HashMap<String, usize>,
+) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut i = 0usize;
+    while i < body.len() {
+        if body[i..].starts_with("\\label") {
+            if let Some((lbl, next_i)) = extract_braced_at(body, i + "\\label".len()) {
+                let k = lbl.trim().to_string();
+                if !k.is_empty() {
+                    labels.insert(k, eq_num);
+                }
+                i = next_i;
+                continue;
+            }
+        }
+        let ch = body[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out.trim().to_string()
+}
+
+fn parse_env_block(
+    env: &str,
+    body: &str,
+    base_dir: Option<&Path>,
+    eq_counter: &mut usize,
+    eq_labels: &mut std::collections::HashMap<String, usize>,
+) -> Option<MdBlock> {
     match env {
-        "equation" | "equation*" | "align" | "align*" | "gather" | "gather*" | "displaymath" => {
-            Some(MdBlock::MathBlock(body.trim().to_string()))
+        "equation" | "align" | "gather" => {
+            *eq_counter += 1;
+            let n = *eq_counter;
+            let clean = strip_and_record_eq_labels(body, n, eq_labels);
+            Some(MdBlock::MathBlock(format!("{clean}\\eqno({n})")))
+        }
+        "equation*" | "align*" | "gather*" | "displaymath" => {
+            let clean = strip_and_record_eq_labels(body, 0, &mut std::collections::HashMap::new());
+            Some(MdBlock::MathBlock(clean))
         }
         "verbatim" | "lstlisting" => Some(MdBlock::CodeBlock {
             lang: if env == "lstlisting" { Some("code".to_string()) } else { None },
             code: body.trim_matches('\n').to_string(),
         }),
         "quote" | "quotation" => {
-            let inner = parse_latex_body(body, base_dir);
+            let inner = parse_latex_body(body, base_dir, eq_counter, eq_labels);
             Some(MdBlock::Blockquote(inner))
         }
         "itemize" | "enumerate" => {
@@ -315,14 +357,19 @@ fn parse_env_block(env: &str, body: &str, base_dir: Option<&Path>) -> Option<MdB
             })
         }
         "figure" | "center" => {
-            let inner = parse_latex_body(body, base_dir);
+            let inner = parse_latex_body(body, base_dir, eq_counter, eq_labels);
             inner.into_iter().next()
         }
         _ => None,
     }
 }
 
-fn parse_latex_body(src: &str, base_dir: Option<&Path>) -> Vec<MdBlock> {
+fn parse_latex_body(
+    src: &str,
+    base_dir: Option<&Path>,
+    eq_counter: &mut usize,
+    eq_labels: &mut std::collections::HashMap<String, usize>,
+) -> Vec<MdBlock> {
     let mut blocks = Vec::new();
     let mut para_buf = String::new();
     let mut i = 0usize;
@@ -374,7 +421,7 @@ fn parse_latex_body(src: &str, base_dir: Option<&Path>) -> Vec<MdBlock> {
                 if let Some(rel_end) = src[body_start..].find(&end_tag) {
                     flush_para(&mut para_buf, &mut blocks);
                     let body = &src[body_start..body_start + rel_end];
-                    if let Some(blk) = parse_env_block(&env, body, base_dir) {
+                    if let Some(blk) = parse_env_block(&env, body, base_dir, eq_counter, eq_labels) {
                         blocks.push(blk);
                     }
                     i = body_start + rel_end + end_tag.len();
@@ -479,7 +526,10 @@ pub fn parse_latex(src: &str, fallback_title: &str, base_dir: Option<&Path>) -> 
     if let Some(ref a) = doc_author {
         blocks.push(MdBlock::Paragraph(vec![InlineSpan::Italic(a.clone())]));
     }
-    blocks.extend(parse_latex_body(body, base_dir));
+    let mut eq_counter = 0usize;
+    let mut eq_labels = std::collections::HashMap::new();
+    blocks.extend(parse_latex_body(body, base_dir, &mut eq_counter, &mut eq_labels));
+    resolve_eq_refs_in_blocks(&mut blocks, &eq_labels);
 
     let mut headings = Vec::new();
     for (idx, blk) in blocks.iter().enumerate() {
@@ -499,6 +549,91 @@ pub fn parse_latex(src: &str, fallback_title: &str, base_dir: Option<&Path>) -> 
         title: doc_title.unwrap_or_else(|| fallback_title.to_string()),
         blocks,
         headings,
+        embedded_images: std::collections::HashMap::new(),
+    }
+}
+
+fn resolve_eq_refs_in_text(s: &mut String, labels: &std::collections::HashMap<String, usize>) {
+    if !s.contains('\u{27E8}') {
+        return;
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while let Some(start) = rest.find('\u{27E8}') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + '\u{27E8}'.len_utf8()..];
+        if let Some(end) = after.find('\u{27E9}') {
+            let token = &after[..end];
+            if let Some(lbl) = token.strip_prefix("eqref:") {
+                if let Some(&n) = labels.get(lbl.trim()) {
+                    out.push_str(&format!("({n})"));
+                } else {
+                    out.push_str(&format!("[{lbl}]"));
+                }
+            } else if let Some(lbl) = token.strip_prefix("ref:") {
+                if let Some(&n) = labels.get(lbl.trim()) {
+                    out.push_str(&format!("{n}"));
+                } else {
+                    out.push_str(&format!("[{lbl}]"));
+                }
+            } else {
+                out.push('\u{27E8}');
+                out.push_str(token);
+                out.push('\u{27E9}');
+            }
+            rest = &after[end + '\u{27E9}'.len_utf8()..];
+        } else {
+            out.push('\u{27E8}');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    *s = out;
+}
+
+fn resolve_eq_refs_in_spans(spans: &mut [InlineSpan], labels: &std::collections::HashMap<String, usize>) {
+    for sp in spans {
+        match sp {
+            InlineSpan::Text(s)
+            | InlineSpan::Bold(s)
+            | InlineSpan::Italic(s)
+            | InlineSpan::BoldItalic(s)
+            | InlineSpan::Strikethrough(s)
+            | InlineSpan::Code(s)
+            | InlineSpan::Math(s) => resolve_eq_refs_in_text(s, labels),
+            InlineSpan::Link { text, .. } => resolve_eq_refs_in_text(text, labels),
+        }
+    }
+}
+
+fn resolve_eq_refs_in_blocks(blocks: &mut [MdBlock], labels: &std::collections::HashMap<String, usize>) {
+    for b in blocks {
+        match b {
+            MdBlock::Heading { spans, .. } | MdBlock::Paragraph(spans) => {
+                resolve_eq_refs_in_spans(spans, labels);
+            }
+            MdBlock::Blockquote(inner) => resolve_eq_refs_in_blocks(inner, labels),
+            MdBlock::Table { headers, rows, .. } => {
+                for h in headers {
+                    resolve_eq_refs_in_spans(h, labels);
+                }
+                for row in rows {
+                    for cell in row {
+                        resolve_eq_refs_in_spans(cell, labels);
+                    }
+                }
+            }
+            MdBlock::List { items, .. } => {
+                for item in items {
+                    resolve_eq_refs_in_spans(&mut item.spans, labels);
+                    resolve_eq_refs_in_blocks(&mut item.sublists, labels);
+                }
+            }
+            MdBlock::CodeBlock { .. }
+            | MdBlock::MathBlock(_)
+            | MdBlock::Image { .. }
+            | MdBlock::HorizontalRule => {}
+        }
     }
 }
 
@@ -546,5 +681,36 @@ Speed & Fast \\
         assert!(doc.blocks.iter().any(|b| matches!(b, MdBlock::MathBlock(_))));
         assert!(doc.blocks.iter().any(|b| matches!(b, MdBlock::Table { .. })));
         assert!(doc.blocks.iter().any(|b| matches!(b, MdBlock::Image { path, .. } if path == "diagram.png")));
+    }
+
+    #[test]
+    fn test_latex_equation_numbers_and_eqref_resolution() {
+        let tex = r#"
+\begin{document}
+See \eqref{eq:einstein} and \ref{eq:euler} below.
+
+\begin{equation}\label{eq:einstein}
+E = mc^2
+\end{equation}
+
+\begin{equation*}
+a + b = c
+\end{equation*}
+
+\begin{align}\label{eq:euler}
+e^{i\pi} + 1 = 0
+\end{align}
+\end{document}
+"#;
+        let doc = parse_latex(tex, "eq.tex", None);
+        let para_txt = match &doc.blocks[0] {
+            MdBlock::Paragraph(spans) => spans_to_plain_text(spans),
+            other => panic!("expected paragraph, got {other:?}"),
+        };
+        assert!(para_txt.contains("(1)"), "expected (1) in '{para_txt}'");
+        assert!(para_txt.contains("2"), "expected 2 in '{para_txt}'");
+        assert!(matches!(&doc.blocks[1], MdBlock::MathBlock(t) if t == "E = mc^2\\eqno(1)"));
+        assert!(matches!(&doc.blocks[2], MdBlock::MathBlock(t) if t == "a + b = c"));
+        assert!(matches!(&doc.blocks[3], MdBlock::MathBlock(t) if t.ends_with("\\eqno(2)")));
     }
 }
