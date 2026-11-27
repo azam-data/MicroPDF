@@ -198,39 +198,56 @@ impl<'a> PdfViewerApp<'a> {
 
         let layout_mode = self.effective_layout_mode();
         let on_page_view = self.view_mode.is_page_view();
+        let distinct_studio = self.ui_skin == super::theme::UiSkin::Distinct
+            && matches!(
+                self.active_doc_kind(),
+                super::theme::DocKind::Markdown | super::theme::DocKind::LaTeX
+            );
 
-        // Group 0: Bookmarks Sidebar & Thumbnail Grid (left of Page Selector)
-        let g_panels = vec![
-            mk_icon(sq_w, BottomBarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks),
-            mk_icon(sq_w, BottomBarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid),
-        ];
-        // Group 1: Page Nav (< | 1/12 | >)
-        let g_pages = vec![
-            mk_icon(sq_w, BottomBarAction::PrevPage, UiIcon::ChevronLeft, false),
-            mk_lbl(page_pill_w, BottomBarAction::PageJump, page_txt, None, matches!(self.input_mode, InputMode::JumpToPage { .. })),
-            mk_icon(sq_w, BottomBarAction::NextPage, UiIcon::ChevronRight, false),
-        ];
+        // Group 0: Bookmarks/Outline Sidebar & Thumbnail Grid (left of Page Selector)
+        let g_panels = if distinct_studio {
+            vec![mk_icon(sq_w, BottomBarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks)]
+        } else {
+            vec![
+                mk_icon(sq_w, BottomBarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks),
+                mk_icon(sq_w, BottomBarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid),
+            ]
+        };
+        // Group 1: Page Nav / Reading Stats pill
+        let g_pages = if distinct_studio {
+            vec![mk_lbl(page_pill_w, BottomBarAction::PageJump, page_txt, None, false)]
+        } else {
+            vec![
+                mk_icon(sq_w, BottomBarAction::PrevPage, UiIcon::ChevronLeft, false),
+                mk_lbl(page_pill_w, BottomBarAction::PageJump, page_txt, None, matches!(self.input_mode, InputMode::JumpToPage { .. })),
+                mk_icon(sq_w, BottomBarAction::NextPage, UiIcon::ChevronRight, false),
+            ]
+        };
         // Group 2: Zoom (- | 100% | +)
         let g_zoom = vec![
             mk_icon(sq_w, BottomBarAction::ZoomOut, UiIcon::ZoomOut, false),
             mk_lbl(zoom_pill_w, BottomBarAction::ZoomReset, zoom_txt, None, false),
             mk_icon(sq_w, BottomBarAction::ZoomIn, UiIcon::ZoomIn, false),
         ];
-        // Group 3: Layout/Fit Modes + Independent Scroll Flow + Text View
-        let g_views = vec![
-            mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, on_page_view && layout_mode == ViewMode::FitPage),
-            mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, on_page_view && layout_mode == ViewMode::FitWidth),
-            mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, on_page_view && layout_mode == ViewMode::FitTextWidth),
-            mk_icon(sq_w, BottomBarAction::TwoPage, UiIcon::TwoPage, on_page_view && layout_mode == ViewMode::TwoPageSpread),
-            mk_lbl(
-                scroll_pill_w,
-                BottomBarAction::Continuous,
-                scroll_txt,
-                Some(UiIcon::Continuous),
-                scroll_mode != ScrollMode::SinglePage || self.show_scroll_mode_popover,
-            ),
-            mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
-        ];
+        // Group 3: Layout/Fit Modes + Independent Scroll Flow + Text View (PDF only in Distinct mode)
+        let g_views = if distinct_studio {
+            Vec::new()
+        } else {
+            vec![
+                mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, on_page_view && layout_mode == ViewMode::FitPage),
+                mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, on_page_view && layout_mode == ViewMode::FitWidth),
+                mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, on_page_view && layout_mode == ViewMode::FitTextWidth),
+                mk_icon(sq_w, BottomBarAction::TwoPage, UiIcon::TwoPage, on_page_view && layout_mode == ViewMode::TwoPageSpread),
+                mk_lbl(
+                    scroll_pill_w,
+                    BottomBarAction::Continuous,
+                    scroll_txt,
+                    Some(UiIcon::Continuous),
+                    scroll_mode != ScrollMode::SinglePage || self.show_scroll_mode_popover,
+                ),
+                mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
+            ]
+        };
         // Group 4: Reading Filter picker pill
         let g_filter = vec![mk_lbl(
             filter_pill_w,
@@ -239,11 +256,15 @@ impl<'a> PdfViewerApp<'a> {
             Some(UiIcon::Filter),
             self.reading_filter != ReadingFilter::Normal || self.show_reading_mode_popover,
         )];
-        // Group 5: Fullscreen & Presentation
-        let g_focus = vec![
-            mk_icon(sq_w, BottomBarAction::Fullscreen, UiIcon::Fullscreen, self.is_fullscreen),
-            mk_icon(sq_w, BottomBarAction::Presentation, UiIcon::Presentation, self.is_presentation),
-        ];
+        // Group 5: Fullscreen (& Presentation for PDF/Classic)
+        let g_focus = if distinct_studio {
+            vec![mk_icon(sq_w, BottomBarAction::Fullscreen, UiIcon::Fullscreen, self.is_fullscreen)]
+        } else {
+            vec![
+                mk_icon(sq_w, BottomBarAction::Fullscreen, UiIcon::Fullscreen, self.is_fullscreen),
+                mk_icon(sq_w, BottomBarAction::Presentation, UiIcon::Presentation, self.is_presentation),
+            ]
+        };
 
         let group_width = |g: &[BottomWidgetRect]| -> i32 {
             let mut sum = 0i32;
@@ -262,6 +283,9 @@ impl<'a> PdfViewerApp<'a> {
         let mut chosen: Vec<&[BottomWidgetRect]> = Vec::new();
         let mut total_w = 0i32;
         for g in &all_groups {
+            if g.is_empty() {
+                continue;
+            }
             let gw = group_width(g);
             let extra = if chosen.is_empty() { gw } else { sep_pad * 2 + gw };
             if !chosen.is_empty() && total_w + extra > max_center_w {

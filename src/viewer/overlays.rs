@@ -556,6 +556,7 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add", false),
             InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save", false),
             InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach", false),
+            InputMode::EpubNotePrompt { text_input, .. } => ("Add Highlight Note", "Type note for the highlighted passage and press Enter", text_input.clone(), "Save Note", false),
             InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place", false),
             InputMode::EditAnnotationText { label, text_input, .. } => (
                 *label,
@@ -740,7 +741,7 @@ impl<'a> PdfViewerApp<'a> {
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let key_sz = (10.5 * s).clamp(9.0, 22.0);
 
-        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.4", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.7", title_sz, theme.text_primary, true);
         let close_hint = "Esc or Click to close";
         let chw = measure_text(close_hint, key_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + cw as i32 - pad - chw.ceil() as i32, cy + (17.0 * s).round() as i32, close_hint, key_sz, theme.text_muted, false);
@@ -752,11 +753,11 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
-            ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
+            ("B / A / L", "Sidebar (Book/Outline/Bookmarks) / Add / Import .txt"),
             ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
+            ("V / Aa", "Reading Modes (V) / EPUB Aa Fonts, Margins & Spread"),
             ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
@@ -764,19 +765,19 @@ impl<'a> PdfViewerApp<'a> {
             ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
             ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
-            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup Line (Shift+D) / Comment (/)"),
-            ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
+            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup (Shift+D) / Comment (/)"),
+            ("Pop Out ↗", "Detach .md/.tex Editor Window (Dock Back restores Split)"),
+            ("Drag / 2×Div", "EPUB Highlight/Note pill; Drag Split Divider (2×=50/50)"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
-            ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
-            ("P / Z / U", "Stamps & Signatures / Optimize / Flatten & Unlock"),
+            ("N / H / P / Z", "Page Numbers / Header & Footer / Stamps / Optimize"),
             ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
-            ("Help Menu", "Step-by-Step User Guide, Compare PDFs & Ruler"),
+            ("Help Menu", "User Guide, UI Skin (Classic/Distinct), Compare & Ruler"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;
         let row_h = (35.0 * s).round() as i32;
         let start_y = cy + (54.0 * s).round() as i32;
-        let key_w = (82.0 * s).round() as u32;
+        let key_w = (92.0 * s).round().min((col_w as f32 * 0.34).round()) as u32;
         let key_h = (22.0 * s).round() as u32;
 
         for (col_idx, list) in [left_items, right_items].iter().enumerate() {

@@ -130,6 +130,10 @@ impl<'a> PdfViewerApp<'a> {
                     list.push(format!("★ {}", title));
                 }
             }
+        } else if cat == MenuCategory::Help {
+            if let Some(slot) = list.get_mut(3) {
+                *slot = format!("UI Skin: Classic / Distinct ({})", self.ui_skin.label());
+            }
         }
         list
     }
@@ -163,6 +167,7 @@ impl<'a> PdfViewerApp<'a> {
             (MenuCategory::Edit, 11) => self.mouse_mode == MouseMode::ArrowShape,
             (MenuCategory::Edit, 13) => self.mouse_mode == MouseMode::Redact,
             (MenuCategory::Edit, 14) => self.mouse_mode == MouseMode::Crop,
+            (MenuCategory::Help, 3) => self.ui_skin == super::theme::UiSkin::Distinct,
             _ => false,
         }
     }
@@ -267,6 +272,7 @@ impl<'a> PdfViewerApp<'a> {
                 || (cat == MenuCategory::Edit && (idx == 3 || idx == 13))
                 || (cat == MenuCategory::Page && (idx == 2 || idx == 5))
                 || (cat == MenuCategory::Export && idx == 2)
+                || (cat == MenuCategory::Help && idx == 3)
             {
                 fill_rect_clipped(
                     buffer,
@@ -820,6 +826,11 @@ impl<'a> PdfViewerApp<'a> {
                 self.user_guide_modal = None;
             }
             (MenuCategory::Help, 3) => {
+                self.ui_skin = self.ui_skin.toggle();
+                self.save_session_to_ini();
+                self.status_notice = Some(format!("UI Skin: {}", self.ui_skin.label()));
+            }
+            (MenuCategory::Help, 4) => {
                 self.show_about_overlay = !self.show_about_overlay;
                 self.show_help_overlay = false;
                 self.show_bookmark_format_overlay = false;

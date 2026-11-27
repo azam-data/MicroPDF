@@ -20,6 +20,8 @@ flate2 = "1"
 rust_xlsxwriter = "0.84"
 pulldown-cmark = { version = "0.13", default-features = false }
 docx-rs = "0.4"
+roxmltree = "0.20"
+hypher = { version = "0.1", default-features = false, features = ["alloc", "english", "french", "german", "spanish"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"

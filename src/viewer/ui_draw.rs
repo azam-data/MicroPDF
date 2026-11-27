@@ -2,22 +2,111 @@
 //! typography (powered by `ab_glyph` + bounded alpha-only glyph cache).
 //! Draws directly into the existing `softbuffer` `0x00RRGGBB` pixel slice with zero GPU overhead.
 
-use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use ab_glyph::{Font, FontVec, GlyphId, PxScale, ScaleFont};
 use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 
-/// Maximum memory allowed for cached alpha-only glyph bitmaps (256 KB).
-pub const MAX_GLYPH_CACHE_BYTES: usize = 256 * 1024;
+/// Maximum memory allowed for cached alpha-only glyph bitmaps (512 KB).
+pub const MAX_GLYPH_CACHE_BYTES: usize = 512 * 1024;
 
 static REGULAR_FONT_Z: &[u8] = include_bytes!("../../assets/ui_regular.ttf.z");
 static BOLD_FONT_Z: &[u8] = include_bytes!("../../assets/ui_bold.ttf.z");
+static BOOK_SERIF_REGULAR_Z: &[u8] = include_bytes!("../../assets/book_serif_regular.ttf.z");
+static BOOK_SERIF_BOLD_Z: &[u8] = include_bytes!("../../assets/book_serif_bold.ttf.z");
+static BOOK_SERIF_ITALIC_Z: &[u8] = include_bytes!("../../assets/book_serif_italic.ttf.z");
+static CODE_MONO_REGULAR_Z: &[u8] = include_bytes!("../../assets/code_mono_regular.ttf.z");
+
+/// Supported typography families for MicroPDF's CPU text engine.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FontFamily {
+    UiSans,
+    BookSerif,
+    CodeMono,
+    CustomOs,
+}
+
+/// Complete styled text parameters for `measure_text_styled` and `draw_text_styled_clipped`.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct TextStyle {
+    pub family: FontFamily,
+    pub size_px: f32,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TextStyle {
+    pub const fn ui(size_px: f32, bold: bool) -> Self {
+        Self {
+            family: FontFamily::UiSans,
+            size_px,
+            bold,
+            italic: false,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub const fn book(size_px: f32, bold: bool, italic: bool) -> Self {
+        Self {
+            family: FontFamily::BookSerif,
+            size_px,
+            bold,
+            italic,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub const fn mono(size_px: f32) -> Self {
+        Self {
+            family: FontFamily::CodeMono,
+            size_px,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self::ui(12.0, false)
+    }
+}
+
+struct CustomOsFontSlot {
+    requested_name: Option<String>,
+    font: Option<FontVec>,
+    is_native_italic: bool,
+}
+
+impl CustomOsFontSlot {
+    fn empty() -> Self {
+        Self {
+            requested_name: None,
+            font: None,
+            is_native_italic: false,
+        }
+    }
+}
 
 struct FontBank {
     regular: Option<FontVec>,
     bold: Option<FontVec>,
+    book_regular: OnceLock<Option<FontVec>>,
+    book_bold: OnceLock<Option<FontVec>>,
+    book_italic: OnceLock<Option<FontVec>>,
+    code_mono: OnceLock<Option<FontVec>>,
+    custom_os: Mutex<CustomOsFontSlot>,
     fallback: Mutex<Option<Option<FontVec>>>,
     cache: Mutex<GlyphCache>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct GlyphKey {
+    ch: char,
+    size_q4: u16,
+    family: FontFamily,
+    bold: bool,
+    italic: bool,
 }
 
 struct CachedGlyph {
@@ -26,11 +115,13 @@ struct CachedGlyph {
     left: i32,
     top: i32,
     advance: f32,
+    gid: u16,
+    from_primary: bool,
     alpha: Vec<u8>,
 }
 
 struct GlyphCache {
-    entries: HashMap<(char, u16, bool), CachedGlyph>,
+    entries: HashMap<GlyphKey, CachedGlyph>,
     total_bytes: usize,
 }
 
@@ -91,63 +182,290 @@ fn font_bank() -> &'static FontBank {
     BANK.get_or_init(|| FontBank {
         regular: decompress_font(REGULAR_FONT_Z),
         bold: decompress_font(BOLD_FONT_Z),
+        book_regular: OnceLock::new(),
+        book_bold: OnceLock::new(),
+        book_italic: OnceLock::new(),
+        code_mono: OnceLock::new(),
+        custom_os: Mutex::new(CustomOsFontSlot::empty()),
         fallback: Mutex::new(None),
         cache: Mutex::new(GlyphCache::new()),
     })
 }
 
-fn rasterize_glyph(ch: char, size_px: f32, bold: bool) -> CachedGlyph {
+/// Returns `(font_ref, is_native_italic)` for a built-in embedded font family.
+fn resolve_builtin_font(
+    family: FontFamily,
+    bold: bool,
+    italic: bool,
+) -> (Option<&'static FontVec>, bool) {
     let bank = font_bank();
-    let primary = if bold {
-        bank.bold.as_ref().or(bank.regular.as_ref())
-    } else {
-        bank.regular.as_ref()
+    match family {
+        FontFamily::UiSans => {
+            let f = if bold {
+                bank.bold.as_ref().or(bank.regular.as_ref())
+            } else {
+                bank.regular.as_ref()
+            };
+            (f, false)
+        }
+        FontFamily::BookSerif | FontFamily::CustomOs => {
+            if italic && !bold {
+                let f = bank
+                    .book_italic
+                    .get_or_init(|| decompress_font(BOOK_SERIF_ITALIC_Z))
+                    .as_ref();
+                if f.is_some() {
+                    return (f, true);
+                }
+            }
+            if bold {
+                let f = bank
+                    .book_bold
+                    .get_or_init(|| decompress_font(BOOK_SERIF_BOLD_Z))
+                    .as_ref();
+                if f.is_some() {
+                    return (f, false);
+                }
+            }
+            let f = bank
+                .book_regular
+                .get_or_init(|| decompress_font(BOOK_SERIF_REGULAR_Z))
+                .as_ref();
+            (f, false)
+        }
+        FontFamily::CodeMono => {
+            let f = bank
+                .code_mono
+                .get_or_init(|| decompress_font(CODE_MONO_REGULAR_Z))
+                .as_ref();
+            (f, false)
+        }
+    }
+}
+
+/// Lazily loads (or clears when `None`) an OS TrueType/OpenType font into the `CustomOs` slot
+/// using `crate::fonts::global_system_fonts()`. Uses 0 bytes of RAM until called with `Some(...)`.
+#[allow(dead_code)]
+pub fn set_custom_os_font(font_name: Option<&str>) -> bool {
+    let bank = font_bank();
+    let trimmed = font_name.map(|s| s.trim()).filter(|s| !s.is_empty());
+
+    let Some(name) = trimmed else {
+        if let Ok(mut guard) = bank.custom_os.lock() {
+            *guard = CustomOsFontSlot::empty();
+        }
+        evict_custom_os_glyphs();
+        return true;
     };
 
+    if let Ok(guard) = bank.custom_os.lock() {
+        if guard
+            .requested_name
+            .as_deref()
+            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            && guard.font.is_some()
+        {
+            return true;
+        }
+    }
+
+    let catalog = crate::fonts::global_system_fonts();
+    let needle = name.to_ascii_lowercase();
+    let matched = catalog
+        .iter()
+        .find(|e| e.path.is_some() && e.display_name.eq_ignore_ascii_case(name))
+        .or_else(|| {
+            catalog.iter().find(|e| {
+                e.path.is_some() && e.display_name.to_ascii_lowercase().starts_with(&needle)
+            })
+        })
+        .or_else(|| {
+            catalog.iter().find(|e| {
+                e.path.is_some() && e.display_name.to_ascii_lowercase().contains(&needle)
+            })
+        });
+
+    let loaded = matched.and_then(|entry| {
+        let path = entry.path.as_ref()?;
+        let bytes = std::fs::read(path).ok()?;
+        let font = FontVec::try_from_vec(bytes).ok()?;
+        let lower = entry.display_name.to_ascii_lowercase();
+        let is_italic = lower.contains("italic") || lower.contains("oblique");
+        Some((entry.display_name.clone(), font, is_italic))
+    });
+
+    let ok = loaded.is_some();
+    if let Ok(mut guard) = bank.custom_os.lock() {
+        if let Some((display_name, font, is_native_italic)) = loaded {
+            *guard = CustomOsFontSlot {
+                requested_name: Some(display_name),
+                font: Some(font),
+                is_native_italic,
+            };
+        } else {
+            *guard = CustomOsFontSlot::empty();
+        }
+    }
+    evict_custom_os_glyphs();
+    ok
+}
+
+#[allow(dead_code)]
+pub fn active_custom_os_font_name() -> Option<String> {
+    font_bank()
+        .custom_os
+        .lock()
+        .ok()
+        .and_then(|g| g.requested_name.clone())
+}
+
+fn evict_custom_os_glyphs() {
+    let bank = font_bank();
+    let mut cache = bank.cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut removed_bytes = 0usize;
+    cache.entries.retain(|k, v| {
+        if k.family == FontFamily::CustomOs {
+            removed_bytes += v.alpha.len()
+                + std::mem::size_of::<CachedGlyph>()
+                + std::mem::size_of::<GlyphKey>()
+                + 16;
+            false
+        } else {
+            true
+        }
+    });
+    cache.total_bytes = cache.total_bytes.saturating_sub(removed_bytes);
+}
+
+fn apply_synthetic_italic(
+    w: u32,
+    h: u32,
+    left: i32,
+    top: i32,
+    ascent: f32,
+    alpha: Vec<u8>,
+) -> (u32, i32, Vec<u8>) {
+    if w == 0 || h == 0 {
+        return (w, left, alpha);
+    }
+    let shear = 0.21f32;
+    let y_top_rel = (top as f32) - ascent;
+    let y_bot_rel = ((top + h as i32) as f32) - ascent;
+    let shift_top = -y_top_rel * shear;
+    let shift_bot = -y_bot_rel * shear;
+    let min_shift = shift_top.min(shift_bot).floor() as i32;
+    let max_shift = shift_top.max(shift_bot).ceil() as i32;
+    let extra_w = (max_shift - min_shift).max(0) as u32;
+    let new_w = w + extra_w;
+    let mut out = vec![0u8; (new_w * h) as usize];
+
+    for row in 0..h {
+        let y_rel = (top + row as i32) as f32 - ascent;
+        let dx = -y_rel * shear - (min_shift as f32);
+        let dx_i = dx.floor() as i32;
+        let frac = dx - (dx_i as f32);
+        let src_row = (row * w) as usize;
+        let dst_row = (row * new_w) as usize;
+        for col in 0..w {
+            let a = alpha[src_row + col as usize] as f32;
+            if a == 0.0 {
+                continue;
+            }
+            let c0 = col as i32 + dx_i;
+            let c1 = c0 + 1;
+            if c0 >= 0 && (c0 as u32) < new_w {
+                let idx = dst_row + c0 as usize;
+                let v = (out[idx] as f32 + a * (1.0 - frac)).round().clamp(0.0, 255.0) as u8;
+                out[idx] = v;
+            }
+            if c1 >= 0 && (c1 as u32) < new_w {
+                let idx = dst_row + c1 as usize;
+                let v = (out[idx] as f32 + a * frac).round().clamp(0.0, 255.0) as u8;
+                out[idx] = v;
+            }
+        }
+    }
+    (new_w, left + min_shift, out)
+}
+
+fn rasterize_glyph_with_font(
+    font: &FontVec,
+    ch: char,
+    scale: PxScale,
+    synthetic_italic: bool,
+    from_primary: bool,
+) -> Option<CachedGlyph> {
+    let gid = font.glyph_id(ch);
+    if gid.0 == 0 && ch != ' ' && ch != '\t' {
+        return None;
+    }
+    let scaled = font.as_scaled(scale);
+    let advance = scaled.h_advance(gid);
+    let ascent = scaled.ascent();
+    let glyph = gid.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
+    if let Some(outlined) = font.outline_glyph(glyph) {
+        let bounds = outlined.px_bounds();
+        let w = (bounds.max.x - bounds.min.x).ceil().max(0.0) as u32;
+        let h = (bounds.max.y - bounds.min.y).ceil().max(0.0) as u32;
+        let mut alpha = vec![0u8; (w * h) as usize];
+        outlined.draw(|gx, gy, cov| {
+            if gx < w && gy < h {
+                let a = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
+                alpha[(gy * w + gx) as usize] = a;
+            }
+        });
+        let left = bounds.min.x.floor() as i32;
+        let top = bounds.min.y.floor() as i32;
+        let (final_w, final_left, final_alpha) = if synthetic_italic {
+            apply_synthetic_italic(w, h, left, top, ascent, alpha)
+        } else {
+            (w, left, alpha)
+        };
+        Some(CachedGlyph {
+            width: final_w,
+            height: h,
+            left: final_left,
+            top,
+            advance,
+            gid: gid.0,
+            from_primary,
+            alpha: final_alpha,
+        })
+    } else {
+        Some(CachedGlyph {
+            width: 0,
+            height: 0,
+            left: 0,
+            top: 0,
+            advance,
+            gid: gid.0,
+            from_primary,
+            alpha: Vec::new(),
+        })
+    }
+}
+
+fn rasterize_glyph_styled(ch: char, size_px: f32, style: TextStyle) -> CachedGlyph {
+    let bank = font_bank();
     let scale = PxScale::from(size_px.max(6.0));
 
-    let try_font = |font: &FontVec| -> Option<CachedGlyph> {
-        let gid = font.glyph_id(ch);
-        if gid.0 == 0 && ch != ' ' && ch != '\t' {
-            return None;
-        }
-        let scaled = font.as_scaled(scale);
-        let advance = scaled.h_advance(gid);
-        let ascent = scaled.ascent();
-        let glyph = gid.with_scale_and_position(scale, ab_glyph::point(0.0, ascent));
-        if let Some(outlined) = font.outline_glyph(glyph) {
-            let bounds = outlined.px_bounds();
-            let w = (bounds.max.x - bounds.min.x).ceil().max(0.0) as u32;
-            let h = (bounds.max.y - bounds.min.y).ceil().max(0.0) as u32;
-            let mut alpha = vec![0u8; (w * h) as usize];
-            outlined.draw(|gx, gy, cov| {
-                if gx < w && gy < h {
-                    let a = (cov.clamp(0.0, 1.0) * 255.0).round() as u8;
-                    alpha[(gy * w + gx) as usize] = a;
+    // Try CustomOs font slot first if requested
+    if style.family == FontFamily::CustomOs {
+        if let Ok(guard) = bank.custom_os.lock() {
+            if let Some(ref custom_font) = guard.font {
+                let synth_italic = style.italic && !guard.is_native_italic;
+                if let Some(g) = rasterize_glyph_with_font(custom_font, ch, scale, synth_italic, true) {
+                    return g;
                 }
-            });
-            Some(CachedGlyph {
-                width: w,
-                height: h,
-                left: bounds.min.x.floor() as i32,
-                top: bounds.min.y.floor() as i32,
-                advance,
-                alpha,
-            })
-        } else {
-            Some(CachedGlyph {
-                width: 0,
-                height: 0,
-                left: 0,
-                top: 0,
-                advance,
-                alpha: Vec::new(),
-            })
+            }
         }
-    };
+    }
+
+    let (primary, is_native_italic) = resolve_builtin_font(style.family, style.bold, style.italic);
+    let synth_italic = style.italic && !is_native_italic;
 
     if let Some(font) = primary {
-        if let Some(g) = try_font(font) {
+        if let Some(g) = rasterize_glyph_with_font(font, ch, scale, synth_italic, true) {
             return g;
         }
     }
@@ -157,7 +475,7 @@ fn rasterize_glyph(ch: char, size_px: f32, bold: bool) -> CachedGlyph {
         if let Ok(mut fb_guard) = bank.fallback.lock() {
             let fb_ref = fb_guard.get_or_insert_with(load_os_fallback_font);
             if let Some(font) = fb_ref.as_ref() {
-                if let Some(g) = try_font(font) {
+                if let Some(g) = rasterize_glyph_with_font(font, ch, scale, synth_italic, false) {
                     return g;
                 }
             }
@@ -174,19 +492,38 @@ fn rasterize_glyph(ch: char, size_px: f32, bold: bool) -> CachedGlyph {
         left: 0,
         top: 0,
         advance: adv,
+        gid: 0,
+        from_primary: false,
         alpha: Vec::new(),
     }
 }
 
-fn with_cached_glyph<R>(ch: char, size_px: f32, bold: bool, f: impl FnOnce(&CachedGlyph) -> R) -> R {
-    let size_key = (size_px.clamp(6.0, 96.0) * 4.0).round() as u16;
-    let snapped_px = (size_key as f32) / 4.0;
-    let key = (ch, size_key, bold);
+fn snap_size_q4(size_px: f32) -> (u16, f32) {
+    let q4 = (size_px.clamp(6.0, 96.0) * 4.0).round() as u16;
+    (q4, (q4 as f32) / 4.0)
+}
+
+fn with_cached_glyph_styled<R>(
+    ch: char,
+    style: TextStyle,
+    f: impl FnOnce(&CachedGlyph) -> R,
+) -> R {
+    let (size_q4, snapped_px) = snap_size_q4(style.size_px);
+    let key = GlyphKey {
+        ch,
+        size_q4,
+        family: style.family,
+        bold: style.bold,
+        italic: style.italic,
+    };
     let bank = font_bank();
     let mut cache = bank.cache.lock().unwrap_or_else(|e| e.into_inner());
     if !cache.entries.contains_key(&key) {
-        let glyph = rasterize_glyph(ch, snapped_px, bold);
-        let bytes = glyph.alpha.len() + std::mem::size_of::<CachedGlyph>() + 16;
+        let glyph = rasterize_glyph_styled(ch, snapped_px, style);
+        let bytes = glyph.alpha.len()
+            + std::mem::size_of::<CachedGlyph>()
+            + std::mem::size_of::<GlyphKey>()
+            + 16;
         if cache.total_bytes + bytes > MAX_GLYPH_CACHE_BYTES {
             cache.entries.clear();
             cache.total_bytes = 0;
@@ -195,6 +532,25 @@ fn with_cached_glyph<R>(ch: char, size_px: f32, bold: bool, f: impl FnOnce(&Cach
         cache.entries.insert(key, glyph);
     }
     f(&cache.entries[&key])
+}
+
+fn kern_pair_for_style(style: TextStyle, scale: PxScale, prev_gid: u16, cur_gid: u16) -> f32 {
+    if prev_gid == 0 || cur_gid == 0 {
+        return 0.0;
+    }
+    let g1 = GlyphId(prev_gid);
+    let g2 = GlyphId(cur_gid);
+    if style.family == FontFamily::CustomOs {
+        if let Ok(guard) = font_bank().custom_os.lock() {
+            if let Some(ref custom_font) = guard.font {
+                return custom_font.as_scaled(scale).kern(g1, g2);
+            }
+        }
+    }
+    let (primary, _) = resolve_builtin_font(style.family, style.bold, style.italic);
+    primary
+        .map(|f| f.as_scaled(scale).kern(g1, g2))
+        .unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -206,44 +562,80 @@ pub fn glyph_cache_bytes() -> usize {
         .byte_len()
 }
 
-/// Measures the horizontal advance width of `text` at `size_px`.
-pub fn measure_text(text: &str, size_px: f32, bold: bool) -> f32 {
+/// Measures the horizontal advance width of `text` using `style` (including real kerning pairs).
+pub fn measure_text_styled(text: &str, style: TextStyle) -> f32 {
+    let (_, snapped_px) = snap_size_q4(style.size_px);
+    let scale = PxScale::from(snapped_px);
     let mut w = 0.0f32;
+    let mut prev_gid: Option<u16> = None;
     for ch in text.chars() {
-        w += with_cached_glyph(ch, size_px, bold, |g| g.advance);
+        let (adv, gid, from_primary) =
+            with_cached_glyph_styled(ch, style, |g| (g.advance, g.gid, g.from_primary));
+        if from_primary {
+            if let Some(pg) = prev_gid {
+                w += kern_pair_for_style(style, scale, pg, gid);
+            }
+            prev_gid = Some(gid);
+        } else {
+            prev_gid = None;
+        }
+        w += adv;
     }
     w
 }
 
-/// Truncates `text` with `"..."` so its measured width does not exceed `max_w`.
-pub fn truncate_ellipsis(text: &str, max_w: f32, size_px: f32, bold: bool) -> String {
+/// Measures the horizontal advance width of `text` at `size_px` using `UiSans`.
+pub fn measure_text(text: &str, size_px: f32, bold: bool) -> f32 {
+    measure_text_styled(text, TextStyle::ui(size_px, bold))
+}
+
+/// Truncates `text` with `"…"` so its styled measured width does not exceed `max_w`.
+#[allow(dead_code)]
+pub fn truncate_ellipsis_styled(text: &str, max_w: f32, style: TextStyle) -> String {
     if max_w <= 4.0 {
         return String::new();
     }
-    if measure_text(text, size_px, bold) <= max_w {
+    if measure_text_styled(text, style) <= max_w {
         return text.to_string();
     }
+    let (_, snapped_px) = snap_size_q4(style.size_px);
+    let scale = PxScale::from(snapped_px);
     let ell = "…";
-    let ell_w = measure_text(ell, size_px, bold);
+    let ell_w = measure_text_styled(ell, style);
     let budget = (max_w - ell_w).max(0.0);
     let mut out = String::new();
     let mut cur_w = 0.0f32;
+    let mut prev_gid: Option<u16> = None;
     for ch in text.chars() {
-        let adv = with_cached_glyph(ch, size_px, bold, |g| g.advance);
-        if cur_w + adv > budget {
+        let (adv, gid, from_primary) =
+            with_cached_glyph_styled(ch, style, |g| (g.advance, g.gid, g.from_primary));
+        let k = if from_primary {
+            prev_gid
+                .map(|pg| kern_pair_for_style(style, scale, pg, gid))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        if cur_w + k + adv > budget {
             break;
         }
-        cur_w += adv;
+        cur_w += k + adv;
+        prev_gid = if from_primary { Some(gid) } else { None };
         out.push(ch);
     }
     out.push_str(ell);
     out
 }
 
-/// Draws antialiased proportional text starting at `(x, y_top)` and clipped horizontally to `max_x`.
-/// Returns the x-coordinate after the last drawn glyph.
+/// Truncates `text` with `"..."` so its measured width does not exceed `max_w`.
+pub fn truncate_ellipsis(text: &str, max_w: f32, size_px: f32, bold: bool) -> String {
+    truncate_ellipsis_styled(text, max_w, TextStyle::ui(size_px, bold))
+}
+
+/// Draws antialiased proportional styled text (with real kerning pairs) starting at `(x, y_top)`
+/// and clipped horizontally to `max_x`. Returns the x-coordinate after the last drawn glyph.
 #[allow(clippy::too_many_arguments)]
-pub fn draw_text_clipped(
+pub fn draw_text_styled_clipped(
     buffer: &mut [u32],
     buf_w: u32,
     buf_h: u32,
@@ -251,21 +643,36 @@ pub fn draw_text_clipped(
     y_top: i32,
     max_x: i32,
     text: &str,
-    size_px: f32,
+    style: TextStyle,
     color: u32,
-    bold: bool,
 ) -> i32 {
     let sr = (color >> 16) & 0xFF;
     let sg = (color >> 8) & 0xFF;
     let sb = color & 0xFF;
     let clip_right = max_x.min(buf_w as i32);
+    let (_, snapped_px) = snap_size_q4(style.size_px);
+    let scale = PxScale::from(snapped_px);
     let mut pen_x = x as f32;
+    let mut prev_gid: Option<u16> = None;
 
     for ch in text.chars() {
         if pen_x.floor() as i32 >= clip_right {
             break;
         }
-        with_cached_glyph(ch, size_px, bold, |g| {
+        let (gid, from_primary) =
+            with_cached_glyph_styled(ch, style, |g| (g.gid, g.from_primary));
+        if from_primary {
+            if let Some(pg) = prev_gid {
+                pen_x += kern_pair_for_style(style, scale, pg, gid);
+            }
+            prev_gid = Some(gid);
+        } else {
+            prev_gid = None;
+        }
+        if pen_x.floor() as i32 >= clip_right {
+            break;
+        }
+        with_cached_glyph_styled(ch, style, |g| {
             let gx0 = pen_x.round() as i32 + g.left;
             let gy0 = y_top + g.top;
             for row in 0..g.height {
@@ -306,6 +713,34 @@ pub fn draw_text_clipped(
     pen_x.round() as i32
 }
 
+/// Draws antialiased proportional text starting at `(x, y_top)` and clipped horizontally to `max_x`.
+/// Returns the x-coordinate after the last drawn glyph.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_text_clipped(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    x: i32,
+    y_top: i32,
+    max_x: i32,
+    text: &str,
+    size_px: f32,
+    color: u32,
+    bold: bool,
+) -> i32 {
+    draw_text_styled_clipped(
+        buffer,
+        buf_w,
+        buf_h,
+        x,
+        y_top,
+        max_x,
+        text,
+        TextStyle::ui(size_px, bold),
+        color,
+    )
+}
+
 /// Convenience wrapper without an explicit right clip beyond `buf_w`.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_text(
@@ -320,6 +755,25 @@ pub fn draw_text(
     bold: bool,
 ) -> i32 {
     draw_text_clipped(buffer, buf_w, buf_h, x, y_top, buf_w as i32, text, size_px, color, bold)
+}
+
+/// Draws styled text vertically centered inside `(box_y, box_y + box_h)`.
+#[allow(clippy::too_many_arguments)]
+#[allow(dead_code)]
+pub fn draw_text_vcenter_styled(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    x: i32,
+    box_y: i32,
+    box_h: u32,
+    max_x: i32,
+    text: &str,
+    style: TextStyle,
+    color: u32,
+) -> i32 {
+    let y_top = box_y + ((box_h as f32 - style.size_px * 1.15) * 0.5).round() as i32;
+    draw_text_styled_clipped(buffer, buf_w, buf_h, x, y_top, max_x, text, style, color)
 }
 
 /// Draws text vertically centered inside `(y, y + h)`.
@@ -878,6 +1332,14 @@ pub enum UiIcon {
     Check,
     Document,
     Star,
+    #[allow(dead_code)]
+    DocPdf,
+    #[allow(dead_code)]
+    DocEpub,
+    #[allow(dead_code)]
+    DocMarkdown,
+    #[allow(dead_code)]
+    DocLatex,
 }
 
 /// Draws `icon` inside the square `(x, y, size, size)` with stroke scaled proportionally.
@@ -1259,6 +1721,190 @@ pub fn draw_icon(
             line(buffer, 0.20, 0.80, 0.78, 0.22);
             line(buffer, 0.46, 0.22, 0.78, 0.22);
             line(buffer, 0.78, 0.22, 0.78, 0.54);
+        }
+        UiIcon::DocPdf => {
+            // Folded document outline + accent ribbon bars
+            line(buffer, 0.20, 0.12, 0.60, 0.12);
+            line(buffer, 0.60, 0.12, 0.80, 0.32);
+            line(buffer, 0.80, 0.32, 0.80, 0.88);
+            line(buffer, 0.80, 0.88, 0.20, 0.88);
+            line(buffer, 0.20, 0.88, 0.20, 0.12);
+            line(buffer, 0.60, 0.12, 0.60, 0.32);
+            line(buffer, 0.60, 0.32, 0.80, 0.32);
+            line(buffer, 0.32, 0.52, 0.68, 0.52);
+            line(buffer, 0.32, 0.68, 0.58, 0.68);
+        }
+        UiIcon::DocEpub => {
+            // Open-book silhouette with central spine
+            line(buffer, 0.10, 0.22, 0.50, 0.28);
+            line(buffer, 0.50, 0.28, 0.90, 0.22);
+            line(buffer, 0.10, 0.22, 0.10, 0.74);
+            line(buffer, 0.90, 0.22, 0.90, 0.74);
+            line(buffer, 0.10, 0.74, 0.50, 0.80);
+            line(buffer, 0.50, 0.80, 0.90, 0.74);
+            line(buffer, 0.50, 0.28, 0.50, 0.80);
+            line(buffer, 0.21, 0.44, 0.39, 0.47);
+            line(buffer, 0.61, 0.47, 0.79, 0.44);
+        }
+        UiIcon::DocMarkdown => {
+            // Rounded badge + 'M↓'
+            stroke_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.06).round() as i32,
+                y + (s * 0.12).round() as i32,
+                (s * 0.88).round().max(4.0) as u32,
+                (s * 0.76).round().max(4.0) as u32,
+                (s * 0.18).max(1.5),
+                color,
+            );
+            line(buffer, 0.20, 0.68, 0.20, 0.32);
+            line(buffer, 0.20, 0.32, 0.34, 0.52);
+            line(buffer, 0.34, 0.52, 0.48, 0.32);
+            line(buffer, 0.48, 0.32, 0.48, 0.68);
+            line(buffer, 0.71, 0.30, 0.71, 0.68);
+            line(buffer, 0.60, 0.55, 0.71, 0.68);
+            line(buffer, 0.82, 0.55, 0.71, 0.68);
+        }
+        UiIcon::DocLatex => {
+            // Rounded math-doc badge + 'Σ'
+            stroke_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.06).round() as i32,
+                y + (s * 0.12).round() as i32,
+                (s * 0.88).round().max(4.0) as u32,
+                (s * 0.76).round().max(4.0) as u32,
+                (s * 0.18).max(1.5),
+                color,
+            );
+            line(buffer, 0.68, 0.30, 0.32, 0.30);
+            line(buffer, 0.32, 0.30, 0.54, 0.50);
+            line(buffer, 0.54, 0.50, 0.32, 0.70);
+            line(buffer, 0.32, 0.70, 0.68, 0.70);
+        }
+    }
+}
+
+/// Draws a crisp color-coded procedural file-type icon/mini-badge inside `(x, y, size, size)`:
+/// - **PDF**: red document badge
+/// - **EPUB**: warm amber/brown open-book icon
+/// - **Markdown**: indigo/blue `M↓` badge
+/// - **LaTeX**: emerald/teal `Σ` math-doc badge
+#[allow(clippy::too_many_arguments)]
+pub fn draw_doc_type_icon(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    kind: super::theme::DocKind,
+    x: i32,
+    y: i32,
+    size: u32,
+    dark_ui: bool,
+) {
+    if size < 4 {
+        return;
+    }
+    let s = size as f32;
+    let fx = x as f32;
+    let fy = y as f32;
+    let stroke_t = (s / 10.5).clamp(1.15, 2.2);
+    let rad = (s * 0.18).max(1.5);
+    let p = |u: f32, v: f32| -> (f32, f32) { (fx + u * s, fy + v * s) };
+    let line = |buf: &mut [u32], u0: f32, v0: f32, u1: f32, v1: f32, col: u32| {
+        let (ax, ay) = p(u0, v0);
+        let (bx, by) = p(u1, v1);
+        draw_line_aa(buf, buf_w, buf_h, ax, ay, bx, by, stroke_t, col);
+    };
+
+    match kind {
+        super::theme::DocKind::Pdf => {
+            let bg = if dark_ui { 0x0045_1A1D } else { 0x00FE_E2E2 };
+            let fg = if dark_ui { 0x00F8_7171 } else { 0x00DC_2626 };
+            let bx = x + (s * 0.12).round() as i32;
+            let by = y + (s * 0.06).round() as i32;
+            let bw = (s * 0.76).round().max(4.0) as u32;
+            let bh = (s * 0.88).round().max(4.0) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, fg);
+            // Folded corner accent + red document bar lines
+            line(buffer, 0.58, 0.10, 0.58, 0.34, fg);
+            line(buffer, 0.58, 0.34, 0.84, 0.34, fg);
+            fill_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.25).round() as i32,
+                y + (s * 0.44).round() as i32,
+                (s * 0.50).round().max(2.0) as u32,
+                (s * 0.14).round().max(1.5) as u32,
+                0.8,
+                fg,
+            );
+            line(buffer, 0.28, 0.72, 0.64, 0.72, fg);
+        }
+        super::theme::DocKind::Epub => {
+            let bg = if dark_ui { 0x003B_2A16 } else { 0x00FE_F3C7 };
+            let fg = if dark_ui { 0x00FB_BF24 } else { 0x00B4_5309 };
+            let spine = if dark_ui { 0x00F5_9E0B } else { 0x0078_350F };
+            // Warm open-book cover + pages
+            fill_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.08).round() as i32,
+                y + (s * 0.22).round() as i32,
+                (s * 0.84).round().max(4.0) as u32,
+                (s * 0.58).round().max(4.0) as u32,
+                rad,
+                bg,
+            );
+            line(buffer, 0.10, 0.22, 0.50, 0.29, fg);
+            line(buffer, 0.50, 0.29, 0.90, 0.22, fg);
+            line(buffer, 0.10, 0.22, 0.10, 0.74, fg);
+            line(buffer, 0.90, 0.22, 0.90, 0.74, fg);
+            line(buffer, 0.10, 0.74, 0.50, 0.81, fg);
+            line(buffer, 0.50, 0.81, 0.90, 0.74, fg);
+            line(buffer, 0.50, 0.29, 0.50, 0.81, spine);
+            line(buffer, 0.21, 0.44, 0.39, 0.48, spine);
+            line(buffer, 0.61, 0.48, 0.79, 0.44, spine);
+        }
+        super::theme::DocKind::Markdown => {
+            let bg = if dark_ui { 0x001E_2952 } else { 0x00E0_E7FF };
+            let fg = if dark_ui { 0x0081_8CF8 } else { 0x0043_38CA };
+            let bx = x + (s * 0.05).round() as i32;
+            let by = y + (s * 0.11).round() as i32;
+            let bw = (s * 0.90).round().max(4.0) as u32;
+            let bh = (s * 0.78).round().max(4.0) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, fg);
+            // Crisp 'M↓'
+            line(buffer, 0.19, 0.68, 0.19, 0.32, fg);
+            line(buffer, 0.19, 0.32, 0.34, 0.53, fg);
+            line(buffer, 0.34, 0.53, 0.49, 0.32, fg);
+            line(buffer, 0.49, 0.32, 0.49, 0.68, fg);
+            line(buffer, 0.71, 0.29, 0.71, 0.68, fg);
+            line(buffer, 0.60, 0.55, 0.71, 0.68, fg);
+            line(buffer, 0.82, 0.55, 0.71, 0.68, fg);
+        }
+        super::theme::DocKind::LaTeX => {
+            let bg = if dark_ui { 0x0013_362B } else { 0x00D1_FAE5 };
+            let fg = if dark_ui { 0x0034_D399 } else { 0x0005_9669 };
+            let bx = x + (s * 0.05).round() as i32;
+            let by = y + (s * 0.11).round() as i32;
+            let bw = (s * 0.90).round().max(4.0) as u32;
+            let bh = (s * 0.78).round().max(4.0) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, fg);
+            // Crisp 'Σ' math-doc emblem
+            line(buffer, 0.69, 0.30, 0.31, 0.30, fg);
+            line(buffer, 0.31, 0.30, 0.54, 0.50, fg);
+            line(buffer, 0.54, 0.50, 0.31, 0.70, fg);
+            line(buffer, 0.31, 0.70, 0.69, 0.70, fg);
+            line(buffer, 0.69, 0.30, 0.69, 0.37, fg);
+            line(buffer, 0.69, 0.70, 0.69, 0.63, fg);
         }
     }
 }

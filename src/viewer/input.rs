@@ -1059,7 +1059,8 @@ impl<'a> PdfViewerApp<'a> {
                 let top_bars_h = self.top_bars_height_px(sf);
                 let status_bar_h = self.status_bar_height_px(sf);
                 let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
-                if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                if (self.effective_scroll_mode() == ScrollMode::MagazineBook
+                    || (self.is_distinct_epub_mode() && self.epub_prefs.two_page_spread))
                     && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
                 {
                     let dir = if scroll_delta_px > 0.0 { 1 } else { -1 };
@@ -1853,23 +1854,52 @@ impl<'a> PdfViewerApp<'a> {
     fn handle_markdown_editor_key(&mut self, key: &winit::keyboard::Key, text: Option<&str>) -> bool {
         use winit::keyboard::{Key, NamedKey};
         self.ensure_md_editor_initialized();
-        let sf = self
-            .window
-            .as_ref()
-            .map(|w| self.effective_scale_factor(w.scale_factor()))
-            .unwrap_or(1.0);
-        let (ew, view_h) = self
-            .window
-            .as_ref()
-            .and_then(|w| {
-                let sz = w.inner_size();
-                let top_bars_h = self.top_bars_height_px(sf);
-                let status_bar_h = self.status_bar_height_px(sf);
-                let sidebar_w = self.sidebar_width_px(sf).min(sz.width.saturating_sub(64));
-                self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, sf)
-                    .map(|(_, _, w_px, h_px)| (w_px, h_px as f32))
-            })
-            .unwrap_or((600, 500.0));
+        let (sf, ew, view_h) = if let Some(ref pop) = self.editor_popout {
+            if self.md_editor_mode == super::text_editor::MdEditorMode::Preview {
+                let psf = self.effective_scale_factor(pop.window.scale_factor());
+                let psz = pop.window.inner_size();
+                let hdr_h = super::text_editor::editor_header_height_px(psf);
+                (psf, psz.width.max(120), psz.height.saturating_sub(hdr_h).max(120) as f32)
+            } else {
+                let wsf = self
+                    .window
+                    .as_ref()
+                    .map(|w| self.effective_scale_factor(w.scale_factor()))
+                    .unwrap_or(1.0);
+                let (ew, vh) = self
+                    .window
+                    .as_ref()
+                    .and_then(|w| {
+                        let sz = w.inner_size();
+                        let top_bars_h = self.top_bars_height_px(wsf);
+                        let status_bar_h = self.status_bar_height_px(wsf);
+                        let sidebar_w = self.sidebar_width_px(wsf).min(sz.width.saturating_sub(64));
+                        self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, wsf)
+                            .map(|(_, _, w_px, h_px)| (w_px, h_px as f32))
+                    })
+                    .unwrap_or((600, 500.0));
+                (wsf, ew, vh)
+            }
+        } else {
+            let wsf = self
+                .window
+                .as_ref()
+                .map(|w| self.effective_scale_factor(w.scale_factor()))
+                .unwrap_or(1.0);
+            let (ew, vh) = self
+                .window
+                .as_ref()
+                .and_then(|w| {
+                    let sz = w.inner_size();
+                    let top_bars_h = self.top_bars_height_px(wsf);
+                    let status_bar_h = self.status_bar_height_px(wsf);
+                    let sidebar_w = self.sidebar_width_px(wsf).min(sz.width.saturating_sub(64));
+                    self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, wsf)
+                        .map(|(_, _, w_px, h_px)| (w_px, h_px as f32))
+                })
+                .unwrap_or((600, 500.0));
+            (wsf, ew, vh)
+        };
         let zoom = self.zoom_level;
 
         if self.cmd_or_ctrl_pressed {
@@ -3652,6 +3682,32 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             }
+            InputMode::EpubNotePrompt {
+                block_idx,
+                start_word,
+                end_word,
+                quote,
+                color_idx,
+                text_input,
+            } => {
+                let note = text_input.trim().to_string();
+                let id = self.epub_book_data.next_id.max(1);
+                self.epub_book_data.next_id = id + 1;
+                self.epub_book_data.highlights.push(super::book_ui::EpubHighlight {
+                    id,
+                    block_idx,
+                    start_word,
+                    end_word,
+                    quote,
+                    color_idx,
+                    note: if note.is_empty() { None } else { Some(note) },
+                });
+                self.save_epub_book_data();
+                self.epub_selection_drag = None;
+                self.epub_selection_pill_rect = None;
+                self.status_notice = Some("Saved EPUB highlight & note".to_string());
+                self.request_redraw();
+            }
             InputMode::FreeTextPrompt {
                 page_idx,
                 pdf_x,
@@ -4348,6 +4404,7 @@ impl<'a> PdfViewerApp<'a> {
                                     }
                                     InputMode::HeaderFooterText { text_input, .. }
                                     | InputMode::StickyNotePrompt { text_input, .. }
+                                    | InputMode::EpubNotePrompt { text_input, .. }
                                     | InputMode::FreeTextPrompt { text_input, .. }
                                     | InputMode::EditAnnotationText { text_input, .. }
                                     | InputMode::EditFormField { value_input: text_input, .. }
@@ -4389,6 +4446,7 @@ impl<'a> PdfViewerApp<'a> {
                             InputMode::HeaderFooterPosition { pos_input, .. } => pos_input.clear(),
                             InputMode::HeaderFooterText { text_input, .. }
                             | InputMode::StickyNotePrompt { text_input, .. }
+                            | InputMode::EpubNotePrompt { text_input, .. }
                             | InputMode::FreeTextPrompt { text_input, .. }
                             | InputMode::EditAnnotationText { text_input, .. }
                             | InputMode::EditFormField { value_input: text_input, .. }
@@ -4442,6 +4500,7 @@ impl<'a> PdfViewerApp<'a> {
                         InputMode::HeaderFooterPosition { pos_input, .. } => pos_input.clear(),
                         InputMode::HeaderFooterText { text_input, .. }
                         | InputMode::StickyNotePrompt { text_input, .. }
+                        | InputMode::EpubNotePrompt { text_input, .. }
                         | InputMode::FreeTextPrompt { text_input, .. }
                         | InputMode::EditAnnotationText { text_input, .. }
                         | InputMode::EditFormField { value_input: text_input, .. }
@@ -4478,6 +4537,7 @@ impl<'a> PdfViewerApp<'a> {
                         }
                         InputMode::HeaderFooterText { text_input, .. }
                         | InputMode::StickyNotePrompt { text_input, .. }
+                        | InputMode::EpubNotePrompt { text_input, .. }
                         | InputMode::FreeTextPrompt { text_input, .. }
                         | InputMode::EditAnnotationText { text_input, .. }
                         | InputMode::EditFormField { value_input: text_input, .. } => {
@@ -4633,6 +4693,7 @@ impl<'a> PdfViewerApp<'a> {
                             }
                             InputMode::HeaderFooterText { text_input, .. }
                             | InputMode::StickyNotePrompt { text_input, .. }
+                            | InputMode::EpubNotePrompt { text_input, .. }
                             | InputMode::FreeTextPrompt { text_input, .. }
                             | InputMode::EditAnnotationText { text_input, .. }
                             | InputMode::EditFormField { value_input: text_input, .. }
@@ -4884,6 +4945,40 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
 
+        // Distinct EPUB sidebar TOC search bar capture when open
+        if self.is_distinct_epub_mode()
+            && self.show_bookmarks
+            && self.book_toc_search.is_some()
+            && !self.cmd_or_ctrl_pressed
+        {
+            match logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.book_toc_search = None;
+                    self.request_redraw();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(ref mut q) = self.book_toc_search {
+                        q.pop();
+                    }
+                    self.request_redraw();
+                    return;
+                }
+                _ => {
+                    if let Some(t) = text {
+                        let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+                        if !clean.is_empty() {
+                            if let Some(ref mut q) = self.book_toc_search {
+                                q.push_str(&clean);
+                            }
+                            self.request_redraw();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Normal Mode hotkeys
         match logical_key {
             Key::Named(NamedKey::Tab) => {
@@ -4934,6 +5029,14 @@ impl<'a> PdfViewerApp<'a> {
                     self.request_redraw();
                 } else if self.annot_context_menu.is_some() {
                     self.annot_context_menu = None;
+                    self.request_redraw();
+                } else if self.show_aa_popover || self.book_info_popover {
+                    self.show_aa_popover = false;
+                    self.book_info_popover = false;
+                    self.request_redraw();
+                } else if self.epub_selection_drag.is_some() {
+                    self.epub_selection_drag = None;
+                    self.epub_selection_pill_rect = None;
                     self.request_redraw();
                 } else if self.show_bookmark_format_overlay {
                     self.show_bookmark_format_overlay = false;
@@ -5222,6 +5325,220 @@ impl<'a> PdfViewerApp<'a> {
             _ => {}
         }
     }
+
+    fn spawn_editor_popout(&mut self, event_loop: &ActiveEventLoop) {
+        if !matches!(self.active_doc_kind(), super::theme::DocKind::Markdown | super::theme::DocKind::LaTeX) {
+            return;
+        }
+        if let Some(ref pop) = self.editor_popout {
+            pop.window.focus_window();
+            return;
+        }
+        let Some(ref ctx) = self.context else {
+            return;
+        };
+        let fname = self.filename_display();
+        let icon = crate::app_icon::build_window_icon();
+        #[allow(unused_mut)]
+        let mut win_attrs = Window::default_attributes()
+            .with_title(format!("MicroPDF Editor — {fname}"))
+            .with_inner_size(LogicalSize::new(760.0, 860.0))
+            .with_window_icon(icon.clone());
+        #[cfg(target_os = "windows")]
+        {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            win_attrs = win_attrs.with_taskbar_icon(icon);
+        }
+        let Ok(raw_win) = event_loop.create_window(win_attrs) else {
+            return;
+        };
+        let pop_win = Rc::new(raw_win);
+        let Ok(surface) = Surface::new(ctx, pop_win.clone()) else {
+            return;
+        };
+        self.ensure_md_editor_initialized();
+        self.md_editor_mode = super::text_editor::MdEditorMode::Preview;
+        self.md_layout = None;
+        self.editor_popout = Some(EditorPopoutWindow {
+            surface: Some(surface),
+            window: pop_win,
+            cursor_pos: (0.0, 0.0),
+            hovered_action: None,
+            hovered_scrollbar: false,
+            shift_pressed: self.shift_pressed,
+            ctrl_pressed: self.ctrl_pressed,
+            cmd_or_ctrl_pressed: self.cmd_or_ctrl_pressed,
+            alt_pressed: self.alt_pressed,
+        });
+        self.request_redraw();
+    }
+
+    fn handle_popout_window_event(&mut self, event: WindowEvent) {
+        let Some(pop_win) = self.editor_popout.as_ref().map(|p| p.window.clone()) else {
+            return;
+        };
+        let sz = pop_win.inner_size();
+        let pop_w = sz.width.max(1);
+        let pop_h = sz.height.max(1);
+        let sf = self.effective_scale_factor(pop_win.scale_factor());
+        let hdr_h = super::text_editor::editor_header_height_px(sf).min(pop_h.saturating_sub(24));
+        let ey = hdr_h as i32;
+        let eh = pop_h.saturating_sub(hdr_h);
+
+        match event {
+            WindowEvent::CloseRequested => {
+                self.close_editor_popout(true);
+            }
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                pop_win.request_redraw();
+            }
+            WindowEvent::RedrawRequested => {
+                let _ = self.render_editor_popout();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let st = modifiers.state();
+                self.shift_pressed = st.shift_key();
+                self.ctrl_pressed = st.control_key();
+                self.alt_pressed = st.alt_key();
+                self.cmd_or_ctrl_pressed = st.super_key() || st.control_key();
+                if let Some(ref mut pop) = self.editor_popout {
+                    pop.shift_pressed = self.shift_pressed;
+                    pop.ctrl_pressed = self.ctrl_pressed;
+                    pop.cmd_or_ctrl_pressed = self.cmd_or_ctrl_pressed;
+                    pop.alt_pressed = self.alt_pressed;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(ref mut pop) = self.editor_popout {
+                    pop.cursor_pos = (position.x, position.y);
+                }
+                if self.md_editor.as_ref().is_some_and(|e| e.scrollbar_drag) {
+                    let zoom = self.zoom_level;
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.scroll_to_scrollbar_y(position.y, 0, ey, pop_w, eh, sf, zoom);
+                    }
+                    pop_win.request_redraw();
+                    return;
+                }
+                if self.md_editor.as_ref().is_some_and(|e| e.dragging) {
+                    let zoom = self.zoom_level;
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.cursor = ed.hit_pos(position.x.round() as i32, position.y.round() as i32, 0, ey, pop_w, sf, zoom);
+                    }
+                    pop_win.request_redraw();
+                    return;
+                }
+                let syntax = self.active_editor_syntax();
+                let new_hov = super::text_editor::hit_test_editor_header(
+                    position.x,
+                    position.y,
+                    0,
+                    0,
+                    pop_w,
+                    hdr_h,
+                    syntax,
+                    self.md_editor_mode,
+                    true,
+                    sf,
+                );
+                let px = position.x.round() as i32;
+                let py = position.y.round() as i32;
+                let on_sb = py >= ey
+                    && self
+                        .md_editor
+                        .as_mut()
+                        .is_some_and(|ed| ed.hit_scrollbar(px, py, 0, ey, pop_w, eh, sf, self.zoom_level));
+                let mut changed = false;
+                if let Some(ref mut pop) = self.editor_popout {
+                    if pop.hovered_action != new_hov || pop.hovered_scrollbar != on_sb {
+                        pop.hovered_action = new_hov;
+                        pop.hovered_scrollbar = on_sb;
+                        changed = true;
+                    }
+                }
+                pop_win.set_cursor(if new_hov.is_some() {
+                    CursorIcon::Pointer
+                } else if py >= ey && !on_sb {
+                    CursorIcon::Text
+                } else {
+                    CursorIcon::Default
+                });
+                if changed {
+                    pop_win.request_redraw();
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Released && button == MouseButton::Left {
+                    if let Some(ref mut ed) = self.md_editor {
+                        if ed.dragging || ed.scrollbar_drag {
+                            ed.dragging = false;
+                            ed.scrollbar_drag = false;
+                            pop_win.request_redraw();
+                            return;
+                        }
+                    }
+                }
+                if state == ElementState::Pressed && button == MouseButton::Left {
+                    let (mx, my) = self.editor_popout.as_ref().map(|p| p.cursor_pos).unwrap_or((0.0, 0.0));
+                    let syntax = self.active_editor_syntax();
+                    if let Some(act) = super::text_editor::hit_test_editor_header(
+                        mx,
+                        my,
+                        0,
+                        0,
+                        pop_w,
+                        hdr_h,
+                        syntax,
+                        self.md_editor_mode,
+                        true,
+                        sf,
+                    ) {
+                        self.handle_editor_bar_action(act, pop_w, eh as f32, sf);
+                        return;
+                    }
+                    let px = mx.round() as i32;
+                    let py = my.round() as i32;
+                    if py >= ey {
+                        self.ensure_md_editor_initialized();
+                        let shift = self.shift_pressed;
+                        let zoom = self.zoom_level;
+                        if let Some(ref mut ed) = self.md_editor {
+                            if ed.hit_scrollbar(px, py, 0, ey, pop_w, eh, sf, zoom) {
+                                ed.scrollbar_drag = true;
+                                ed.scroll_to_scrollbar_y(my, 0, ey, pop_w, eh, sf, zoom);
+                            } else {
+                                let old = ed.cursor;
+                                let pos = ed.hit_pos(px, py, 0, ey, pop_w, sf, zoom);
+                                ed.cursor = pos;
+                                ed.sel_anchor = if shift { ed.sel_anchor.or(Some(old)) } else { Some(pos) };
+                                ed.dragging = true;
+                            }
+                        }
+                        pop_win.request_redraw();
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let dy = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 48.0,
+                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                self.ensure_md_editor_initialized();
+                let zoom = self.zoom_level;
+                if let Some(ref mut ed) = self.md_editor {
+                    let max_s = ed.max_scroll_y(pop_w, eh as f32, sf, zoom);
+                    ed.scroll_y = (ed.scroll_y - dy).clamp(0.0, max_s);
+                    pop_win.request_redraw();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed {
+                    let _ = self.handle_markdown_editor_key(&event.logical_key, event.text.as_deref());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<'a> ApplicationHandler for PdfViewerApp<'a> {
@@ -5259,6 +5576,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if self.pending_app_exit {
+            self.close_editor_popout(false);
             self.invalidate_page_caches();
             self.thumbnail_cache.clear();
             self.tabs.clear();
@@ -5308,6 +5626,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
             ));
         }
 
+        if self.pending_open_editor_popout {
+            self.pending_open_editor_popout = false;
+            self.spawn_editor_popout(event_loop);
+        }
+
         if let Some(dialog) = self.pending_dialog.take() {
             match dialog {
                 PendingDialog::Open => self.open_file_dialog(),
@@ -5346,12 +5669,17 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
+        if self.editor_popout.as_ref().is_some_and(|p| p.window.id() == window_id) {
+            self.handle_popout_window_event(event);
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 if self.request_close_action(super::doc_props_modal::PendingCloseAction::ExitApp) {
+                    self.close_editor_popout(false);
                     self.invalidate_page_caches();
                     self.thumbnail_cache.clear();
                     self.tabs.clear();
@@ -5674,7 +6002,8 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                         let canvas_h = sz.height.saturating_sub(top_bars_h + status_bar_h);
-                        if self.effective_scroll_mode() == ScrollMode::MagazineBook
+                        if (self.effective_scroll_mode() == ScrollMode::MagazineBook
+                            || (self.is_distinct_epub_mode() && self.epub_prefs.two_page_spread))
                             && self.md_editor_mode == super::text_editor::MdEditorMode::Preview
                         {
                             if dy.abs() > 4.0 {
@@ -5811,6 +6140,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if self.hscrollbar_drag {
                     self.scroll_to_hscrollbar_x(position.x, win_w, win_h, status_bar_h, sf);
+                    return;
+                }
+                if self.md_split_drag {
+                    let canvas_w = win_w.saturating_sub(sidebar_w).max(1) as f32;
+                    let rel = (position.x as f32 - sidebar_w as f32) / canvas_w;
+                    self.md_split_ratio = Self::clamp_md_split_ratio(rel);
+                    self.md_layout = None;
+                    self.request_redraw();
                     return;
                 }
                 if self.md_editor.as_ref().is_some_and(|e| e.scrollbar_drag) {
@@ -6105,6 +6442,27 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                         }
                     }
+                    if new_hover.is_none() && self.is_distinct_epub_mode() && self.show_aa_popover {
+                        if let Some(ah) = self.hit_test_aa_popover(position.x, position.y, win_w, win_h, status_bar_h, sf) {
+                            if ah != super::book_ui::AaPopoverHit::InsidePopover {
+                                new_hover = Some(UiHit::AaPopover(ah));
+                            }
+                        }
+                    }
+                    if new_hover.is_none() && self.is_distinct_epub_mode() && self.book_info_popover {
+                        if let Some(bh) = self.hit_test_book_info_popover(position.x, position.y, sidebar_w, top_bars_h, win_w, win_h, sf) {
+                            if bh != super::book_ui::BookInfoPopoverHit::Inside {
+                                new_hover = Some(UiHit::BookInfoPopover(bh));
+                            }
+                        }
+                    }
+                    if new_hover.is_none() && self.is_distinct_epub_mode() && self.epub_selection_pill_rect.is_some() {
+                        if let Some(ph) = self.hit_test_epub_selection_pill(position.x, position.y, sf) {
+                            if ph != super::book_ui::BookSelectionPillHit::InsidePill {
+                                new_hover = Some(UiHit::BookSelectionPill(ph));
+                            }
+                        }
+                    }
                     if new_hover.is_none() && self.input_mode != InputMode::Normal {
                         if let Some(h) = self.hit_test_active_input_overlay(position.x, position.y, win_w, top_bars_h, sf) {
                             if h != super::overlays::OverlayHit::InsideModal {
@@ -6158,11 +6516,23 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         && status_bar_h > 0
                         && (position.y as i32) >= win_h.saturating_sub(status_bar_h) as i32
                     {
-                        if let Some(act) = self.hit_test_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
+                        if self.is_distinct_epub_mode() {
+                            if let Some(eb) = self.hit_test_distinct_epub_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
+                                new_hover = Some(UiHit::EpubBottom(eb));
+                            }
+                        } else if let Some(act) = self.hit_test_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                             new_hover = Some(UiHit::BottomBar(act));
                         }
                     } else if new_hover.is_none() && self.show_bookmarks && (position.x as u32) < sidebar_w {
-                        if let Some(sh) = self.hit_test_bookmark_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
+                        if self.is_distinct_epub_mode() {
+                            if let Some(bh) = self.hit_test_distinct_epub_sidebar(position.x, position.y, sidebar_w, win_h.saturating_sub(status_bar_h), top_bars_h, sf) {
+                                new_hover = Some(UiHit::BookSidebar(bh));
+                            }
+                        } else if self.is_distinct_outline_mode() {
+                            if let Some(SidebarHit::BookmarkRow { index, .. }) = self.hit_test_distinct_outline_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
+                                new_hover = Some(UiHit::SidebarRow(index));
+                            }
+                        } else if let Some(sh) = self.hit_test_bookmark_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
                             new_hover = Some(match sh {
                                 SidebarHit::AddBookmarkButton => UiHit::SidebarAdd,
                                 SidebarHit::ImportTxtButton => UiHit::SidebarImport,
@@ -6181,8 +6551,35 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             new_hover = Some(UiHit::Overlay(oh));
                         }
                     } else if new_hover.is_none() && self.is_markdown_tab() {
-                        if let Some(mh) = self.hit_test_markdown_view(position.x, position.y) {
-                            new_hover = Some(UiHit::MarkdownView(mh));
+                        if let Some((hx, hy, hw, hh)) = self.md_editor_header_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, sf) {
+                            if let Some(act) = super::text_editor::hit_test_editor_header(
+                                position.x,
+                                position.y,
+                                hx,
+                                hy,
+                                hw,
+                                hh,
+                                self.active_editor_syntax(),
+                                self.md_editor_mode,
+                                false,
+                                sf,
+                            ) {
+                                new_hover = Some(UiHit::MdEditorBar(act));
+                            }
+                        }
+                        if new_hover.is_none() {
+                            if let Some(div_x) = self.md_split_divider_x(sidebar_w, win_w) {
+                                let ix = position.x.round() as i32;
+                                let iy = position.y.round() as i32;
+                                if (ix - div_x).abs() <= 4 && iy >= top_bars_h as i32 && iy < (win_h.saturating_sub(status_bar_h)) as i32 {
+                                    new_hover = Some(UiHit::MdSplitDivider);
+                                }
+                            }
+                        }
+                        if new_hover.is_none() {
+                            if let Some(mh) = self.hit_test_markdown_view(position.x, position.y) {
+                                new_hover = Some(UiHit::MarkdownView(mh));
+                            }
                         }
                     } else if new_hover.is_none() && self.view_mode == ViewMode::TextView {
                         if let Some(th) = self.hit_test_text_view(position.x, position.y, sidebar_w, top_bars_h, win_w, sf) {
@@ -6218,7 +6615,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         let grab = !pointer
                             && (self.mouse_mode == MouseMode::Hand
                                 || self.compare_mode.as_ref().is_some_and(|c| c.max_pan_x > 1.0 || c.max_scroll_y > 1.0));
-                        w.set_cursor(if pointer {
+                        w.set_cursor(if new_hover == Some(UiHit::MdSplitDivider) {
+                            CursorIcon::ColResize
+                        } else if pointer {
                             CursorIcon::Pointer
                         } else if grab {
                             CursorIcon::Grab
@@ -6240,7 +6639,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
 
                 if self.drag_start.is_some() || self.grid_drag_page.is_some() {
                     if let Some((sx1, sy1)) = self.drag_start {
-                        if self.mouse_mode == MouseMode::InkPen && self.view_mode.is_page_view() {
+                        if self.is_distinct_epub_mode() {
+                            if let Some(end_pos) = epub_word_pos_at(&self.epub_word_rects, position.x, position.y) {
+                                let anchor = self.epub_selection_drag.map(|(a, _)| a).unwrap_or(end_pos);
+                                self.epub_selection_drag = Some((anchor, end_pos));
+                            }
+                        } else if self.mouse_mode == MouseMode::InkPen && self.view_mode.is_page_view() {
                             let px = position.x as f32;
                             let py = position.y as f32;
                             let should_push = self.ink_stroke_screen_pts.last().map_or(true, |&(lx, ly)| {
@@ -6315,6 +6719,17 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Released && self.is_distinct_epub_mode() && button == MouseButton::Left {
+                    if let Some((sx, sy)) = self.drag_start.take() {
+                        let dist = ((self.cursor_pos.0 - sx).powi(2) + (self.cursor_pos.1 - sy).powi(2)).sqrt();
+                        if dist < 4.0 && self.epub_selection_drag.is_some_and(|(a, b)| a == b) {
+                            self.epub_selection_drag = None;
+                            self.epub_selection_pill_rect = None;
+                        }
+                        self.request_redraw();
+                        return;
+                    }
+                }
                 if state == ElementState::Released && self.scrollbar_drag {
                     self.scrollbar_drag = false;
                     self.request_redraw();
@@ -6322,6 +6737,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if state == ElementState::Released && self.hscrollbar_drag {
                     self.hscrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.md_split_drag {
+                    self.md_split_drag = false;
                     self.request_redraw();
                     return;
                 }
@@ -6953,6 +7373,62 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
+                // 0a0c. Distinct EPUB Aa Typography popover, Book Info popover & Selection pill clicks
+                if self.is_distinct_epub_mode() && state == ElementState::Pressed && button == MouseButton::Left {
+                    if self.show_aa_popover {
+                        if let Some(hit) = self.hit_test_aa_popover(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            win_w,
+                            win_h,
+                            status_bar_h,
+                            scale_factor,
+                        ) {
+                            self.handle_aa_popover_click(hit);
+                            return;
+                        }
+                        let clicking_aa = status_bar_h > 0
+                            && (self.cursor_pos.1 as i32) >= win_h.saturating_sub(status_bar_h) as i32
+                            && self.hit_test_distinct_epub_bottom_bar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                status_bar_h,
+                                scale_factor,
+                            ) == Some(super::book_ui::EpubBottomHit::ToggleAa);
+                        if !clicking_aa {
+                            self.show_aa_popover = false;
+                            self.request_redraw();
+                        }
+                    }
+                    if self.book_info_popover {
+                        if let Some(hit) = self.hit_test_book_info_popover(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            sidebar_w,
+                            top_bars_h,
+                            win_w,
+                            win_h,
+                            scale_factor,
+                        ) {
+                            if hit == super::book_ui::BookInfoPopoverHit::Close {
+                                self.book_info_popover = false;
+                                self.request_redraw();
+                            }
+                            return;
+                        }
+                        self.book_info_popover = false;
+                        self.request_redraw();
+                    }
+                    if self.epub_selection_pill_rect.is_some() {
+                        if let Some(hit) = self.hit_test_epub_selection_pill(self.cursor_pos.0, self.cursor_pos.1, scale_factor) {
+                            self.handle_epub_selection_pill_click(hit);
+                            return;
+                        }
+                    }
+                }
+
                 // 0a1. Session Notification Board popover clicks
                 if self.show_notifications && state == ElementState::Pressed && button == MouseButton::Left {
                     if let Some(on_clear) = self.hit_test_notification_board(
@@ -7101,7 +7577,18 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     && (self.cursor_pos.1 as i32) >= win_h.saturating_sub(status_bar_h) as i32
                 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
-                        if let Some(action) = self.hit_test_bottom_bar(
+                        if self.is_distinct_epub_mode() {
+                            if let Some(hit) = self.hit_test_distinct_epub_bottom_bar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                status_bar_h,
+                                scale_factor,
+                            ) {
+                                self.handle_distinct_epub_bottom_click(hit, win_w, win_h, scale_factor);
+                            }
+                        } else if let Some(action) = self.hit_test_bottom_bar(
                             self.cursor_pos.0,
                             self.cursor_pos.1,
                             win_w,
@@ -7307,6 +7794,45 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 // 0d2. Markdown Reader View controls, links & live editor clicks
                 if self.is_markdown_tab() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some((hx, hy, hw, hh)) = self.md_editor_header_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, scale_factor) {
+                            if let Some(act) = super::text_editor::hit_test_editor_header(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                hx,
+                                hy,
+                                hw,
+                                hh,
+                                self.active_editor_syntax(),
+                                self.md_editor_mode,
+                                false,
+                                scale_factor,
+                            ) {
+                                let (ew, eh) = self
+                                    .md_editor_rect(sidebar_w, top_bars_h, win_w, win_h, status_bar_h, scale_factor)
+                                    .map(|(_, _, w_px, h_px)| (w_px, h_px as f32))
+                                    .unwrap_or((hw, 400.0));
+                                self.handle_editor_bar_action(act, ew, eh, scale_factor);
+                                return;
+                            }
+                        }
+                        if let Some(div_x) = self.md_split_divider_x(sidebar_w, win_w) {
+                            let px = self.cursor_pos.0.round() as i32;
+                            let py = self.cursor_pos.1.round() as i32;
+                            if (px - div_x).abs() <= 4 && py >= top_bars_h as i32 && py < (win_h.saturating_sub(status_bar_h)) as i32 {
+                                let now = Instant::now();
+                                if self.md_split_last_click.is_some_and(|t| now.duration_since(t) <= Duration::from_millis(350)) {
+                                    self.md_split_ratio = 0.50;
+                                    self.md_split_last_click = None;
+                                    self.md_split_drag = false;
+                                    self.md_layout = None;
+                                    self.request_redraw();
+                                } else {
+                                    self.md_split_last_click = Some(now);
+                                    self.md_split_drag = true;
+                                }
+                                return;
+                            }
+                        }
                         if let Some(hit) = self.hit_test_markdown_view(self.cursor_pos.0, self.cursor_pos.1) {
                             self.handle_markdown_click(hit);
                             return;
@@ -7334,6 +7860,19 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 self.request_redraw();
                                 return;
                             }
+                        }
+                        if self.is_distinct_epub_mode()
+                            && !(self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w)
+                        {
+                            self.drag_start = Some(self.cursor_pos);
+                            if let Some(pos) = epub_word_pos_at(&self.epub_word_rects, self.cursor_pos.0, self.cursor_pos.1) {
+                                self.epub_selection_drag = Some((pos, pos));
+                            } else {
+                                self.epub_selection_drag = None;
+                            }
+                            self.epub_selection_pill_rect = None;
+                            self.request_redraw();
+                            return;
                         }
                     }
                 }
@@ -7381,16 +7920,42 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
-                // 1. Check Left Bookmark Sidebar interactions
+                // 1. Check Left Bookmark / Outline Sidebar interactions
                 if self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w {
+                    if self.is_distinct_epub_mode() {
+                        if state == ElementState::Pressed && button == MouseButton::Left {
+                            if let Some(hit) = self.hit_test_distinct_epub_sidebar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                sidebar_w,
+                                win_h.saturating_sub(status_bar_h),
+                                top_bars_h,
+                                scale_factor,
+                            ) {
+                                self.handle_distinct_epub_sidebar_click(hit);
+                            }
+                        }
+                        return;
+                    }
                     if state == ElementState::Pressed {
-                        if let Some(hit) = self.hit_test_bookmark_sidebar(
-                            self.cursor_pos.0,
-                            self.cursor_pos.1,
-                            sidebar_w,
-                            top_bars_h,
-                            scale_factor,
-                        ) {
+                        let sidebar_hit = if self.is_distinct_outline_mode() {
+                            self.hit_test_distinct_outline_sidebar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                sidebar_w,
+                                top_bars_h,
+                                scale_factor,
+                            )
+                        } else {
+                            self.hit_test_bookmark_sidebar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                sidebar_w,
+                                top_bars_h,
+                                scale_factor,
+                            )
+                        };
+                        if let Some(hit) = sidebar_hit {
                             match hit {
                                 SidebarHit::AddBookmarkButton => {
                                     if button == MouseButton::Left {
@@ -8429,4 +8994,31 @@ fn same_file(a: &Path, b: &Path) -> bool {
         (Ok(x), Ok(y)) => x == y,
         _ => a == b,
     }
+}
+
+/// Finds the `(block_idx, word_idx)` of the rendered EPUB word under or closest to `(mx, my)`.
+fn epub_word_pos_at(
+    word_rects: &[super::book_ui::EpubWordHit],
+    mx: f64,
+    my: f64,
+) -> Option<(usize, usize)> {
+    let ix = mx.round() as i32;
+    let iy = my.round() as i32;
+    for wr in word_rects {
+        if wr.contains(ix, iy) {
+            return Some((wr.block_idx, wr.word_idx));
+        }
+    }
+    let mut best: Option<(i64, (usize, usize))> = None;
+    for wr in word_rects {
+        let cx = wr.x + (wr.w as i32) / 2;
+        let cy = wr.y + (wr.h as i32) / 2;
+        let dx = (ix - cx) as i64;
+        let dy = ((iy - cy) * 4) as i64;
+        let d2 = dx * dx + dy * dy;
+        if dy.abs() <= (wr.h as i64) * 5 && best.is_none_or(|(bd, _)| d2 < bd) {
+            best = Some((d2, (wr.block_idx, wr.word_idx)));
+        }
+    }
+    best.map(|(_, pos)| pos)
 }

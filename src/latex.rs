@@ -550,6 +550,7 @@ pub fn parse_latex(src: &str, fallback_title: &str, base_dir: Option<&Path>) -> 
         blocks,
         headings,
         embedded_images: std::collections::HashMap::new(),
+        book_meta: None,
     }
 }
 

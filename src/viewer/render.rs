@@ -2180,16 +2180,36 @@ impl<'a> PdfViewerApp<'a> {
             );
         }
 
-        // Left Bookmark Sidebar
+        // Left Bookmark / Distinct Book / Outline Sidebar
         if self.show_bookmarks && sidebar_w > 0 {
-            self.draw_bookmark_sidebar(
-                buffer,
-                width,
-                height.saturating_sub(status_bar_h),
-                sidebar_w,
-                top_bars_h,
-                scale_factor,
-            );
+            if self.is_distinct_epub_mode() {
+                self.draw_distinct_epub_sidebar(
+                    buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
+                    scale_factor,
+                );
+            } else if self.is_distinct_outline_mode() {
+                self.draw_distinct_outline_sidebar(
+                    buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
+                    scale_factor,
+                );
+            } else {
+                self.draw_bookmark_sidebar(
+                    buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
+                    scale_factor,
+                );
+            }
         }
 
         // Multi-Document Tab Bar
@@ -2202,6 +2222,20 @@ impl<'a> PdfViewerApp<'a> {
         self.draw_status_bar(buffer, width, height, status_bar_h, scale_factor);
 
         let chrome_visible = !self.is_fullscreen && !self.is_presentation;
+
+        // Distinct EPUB Floating Selection Action Pill (Highlight | Add Note | Copy)
+        if self.is_distinct_epub_mode()
+            && self.epub_selection_drag.is_some()
+            && self.drag_start.is_none()
+            && !self.has_blocking_modal()
+            && !self.show_aa_popover
+            && !self.book_info_popover
+        {
+            self.recompute_epub_selection_pill(width, top_bars_h, scale_factor);
+            self.draw_epub_selection_pill(buffer, width, height, scale_factor);
+        } else if self.drag_start.is_some() || !self.is_distinct_epub_mode() {
+            self.epub_selection_pill_rect = None;
+        }
 
         // Session Notification Board Popover (bottom-left)
         if chrome_visible && self.show_notifications {
@@ -2216,6 +2250,16 @@ impl<'a> PdfViewerApp<'a> {
         // Scroll Mode Picker Popover (Single / Vert / Book / Magazine)
         if chrome_visible && self.show_scroll_mode_popover {
             self.draw_scroll_mode_popover(buffer, width, height, status_bar_h, scale_factor);
+        }
+
+        // Distinct EPUB Book Metadata Info Popover & Aa Typography Popover
+        if chrome_visible && self.is_distinct_epub_mode() {
+            if self.book_info_popover && self.show_bookmarks && sidebar_w > 0 {
+                self.draw_book_info_popover(buffer, width, height, sidebar_w, top_bars_h, scale_factor);
+            }
+            if self.show_aa_popover {
+                self.draw_aa_popover(buffer, width, height, status_bar_h, scale_factor);
+            }
         }
 
         // Floating Hover Tooltip Pill for Top Toolbar & Bottom Bar buttons (only when no modal/menu/prompt is open)
@@ -2516,6 +2560,90 @@ impl<'a> PdfViewerApp<'a> {
 
         self.update_title_bar();
         Ok(())
+    }
+
+    pub(super) fn render_editor_popout(&mut self) -> Result<()> {
+        let Some(mut pop) = self.editor_popout.take() else {
+            return Ok(());
+        };
+        let size = pop.window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+        let sf = self.effective_scale_factor(pop.window.scale_factor());
+
+        let theme = self.ui_theme();
+        let (page_bg, content_theme) = super::markdown_view::md_reading_theme(
+            theme,
+            self.reading_filter,
+            self.ui_theme_mode,
+        );
+        let syntax = self.active_editor_syntax();
+        let mode = self.md_editor_mode;
+        let zoom = self.zoom_level;
+        self.ensure_md_editor_initialized();
+
+        let render_res = if let Some(mut surface) = pop.surface.take() {
+            let res = (|| -> Result<()> {
+                surface
+                    .resize(
+                        NonZeroU32::new(width).unwrap(),
+                        NonZeroU32::new(height).unwrap(),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Failed to resize popout surface: {e}"))?;
+                let mut buffer = surface
+                    .buffer_mut()
+                    .map_err(|e| anyhow::anyhow!("Failed to acquire popout buffer: {e}"))?;
+
+                let hdr_h = super::text_editor::editor_header_height_px(sf).min(height.saturating_sub(24));
+                super::text_editor::draw_editor_header(
+                    &mut buffer,
+                    width,
+                    height,
+                    0,
+                    0,
+                    width,
+                    hdr_h,
+                    syntax,
+                    mode,
+                    true,
+                    pop.hovered_action,
+                    &theme,
+                    sf,
+                );
+
+                let eh = height.saturating_sub(hdr_h);
+                if eh > 0 {
+                    if let Some(ref mut ed) = self.md_editor {
+                        ed.draw(
+                            &mut buffer,
+                            width,
+                            height,
+                            0,
+                            hdr_h as i32,
+                            width,
+                            eh,
+                            page_bg,
+                            &content_theme,
+                            sf,
+                            zoom,
+                            syntax,
+                        );
+                    }
+                }
+
+                buffer
+                    .present()
+                    .map_err(|e| anyhow::anyhow!("Failed to present popout buffer: {e}"))?;
+                Ok(())
+            })();
+            pop.surface = Some(surface);
+            res
+        } else {
+            Ok(())
+        };
+
+        self.editor_popout = Some(pop);
+        render_res
     }
 }
 

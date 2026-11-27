@@ -403,6 +403,9 @@ impl<'a> PdfViewerApp<'a> {
             accent_dot,
         };
 
+        let distinct_epub = self.is_distinct_epub_mode();
+        let distinct_reflowable = self.ui_skin == super::theme::UiSkin::Distinct && self.is_markdown_tab();
+
         // Group 1: Panels & File actions (Sidebar, Grid, Open, Save, SaveAs, Print)
         let mut g1 = 0usize;
         if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) {
@@ -410,7 +413,7 @@ impl<'a> PdfViewerApp<'a> {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Grid) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Grid) && !distinct_reflowable {
             if try_push(mk_ic(ToolbarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -420,7 +423,7 @@ impl<'a> PdfViewerApp<'a> {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Save) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Save) && !distinct_epub {
             if try_push(mk_ic(ToolbarAction::Save, UiIcon::Save, self.has_unsaved_edits, self.has_unsaved_edits), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -468,33 +471,35 @@ impl<'a> PdfViewerApp<'a> {
                 push_sep(&mut cur_x, &mut seps, g_md);
             }
 
-            let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
-            let zbtn_w = (22.0 * s).round() as u32;
-            let zlbl_w = (42.0 * s).round() as u32;
-            let mut g_zoom = 0usize;
-            for (act, lbl, pw) in [
-                (ToolbarAction::MdZoomOut, "-".to_string(), zbtn_w),
-                (ToolbarAction::MdZoomReset, z_pct, zlbl_w),
-                (ToolbarAction::MdZoomIn, "+".to_string(), zbtn_w),
-            ] {
-                if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
-                    g_zoom += 1;
+            if !distinct_epub {
+                let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
+                let zbtn_w = (22.0 * s).round() as u32;
+                let zlbl_w = (42.0 * s).round() as u32;
+                let mut g_zoom = 0usize;
+                for (act, lbl, pw) in [
+                    (ToolbarAction::MdZoomOut, "-".to_string(), zbtn_w),
+                    (ToolbarAction::MdZoomReset, z_pct, zlbl_w),
+                    (ToolbarAction::MdZoomIn, "+".to_string(), zbtn_w),
+                ] {
+                    if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
+                        g_zoom += 1;
+                    }
                 }
-            }
-            push_sep(&mut cur_x, &mut seps, g_zoom);
+                push_sep(&mut cur_x, &mut seps, g_zoom);
 
-            if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
+                if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
+                    try_push(
+                        mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
+                        &mut cur_x,
+                        &mut widgets,
+                    );
+                }
                 try_push(
-                    mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
+                    mk_pill(ToolbarAction::MdReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
                     &mut cur_x,
                     &mut widgets,
                 );
             }
-            try_push(
-                mk_pill(ToolbarAction::MdReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
-                &mut cur_x,
-                &mut widgets,
-            );
             try_push(
                 mk_pill(ToolbarAction::MdExportPrint, "Export / Print".to_string(), (90.0 * s).round() as u32, false, false),
                 &mut cur_x,

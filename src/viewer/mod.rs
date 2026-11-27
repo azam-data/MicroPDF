@@ -1,3 +1,4 @@
+mod book_ui;
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
@@ -2545,13 +2546,182 @@ mod tests {
         draw_icon(&mut buf, 320, 120, UiIcon::Moon, 62, 64, 18, 0x001E_293B);
         assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
 
-        // Stress-test many sizes to verify the 256 KB glyph cache cap holds
+        // Stress-test many sizes to verify the glyph cache cap holds
         for sz in [10.0f32, 12.0, 14.0, 16.0, 18.0, 22.0, 28.0] {
             let _ = measure_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", sz, false);
         }
         assert!(
-            glyph_cache_bytes() <= 256 * 1024,
-            "glyph cache exceeded 256 KB cap: {} bytes",
+            glyph_cache_bytes() <= MAX_GLYPH_CACHE_BYTES,
+            "glyph cache exceeded {} byte cap: {} bytes",
+            MAX_GLYPH_CACHE_BYTES,
+            glyph_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn test_phase1_ui_skin_doc_kind_and_help_menu() {
+        use super::state::{MenuCategory, PdfViewerApp, SessionConfig};
+        use super::theme::{DocKind, UiSkin};
+        use std::path::Path;
+
+        // UiSkin defaults, toggle, labels, and INI round-trip
+        assert_eq!(UiSkin::default(), UiSkin::Classic);
+        assert_eq!(UiSkin::Classic.label(), "Classic");
+        assert_eq!(UiSkin::Distinct.label(), "Distinct");
+        assert_eq!(UiSkin::Classic.toggle(), UiSkin::Distinct);
+        assert_eq!(UiSkin::Distinct.toggle(), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("distinct"), UiSkin::Distinct);
+        assert_eq!(UiSkin::from_ini_str("DISTINCT"), UiSkin::Distinct);
+        assert_eq!(UiSkin::from_ini_str("classic"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Classic);
+
+        let legacy_ini = "ui_theme=dark\nactive_tab=0\n";
+        let parsed_legacy = PdfViewerApp::parse_session_ini(legacy_ini);
+        assert_eq!(parsed_legacy.ui_skin, UiSkin::Classic);
+
+        let mut cfg = SessionConfig::default();
+        cfg.ui_skin = UiSkin::Distinct;
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        assert!(ini.contains("ui_skin=distinct"));
+        let roundtripped = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(roundtripped.ui_skin, UiSkin::Distinct);
+
+        // DocKind detection
+        assert_eq!(DocKind::from_path(Path::new("report.pdf")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("REPORT.PDF")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("notes.md")), DocKind::Markdown);
+        assert_eq!(DocKind::from_path(Path::new("README.MARKDOWN")), DocKind::Markdown);
+        assert_eq!(DocKind::from_path(Path::new("paper.tex")), DocKind::LaTeX);
+        assert_eq!(DocKind::from_path(Path::new("novel.EPUB")), DocKind::Epub);
+        assert!(!DocKind::Pdf.is_reflowable());
+        assert!(DocKind::Markdown.is_reflowable());
+        assert!(DocKind::LaTeX.is_reflowable());
+        assert!(DocKind::Epub.is_reflowable());
+
+        // Help menu contains UI Skin entry without breaking existing items
+        let help_items = MenuCategory::Help.items();
+        assert!(help_items.iter().any(|s| s.contains("User Guide")));
+        assert!(help_items.iter().any(|s| s.contains("Keyboard & Mouse Shortcuts")));
+        assert!(help_items.iter().any(|s| s.contains("Bookmark Import Format")));
+        assert!(help_items.iter().any(|s| s.contains("UI Skin: Classic / Distinct")));
+        assert!(help_items.iter().any(|s| s.contains("About MicroPDF")));
+    }
+
+    #[test]
+    fn test_phase1_multifamily_typography_kerning_custom_os_and_doc_icons() {
+        use super::theme::DocKind;
+        use super::ui_draw::*;
+
+        let serif_reg = TextStyle::book(24.0, false, false);
+        let serif_bold = TextStyle::book(24.0, true, false);
+        let serif_ital = TextStyle::book(24.0, false, true);
+        let mono = TextStyle::mono(16.0);
+
+        // Positive measurements across BookSerif & CodeMono
+        let w_reg = measure_text_styled("Hello Typography", serif_reg);
+        let w_bold = measure_text_styled("Hello Typography", serif_bold);
+        let w_ital = measure_text_styled("Hello Typography", serif_ital);
+        assert!(w_reg > 40.0 && w_bold > 40.0 && w_ital > 40.0);
+
+        // CodeMono is strictly monospaced: 'i' and 'W' have equal advance width
+        let w_mono_i = measure_text_styled("iiii", mono);
+        let w_mono_w = measure_text_styled("WWWW", mono);
+        assert!(
+            (w_mono_i - w_mono_w).abs() < 0.05,
+            "CodeMono must have uniform advance: iiii={w_mono_i}, WWWW={w_mono_w}"
+        );
+
+        // Real kerning pairs in BookSerif: "AV" and "To" tighten advance width vs unkerned sum
+        let av_kerned = measure_text_styled("AV", serif_reg);
+        let av_sum = measure_text_styled("A", serif_reg) + measure_text_styled("V", serif_reg);
+        assert!(
+            av_kerned < av_sum - 0.5,
+            "Expected negative kerning on BookSerif 'AV': kerned={av_kerned}, sum={av_sum}"
+        );
+
+        let to_kerned = measure_text_styled("To", serif_reg);
+        let to_sum = measure_text_styled("T", serif_reg) + measure_text_styled("o", serif_reg);
+        assert!(
+            to_kerned < to_sum - 0.3,
+            "Expected negative kerning on BookSerif 'To': kerned={to_kerned}, sum={to_sum}"
+        );
+
+        // Render BookSerif (regular/bold/italic), CodeMono, and all 4 DocKind icons
+        let mut buf = vec![0x00FF_FFFFu32; 360 * 180];
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 10, 348, "AV Book Serif", serif_reg, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 42, 348, "Bold Serif", serif_bold, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 74, 348, "Italic Serif", serif_ital, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 108, 348, "fn main() {}", mono, 0x001E_293B);
+
+        for (i, (kind, icon)) in [
+            (DocKind::Pdf, UiIcon::DocPdf),
+            (DocKind::Epub, UiIcon::DocEpub),
+            (DocKind::Markdown, UiIcon::DocMarkdown),
+            (DocKind::LaTeX, UiIcon::DocLatex),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            draw_doc_type_icon(&mut buf, 360, 180, kind, 12 + (i as i32) * 24, 140, 16, false);
+            draw_doc_type_icon(&mut buf, 360, 180, kind, 120 + (i as i32) * 24, 140, 16, true);
+            draw_icon(&mut buf, 360, 180, icon, 228 + (i as i32) * 24, 140, 16, 0x001E_293B);
+        }
+        assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
+
+        // Lazy CustomOs slot: clears cleanly and falls back safely when unloaded
+        assert!(set_custom_os_font(None));
+        assert_eq!(active_custom_os_font_name(), None);
+        let fallback_w = measure_text_styled(
+            "Fallback Serif",
+            TextStyle {
+                family: FontFamily::CustomOs,
+                size_px: 18.0,
+                bold: false,
+                italic: false,
+            },
+        );
+        assert!(fallback_w > 30.0);
+
+        // If any OS font exists in catalog, verify CustomOs can load and unload it cleanly
+        if let Some(entry) = crate::fonts::global_system_fonts()
+            .iter()
+            .find(|e| e.path.is_some())
+        {
+            assert!(set_custom_os_font(Some(&entry.display_name)));
+            assert!(active_custom_os_font_name().is_some());
+            let os_w = measure_text_styled(
+                "Custom OS Font",
+                TextStyle {
+                    family: FontFamily::CustomOs,
+                    size_px: 18.0,
+                    bold: false,
+                    italic: false,
+                },
+            );
+            assert!(os_w > 20.0);
+            assert!(set_custom_os_font(None));
+            assert_eq!(active_custom_os_font_name(), None);
+        }
+
+        // Stress-test across families & sizes to ensure bounded 512 KB cache holds
+        for fam in [FontFamily::UiSans, FontFamily::BookSerif, FontFamily::CodeMono] {
+            for sz in [11.0f32, 14.0, 18.0, 24.0, 32.0] {
+                let _ = measure_text_styled(
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                    TextStyle {
+                        family: fam,
+                        size_px: sz,
+                        bold: false,
+                        italic: fam == FontFamily::BookSerif,
+                    },
+                );
+            }
+        }
+        assert!(
+            glyph_cache_bytes() <= MAX_GLYPH_CACHE_BYTES,
+            "glyph cache exceeded {} byte cap: {} bytes",
+            MAX_GLYPH_CACHE_BYTES,
             glyph_cache_bytes()
         );
     }
@@ -3029,6 +3199,120 @@ mod tests {
         let (sigs, stamps) = ensure_asset_subdirs(&tmp);
         assert!(sigs.is_dir() && stamps.is_dir());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_phase2_hypher_justified_wrapping_and_line_level_spread_pagination() {
+        use super::markdown_view::{
+            layout_blocks, paginate_book_pages, tokenize_spans, wrap_styled_words_ex,
+            BookLayoutOpts, LaidOutBlock,
+        };
+        use super::ui_draw::FontFamily;
+        use crate::markdown::{InlineSpan, MdBlock};
+        use std::collections::HashMap;
+
+        let opts = BookLayoutOpts {
+            book_mode: true,
+            font_family: FontFamily::BookSerif,
+            line_mult: 1.56,
+            justify: true,
+            hyphenate: true,
+            hypher_lang: hypher::Lang::English,
+        };
+        let mut links = Vec::new();
+        let text = "Typography extraordinary international characteristics communication representation considerations.";
+        let words = tokenize_spans(&[InlineSpan::Text(text.to_string())], 16.0, &mut links, 0, opts);
+        let lines = wrap_styled_words_ex(words, 165.0, 24.0, 16.0, opts);
+        assert!(lines.len() >= 3, "Expected multi-line wrap, got {}", lines.len());
+        assert!(lines[0].first_line_indent > 0.0, "Consecutive paragraph first line indent missing");
+        assert!(!lines[0].is_last_in_para && lines.last().unwrap().is_last_in_para);
+        let has_hyphen_break = lines[..lines.len() - 1]
+            .iter()
+            .any(|ln| ln.spans.last().is_some_and(|w| w.text.ends_with('-')));
+        assert!(has_hyphen_break, "Expected hypher syllable hyphenation across narrow justified book column");
+
+        // Build two paragraphs where the second long paragraph MUST split at line level across 2 book pages
+        let long_sentence = "In the beginning the universe was created and every single carefully typeset line flows cleanly across the open spread without jarring empty gaps. ".repeat(6);
+        let ast = vec![
+            MdBlock::Paragraph(vec![InlineSpan::Text("Opening short paragraph.".to_string())]),
+            MdBlock::Paragraph(vec![InlineSpan::Text(long_sentence)]),
+        ];
+        let mut code_blocks = Vec::new();
+        let mut images = Vec::new();
+        let embedded = HashMap::new();
+        let (blocks, _) = layout_blocks(
+            &ast, 280.0, 16.0, 1.0, 0.0, &mut links, &mut code_blocks, &mut images, &embedded, true, None, opts, None,
+        );
+        let total_p2_lines = match &blocks[1] {
+            LaidOutBlock::Paragraph { lines, .. } => lines.len(),
+            _ => panic!("expected paragraph"),
+        };
+        assert!(total_p2_lines >= 8, "Expected >= 8 lines in paragraph 2, got {total_p2_lines}");
+
+        // Choose a small page height (~5 lines tall) so paragraph 2 splits cleanly across multiple pages
+        let pages = paginate_book_pages(&blocks, 130.0, true);
+        assert!(pages.len() >= 3, "Expected cover + >=2 content pages, got {}", pages.len());
+        assert!(pages[0].is_cover);
+        let p2_slices: Vec<(usize, usize)> = pages[1..]
+            .iter()
+            .flat_map(|p| p.slices.iter())
+            .filter(|s| s.block_idx == 1)
+            .map(|s| (s.line_start, s.line_end))
+            .collect();
+        assert!(p2_slices.len() >= 2, "Long paragraph must split across >=2 pages at line granularity");
+        assert_eq!(p2_slices.first().unwrap().0, 0);
+        assert_eq!(p2_slices.last().unwrap().1, total_p2_lines);
+        for pair in p2_slices.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "Line slices across page boundary must be contiguous with zero lost lines");
+        }
+    }
+
+    #[test]
+    fn test_phase2_epub_prefs_and_books_ini_roundtrip() {
+        use super::book_ui::{
+            parse_books_ini, serialize_books_ini, EpubBookData, EpubBookmark, EpubFontChoice,
+            EpubHighlight, EpubReaderPrefs, LineSpacingPreset, MarginPreset,
+        };
+        use super::state::{PdfViewerApp, SessionConfig};
+        use std::path::PathBuf;
+
+        let mut cfg = SessionConfig::default();
+        cfg.epub_prefs = EpubReaderPrefs {
+            font_choice: EpubFontChoice::OsSerif("Georgia".to_string()),
+            font_size_px: 19.5,
+            line_spacing: LineSpacingPreset::Relaxed,
+            margins: MarginPreset::Wide,
+            justify: false,
+            hyphenate: false,
+            two_page_spread: false,
+        };
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(parsed.epub_prefs, cfg.epub_prefs);
+
+        // Portable micropdf_books.ini annotations + bookmarks roundtrip
+        let mut all_books = std::collections::BTreeMap::new();
+        let mut book = EpubBookData::default();
+        book.next_id = 2;
+        book.highlights.push(EpubHighlight {
+            id: 1,
+            block_idx: 12,
+            start_word: 3,
+            end_word: 9,
+            quote: "Call me | Ishmael\nChapter 1".to_string(),
+            color_idx: 2,
+            note: Some("Famous opening | line\nKeep for essay".to_string()),
+        });
+        book.bookmarks.push(EpubBookmark {
+            block_idx: 12,
+            page_num: 4,
+            label: "Chapter 1: Loomings".to_string(),
+        });
+        all_books.insert("books/moby_dick.epub".to_string(), book.clone());
+        let _ = PathBuf::from("books/moby_dick.epub");
+        let saved_books = serialize_books_ini(&all_books);
+        let parsed_books = parse_books_ini(&saved_books);
+        assert_eq!(parsed_books.get("books/moby_dick.epub"), Some(&book));
     }
 }
 

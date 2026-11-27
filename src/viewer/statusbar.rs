@@ -163,6 +163,9 @@ impl<'a> PdfViewerApp<'a> {
                     printers.len()
                 ))
             }
+            InputMode::EpubNotePrompt { text_input, .. } => Some(format!(
+                "BOOK NOTE: {text_input}_ | Enter=Save Esc=Cancel"
+            )),
         }
     }
 
@@ -174,6 +177,10 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         scale_factor: f64,
     ) {
-        self.draw_bottom_view_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
+        if self.is_distinct_epub_mode() {
+            self.draw_distinct_epub_bottom_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
+        } else {
+            self.draw_bottom_view_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
+        }
     }
 }

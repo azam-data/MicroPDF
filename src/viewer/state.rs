@@ -11,6 +11,11 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::window::Window;
 
+use super::book_ui::{
+    AaPopoverHit, BookInfoPopoverHit, BookSidebarHit, BookSidebarTab, BookSelectionPillHit,
+    EpubBookData, EpubBottomHit, EpubFontChoice, EpubReaderPrefs, EpubWordHit, LineSpacingPreset,
+    MarginPreset,
+};
 use super::bottom_bar::BottomBarAction;
 use super::combine_modal::{CombineHit, CombineModalState};
 use super::compare_mode::{CompareHit, CompareModeState};
@@ -32,7 +37,7 @@ use super::print_preview::{ManualDuplexHit, ManualDuplexWaitState, PrintPreviewH
 use super::split_pages_modal::{SplitPagesHit, SplitPagesModalState};
 use super::stamp_manager_modal::{StampManagerHit, StampManagerModalState};
 use super::text_view::{CachedTextViewPage, TextViewHit};
-use super::theme::{UiTheme, UiThemeMode};
+use super::theme::{DocKind, UiSkin, UiTheme, UiThemeMode};
 use super::toolbar::{CustomizeHit, ToolbarAction, ToolbarConfig};
 use super::user_guide::{UserGuideHit, UserGuideState};
 use super::watermark_modal::{WatermarkHit, WatermarkModalState};
@@ -207,6 +212,7 @@ impl MenuCategory {
                 "User Guide (How to Use)",
                 "Keyboard & Mouse Shortcuts (? / F1)",
                 "Bookmark Import Format (.txt)",
+                "UI Skin: Classic / Distinct",
                 "About MicroPDF",
             ],
         }
@@ -552,10 +558,12 @@ pub(super) struct SessionConfig {
     pub(super) recent_files: Vec<PathBuf>,
     pub(super) last_positions: Vec<LastPositionEntry>,
     pub(super) ui_theme: UiThemeMode,
+    pub(super) ui_skin: UiSkin,
     pub(super) ui_scale: f32,
     pub(super) scroll_mode: ScrollMode,
     pub(super) page_turn_anim_ms: u64,
     pub(super) reading_filter: ReadingFilter,
+    pub(super) epub_prefs: EpubReaderPrefs,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
@@ -571,10 +579,12 @@ impl Default for SessionConfig {
             recent_files: Vec::new(),
             last_positions: Vec::new(),
             ui_theme: UiThemeMode::Light,
+            ui_skin: UiSkin::Classic,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
             page_turn_anim_ms: 450,
             reading_filter: ReadingFilter::Normal,
+            epub_prefs: EpubReaderPrefs::default(),
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
@@ -835,6 +845,13 @@ pub(super) enum UiHit {
     TextView(TextViewHit),
     MarkdownView(super::markdown_view::MarkdownHit),
     MarkdownExport(super::markdown_export_modal::MarkdownExportHit),
+    MdEditorBar(super::text_editor::EditorBarAction),
+    MdSplitDivider,
+    BookSidebar(BookSidebarHit),
+    BookInfoPopover(BookInfoPopoverHit),
+    AaPopover(AaPopoverHit),
+    BookSelectionPill(BookSelectionPillHit),
+    EpubBottom(EpubBottomHit),
     Overlay(OverlayHit),
     BookmarkFormatSaveSample,
     BookmarkFormatClose,
@@ -914,6 +931,14 @@ pub(super) enum InputMode {
     EditBookmark {
         bookmark_idx: usize,
         title_input: String,
+    },
+    EpubNotePrompt {
+        block_idx: usize,
+        start_word: usize,
+        end_word: usize,
+        quote: String,
+        color_idx: u8,
+        text_input: String,
     },
     StickyNotePrompt {
         page_idx: u16,
@@ -1108,6 +1133,20 @@ pub(super) enum PendingDialog {
     AddFavoriteFile,
 }
 
+/// On-demand secondary editor window for Markdown / LaTeX tabs (0 bytes when closed).
+/// Strict drop order: `surface` drops before `window`.
+pub(super) struct EditorPopoutWindow {
+    pub(super) surface: Option<Surface<Rc<Window>, Rc<Window>>>,
+    pub(super) window: Rc<Window>,
+    pub(super) cursor_pos: (f64, f64),
+    pub(super) hovered_action: Option<super::text_editor::EditorBarAction>,
+    pub(super) hovered_scrollbar: bool,
+    pub(super) shift_pressed: bool,
+    pub(super) ctrl_pressed: bool,
+    pub(super) cmd_or_ctrl_pressed: bool,
+    pub(super) alt_pressed: bool,
+}
+
 pub struct PdfViewerApp<'a> {
     pub(super) engine: &'a PdfEngine,
     /// Open document tabs; inactive tabs hold zero rendered bitmaps.
@@ -1127,9 +1166,26 @@ pub struct PdfViewerApp<'a> {
     pub(super) md_source: Option<String>,
     pub(super) md_editor: Option<super::text_editor::TextEditorState>,
     pub(super) md_editor_mode: super::text_editor::MdEditorMode,
+    pub(super) md_split_ratio: f32,
+    pub(super) md_split_drag: bool,
+    pub(super) md_split_last_click: Option<Instant>,
+    pub(super) pending_open_editor_popout: bool,
+    pub(super) editor_popout: Option<EditorPopoutWindow>,
     pub(super) md_doc_gen: u64,
     pub(super) md_layout: Option<super::markdown_view::MdLayoutCache>,
     pub(super) md_active_hits: Vec<super::markdown_view::MdHitRect>,
+    /// Phase 2 Distinct EPUB reader preferences & per-book annotations/bookmarks/UI state.
+    pub(super) epub_prefs: EpubReaderPrefs,
+    pub(super) epub_book_data: EpubBookData,
+    pub(super) book_sidebar_tab: BookSidebarTab,
+    pub(super) book_toc_collapsed: HashSet<usize>,
+    pub(super) book_toc_search: Option<String>,
+    pub(super) book_info_popover: bool,
+    pub(super) show_aa_popover: bool,
+    pub(super) epub_cover_thumb: Option<(String, u32, u32, Vec<u32>)>,
+    pub(super) epub_word_rects: Vec<EpubWordHit>,
+    pub(super) epub_selection_drag: Option<((usize, usize), (usize, usize))>,
+    pub(super) epub_selection_pill_rect: Option<(i32, i32, u32, u32)>,
     pub(super) file_path: PathBuf,
     pub(super) current_page_index: u16,
     pub(super) roman_end: usize,
@@ -1299,6 +1355,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) show_customize_toolbar: bool,
     /// Bright Light default UI theme with Dark Mode toggle.
     pub(super) ui_theme_mode: UiThemeMode,
+    /// Visual skin mode (`Classic` default vs `Distinct`).
+    pub(super) ui_skin: UiSkin,
     /// User-adjustable UI interface scale multiplier (`0.80..=1.60`, persisted in `micropdf.ini`).
     pub(super) ui_scale: f32,
     /// Inline icon toolbar beside the menus on the unified top bar (`View -> Show Toolbar`).
@@ -1390,7 +1448,32 @@ pub struct PdfViewerApp<'a> {
 
 impl<'a> PdfViewerApp<'a> {
     pub(super) fn ui_theme(&self) -> UiTheme {
-        self.ui_theme_mode.theme()
+        self.ui_theme_mode
+            .theme_for(self.ui_skin, self.active_doc_kind())
+    }
+
+    pub(super) fn active_doc_kind(&self) -> DocKind {
+        let by_path = DocKind::from_path(&self.file_path);
+        if self.markdown_doc.is_some() && by_path == DocKind::Pdf {
+            DocKind::Markdown
+        } else {
+            by_path
+        }
+    }
+
+    pub(super) fn tab_doc_kind(&self, tab_idx: usize) -> DocKind {
+        if tab_idx == self.active_tab {
+            self.active_doc_kind()
+        } else if let Some(slot) = self.tabs.get(tab_idx) {
+            let by_path = DocKind::from_path(&slot.file_path);
+            if slot.markdown_doc.is_some() && by_path == DocKind::Pdf {
+                DocKind::Markdown
+            } else {
+                by_path
+            }
+        } else {
+            DocKind::Pdf
+        }
     }
 
     /// Effective UI scale combining OS display HiDPI `window_sf` with user's `ui_scale` preference.
@@ -1529,9 +1612,25 @@ impl<'a> PdfViewerApp<'a> {
             md_source: None,
             md_editor: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            md_split_ratio: 0.50,
+            md_split_drag: false,
+            md_split_last_click: None,
+            pending_open_editor_popout: false,
+            editor_popout: None,
             md_doc_gen: 0,
             md_layout: None,
             md_active_hits: Vec::new(),
+            epub_prefs: EpubReaderPrefs::default(),
+            epub_book_data: EpubBookData::default(),
+            book_sidebar_tab: BookSidebarTab::Contents,
+            book_toc_collapsed: HashSet::new(),
+            book_toc_search: None,
+            book_info_popover: false,
+            show_aa_popover: false,
+            epub_cover_thumb: None,
+            epub_word_rects: Vec::new(),
+            epub_selection_drag: None,
+            epub_selection_pill_rect: None,
             file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
@@ -1633,6 +1732,7 @@ impl<'a> PdfViewerApp<'a> {
             show_about_overlay: false,
             show_customize_toolbar: false,
             ui_theme_mode: UiThemeMode::Light,
+            ui_skin: UiSkin::Classic,
             ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
@@ -1726,6 +1826,8 @@ impl<'a> PdfViewerApp<'a> {
             || self.show_reading_mode_popover
             || self.show_scroll_mode_popover
             || self.show_notifications
+            || self.show_aa_popover
+            || self.book_info_popover
     }
 
     /// Dismisses all transient menus, context menus, and floating popovers.
@@ -1738,6 +1840,8 @@ impl<'a> PdfViewerApp<'a> {
         self.show_reading_mode_popover = false;
         self.show_scroll_mode_popover = false;
         self.show_notifications = false;
+        self.show_aa_popover = false;
+        self.book_info_popover = false;
         self.active_note_popover = None;
     }
 
@@ -1876,12 +1980,20 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn serialize_session_ini(cfg: &SessionConfig) -> String {
         let mut out = String::from("# MicroPDF v1.4 Session, Recent Files, Last Positions & UI Preferences\n");
         out.push_str(&format!("ui_theme={}\n", cfg.ui_theme.to_ini_str()));
+        out.push_str(&format!("ui_skin={}\n", cfg.ui_skin.to_ini_str()));
         out.push_str(&format!("ui_scale={:.2}\n", cfg.ui_scale.clamp(MIN_UI_SCALE, MAX_UI_SCALE)));
         out.push_str(&format!("scroll_mode={}\n", cfg.scroll_mode.to_ini_str()));
         out.push_str(&format!("page_turn_anim_ms={}\n", cfg.page_turn_anim_ms.min(3000)));
         out.push_str(&format!("reading_filter={}\n", cfg.reading_filter.to_ini_str()));
         out.push_str(&format!("show_toolbar={}\n", if cfg.show_toolbar { 1 } else { 0 }));
         out.push_str(&format!("encrypt_config={}\n", if cfg.encrypt_config { 1 } else { 0 }));
+        out.push_str(&format!("epub_font={}\n", cfg.epub_prefs.font_choice.to_ini_str()));
+        out.push_str(&format!("epub_font_size={:.1}\n", cfg.epub_prefs.font_size_px.clamp(11.0, 32.0)));
+        out.push_str(&format!("epub_line_spacing={}\n", cfg.epub_prefs.line_spacing.to_ini_str()));
+        out.push_str(&format!("epub_margins={}\n", cfg.epub_prefs.margins.to_ini_str()));
+        out.push_str(&format!("epub_justify={}\n", if cfg.epub_prefs.justify { 1 } else { 0 }));
+        out.push_str(&format!("epub_hyphenate={}\n", if cfg.epub_prefs.hyphenate { 1 } else { 0 }));
+        out.push_str(&format!("epub_spread={}\n", if cfg.epub_prefs.two_page_spread { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
             out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
@@ -1936,6 +2048,8 @@ impl<'a> PdfViewerApp<'a> {
             }
             if let Some(val) = line.strip_prefix("ui_theme=") {
                 cfg.ui_theme = UiThemeMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("ui_skin=") {
+                cfg.ui_skin = UiSkin::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("ui_scale=") {
                 if let Ok(sc) = val.trim().parse::<f32>() {
                     if sc.is_finite() {
@@ -1956,6 +2070,27 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("encrypt_config=") {
                 let v = val.trim();
                 cfg.encrypt_config = v == "1" || v.eq_ignore_ascii_case("true");
+            } else if let Some(val) = line.strip_prefix("epub_font=") {
+                cfg.epub_prefs.font_choice = EpubFontChoice::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("epub_font_size=") {
+                if let Ok(sz) = val.trim().parse::<f32>() {
+                    if sz.is_finite() {
+                        cfg.epub_prefs.font_size_px = sz.clamp(11.0, 32.0);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_line_spacing=") {
+                cfg.epub_prefs.line_spacing = LineSpacingPreset::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("epub_margins=") {
+                cfg.epub_prefs.margins = MarginPreset::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("epub_justify=") {
+                let v = val.trim();
+                cfg.epub_prefs.justify = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("epub_hyphenate=") {
+                let v = val.trim();
+                cfg.epub_prefs.hyphenate = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("epub_spread=") {
+                let v = val.trim();
+                cfg.epub_prefs.two_page_spread = !(v == "0" || v.eq_ignore_ascii_case("false"));
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("hf_profile=") {
@@ -2078,7 +2213,7 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn save_session_to_ini(&mut self) {
         // Record active and inactive tab reading positions into the 50-entry LRU table
         let encode_pos = |p: &std::path::Path, pg: u16, sy: f32| -> u16 {
-            if Self::is_markdown_path(p) || Self::is_latex_path(p) || Self::is_epub_path(p) {
+            if DocKind::from_path(p).is_reflowable() {
                 sy.round().clamp(0.0, 65535.0) as u16
             } else {
                 pg
@@ -2163,6 +2298,7 @@ impl<'a> PdfViewerApp<'a> {
             recent_files: self.recent_files.clone(),
             last_positions: self.last_positions.clone(),
             ui_theme: self.ui_theme_mode,
+            ui_skin: self.ui_skin,
             ui_scale: self.ui_scale,
             scroll_mode: self.scroll_mode,
             page_turn_anim_ms: self.page_turn_anim_ms,
@@ -2172,6 +2308,7 @@ impl<'a> PdfViewerApp<'a> {
             hf_profiles: self.hf_profiles.clone(),
             encrypt_config: self.encrypt_config,
             favorites: self.favorites.clone(),
+            epub_prefs: self.epub_prefs.clone(),
         };
         let ini_text = Self::serialize_session_ini(&cfg);
         let payload = if self.encrypt_config {
@@ -2227,6 +2364,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let cfg = Self::parse_session_ini(&content);
         self.ui_theme_mode = cfg.ui_theme;
+        self.ui_skin = cfg.ui_skin;
         self.ui_scale = cfg.ui_scale;
         self.scroll_mode = cfg.scroll_mode;
         self.page_turn_anim_ms = cfg.page_turn_anim_ms;
@@ -2234,6 +2372,7 @@ impl<'a> PdfViewerApp<'a> {
         self.show_toolbar = cfg.show_toolbar;
         self.encrypt_config = was_encrypted || cfg.encrypt_config;
         self.favorites = cfg.favorites;
+        self.epub_prefs = cfg.epub_prefs;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
         self.last_positions = cfg.last_positions;
@@ -2948,6 +3087,9 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn request_redraw(&self) {
         if let Some(window) = self.window.as_ref() {
             window.request_redraw();
+        }
+        if let Some(pop) = self.editor_popout.as_ref() {
+            pop.window.request_redraw();
         }
     }
 }

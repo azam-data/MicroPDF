@@ -98,11 +98,31 @@ pub struct MdHeading {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TocEntry {
+    pub title: String,
+    pub level: u8,
+    pub block_idx: usize,
+    pub children: Vec<TocEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BookMetadata {
+    pub title: String,
+    pub author: Option<String>,
+    pub publisher: Option<String>,
+    pub language: Option<String>,
+    pub description: Option<String>,
+    pub cover_image_key: Option<String>,
+    pub toc: Vec<TocEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MarkdownDoc {
     pub title: String,
     pub blocks: Vec<MdBlock>,
     pub headings: Vec<MdHeading>,
     pub embedded_images: std::collections::HashMap<String, Vec<u8>>,
+    pub book_meta: Option<BookMetadata>,
 }
 
 #[derive(Default)]
@@ -539,6 +559,7 @@ pub fn parse_markdown(src: &str, fallback_title: &str) -> MarkdownDoc {
         blocks,
         headings,
         embedded_images: std::collections::HashMap::new(),
+        book_meta: None,
     }
 }
 
