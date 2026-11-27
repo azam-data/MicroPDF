@@ -62,14 +62,14 @@ impl ToolbarItem {
         match self {
             Self::Sidebar => "Bookmarks Sidebar (B)",
             Self::Grid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open PDF (O)",
+            Self::Open => "Open Documents (O)",
             Self::Save => "Save PDF (S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview (Ctrl+P)",
             Self::Annotations => "Annotations (Highlight/Underline/Strike/Note/Pen/Text/Shapes)",
             Self::EditTools => "Edit Tools (Redact / Crop / Stamp)",
             Self::Rotate => "Rotate Page 90° (R)",
-            Self::Search => "Find Text (Ctrl+F)",
+            Self::Search => "Find in the document (Ctrl+F)",
             Self::UiScale => "Zoom Interface (UI Scale - / % / +)",
             Self::ThemeToggle => "Light / Dark UI Toggle",
         }
@@ -197,7 +197,7 @@ impl ToolbarAction {
         match self {
             Self::ToggleSidebar => "Bookmarks Sidebar (B)",
             Self::ToggleGrid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open PDF / MD / LaTeX / EPUB (O)",
+            Self::Open => "Open Documents (PDF / MD / LaTeX / EPUB) (O)",
             Self::Save => "Save (S / Ctrl+S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview / Export (Ctrl+P)",
@@ -216,7 +216,7 @@ impl ToolbarAction {
             Self::ToolCrop => "Crop Page Area (drag area)",
             Self::ToolStamp => "Stamp Signature / Image (P)",
             Self::RotatePage => "Rotate Page 90° (R)",
-            Self::FindText => "Find Text (Ctrl+F)",
+            Self::FindText => "Find in the document (Ctrl+F)",
             Self::MdModePreview => "Preview Mode",
             Self::MdModeSplit => "Split Editor & Live Preview",
             Self::MdModeEdit => "Source Editor Mode",
@@ -408,7 +408,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // Group 1: Panels & File actions (Sidebar, Grid, Open, Save, SaveAs, Print)
         let mut g1 = 0usize;
-        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) || distinct_epub {
             if try_push(mk_ic(ToolbarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -505,6 +505,14 @@ impl<'a> PdfViewerApp<'a> {
                 &mut cur_x,
                 &mut widgets,
             );
+            if self.toolbar_config.is_enabled(ToolbarItem::Search) {
+                push_sep(&mut cur_x, &mut seps, 1);
+                try_push(
+                    mk_ic(ToolbarAction::FindText, UiIcon::Search, matches!(self.input_mode, InputMode::SearchText { .. }), false),
+                    &mut cur_x,
+                    &mut widgets,
+                );
+            }
         } else {
             // Group 2: Select + Full Annotations Suite + Color Swatch (PDF tabs only)
             let mut g2 = 0usize;
@@ -846,7 +854,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             ToolbarAction::FindText => {
-                if self.doc.is_some() {
+                if self.doc.is_some() || self.is_markdown_tab() {
                     self.input_mode = InputMode::SearchText {
                         query_input: self.search_query.clone(),
                     };

@@ -1550,9 +1550,51 @@ impl<'a> PdfViewerApp<'a> {
         if q_chars.is_empty() {
             self.search_query.clear();
             self.search_matches.clear();
+            self.md_search_matches.clear();
             self.current_search_match = 0;
             self.incremental_search = None;
             self.status_notice = Some("Cleared text search highlights".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
+
+        if self.is_markdown_tab() {
+            self.search_query = trimmed.clone();
+            self.search_matches.clear();
+            self.md_search_matches.clear();
+            self.incremental_search = None;
+            self.current_search_match = 0;
+
+            let matches = if let Some(md_doc) = self.markdown_doc.as_ref() {
+                super::markdown_view::search_markdown_doc(
+                    md_doc,
+                    &trimmed,
+                    case_sensitive,
+                    whole_word,
+                )
+            } else {
+                Vec::new()
+            };
+
+            if matches.is_empty() {
+                self.status_notice = Some(format!("No matches found for '{}'", trimmed));
+            } else {
+                let cur_blk = self.current_visible_epub_block_idx();
+                let start_idx = matches
+                    .iter()
+                    .position(|m| m.ast_block_idx >= cur_blk)
+                    .unwrap_or(0);
+                self.md_search_matches = matches;
+                self.current_search_match = start_idx;
+                self.jump_to_md_search_match(start_idx);
+                self.status_notice = Some(format!(
+                    "Match {}/{} for '{}' (F3 next / Shift+F3 prev)",
+                    start_idx + 1,
+                    self.md_search_matches.len(),
+                    trimmed
+                ));
+            }
             self.update_title_bar();
             self.request_redraw();
             return;
@@ -1568,6 +1610,7 @@ impl<'a> PdfViewerApp<'a> {
 
         self.search_query = trimmed.clone();
         self.search_matches.clear();
+        self.md_search_matches.clear();
         self.current_search_match = 0;
         self.incremental_search = Some(IncrementalSearchState {
             query: trimmed,
@@ -1710,6 +1753,27 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn jump_to_next_search_match(&mut self) {
+        if self.is_markdown_tab() {
+            if self.md_search_matches.is_empty() {
+                self.input_mode = InputMode::SearchText {
+                    query_input: self.search_query.clone(),
+                };
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+            self.current_search_match = (self.current_search_match + 1) % self.md_search_matches.len();
+            self.jump_to_md_search_match(self.current_search_match);
+            self.status_notice = Some(format!(
+                "Match {}/{} for '{}'",
+                self.current_search_match + 1,
+                self.md_search_matches.len(),
+                self.search_query
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         if self.search_matches.is_empty() {
             self.input_mode = InputMode::SearchText {
                 query_input: self.search_query.clone(),
@@ -1737,6 +1801,32 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn jump_to_prev_search_match(&mut self) {
+        if self.is_markdown_tab() {
+            if self.md_search_matches.is_empty() {
+                self.input_mode = InputMode::SearchText {
+                    query_input: self.search_query.clone(),
+                };
+                self.update_title_bar();
+                self.request_redraw();
+                return;
+            }
+            let len = self.md_search_matches.len();
+            self.current_search_match = if self.current_search_match == 0 {
+                len - 1
+            } else {
+                self.current_search_match - 1
+            };
+            self.jump_to_md_search_match(self.current_search_match);
+            self.status_notice = Some(format!(
+                "Match {}/{} for '{}'",
+                self.current_search_match + 1,
+                len,
+                self.search_query
+            ));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         if self.search_matches.is_empty() {
             self.input_mode = InputMode::SearchText {
                 query_input: self.search_query.clone(),
@@ -1823,6 +1913,7 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
+            .set_title("Open Documents")
             .add_filter("Supported Documents (PDF, Markdown, LaTeX, EPUB)", &["pdf", "md", "markdown", "tex", "epub"])
             .add_filter("PDF Document", &["pdf"])
             .add_filter("EPUB E-Book", &["epub"])
@@ -1907,6 +1998,21 @@ impl<'a> PdfViewerApp<'a> {
                 let s = ch.as_str();
                 if s.eq_ignore_ascii_case("s") {
                     self.save_active_markdown();
+                    return true;
+                } else if s.eq_ignore_ascii_case("f") {
+                    self.input_mode = InputMode::SearchText {
+                        query_input: self.search_query.clone(),
+                    };
+                    self.status_notice = None;
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return true;
+                } else if s.eq_ignore_ascii_case("g") {
+                    if self.shift_pressed || s == "G" {
+                        self.jump_to_prev_search_match();
+                    } else {
+                        self.jump_to_next_search_match();
+                    }
                     return true;
                 } else if s.eq_ignore_ascii_case("a") {
                     if let Some(ref mut ed) = self.md_editor {
@@ -4603,7 +4709,7 @@ impl<'a> PdfViewerApp<'a> {
                         let trimmed = query_input.trim();
                         if !trimmed.is_empty()
                             && trimmed == self.search_query
-                            && !self.search_matches.is_empty()
+                            && self.active_search_match_count() > 0
                         {
                             if self.shift_pressed {
                                 self.jump_to_prev_search_match();
@@ -5068,6 +5174,13 @@ impl<'a> PdfViewerApp<'a> {
                     self.close_deskew_bar();
                 } else if self.incremental_search.is_some() {
                     self.cancel_incremental_search();
+                } else if !self.md_search_matches.is_empty() {
+                    self.md_search_matches.clear();
+                    self.search_query.clear();
+                    self.current_search_match = 0;
+                    self.status_notice = Some("Cleared text search highlights".to_string());
+                    self.update_title_bar();
+                    self.request_redraw();
                 } else if self.optimize_job.is_some() {
                     self.cancel_optimize_job();
                 } else if self.print_job.is_some() {
@@ -6142,6 +6255,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.scroll_to_hscrollbar_x(position.x, win_w, win_h, status_bar_h, sf);
                     return;
                 }
+                if self.epub_margin_slider_drag {
+                    let (tx0, tx1) = Self::aa_margin_slider_track_x(win_w, win_h, status_bar_h, sf);
+                    let norm = ((position.x as f32 - tx0 as f32) / ((tx1 - tx0).max(1) as f32)).clamp(0.0, 1.0);
+                    self.epub_prefs.set_margin_slider_norm(norm);
+                    self.md_layout = None;
+                    self.request_redraw();
+                    return;
+                }
                 if self.md_split_drag {
                     let canvas_w = win_w.saturating_sub(sidebar_w).max(1) as f32;
                     let rel = (position.x as f32 - sidebar_w as f32) / canvas_w;
@@ -6737,6 +6858,12 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if state == ElementState::Released && self.hscrollbar_drag {
                     self.hscrollbar_drag = false;
+                    self.request_redraw();
+                    return;
+                }
+                if state == ElementState::Released && self.epub_margin_slider_drag {
+                    self.epub_margin_slider_drag = false;
+                    self.save_session_to_ini();
                     self.request_redraw();
                     return;
                 }
@@ -7384,6 +7511,9 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             status_bar_h,
                             scale_factor,
                         ) {
+                            if matches!(hit, super::book_ui::AaPopoverHit::MarginSlider(_)) {
+                                self.epub_margin_slider_drag = true;
+                            }
                             self.handle_aa_popover_click(hit);
                             return;
                         }

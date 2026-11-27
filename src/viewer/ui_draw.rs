@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 
-/// Maximum memory allowed for cached alpha-only glyph bitmaps (512 KB).
-pub const MAX_GLYPH_CACHE_BYTES: usize = 512 * 1024;
+/// Maximum memory allowed for cached alpha-only glyph bitmaps (4 MB).
+pub const MAX_GLYPH_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
 static REGULAR_FONT_Z: &[u8] = include_bytes!("../../assets/ui_regular.ttf.z");
 static BOLD_FONT_Z: &[u8] = include_bytes!("../../assets/ui_bold.ttf.z");
@@ -562,31 +562,94 @@ pub fn glyph_cache_bytes() -> usize {
         .byte_len()
 }
 
-/// Measures the horizontal advance width of `text` using `style` (including real kerning pairs).
-pub fn measure_text_styled(text: &str, style: TextStyle) -> f32 {
-    let (_, snapped_px) = snap_size_q4(style.size_px);
-    let scale = PxScale::from(snapped_px);
-    let mut w = 0.0f32;
-    let mut prev_gid: Option<u16> = None;
-    for ch in text.chars() {
-        let (adv, gid, from_primary) =
-            with_cached_glyph_styled(ch, style, |g| (g.advance, g.gid, g.from_primary));
-        if from_primary {
-            if let Some(pg) = prev_gid {
-                w += kern_pair_for_style(style, scale, pg, gid);
+#[inline]
+fn measure_char_fallback(ch: char, scale: PxScale, primary_space_adv: f32) -> f32 {
+    if !ch.is_ascii() {
+        let bank = font_bank();
+        if let Ok(mut fb_guard) = bank.fallback.lock() {
+            let fb_ref = fb_guard.get_or_insert_with(load_os_fallback_font);
+            if let Some(font) = fb_ref.as_ref() {
+                let gid = font.glyph_id(ch);
+                if gid.0 != 0 {
+                    return font.as_scaled(scale).h_advance(gid);
+                }
             }
+        }
+    }
+    primary_space_adv
+}
+
+fn measure_text_with_font(text: &str, font: &FontVec, scale: PxScale) -> f32 {
+    let scaled = font.as_scaled(scale);
+    let space_adv = scaled.h_advance(font.glyph_id(' '));
+    let mut w = 0.0f32;
+    let mut prev_gid: Option<GlyphId> = None;
+    for ch in text.chars() {
+        let gid = font.glyph_id(ch);
+        if gid.0 != 0 || ch == ' ' || ch == '\t' {
+            if let Some(pg) = prev_gid {
+                w += scaled.kern(pg, gid);
+            }
+            w += scaled.h_advance(gid);
             prev_gid = Some(gid);
         } else {
             prev_gid = None;
+            w += measure_char_fallback(ch, scale, space_adv);
         }
-        w += adv;
     }
     w
+}
+
+/// Measures the horizontal advance width of `text` using `style` (including real kerning pairs)
+/// directly from font metrics without rasterizing glyph bitmaps or locking the glyph cache.
+pub fn measure_text_styled(text: &str, style: TextStyle) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let (_, snapped_px) = snap_size_q4(style.size_px);
+    let scale = PxScale::from(snapped_px);
+    if style.family == FontFamily::CustomOs {
+        if let Ok(guard) = font_bank().custom_os.lock() {
+            if let Some(ref custom_font) = guard.font {
+                return measure_text_with_font(text, custom_font, scale);
+            }
+        }
+    }
+    let (primary, _) = resolve_builtin_font(style.family, style.bold, style.italic);
+    if let Some(font) = primary {
+        measure_text_with_font(text, font, scale)
+    } else {
+        text.chars().count() as f32 * snapped_px * 0.5
+    }
 }
 
 /// Measures the horizontal advance width of `text` at `size_px` using `UiSans`.
 pub fn measure_text(text: &str, size_px: f32, bold: bool) -> f32 {
     measure_text_styled(text, TextStyle::ui(size_px, bold))
+}
+
+fn truncate_with_font(text: &str, budget: f32, font: &FontVec, scale: PxScale) -> String {
+    let scaled = font.as_scaled(scale);
+    let space_adv = scaled.h_advance(font.glyph_id(' '));
+    let mut out = String::new();
+    let mut cur_w = 0.0f32;
+    let mut prev_gid: Option<GlyphId> = None;
+    for ch in text.chars() {
+        let gid = font.glyph_id(ch);
+        let (adv, k, next_prev) = if gid.0 != 0 || ch == ' ' || ch == '\t' {
+            let k = prev_gid.map(|pg| scaled.kern(pg, gid)).unwrap_or(0.0);
+            (scaled.h_advance(gid), k, Some(gid))
+        } else {
+            (measure_char_fallback(ch, scale, space_adv), 0.0, None)
+        };
+        if cur_w + k + adv > budget {
+            break;
+        }
+        cur_w += k + adv;
+        prev_gid = next_prev;
+        out.push(ch);
+    }
+    out
 }
 
 /// Truncates `text` with `"…"` so its styled measured width does not exceed `max_w`.
@@ -603,26 +666,23 @@ pub fn truncate_ellipsis_styled(text: &str, max_w: f32, style: TextStyle) -> Str
     let ell = "…";
     let ell_w = measure_text_styled(ell, style);
     let budget = (max_w - ell_w).max(0.0);
-    let mut out = String::new();
-    let mut cur_w = 0.0f32;
-    let mut prev_gid: Option<u16> = None;
-    for ch in text.chars() {
-        let (adv, gid, from_primary) =
-            with_cached_glyph_styled(ch, style, |g| (g.advance, g.gid, g.from_primary));
-        let k = if from_primary {
-            prev_gid
-                .map(|pg| kern_pair_for_style(style, scale, pg, gid))
-                .unwrap_or(0.0)
+    let mut out = if style.family == FontFamily::CustomOs {
+        if let Ok(guard) = font_bank().custom_os.lock() {
+            if let Some(ref custom_font) = guard.font {
+                truncate_with_font(text, budget, custom_font, scale)
+            } else if let (Some(font), _) = resolve_builtin_font(style.family, style.bold, style.italic) {
+                truncate_with_font(text, budget, font, scale)
+            } else {
+                String::new()
+            }
         } else {
-            0.0
-        };
-        if cur_w + k + adv > budget {
-            break;
+            String::new()
         }
-        cur_w += k + adv;
-        prev_gid = if from_primary { Some(gid) } else { None };
-        out.push(ch);
-    }
+    } else if let (Some(font), _) = resolve_builtin_font(style.family, style.bold, style.italic) {
+        truncate_with_font(text, budget, font, scale)
+    } else {
+        String::new()
+    };
     out.push_str(ell);
     out
 }
@@ -2017,4 +2077,172 @@ pub fn draw_magazine_page_turn_overlay(
         }
     }
 }
+
+/// CPU-rendered Apple Books-inspired 3D hand-turned curved page-peel animation.
+///
+/// `buffer` already contains the newly revealed destination spread inside
+/// `(spread_x, spread_y, spread_w, spread_h)`. `prev_spread` holds the `spread_w * spread_h`
+/// pixel snapshot of the outgoing spread (freed as soon as the animation completes).
+#[allow(clippy::too_many_arguments)]
+pub fn draw_apple_books_page_curl(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    prev_spread: &[u32],
+    spread_x: i32,
+    spread_y: i32,
+    spread_w: u32,
+    spread_h: u32,
+    linear_t: f32,
+    direction: i8,
+    paper_bg: u32,
+    s: f32,
+) {
+    if spread_w < 8 || spread_h < 8 || prev_spread.len() < (spread_w as usize * spread_h as usize) {
+        return;
+    }
+    let t = linear_t.clamp(0.0, 1.0);
+    // Smooth S-curve easing for a natural hand sweep
+    let e = t * t * (3.0 - 2.0 * t);
+    let arch = (e * std::f32::consts::PI).sin();
+
+    let w = spread_w as f32;
+    let h = spread_h as f32;
+    let inv_h = 1.0 / h.max(1.0);
+    let forward = direction >= 0;
+
+    // Slight diagonal tilt like a thumb lifting the bottom corner and sweeping across the book
+    let tilt_dx = w * 0.11 * arch;
+    // Apparent width of the curled-over back side of the turning sheet
+    let curl_w = (w * (0.055 + 0.145 * arch)).clamp(16.0 * s, w * 0.23);
+    let inv_curl_w = 1.0 / curl_w.max(1.0);
+    // Drop shadow cast underneath onto the newly revealed page
+    let under_shadow_w = (curl_w * 0.85 + 22.0 * s) * (0.35 + 0.65 * arch);
+    let inv_under_shadow = 1.0 / under_shadow_w.max(1.0);
+    // Soft outer shadow cast by the curled trailing lip onto the outgoing page
+    let lip_shadow_w = (22.0 * s) * (0.30 + 0.70 * arch);
+    let inv_lip_shadow = 1.0 / lip_shadow_w.max(1.0);
+
+    let base_x = if forward {
+        (w + curl_w * 0.15 + tilt_dx * 0.5) * (1.0 - e)
+            - (curl_w + lip_shadow_w + tilt_dx * 0.5) * e
+    } else {
+        -(curl_w * 0.15 + tilt_dx * 0.5) * (1.0 - e)
+            + (w + curl_w + lip_shadow_w + tilt_dx * 0.5) * e
+    };
+
+    let pr = ((paper_bg >> 16) & 0xFF) as f32;
+    let pg = ((paper_bg >> 8) & 0xFF) as f32;
+    let pb = (paper_bg & 0xFF) as f32;
+    let is_dark_paper = (pr * 0.299 + pg * 0.587 + pb * 0.114) < 110.0;
+
+    let y_start = 0.max(-spread_y) as u32;
+    let y_end = spread_h.min((buf_h as i32 - spread_y).max(0) as u32);
+    let x_start = 0.max(-spread_x) as u32;
+    let x_end = spread_w.min((buf_w as i32 - spread_x).max(0) as u32);
+    if y_end <= y_start || x_end <= x_start {
+        return;
+    }
+
+    let sw_usize = spread_w as usize;
+    let bw_usize = buf_w as usize;
+    let w_max_i = (spread_w - 1) as i32;
+    let h_max_i = (spread_h - 1) as i32;
+
+    for ly in y_start..y_end {
+        let yn = ly as f32 * inv_h;
+        // Subtle vertical arc curvature so the fold bends slightly like real paper
+        let bend = (yn - 0.5) * (yn - 0.5) * (w * 0.025 * arch);
+        let fold_x = if forward {
+            base_x - (yn - 0.5) * tilt_dx + bend
+        } else {
+            base_x + (yn - 0.5) * tilt_dx - bend
+        };
+
+        let dst_row = (spread_y + ly as i32) as usize * bw_usize;
+        let prev_row = ly as usize * sw_usize;
+
+        for lx in x_start..x_end {
+            let fx = lx as f32;
+            // Signed distance from fold crease:
+            //   d > 0             : newly revealed destination page (already in `buffer`)
+            //   -curl_w <= d <= 0 : 3D curled back-side of turning page
+            //   d < -curl_w       : still-unturned outgoing page (`prev_spread`)
+            let d = if forward { fx - fold_x } else { fold_x - fx };
+            let dst_idx = dst_row + (spread_x + lx as i32) as usize;
+
+            if d > 0.0 {
+                if d < under_shadow_w {
+                    let frac = 1.0 - d * inv_under_shadow;
+                    let shadow = (frac * frac) * (0.46 * (0.42 + 0.58 * arch));
+                    let keep = ((1.0 - shadow) * 255.0).round().clamp(0.0, 255.0) as u32;
+                    let dst = buffer[dst_idx];
+                    let r = (((dst >> 16) & 0xFF) * keep) / 255;
+                    let g = (((dst >> 8) & 0xFF) * keep) / 255;
+                    let b = ((dst & 0xFF) * keep) / 255;
+                    buffer[dst_idx] = (r << 16) | (g << 8) | b;
+                }
+            } else if d >= -curl_w {
+                let u = (-d) * inv_curl_w; // 0 at crease, 1 at curled lip edge
+                // Sample mirrored outgoing page for realistic translucent paper bleed-through
+                let sample_dist = (-d) * (1.05 + 0.25 * u);
+                let src_lx = if forward {
+                    (fold_x + sample_dist).round() as i32
+                } else {
+                    (fold_x - sample_dist).round() as i32
+                }
+                .clamp(0, w_max_i) as usize;
+                let src_ly = (ly as f32 - (1.0 - u) * 5.0 * s * arch)
+                    .round()
+                    .clamp(0.0, h_max_i as f32) as usize;
+                let ghost_px = prev_spread[src_ly * sw_usize + src_lx];
+                let gr = ((ghost_px >> 16) & 0xFF) as f32;
+                let gg = ((ghost_px >> 8) & 0xFF) as f32;
+                let gb = (ghost_px & 0xFF) as f32;
+
+                // Blend paper back-side (78%) with faint ghosted text from turning sheet (22%)
+                let mut cr = pr * 0.78 + gr * 0.22;
+                let mut cg = pg * 0.78 + gg * 0.22;
+                let mut cb = pb * 0.78 + gb * 0.22;
+
+                // 3D cylindrical illumination across the curved sheet:
+                // darker inside the crease (u ~ 0), bright specular sheen on crest (u ~ 0.35),
+                // softly rolling off toward trailing paper lip (u ~ 1)
+                let crest = (u * std::f32::consts::PI).sin();
+                let specular = (1.0 - ((u - 0.34) / 0.28).abs()).clamp(0.0, 1.0);
+                let spec_boost = specular * specular * if is_dark_paper { 28.0 } else { 22.0 };
+                let shade = 0.80 + 0.24 * crest - (1.0 - u).powi(3) * 0.14;
+
+                cr = (cr * shade + spec_boost).clamp(0.0, 255.0);
+                cg = (cg * shade + spec_boost).clamp(0.0, 255.0);
+                cb = (cb * shade + spec_boost).clamp(0.0, 255.0);
+
+                // Crisp 1px paper edge rim at the trailing lip
+                if u > 0.955 {
+                    let rim = if is_dark_paper { 1.18 } else { 0.88 };
+                    cr = (cr * rim).clamp(0.0, 255.0);
+                    cg = (cg * rim).clamp(0.0, 255.0);
+                    cb = (cb * rim).clamp(0.0, 255.0);
+                }
+
+                buffer[dst_idx] =
+                    ((cr as u32) << 16) | ((cg as u32) << 8) | (cb as u32);
+            } else {
+                let mut px = prev_spread[prev_row + lx as usize];
+                let behind_d = -d - curl_w;
+                if behind_d < lip_shadow_w {
+                    let frac = 1.0 - behind_d * inv_lip_shadow;
+                    let shadow = (frac * frac) * (0.32 * (0.35 + 0.65 * arch));
+                    let keep = ((1.0 - shadow) * 255.0).round().clamp(0.0, 255.0) as u32;
+                    let r = (((px >> 16) & 0xFF) * keep) / 255;
+                    let g = (((px >> 8) & 0xFF) * keep) / 255;
+                    let b = ((px & 0xFF) * keep) / 255;
+                    px = (r << 16) | (g << 8) | b;
+                }
+                buffer[dst_idx] = px;
+            }
+        }
+    }
+}
+
 

@@ -284,37 +284,42 @@ fn compute_latex_line_states(lines: &[String]) -> Vec<bool> {
         let mut i = 0usize;
         while i < bytes.len() {
             if bytes[i] == b'\\' {
-                if code_part[i..].starts_with("\\begin{") {
-                    if let Some(end_b) = code_part[i + 7..].find('}') {
-                        let env = &code_part[i + 7..i + 7 + end_b];
-                        if is_latex_math_env_name(env) {
-                            math_env_depth += 1;
+                if bytes[i..].starts_with(b"\\begin{") {
+                    if let Some(end_b) = bytes[i + 7..].iter().position(|&b| b == b'}') {
+                        if let Ok(env) = std::str::from_utf8(&bytes[i + 7..i + 7 + end_b]) {
+                            if is_latex_math_env_name(env) {
+                                math_env_depth += 1;
+                            }
                         }
                         i += 7 + end_b + 1;
                         continue;
                     }
-                } else if code_part[i..].starts_with("\\end{") {
-                    if let Some(end_b) = code_part[i + 5..].find('}') {
-                        let env = &code_part[i + 5..i + 5 + end_b];
-                        if is_latex_math_env_name(env) {
-                            math_env_depth = math_env_depth.saturating_sub(1);
+                } else if bytes[i..].starts_with(b"\\end{") {
+                    if let Some(end_b) = bytes[i + 5..].iter().position(|&b| b == b'}') {
+                        if let Ok(env) = std::str::from_utf8(&bytes[i + 5..i + 5 + end_b]) {
+                            if is_latex_math_env_name(env) {
+                                math_env_depth = math_env_depth.saturating_sub(1);
+                            }
                         }
                         i += 5 + end_b + 1;
                         continue;
                     }
-                } else if code_part[i..].starts_with("\\[") {
+                } else if bytes[i..].starts_with(b"\\[") {
                     in_math = true;
                     i += 2;
                     continue;
-                } else if code_part[i..].starts_with("\\]") {
+                } else if bytes[i..].starts_with(b"\\]") {
                     in_math = false;
                     i += 2;
                     continue;
                 }
-                i += 2.min(bytes.len() - i);
+                i += 1;
+                if i < bytes.len() && bytes[i].is_ascii() {
+                    i += 1;
+                }
                 continue;
             }
-            if code_part[i..].starts_with("$$") {
+            if bytes[i..].starts_with(b"$$") {
                 in_math = !in_math;
                 i += 2;
                 continue;

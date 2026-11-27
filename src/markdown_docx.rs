@@ -247,6 +247,9 @@ fn emit_blocks_to_docx(mut docx: Docx, blocks: &[MdBlock]) -> Docx {
                 );
                 docx = docx.add_paragraph(p);
             }
+            MdBlock::PageBreak => {
+                docx = docx.add_paragraph(Paragraph::new().page_break_before(true));
+            }
             MdBlock::MathBlock(tex) => {
                 let readable = crate::math_render::math_to_readable_text(tex);
                 let mut p = Paragraph::new()

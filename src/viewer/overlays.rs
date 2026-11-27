@@ -143,7 +143,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let title_sz = (16.0 * s).clamp(13.0, 34.0);
         let sub_sz = (12.0 * s).clamp(10.0, 26.0);
-        let title = "Drop a PDF here to open";
+        let title = "Drop a document here to open";
         let tw = measure_text(title, title_sz, true);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - tw) * 0.5).round() as i32, cy + (84.0 * s).round() as i32, title, title_sz, theme.text_primary, true);
 
@@ -151,11 +151,11 @@ impl<'a> PdfViewerApp<'a> {
         let sw = measure_text(sub, sub_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - sw) * 0.5).round() as i32, cy + (107.0 * s).round() as i32, sub, sub_sz, theme.text_muted, false);
 
-        // Open PDF & Favorites buttons
+        // Open Documents & Favorites buttons
         if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeOpen) {
             let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeOpen));
             fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.accent_hover } else { theme.accent });
-            let lbl = "Open PDF  (O)";
+            let lbl = "Open Documents  (O)";
             let lw = measure_text(lbl, sub_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_on_accent, true);
         }
@@ -295,8 +295,9 @@ impl<'a> PdfViewerApp<'a> {
                 let body_sz = (12.0 * s).clamp(10.0, 26.0);
                 let small_sz = (10.5 * s).clamp(9.0, 22.0);
                 let first_btn_x = hits[0].x;
-                let count_str = if !self.search_matches.is_empty() {
-                    format!("{}/{}", self.current_search_match + 1, self.search_matches.len())
+                let total_matches = self.active_search_match_count();
+                let count_str = if total_matches > 0 {
+                    format!("{}/{}", self.current_search_match + 1, total_matches)
                 } else {
                     String::new()
                 };
@@ -308,7 +309,7 @@ impl<'a> PdfViewerApp<'a> {
                 let input_x = px + (30.0 * s).round() as i32;
                 let input_max_x = (first_btn_x - count_w - 6).max(input_x + 20);
                 let display = if query_input.is_empty() {
-                    "Find in PDF... |".to_string()
+                    "Find in the document... |".to_string()
                 } else {
                     format!("{query_input}|")
                 };
@@ -757,11 +758,11 @@ impl<'a> PdfViewerApp<'a> {
             ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V / Aa", "Reading Modes (V) / EPUB Aa Fonts, Margins & Spread"),
-            ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
+            ("V / Aa", "Reading Modes (V) / EPUB Aa Fonts, Margins, Justify & Curl"),
+            ("Ctrl+F", "Find in the document (PDF/EPUB/MD/LaTeX; F3 / Shift+F3)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF/.md/.tex/.epub / Save / Watermark Dialog"),
+            ("O / S / W", "Open Documents / Save / Watermark Dialog"),
             ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
             ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
@@ -927,6 +928,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.input_mode = InputMode::Normal;
                 self.cancel_incremental_search();
                 self.search_matches.clear();
+                self.md_search_matches.clear();
                 self.search_query.clear();
             }
             OverlayHit::OptimizePreset(p) => {

@@ -72,6 +72,10 @@ impl<'a> PdfViewerApp<'a> {
         self.book_toc_collapsed.clear();
         self.book_toc_search = None;
         self.md_split_drag = false;
+        self.epub_margin_slider_drag = false;
+        self.md_image_cache.clear();
+        self.md_search_matches.clear();
+        self.page_turn_anim = None;
         if self.active_doc_kind() == DocKind::Epub {
             self.load_epub_book_data();
             if self.ui_skin == UiSkin::Distinct {
@@ -1655,7 +1659,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.tabs.is_empty() {
             super::ui_draw::draw_text_vcenter(
                 buffer, buf_w, buf_h, px + (12.0 * s).round() as i32, list_top, row_h,
-                px + pw as i32 - 12, "No open PDFs", body_sz, theme.text_muted, false,
+                px + pw as i32 - 12, "No open documents", body_sz, theme.text_muted, false,
             );
         } else {
             let max_scroll = self.tabs.len().saturating_sub(vis_rows);

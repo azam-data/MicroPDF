@@ -48,6 +48,8 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
     let mut ncx_path: Option<String> = None;
     let mut cover_path: Option<String> = None;
     let mut spine_hrefs: Vec<String> = Vec::new();
+    let mut guide_toc_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut non_linear_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     if !parse_opf_with_roxmltree(
         &opf_xml,
@@ -63,6 +65,8 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
         &mut ncx_path,
         &mut cover_path,
         &mut spine_hrefs,
+        &mut guide_toc_paths,
+        &mut non_linear_paths,
     ) {
         // Tolerant fallback if .opf is malformed XML
         title = extract_tag_text(&opf_xml, "dc:title")
@@ -111,6 +115,17 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
                     }
                     manifest.insert(id, (resolved, media, props));
                 }
+            } else if tag.name.eq_ignore_ascii_case("reference") {
+                let rtype = get_attr(&tag.raw, "type").unwrap_or_default();
+                if rtype.eq_ignore_ascii_case("toc") {
+                    if let Some(href) = get_attr(&tag.raw, "href") {
+                        let file_part = href.split('#').next().unwrap_or(&href);
+                        let resolved = normalize_zip_path(&opf_dir, &percent_decode(file_part));
+                        if !resolved.is_empty() {
+                            guide_toc_paths.insert(resolved);
+                        }
+                    }
+                }
             }
         }
         if cover_path.is_none() {
@@ -125,6 +140,11 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
                 if let Some(idref) = get_attr(&tag.raw, "idref") {
                     if let Some((href, media, _)) = manifest.get(&idref) {
                         if media.contains("html") || media.contains("xml") || media.is_empty() {
+                            if get_attr(&tag.raw, "linear")
+                                .is_some_and(|v| v.eq_ignore_ascii_case("no"))
+                            {
+                                non_linear_paths.insert(href.clone());
+                            }
                             spine_hrefs.push(href.clone());
                         }
                     }
@@ -172,6 +192,7 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
     let mut embedded_images: HashMap<String, Vec<u8>> = HashMap::new();
     let mut chapter_start_block: HashMap<String, usize> = HashMap::new();
     let mut anchor_blocks: HashMap<(String, String), usize> = HashMap::new();
+    let mut skipped_toc_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // Keep cover separate in embedded_images + BookMetadata.cover_image_key (not injected as a body block)
     let mut cover_image_key: Option<String> = None;
@@ -182,9 +203,24 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
         }
     }
 
-    for (chap_idx, chap_path) in spine_hrefs.iter().enumerate() {
-        // Skip standalone EPUB3 nav file if it has no narrative content
-        if nav_path.as_deref() == Some(chap_path.as_str()) && spine_hrefs.len() > 1 {
+    for chap_path in &spine_hrefs {
+        // Skip standalone EPUB3 nav file or OPF <guide type="toc"> file from the book body
+        if spine_hrefs.len() > 1
+            && (nav_path.as_deref() == Some(chap_path.as_str())
+                || guide_toc_paths.contains(chap_path.as_str()))
+        {
+            if raw_toc.is_empty() {
+                if let Ok(tb) = zip.read_file(chap_path) {
+                    let thtml = String::from_utf8_lossy(&tb);
+                    let tdir = parent_dir(chap_path);
+                    let extracted = extract_toc_from_html_links(&thtml, &tdir);
+                    if !extracted.is_empty() {
+                        collect_raw_toc_labels(&extracted, &mut toc_labels);
+                        raw_toc = extracted;
+                    }
+                }
+            }
+            skipped_toc_paths.insert(chap_path.clone());
             continue;
         }
         let Ok(chap_bytes) = zip.read_file(chap_path) else {
@@ -193,60 +229,95 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
         let html = String::from_utf8_lossy(&chap_bytes);
         let chap_dir = parent_dir(chap_path);
 
-        if chap_idx > 0 && !blocks.is_empty() {
-            blocks.push(MdBlock::HorizontalRule);
-        }
-
-        let start_block_idx = blocks.len();
-        chapter_start_block
-            .entry(chap_path.clone())
-            .or_insert(start_block_idx);
-        let before_headings = headings.len();
+        // Parse into temporary chapter buffers first so we can detect & omit standalone HTML TOC
+        // pages before inserting a PageBreak or polluting the book body.
+        let mut chap_blocks: Vec<MdBlock> = Vec::new();
+        let mut chap_headings: Vec<MdHeading> = Vec::new();
+        let mut chap_anchors: HashMap<(String, String), usize> = HashMap::new();
 
         let parsed_dom = parse_xhtml_chapter_roxmltree(
             &html,
             chap_path,
             &chap_dir,
             &zip,
-            &mut blocks,
-            &mut headings,
+            &mut chap_blocks,
+            &mut chap_headings,
             &mut embedded_images,
-            &mut anchor_blocks,
+            &mut chap_anchors,
         );
         if !parsed_dom {
             parse_xhtml_chapter(
                 &html,
                 &chap_dir,
                 &zip,
-                &mut blocks,
-                &mut headings,
+                &mut chap_blocks,
+                &mut chap_headings,
                 &mut embedded_images,
             );
         }
 
-        // If chapter had no explicit <h1>-<h3>, inject TOC label as chapter heading
-        if headings.len() == before_headings {
-            if let Some(lbl) = toc_labels.get(chap_path) {
-                let b_idx = start_block_idx;
-                blocks.insert(
-                    b_idx,
-                    MdBlock::Heading {
-                        level: 2,
-                        spans: vec![InlineSpan::Text(lbl.clone())],
-                    },
-                );
-                // Shift anchor_blocks recorded inside this chapter by +1
-                for ((p, _), b) in anchor_blocks.iter_mut() {
-                    if p == chap_path && *b >= b_idx {
-                        *b += 1;
-                    }
+        if spine_hrefs.len() > 1
+            && is_standalone_toc_chapter(
+                chap_path,
+                &chap_blocks,
+                non_linear_paths.contains(chap_path.as_str()),
+            )
+        {
+            if raw_toc.is_empty() {
+                let extracted = extract_toc_from_html_links(&html, &chap_dir);
+                if !extracted.is_empty() {
+                    collect_raw_toc_labels(&extracted, &mut toc_labels);
+                    raw_toc = extracted;
                 }
+            }
+            skipped_toc_paths.insert(chap_path.clone());
+            continue;
+        }
+
+        if chap_blocks.is_empty() {
+            continue;
+        }
+
+        // Start every EPUB chapter on a clean new page (regardless of font or size)
+        if !blocks.is_empty() {
+            blocks.push(MdBlock::PageBreak);
+        }
+
+        let start_block_idx = blocks.len();
+        chapter_start_block
+            .entry(chap_path.clone())
+            .or_insert(start_block_idx);
+
+        // If chapter had no explicit <h1>-<h3>, inject TOC label as chapter heading
+        let mut injected_heading = false;
+        if chap_headings.is_empty() {
+            if let Some(lbl) = toc_labels.get(chap_path) {
+                blocks.push(MdBlock::Heading {
+                    level: 2,
+                    spans: vec![InlineSpan::Text(lbl.clone())],
+                });
                 headings.push(MdHeading {
                     level: 2,
                     title: lbl.clone(),
-                    block_idx: b_idx,
+                    block_idx: start_block_idx,
                 });
+                injected_heading = true;
             }
+        }
+
+        let block_offset = blocks.len();
+        blocks.extend(chap_blocks);
+        for mut h in chap_headings {
+            h.block_idx += block_offset;
+            headings.push(h);
+        }
+        for (k, rel_idx) in chap_anchors {
+            let abs_idx = if injected_heading && rel_idx == 0 {
+                start_block_idx
+            } else {
+                block_offset + rel_idx
+            };
+            anchor_blocks.entry(k).or_insert(abs_idx);
         }
     }
 
@@ -254,6 +325,10 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
         blocks.push(MdBlock::Paragraph(vec![InlineSpan::Text(
             "(Empty EPUB document)".to_string(),
         )]));
+    }
+
+    if !skipped_toc_paths.is_empty() {
+        raw_toc = filter_skipped_toc_nodes(raw_toc, &skipped_toc_paths);
     }
 
     let mut toc = resolve_raw_toc(&raw_toc, &chapter_start_block, &anchor_blocks, blocks.len());
@@ -308,6 +383,8 @@ fn parse_opf_with_roxmltree(
     ncx_path: &mut Option<String>,
     cover_path: &mut Option<String>,
     spine_hrefs: &mut Vec<String>,
+    guide_toc_paths: &mut std::collections::HashSet<String>,
+    non_linear_paths: &mut std::collections::HashSet<String>,
 ) -> bool {
     let cleaned = prepare_xml_for_roxmltree(opf_xml);
     let Ok(doc) = roxmltree::Document::parse(&cleaned) else {
@@ -316,7 +393,7 @@ fn parse_opf_with_roxmltree(
 
     let mut parsed_title: Option<String> = None;
     let mut epub2_cover_id: Option<String> = None;
-    let mut spine_idrefs: Vec<String> = Vec::new();
+    let mut spine_idrefs: Vec<(String, bool)> = Vec::new();
 
     for node in doc.descendants() {
         if !node.is_element() {
@@ -392,9 +469,25 @@ fn parse_opf_with_roxmltree(
                     (resolved, media.to_string(), props.to_string()),
                 );
             }
+        } else if local.eq_ignore_ascii_case("reference") {
+            if node
+                .attribute("type")
+                .is_some_and(|t| t.eq_ignore_ascii_case("toc"))
+            {
+                if let Some(href) = node.attribute("href") {
+                    let file_part = href.split('#').next().unwrap_or(href);
+                    let resolved = normalize_zip_path(opf_dir, &percent_decode(file_part));
+                    if !resolved.is_empty() {
+                        guide_toc_paths.insert(resolved);
+                    }
+                }
+            }
         } else if local.eq_ignore_ascii_case("itemref") {
             if let Some(idref) = node.attribute("idref") {
-                spine_idrefs.push(idref.to_string());
+                let non_linear = node
+                    .attribute("linear")
+                    .is_some_and(|v| v.eq_ignore_ascii_case("no"));
+                spine_idrefs.push((idref.to_string(), non_linear));
             }
         }
     }
@@ -407,9 +500,12 @@ fn parse_opf_with_roxmltree(
         }
     }
 
-    for idref in spine_idrefs {
+    for (idref, non_linear) in spine_idrefs {
         if let Some((href, media, _)) = manifest.get(&idref) {
             if media.contains("html") || media.contains("xml") || media.is_empty() {
+                if non_linear {
+                    non_linear_paths.insert(href.clone());
+                }
                 spine_hrefs.push(href.clone());
             }
         }
@@ -417,6 +513,199 @@ fn parse_opf_with_roxmltree(
 
     *title = parsed_title.unwrap_or_else(|| fallback_title.to_string());
     true
+}
+
+fn is_toc_heading_title(raw: &str) -> bool {
+    let norm = raw
+        .trim()
+        .to_ascii_lowercase()
+        .trim_matches(|c: char| !c.is_alphanumeric() && c != ' ')
+        .to_string();
+    matches!(
+        norm.as_str(),
+        "contents"
+            | "table of contents"
+            | "toc"
+            | "brief contents"
+            | "detailed contents"
+            | "short contents"
+            | "summary of contents"
+            | "index of contents"
+    )
+}
+
+fn is_toc_filename(zip_path: &str) -> bool {
+    let fname = zip_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(zip_path)
+        .to_ascii_lowercase();
+    let stem = fname
+        .rsplit_once('.')
+        .map(|(s, _)| s)
+        .unwrap_or(&fname);
+    matches!(
+        stem,
+        "toc" | "nav" | "contents" | "tableofcontents" | "table-of-contents" | "table_of_contents"
+    ) || stem.ends_with("_toc")
+        || stem.ends_with("-toc")
+        || stem.starts_with("toc_")
+        || stem.starts_with("toc-")
+}
+
+/// Detects dedicated HTML Table-of-Contents spine chapters so they live solely in the sidebar
+/// Contents tree and never appear as an inline link-list attachment inside the book body.
+fn is_standalone_toc_chapter(chap_path: &str, blocks: &[MdBlock], is_non_linear: bool) -> bool {
+    if blocks.is_empty() {
+        return false;
+    }
+    let mut heading_is_toc = false;
+    let mut total_items = 0usize;
+    let mut link_items = 0usize;
+    let mut has_long_prose = false;
+
+    fn inspect_list(items: &[MdListItem], total: &mut usize, links: &mut usize, long_prose: &mut bool) {
+        for it in items {
+            *total += 1;
+            let text_len: usize = it.spans.iter().map(|s| s.as_plain_text().len()).sum();
+            let has_link = it.spans.iter().any(|s| matches!(s, InlineSpan::Link { .. }));
+            if has_link {
+                *links += 1;
+            }
+            if text_len > 280 && !has_link {
+                *long_prose = true;
+            }
+            for sub in &it.sublists {
+                if let MdBlock::List { items: sub_items, .. } = sub {
+                    inspect_list(sub_items, total, links, long_prose);
+                }
+            }
+        }
+    }
+
+    for (idx, b) in blocks.iter().enumerate() {
+        match b {
+            MdBlock::Heading { spans, .. } => {
+                let txt: String = spans.iter().map(|s| s.as_plain_text()).collect();
+                if idx <= 1 && is_toc_heading_title(&txt) {
+                    heading_is_toc = true;
+                }
+            }
+            MdBlock::Paragraph(spans) => {
+                let txt: String = spans.iter().map(|s| s.as_plain_text()).collect();
+                let trimmed = txt.trim();
+                if idx == 0 && is_toc_heading_title(trimmed) {
+                    heading_is_toc = true;
+                    continue;
+                }
+                if trimmed.is_empty() {
+                    continue;
+                }
+                total_items += 1;
+                let has_link = spans.iter().any(|s| matches!(s, InlineSpan::Link { .. }));
+                if has_link {
+                    link_items += 1;
+                } else if trimmed.len() > 260 {
+                    has_long_prose = true;
+                }
+            }
+            MdBlock::List { items, .. } => {
+                inspect_list(items, &mut total_items, &mut link_items, &mut has_long_prose);
+            }
+            MdBlock::Table { rows, .. } => {
+                for row in rows {
+                    total_items += 1;
+                    let has_link = row
+                        .iter()
+                        .any(|cell| cell.iter().any(|s| matches!(s, InlineSpan::Link { .. })));
+                    if has_link {
+                        link_items += 1;
+                    }
+                }
+            }
+            MdBlock::CodeBlock { .. } | MdBlock::MathBlock(_) | MdBlock::Image { .. } => {
+                has_long_prose = true;
+            }
+            _ => {}
+        }
+    }
+
+    if has_long_prose {
+        return false;
+    }
+    let name_is_toc = is_toc_filename(chap_path);
+    if (name_is_toc || heading_is_toc) && link_items >= 2 && link_items * 100 >= total_items.max(1) * 55 {
+        return true;
+    }
+    if is_non_linear && (name_is_toc || heading_is_toc) && total_items <= 40 {
+        return true;
+    }
+    // Even without a standard filename, if a chapter's heading is explicitly "Table of Contents" /
+    // "Contents" and it has short chapter-like lines with zero prose paragraphs, treat as TOC.
+    if heading_is_toc && total_items >= 3 && link_items >= 2 && link_items * 100 >= total_items * 50 {
+        return true;
+    }
+    false
+}
+
+/// Fallback TOC extractor from an HTML TOC page when neither `nav.xhtml` nor `toc.ncx` exists.
+fn extract_toc_from_html_links(html: &str, chap_dir: &str) -> Vec<RawTocNode> {
+    let cleaned = prepare_xml_for_roxmltree(html);
+    let Ok(doc) = roxmltree::Document::parse(&cleaned) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in doc.descendants() {
+        if node.is_element() && node.tag_name().name().eq_ignore_ascii_case("a") {
+            let Some(raw_href) = node.attribute("href") else {
+                continue;
+            };
+            let trimmed_href = raw_href.trim();
+            if trimmed_href.is_empty()
+                || trimmed_href.starts_with("http://")
+                || trimmed_href.starts_with("https://")
+                || trimmed_href.starts_with("mailto:")
+            {
+                continue;
+            }
+            let title = collapse_ws(&collect_node_text(node)).trim().to_string();
+            if title.is_empty() || is_toc_heading_title(&title) {
+                continue;
+            }
+            let mut parts = trimmed_href.splitn(2, '#');
+            let file_part = parts.next().unwrap_or("");
+            let frag = parts
+                .next()
+                .map(|f| percent_decode(f))
+                .filter(|f| !f.is_empty());
+            let zip_path = normalize_zip_path(chap_dir, &percent_decode(file_part));
+            if !zip_path.is_empty() {
+                out.push(RawTocNode {
+                    title,
+                    level: 0,
+                    zip_path,
+                    fragment: frag,
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn filter_skipped_toc_nodes(
+    nodes: Vec<RawTocNode>,
+    skipped: &std::collections::HashSet<String>,
+) -> Vec<RawTocNode> {
+    let mut out = Vec::with_capacity(nodes.len());
+    for mut n in nodes {
+        n.children = filter_skipped_toc_nodes(n.children, skipped);
+        if skipped.contains(&n.zip_path) && n.children.is_empty() {
+            continue;
+        }
+        out.push(n);
+    }
+    out
 }
 
 fn collect_node_text(node: roxmltree::Node<'_, '_>) -> String {
@@ -1000,9 +1289,32 @@ fn parse_xhtml_chapter_roxmltree(
         if !node.is_element() {
             return;
         }
+        let tag = node.tag_name().name().to_ascii_lowercase();
+        if tag == "nav" {
+            let is_toc_nav = node.attributes().any(|a| {
+                (a.name().eq_ignore_ascii_case("type")
+                    && a.value().split_whitespace().any(|v| v.eq_ignore_ascii_case("toc")))
+                    || (a.name().eq_ignore_ascii_case("role")
+                        && a.value().eq_ignore_ascii_case("doc-toc"))
+            });
+            if is_toc_nav {
+                return;
+            }
+        }
+        if !ctx.blocks.is_empty() && !matches!(ctx.blocks.last(), Some(MdBlock::PageBreak)) {
+            if let Some(style_attr) = node.attribute("style") {
+                let lower = style_attr.to_ascii_lowercase();
+                if lower.contains("page-break-before:always")
+                    || lower.contains("page-break-before: always")
+                    || lower.contains("break-before:page")
+                    || lower.contains("break-before: page")
+                {
+                    ctx.blocks.push(MdBlock::PageBreak);
+                }
+            }
+        }
         let b_idx_here = ctx.blocks.len();
         record_id(ctx, node, b_idx_here);
-        let tag = node.tag_name().name().to_ascii_lowercase();
         match tag.as_str() {
             "head" | "script" | "style" | "title" => return,
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
@@ -2004,5 +2316,109 @@ mod tests {
         assert_eq!(meta2.toc[0].title, "Book I");
         assert_eq!(meta2.toc[0].children.len(), 1);
         assert_eq!(meta2.toc[0].children[0].title, "Chapter 1");
+    }
+
+    #[test]
+    fn test_epub_chapter_page_breaks_and_toc_deduplication() {
+        let mut zw = ZipWriter::new();
+        zw.add_stored("mimetype", b"application/epub+zip");
+        zw.add_deflated(
+            "META-INF/container.xml",
+            br#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/content.opf",
+            br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Clean Book</dc:title>
+    <dc:creator>Author Name</dc:creator>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="htmltoc" href="toc.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="htmltoc"/>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+  </spine>
+  <guide>
+    <reference type="toc" title="Table of Contents" href="toc.xhtml"/>
+  </guide>
+</package>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/nav.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><nav epub:type="toc"><ol>
+  <li><a href="toc.xhtml">Table of Contents</a></li>
+  <li><a href="ch1.xhtml">Chapter 1: Dawn</a></li>
+  <li><a href="ch2.xhtml">Chapter 2: Noon</a></li>
+</ol></nav></body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/toc.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1>Table of Contents</h1>
+  <ul>
+    <li><a href="ch1.xhtml">Chapter 1: Dawn</a></li>
+    <li><a href="ch2.xhtml">Chapter 2: Noon</a></li>
+  </ul>
+</body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/ch1.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body>
+  <nav epub:type="toc"><ol><li><a href="ch2.xhtml">Inline Toc Link</a></li></ol></nav>
+  <h1>Chapter 1: Dawn</h1>
+  <p>Morning light across the valley.</p>
+</body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/ch2.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1>Chapter 2: Noon</h1>
+  <p>High sun above the harbor.</p>
+</body></html>"#,
+        );
+
+        let doc = parse_epub_bytes(&zw.finish(), "Clean Book").expect("parse epub");
+        let meta = doc.book_meta.as_ref().expect("book_meta");
+        // Sidebar TOC keeps Chapter 1 & Chapter 2 and strips self-link to skipped toc.xhtml
+        assert_eq!(meta.toc.len(), 2);
+        assert_eq!(meta.toc[0].title, "Chapter 1: Dawn");
+        assert_eq!(meta.toc[1].title, "Chapter 2: Noon");
+
+        // Body must NOT contain standalone Table of Contents heading or inline <nav epub:type="toc">
+        let all_body_text: String = doc
+            .blocks
+            .iter()
+            .map(|b| match b {
+                MdBlock::Heading { spans, .. } | MdBlock::Paragraph(spans) => {
+                    spans.iter().map(|s| s.as_plain_text()).collect::<String>()
+                }
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!all_body_text.contains("Table of Contents"), "TOC chapter must not appear in book body");
+        assert!(!all_body_text.contains("Inline Toc Link"), "Inline nav toc must not appear in book body");
+        assert!(all_body_text.contains("Morning light"));
+        assert!(all_body_text.contains("High sun"));
+
+        // Chapter 1 and Chapter 2 must be separated by an explicit MdBlock::PageBreak
+        let ch1_idx = doc.blocks.iter().position(|b| matches!(b, MdBlock::Heading { spans, .. } if spans.iter().any(|s| s.as_plain_text().contains("Chapter 1")))).expect("ch1");
+        let ch2_idx = doc.blocks.iter().position(|b| matches!(b, MdBlock::Heading { spans, .. } if spans.iter().any(|s| s.as_plain_text().contains("Chapter 2")))).expect("ch2");
+        assert!(
+            doc.blocks[ch1_idx..ch2_idx].iter().any(|b| matches!(b, MdBlock::PageBreak)),
+            "Expected MdBlock::PageBreak between Chapter 1 and Chapter 2"
+        );
     }
 }

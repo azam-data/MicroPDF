@@ -87,6 +87,7 @@ pub enum MdBlock {
         items: Vec<MdListItem>,
     },
     HorizontalRule,
+    PageBreak,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -116,7 +116,7 @@ impl MenuCategory {
     pub fn items(self) -> &'static [&'static str] {
         match self {
             MenuCategory::File => &[
-                "Open PDF in Tab (O)",
+                "Open Documents in Tab (O)",
                 "Create PDF from Images...",
                 "Combine Multiple PDFs... (Shift+M)",
                 "Import Bookmarks .txt (L)",
@@ -159,7 +159,7 @@ impl MenuCategory {
                 "Undo (Ctrl+Z / Cmd+Z)",
                 "Redo (Ctrl+Y / Ctrl+Shift+Z)",
                 "Copy Selected Text (Ctrl+C / Cmd+C)",
-                "Find Text in PDF... (Ctrl+F / Cmd+F)",
+                "Find in the document... (Ctrl+F / Cmd+F)",
                 "Mouse Mode: Select Text / Fill Forms",
                 "Annotate: Highlight Text",
                 "Annotate: Underline Text",
@@ -470,13 +470,58 @@ impl ScrollMode {
     }
 }
 
-/// 220 ms page-turn animation state for Magazine / Book mode.
+/// Page-turn animation state for Apple Books 3D curl & Magazine / Book mode.
+/// `prev_spread` is allocated ONLY while the ~420 ms animation is running and dropped immediately on finish.
 #[derive(Clone, Debug)]
 pub(super) struct PageTurnAnim {
     pub(super) started_at: Instant,
     pub(super) duration_ms: u64,
     /// `+1` for turning forward (next page/spread), `-1` for turning backward.
     pub(super) direction: i8,
+    /// Outgoing spread scroll offset so frame 0 can render the outgoing spread into `prev_spread`.
+    pub(super) from_scroll_y: Option<f32>,
+    /// Temporary outgoing spread pixel buffer `(w, h, pixels)` freed when animation ends.
+    pub(super) prev_spread: Option<(u32, u32, Vec<u32>)>,
+}
+
+/// Full-text search hit inside an EPUB, Markdown, or LaTeX `MarkdownDoc`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct MdSearchMatch {
+    pub(super) ast_block_idx: usize,
+    pub(super) word_start: usize,
+    pub(super) word_end: usize,
+    pub(super) snippet: String,
+}
+
+/// Bounded 24 MB on-demand decoded image cache for EPUB/Markdown/LaTeX so large image-heavy
+/// books never freeze on UI zoom / layout rebuilds while keeping zero RAM on inactive tabs.
+pub(super) const MAX_MD_IMAGE_CACHE_BYTES: usize = 24 * 1024 * 1024;
+
+#[derive(Default)]
+pub(super) struct MdDecodedImageCache {
+    pub(super) entries: HashMap<(String, u32, u32), (u32, u32, Vec<u32>)>,
+    pub(super) total_bytes: usize,
+    pub(super) dims: HashMap<String, (u32, u32)>,
+}
+
+impl MdDecodedImageCache {
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.total_bytes = 0;
+        self.dims.clear();
+    }
+
+    pub(super) fn insert_decoded(&mut self, key: (String, u32, u32), w: u32, h: u32, px: Vec<u32>) {
+        let bytes = px.len() * std::mem::size_of::<u32>() + 64;
+        if self.total_bytes + bytes > MAX_MD_IMAGE_CACHE_BYTES {
+            self.entries.clear();
+            self.total_bytes = 0;
+        }
+        if bytes <= MAX_MD_IMAGE_CACHE_BYTES {
+            self.total_bytes += bytes;
+            self.entries.insert(key, (w, h, px));
+        }
+    }
 }
 
 /// Page, Text & Grid View Modes (`1`, `2`, `3`, `4`, `5`, `T`, and `Tab`).
@@ -1173,6 +1218,8 @@ pub struct PdfViewerApp<'a> {
     pub(super) editor_popout: Option<EditorPopoutWindow>,
     pub(super) md_doc_gen: u64,
     pub(super) md_layout: Option<super::markdown_view::MdLayoutCache>,
+    pub(super) md_image_cache: MdDecodedImageCache,
+    pub(super) md_search_matches: Vec<MdSearchMatch>,
     pub(super) md_active_hits: Vec<super::markdown_view::MdHitRect>,
     /// Phase 2 Distinct EPUB reader preferences & per-book annotations/bookmarks/UI state.
     pub(super) epub_prefs: EpubReaderPrefs,
@@ -1182,6 +1229,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) book_toc_search: Option<String>,
     pub(super) book_info_popover: bool,
     pub(super) show_aa_popover: bool,
+    pub(super) epub_margin_slider_drag: bool,
     pub(super) epub_cover_thumb: Option<(String, u32, u32, Vec<u32>)>,
     pub(super) epub_word_rects: Vec<EpubWordHit>,
     pub(super) epub_selection_drag: Option<((usize, usize), (usize, usize))>,
@@ -1566,8 +1614,28 @@ impl<'a> PdfViewerApp<'a> {
                 started_at: Instant::now(),
                 duration_ms: self.page_turn_anim_ms,
                 direction,
+                from_scroll_y: None,
+                prev_spread: None,
             });
         }
+    }
+
+    pub(super) fn trigger_epub_page_curl(&mut self, direction: i8, from_scroll_y: f32) {
+        if !self.epub_prefs.page_curl_anim {
+            return;
+        }
+        let dur = if self.page_turn_anim_ms == 0 {
+            420
+        } else {
+            self.page_turn_anim_ms.clamp(220, 1200)
+        };
+        self.page_turn_anim = Some(PageTurnAnim {
+            started_at: Instant::now(),
+            duration_ms: dur,
+            direction,
+            from_scroll_y: Some(from_scroll_y),
+            prev_spread: None,
+        });
     }
 
     /// Returns `Some((eased_t, direction))` while the page-turn animation is active,
@@ -1582,6 +1650,14 @@ impl<'a> PdfViewerApp<'a> {
         } else {
             let eased = 1.0 - (1.0 - t).powi(3);
             Some((eased, anim.direction))
+        }
+    }
+
+    pub(super) fn active_search_match_count(&self) -> usize {
+        if self.is_markdown_tab() {
+            self.md_search_matches.len()
+        } else {
+            self.search_matches.len()
         }
     }
 
@@ -1619,6 +1695,8 @@ impl<'a> PdfViewerApp<'a> {
             editor_popout: None,
             md_doc_gen: 0,
             md_layout: None,
+            md_image_cache: MdDecodedImageCache::default(),
+            md_search_matches: Vec::new(),
             md_active_hits: Vec::new(),
             epub_prefs: EpubReaderPrefs::default(),
             epub_book_data: EpubBookData::default(),
@@ -1627,6 +1705,7 @@ impl<'a> PdfViewerApp<'a> {
             book_toc_search: None,
             book_info_popover: false,
             show_aa_popover: false,
+            epub_margin_slider_drag: false,
             epub_cover_thumb: None,
             epub_word_rects: Vec::new(),
             epub_selection_drag: None,
@@ -1771,7 +1850,7 @@ impl<'a> PdfViewerApp<'a> {
             is_presentation: false,
             pre_presentation_state: None,
             status_notice: if initial_path.is_none() {
-                Some("Drop a PDF here or press O to open".to_string())
+                Some("Drop a document here or press O to open".to_string())
             } else {
                 None
             },
@@ -1991,9 +2070,11 @@ impl<'a> PdfViewerApp<'a> {
         out.push_str(&format!("epub_font_size={:.1}\n", cfg.epub_prefs.font_size_px.clamp(11.0, 32.0)));
         out.push_str(&format!("epub_line_spacing={}\n", cfg.epub_prefs.line_spacing.to_ini_str()));
         out.push_str(&format!("epub_margins={}\n", cfg.epub_prefs.margins.to_ini_str()));
+        out.push_str(&format!("epub_margin_ratio={:.3}\n", cfg.epub_prefs.effective_margin_ratio()));
         out.push_str(&format!("epub_justify={}\n", if cfg.epub_prefs.justify { 1 } else { 0 }));
         out.push_str(&format!("epub_hyphenate={}\n", if cfg.epub_prefs.hyphenate { 1 } else { 0 }));
         out.push_str(&format!("epub_spread={}\n", if cfg.epub_prefs.two_page_spread { 1 } else { 0 }));
+        out.push_str(&format!("epub_page_curl={}\n", if cfg.epub_prefs.page_curl_anim { 1 } else { 0 }));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
             out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
@@ -2081,7 +2162,13 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("epub_line_spacing=") {
                 cfg.epub_prefs.line_spacing = LineSpacingPreset::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("epub_margins=") {
-                cfg.epub_prefs.margins = MarginPreset::from_ini_str(val);
+                cfg.epub_prefs.set_margin_preset(MarginPreset::from_ini_str(val));
+            } else if let Some(val) = line.strip_prefix("epub_margin_ratio=") {
+                if let Ok(r) = val.trim().parse::<f32>() {
+                    if r.is_finite() {
+                        cfg.epub_prefs.set_margin_ratio(r);
+                    }
+                }
             } else if let Some(val) = line.strip_prefix("epub_justify=") {
                 let v = val.trim();
                 cfg.epub_prefs.justify = !(v == "0" || v.eq_ignore_ascii_case("false"));
@@ -2091,6 +2178,9 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("epub_spread=") {
                 let v = val.trim();
                 cfg.epub_prefs.two_page_spread = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("epub_page_curl=") {
+                let v = val.trim();
+                cfg.epub_prefs.page_curl_anim = !(v == "0" || v.eq_ignore_ascii_case("false"));
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("hf_profile=") {

@@ -124,6 +124,10 @@ pub(super) enum LaidOutBlock {
         h: f32,
         ast_block_idx: usize,
     },
+    PageBreak {
+        y: f32,
+        ast_block_idx: usize,
+    },
     MathBlock {
         y: f32,
         h: f32,
@@ -135,7 +139,6 @@ pub(super) enum LaidOutBlock {
         y: f32,
         h: f32,
         ast_block_idx: usize,
-        img_idx: usize,
         w_px: u32,
         h_px: u32,
         is_cover: bool,
@@ -209,7 +212,6 @@ pub(super) struct MdLayoutCache {
     pub(super) links: Vec<String>,
     pub(super) code_blocks: Vec<String>,
     pub(super) code_h_scroll: Vec<f32>,
-    pub(super) images: Vec<Option<(u32, u32, Vec<u32>)>>,
 }
 
 fn measure_word_for_opts(word: &str, font_sz: f32, bold: bool, italic: bool, code: bool, opts: BookLayoutOpts) -> f32 {
@@ -302,6 +304,8 @@ pub(super) fn tokenize_spans(
             });
             continue;
         }
+        // Compute space width once per span instead of re-measuring on every whitespace token
+        let space_w = measure_word_for_opts(" ", font_sz, bold, italic, false, opts);
         let mut cur_start = 0usize;
         let bytes = txt.as_bytes();
         let mut i = 0usize;
@@ -329,14 +333,9 @@ pub(super) fn tokenize_spans(
                 while i < bytes.len() && bytes[i].is_ascii_whitespace() {
                     i += 1;
                 }
-                let space_str = if txt[sp_start..i].contains('\n') { "\n" } else { " " };
-                let w = if space_str == "\n" {
-                    0.0
-                } else {
-                    measure_word_for_opts(" ", font_sz, bold, italic, false, opts)
-                };
+                let is_nl = bytes[sp_start..i].contains(&b'\n');
                 out.push(StyledWord {
-                    text: space_str.to_string(),
+                    text: if is_nl { "\n".to_string() } else { " ".to_string() },
                     bold,
                     italic,
                     strike,
@@ -345,7 +344,7 @@ pub(super) fn tokenize_spans(
                     link_idx,
                     ast_block_idx,
                     word_idx: usize::MAX,
-                    w,
+                    w: if is_nl { 0.0 } else { space_w },
                 });
                 cur_start = i;
             } else {
@@ -383,44 +382,74 @@ fn try_hyphenate_word(
     if !opts.hyphenate || word.code || word.math || word.text.len() < 6 {
         return None;
     }
-    // Strip leading/trailing punctuation so we only hyphenate the alphabetic core cleanly
-    let chars: Vec<(usize, char)> = word.text.char_indices().collect();
-    let mut start_ci = 0usize;
-    while start_ci < chars.len() && !chars[start_ci].1.is_alphabetic() {
-        start_ci += 1;
+    let text = word.text.as_str();
+    let (byte_start, byte_end) = if text.is_ascii() {
+        let bytes = text.as_bytes();
+        let mut s = 0usize;
+        while s < bytes.len() && !bytes[s].is_ascii_alphabetic() {
+            s += 1;
+        }
+        let mut e = bytes.len();
+        while e > s && !bytes[e - 1].is_ascii_alphabetic() {
+            e -= 1;
+        }
+        if e.saturating_sub(s) < 5 || !bytes[s..e].iter().all(|b| b.is_ascii_alphabetic()) {
+            return None;
+        }
+        (s, e)
+    } else {
+        let mut byte_start = text.len();
+        let mut byte_end = 0usize;
+        for (bi, ch) in text.char_indices() {
+            if ch.is_alphabetic() {
+                if byte_start == text.len() {
+                    byte_start = bi;
+                }
+                byte_end = bi + ch.len_utf8();
+            }
+        }
+        if byte_start >= byte_end {
+            return None;
+        }
+        let core = &text[byte_start..byte_end];
+        if core.chars().count() < 5 || !core.chars().all(|c| c.is_alphabetic()) {
+            return None;
+        }
+        (byte_start, byte_end)
+    };
+    let lead = &text[..byte_start];
+    let core = &text[byte_start..byte_end];
+    let trail = &text[byte_end..];
+    let mut break_offsets = [0usize; 16];
+    let mut n_breaks = 0usize;
+    let mut acc = 0usize;
+    for syl in hypher::hyphenate(core, opts.hypher_lang) {
+        acc += syl.len();
+        if acc < core.len() && n_breaks < break_offsets.len() {
+            break_offsets[n_breaks] = acc;
+            n_breaks += 1;
+        }
     }
-    let mut end_ci = chars.len();
-    while end_ci > start_ci && !chars[end_ci - 1].1.is_alphabetic() {
-        end_ci -= 1;
-    }
-    if end_ci.saturating_sub(start_ci) < 5 {
+    if n_breaks == 0 {
         return None;
     }
-    let byte_start = chars[start_ci].0;
-    let byte_end = if end_ci < chars.len() { chars[end_ci].0 } else { word.text.len() };
-    let lead = &word.text[..byte_start];
-    let core = &word.text[byte_start..byte_end];
-    let trail = &word.text[byte_end..];
-    if !core.chars().all(|c| c.is_alphabetic()) {
-        return None;
-    }
-    let syllables: Vec<&str> = hypher::hyphenate(core, opts.hypher_lang).collect();
-    if syllables.len() < 2 {
-        return None;
-    }
-    for k in (1..syllables.len()).rev() {
-        let left_core: String = syllables[..k].concat();
-        let right_core: String = syllables[k..].concat();
+    let mut cand_buf = String::with_capacity(text.len() + 2);
+    for &split_b in break_offsets[..n_breaks].iter().rev() {
+        let left_core = &core[..split_b];
+        let right_core = &core[split_b..];
         if left_core.chars().count() < 2 || right_core.chars().count() < 2 {
             continue;
         }
-        let left_txt = format!("{lead}{left_core}-");
-        let left_w = measure_word_for_opts(&left_txt, font_sz, word.bold, word.italic, false, opts);
+        cand_buf.clear();
+        cand_buf.push_str(lead);
+        cand_buf.push_str(left_core);
+        cand_buf.push('-');
+        let left_w = measure_word_for_opts(&cand_buf, font_sz, word.bold, word.italic, false, opts);
         if left_w <= avail_w {
             let right_txt = format!("{right_core}{trail}");
             let right_w = measure_word_for_opts(&right_txt, font_sz, word.bold, word.italic, false, opts);
             let mut left_wrd = word.clone();
-            left_wrd.text = left_txt;
+            left_wrd.text = cand_buf;
             left_wrd.w = left_w;
             let mut right_wrd = word.clone();
             right_wrd.text = right_txt;
@@ -536,7 +565,7 @@ pub(super) fn layout_blocks(
     mut y: f32,
     links: &mut Vec<String>,
     code_blocks: &mut Vec<String>,
-    images: &mut Vec<Option<(u32, u32, Vec<u32>)>>,
+    dims_cache: &mut HashMap<String, (u32, u32)>,
     embedded_images: &HashMap<String, Vec<u8>>,
     is_epub: bool,
     classic_cover_key: Option<&str>,
@@ -559,7 +588,7 @@ pub(super) fn layout_blocks(
                     col_w,
                     base_fs,
                     s,
-                    images,
+                    dims_cache,
                     embedded_images,
                 );
                 let (_, bh) = md_block_y_h(&blk);
@@ -696,7 +725,7 @@ pub(super) fn layout_blocks(
                     y + 8.0 * s,
                     links,
                     code_blocks,
-                    images,
+                    dims_cache,
                     embedded_images,
                     false,
                     None,
@@ -817,6 +846,14 @@ pub(super) fn layout_blocks(
                 });
                 y += h + 8.0 * s;
             }
+            MdBlock::PageBreak => {
+                prev_was_body_para = false;
+                out.push(LaidOutBlock::PageBreak {
+                    y,
+                    ast_block_idx: idx,
+                });
+                y += 18.0 * s;
+            }
             MdBlock::MathBlock(tex) => {
                 prev_was_body_para = false;
                 let fs = base_fs * 1.15;
@@ -845,7 +882,7 @@ pub(super) fn layout_blocks(
                     col_w,
                     base_fs,
                     s,
-                    images,
+                    dims_cache,
                     embedded_images,
                 );
                 let (_, h) = md_block_y_h(&blk);
@@ -858,6 +895,57 @@ pub(super) fn layout_blocks(
     (out, y)
 }
 
+fn probe_image_dimensions(
+    path: &str,
+    dims_cache: &mut HashMap<String, (u32, u32)>,
+    embedded_images: &HashMap<String, Vec<u8>>,
+) -> Option<(u32, u32)> {
+    if let Some(&dims) = dims_cache.get(path) {
+        return if dims.0 > 0 && dims.1 > 0 { Some(dims) } else { None };
+    }
+    let dims = embedded_images
+        .get(path)
+        .and_then(|bytes| {
+            image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok())
+        })
+        .or_else(|| image::image_dimensions(path).ok());
+    dims_cache.insert(path.to_string(), dims.unwrap_or((0, 0)));
+    dims.filter(|&(w, h)| w > 0 && h > 0)
+}
+
+fn ensure_md_image_decoded<'c>(
+    path: &str,
+    dw_u: u32,
+    dh_u: u32,
+    embedded_images: &HashMap<String, Vec<u8>>,
+    cache: &'c mut MdDecodedImageCache,
+) -> Option<&'c (u32, u32, Vec<u32>)> {
+    let key = (path.to_string(), dw_u, dh_u);
+    if !cache.entries.contains_key(&key) {
+        let decoded_img = embedded_images
+            .get(path)
+            .and_then(|bytes| image::load_from_memory(bytes).ok())
+            .or_else(|| image::open(path).ok())?;
+        let rgb = decoded_img.to_rgb8();
+        let (iw, ih) = rgb.dimensions();
+        let resized = if dw_u == iw && dh_u == ih {
+            rgb
+        } else {
+            image::imageops::resize(&rgb, dw_u, dh_u, image::imageops::FilterType::Triangle)
+        };
+        let mut px = Vec::with_capacity((dw_u * dh_u) as usize);
+        for p in resized.pixels() {
+            let [r, g, b] = p.0;
+            px.push(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
+        }
+        cache.insert_decoded(key.clone(), dw_u, dh_u, px);
+    }
+    cache.entries.get(&key)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn layout_single_image(
     ast_block_idx: usize,
@@ -868,17 +956,10 @@ fn layout_single_image(
     col_w: f32,
     base_fs: f32,
     s: f32,
-    images: &mut Vec<Option<(u32, u32, Vec<u32>)>>,
+    dims_cache: &mut HashMap<String, (u32, u32)>,
     embedded_images: &HashMap<String, Vec<u8>>,
 ) -> LaidOutBlock {
-    let img_idx = images.len();
-    let decoded_img = embedded_images
-        .get(path)
-        .and_then(|bytes| image::load_from_memory(bytes).ok())
-        .or_else(|| image::open(path).ok());
-    let (w_px, h_px, decoded) = if let Some(im) = decoded_img {
-        let rgb = im.to_rgb8();
-        let (iw, ih) = rgb.dimensions();
+    let (w_px, h_px) = if let Some((iw, ih)) = probe_image_dimensions(path, dims_cache, embedded_images) {
         let max_w = if is_cover { col_w.min(420.0 * s) } else { col_w.min(620.0 * s) };
         let max_h = if is_cover { 560.0 * s } else { 440.0 * s };
         let nat_w = (iw as f32) * s;
@@ -893,23 +974,10 @@ fn layout_single_image(
             dw *= max_h / dh;
             dh = max_h;
         }
-        let dw_u = dw.round().max(1.0) as u32;
-        let dh_u = dh.round().max(1.0) as u32;
-        let resized = if dw_u == iw && dh_u == ih {
-            rgb
-        } else {
-            image::imageops::resize(&rgb, dw_u, dh_u, image::imageops::FilterType::Triangle)
-        };
-        let mut px = Vec::with_capacity((dw_u * dh_u) as usize);
-        for p in resized.pixels() {
-            let [r, g, b] = p.0;
-            px.push(((r as u32) << 16) | ((g as u32) << 8) | (b as u32));
-        }
-        (dw_u, dh_u, Some((dw_u, dh_u, px)))
+        (dw.round().max(1.0) as u32, dh.round().max(1.0) as u32)
     } else {
-        (col_w.min(420.0 * s).round().max(120.0) as u32, (44.0 * s).round() as u32, None)
+        (col_w.min(420.0 * s).round().max(120.0) as u32, (44.0 * s).round() as u32)
     };
-    images.push(decoded);
     let cap_h = if caption.is_some() { 24.0 * s } else { 0.0 };
     let pad_v = if is_cover { 24.0 * s } else { 12.0 * s };
     let h = h_px as f32 + cap_h + pad_v;
@@ -917,7 +985,6 @@ fn layout_single_image(
         y,
         h,
         ast_block_idx,
-        img_idx,
         w_px,
         h_px,
         is_cover,
@@ -1051,9 +1118,14 @@ pub(super) fn paginate_book_pages(
             | LaidOutBlock::Table { ast_block_idx, .. }
             | LaidOutBlock::ListItem { ast_block_idx, .. }
             | LaidOutBlock::HorizontalRule { ast_block_idx, .. }
+            | LaidOutBlock::PageBreak { ast_block_idx, .. }
             | LaidOutBlock::MathBlock { ast_block_idx, .. }
             | LaidOutBlock::Image { ast_block_idx, .. } => *ast_block_idx,
         };
+        if matches!(blk, LaidOutBlock::PageBreak { .. }) {
+            flush_page(&mut pages, &mut cur_slices, &mut cur_h, &mut page_first_y, &mut page_first_ast);
+            continue;
+        }
         let next_gap = blocks
             .get(bi + 1)
             .map(|nb| {
@@ -1066,19 +1138,39 @@ pub(super) fn paginate_book_pages(
             LaidOutBlock::Heading { lines, line_h, .. }
             | LaidOutBlock::Paragraph { lines, line_h, .. }
             | LaidOutBlock::ListItem { lines, line_h, .. } => {
-                let is_heading = matches!(blk, LaidOutBlock::Heading { .. });
-                if is_heading && !cur_slices.is_empty() {
-                    let follow_h = blocks
-                        .get(bi + 1)
-                        .map(|nb| match nb {
-                            LaidOutBlock::Paragraph { line_h: lh, lines: lns, .. } => {
-                                (*lh) * (lns.len().min(2) as f32)
+                if let LaidOutBlock::Heading { level, .. } = blk {
+                    if !cur_slices.is_empty() {
+                        // Start every major chapter heading (H1) on a clean new page whenever
+                        // body content already appeared on the current page.
+                        let has_body_on_page = cur_slices.iter().any(|sl| {
+                            matches!(
+                                blocks.get(sl.block_idx),
+                                Some(
+                                    LaidOutBlock::Paragraph { .. }
+                                        | LaidOutBlock::ListItem { .. }
+                                        | LaidOutBlock::Blockquote { .. }
+                                        | LaidOutBlock::Table { .. }
+                                        | LaidOutBlock::CodeBlock { .. }
+                                        | LaidOutBlock::Image { .. }
+                                )
+                            )
+                        });
+                        if *level == 1 && has_body_on_page {
+                            flush_page(&mut pages, &mut cur_slices, &mut cur_h, &mut page_first_y, &mut page_first_ast);
+                        } else {
+                            let follow_h = blocks
+                                .get(bi + 1)
+                                .map(|nb| match nb {
+                                    LaidOutBlock::Paragraph { line_h: lh, lines: lns, .. } => {
+                                        (*lh) * (lns.len().min(2) as f32)
+                                    }
+                                    _ => md_block_y_h(nb).1.min(*line_h * 2.0),
+                                })
+                                .unwrap_or(0.0);
+                            if cur_h + bh + follow_h > page_h {
+                                flush_page(&mut pages, &mut cur_slices, &mut cur_h, &mut page_first_y, &mut page_first_ast);
                             }
-                            _ => md_block_y_h(nb).1.min(*line_h * 2.0),
-                        })
-                        .unwrap_or(0.0);
-                    if cur_h + bh + follow_h > page_h {
-                        flush_page(&mut pages, &mut cur_slices, &mut cur_h, &mut page_first_y, &mut page_first_ast);
+                        }
                     }
                 }
                 let n = lines.len();
@@ -1191,7 +1283,7 @@ impl<'a> PdfViewerApp<'a> {
         let s = sf as f32;
         let is_magazine = spread_mode && self.md_editor_mode == MdEditorMode::Preview;
         let col_w = if book_mode {
-            let margin_ratio = self.epub_prefs.margins.pad_ratio();
+            let margin_ratio = self.epub_prefs.effective_margin_ratio();
             if is_magazine {
                 let spread_w = canvas_w
                     .saturating_sub((28.0 * s).round() as u32)
@@ -1227,6 +1319,12 @@ impl<'a> PdfViewerApp<'a> {
         let sf_bits = sf.to_bits();
         let doc_gen = self.md_doc_gen;
 
+        let cached_word_count = self
+            .md_layout
+            .as_ref()
+            .filter(|c| c.doc_gen == doc_gen)
+            .map(|c| c.word_count);
+
         if let Some(ref cache) = self.md_layout {
             if cache.col_w == col_w
                 && cache.zoom_bits == zoom_bits
@@ -1259,22 +1357,26 @@ impl<'a> PdfViewerApp<'a> {
         };
         let mut links = Vec::new();
         let mut code_blocks = Vec::new();
-        let mut images = Vec::new();
         let mut block_y_by_ast_idx = HashMap::new();
         let is_epub = Self::is_epub_path(&self.file_path);
         let classic_cover_key = doc
             .book_meta
             .as_ref()
             .and_then(|m| m.cover_image_key.as_deref());
+        let initial_y = if book_mode && !is_magazine {
+            self.epub_prefs.vertical_pad_px(760.0 * s, s).0
+        } else {
+            24.0 * s
+        };
         let (blocks, end_y) = layout_blocks(
             &doc.blocks,
             col_w as f32,
             base_fs,
             s,
-            24.0 * s,
+            initial_y,
             &mut links,
             &mut code_blocks,
-            &mut images,
+            &mut self.md_image_cache.dims,
             &doc.embedded_images,
             is_epub,
             classic_cover_key,
@@ -1282,7 +1384,7 @@ impl<'a> PdfViewerApp<'a> {
             Some(&mut block_y_by_ast_idx),
         );
         let code_h_scroll = vec![0.0f32; code_blocks.len()];
-        let word_count = count_doc_words(&doc.blocks);
+        let word_count = cached_word_count.unwrap_or_else(|| count_doc_words(&doc.blocks));
         self.md_layout = Some(MdLayoutCache {
             col_w,
             zoom_bits,
@@ -1300,7 +1402,6 @@ impl<'a> PdfViewerApp<'a> {
             links,
             code_blocks,
             code_h_scroll,
-            images,
             word_count,
         });
     }
@@ -1335,7 +1436,12 @@ impl<'a> PdfViewerApp<'a> {
         let hdr_h = self.md_header_bar_height_px(sf) as f32;
         let content_h = (canvas_h as f32 - hdr_h).max(160.0);
         let spread_h = (content_h - 24.0 * s).max(140.0);
-        (spread_h - 44.0 * s - 22.0 * s).max(80.0)
+        if self.is_distinct_epub_mode() {
+            let (top_pad, bot_pad) = self.epub_prefs.vertical_pad_px(spread_h, s);
+            (spread_h - top_pad - bot_pad - 22.0 * s).max(80.0)
+        } else {
+            (spread_h - 44.0 * s - 22.0 * s).max(80.0)
+        }
     }
 
     /// Cached page info used by the Distinct EPUB bottom strip & sidebar (`1`-based).
@@ -1414,6 +1520,7 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.epub_selection_drag = None;
         self.epub_selection_pill_rect = None;
+        self.page_turn_anim = None;
         self.request_redraw();
     }
 
@@ -1469,11 +1576,12 @@ impl<'a> PdfViewerApp<'a> {
                 cur_spread.saturating_sub(1)
             };
             if next_spread != cur_spread {
+                let old_scroll_y = self.scroll_y;
                 let (target_left_idx, _) = md_magazine_pages_for_spread(next_spread, total);
                 self.scroll_y = cache.book_pages[target_left_idx.min(cache.book_pages.len().saturating_sub(1))].start_y;
                 self.epub_selection_drag = None;
                 self.epub_selection_pill_rect = None;
-                self.trigger_page_turn_anim(dir);
+                self.trigger_epub_page_curl(dir, old_scroll_y);
                 self.request_redraw();
             }
             return;
@@ -1504,6 +1612,40 @@ impl<'a> PdfViewerApp<'a> {
             self.scroll_y = pages[target_left_idx.min(pages.len().saturating_sub(1))];
             self.trigger_page_turn_anim(dir);
             self.request_redraw();
+        }
+    }
+
+    /// Jumps to a `MdSearchMatch` by index (switching EPUB page spread or scrolling cleanly).
+    pub(super) fn jump_to_md_search_match(&mut self, match_idx: usize) {
+        let Some(m) = self.md_search_matches.get(match_idx).cloned() else {
+            return;
+        };
+        self.page_turn_anim = None;
+        self.scroll_to_md_heading(m.ast_block_idx);
+        // If Markdown/LaTeX editor is visible, also scroll/jump the source editor to the query
+        if self.md_editor_mode != MdEditorMode::Preview && !Self::is_epub_path(&self.file_path) {
+            if let Some(ref mut ed) = self.md_editor {
+                let q = self.search_query.clone();
+                if !q.is_empty() {
+                    let cs = self.search_case_sensitive;
+                    let q_cmp = if cs { q.clone() } else { q.to_lowercase() };
+                    let mut seen = 0usize;
+                    for (li, line) in ed.lines.iter().enumerate() {
+                        let hay = if cs { line.clone() } else { line.to_lowercase() };
+                        if let Some(col) = hay.find(&q_cmp) {
+                            if seen >= match_idx {
+                                let start_b = if line.is_char_boundary(col) { col } else { 0 };
+                                let end_b = (start_b + q.len()).min(line.len());
+                                let end_b = if line.is_char_boundary(end_b) { end_b } else { line.len() };
+                                ed.sel_anchor = Some((li, start_b));
+                                ed.cursor = (li, end_b);
+                                break;
+                            }
+                            seen += 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1727,9 +1869,11 @@ impl<'a> PdfViewerApp<'a> {
                         .saturating_sub((28.0 * s).round() as u32)
                         .min((1260.0 * s).round() as u32)
                         .max(320);
-                    let page_pad_y = (22.0 * s).round() as i32;
-                    let page_top = spread_y + page_pad_y;
-                    let page_bot = (spread_y + spread_h as i32 - page_pad_y - (22.0 * s).round() as i32).max(page_top + 40);
+                    let (top_pad_f, bot_pad_f) = self.epub_prefs.vertical_pad_px(spread_h as f32, s);
+                    let top_pad = top_pad_f.round() as i32;
+                    let bot_pad = bot_pad_f.round() as i32;
+                    let page_top = spread_y + top_pad;
+                    let page_bot = (spread_y + spread_h as i32 - bot_pad - (22.0 * s).round() as i32).max(page_top + 40);
                     let page_inner_h = (page_bot - page_top) as f32;
 
                     self.ensure_book_pages(page_inner_h, true);
@@ -1737,239 +1881,154 @@ impl<'a> PdfViewerApp<'a> {
                     let cover_thumb_opt = self.epub_cover_thumb.clone();
                     let highlights = self.epub_book_data.highlights.clone();
                     let bookmarks = self.epub_book_data.bookmarks.clone();
-                    let mut anim_rect = (preview_x0, spread_y, spread_w, spread_h);
+                    let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
+                    let active_search_idx = if !self.md_search_matches.is_empty() {
+                        Some(self.current_search_match.min(self.md_search_matches.len() - 1))
+                    } else {
+                        None
+                    };
+                    let empty_imgs: HashMap<String, Vec<u8>> = HashMap::new();
+                    let embedded_imgs = self
+                        .markdown_doc
+                        .as_ref()
+                        .map(|d| &d.embedded_images)
+                        .unwrap_or(&empty_imgs);
 
                     if let Some(ref cache) = self.md_layout {
-                        let total_pages = cache.book_pages.len().max(1);
-                        let num_spreads = md_magazine_total_spreads(total_pages);
-                        let mut page_idx = 0usize;
-                        for (i, pg) in cache.book_pages.iter().enumerate() {
-                            if pg.start_y <= scroll_y + 2.0 {
-                                page_idx = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        let spread_idx = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
-                        let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total_pages);
-                        let num_sz = (10.5 * s).clamp(9.0, 17.0);
-                        let num_y = spread_y + spread_h as i32 - (22.0 * s).round() as i32;
-                        let total_content = total_pages.saturating_sub(1).max(1);
+                        let rctx_base = BookDrawCtx {
+                            book_mode: true,
+                            font_family: cache.book_font_family,
+                            highlights: &highlights,
+                            sel_range,
+                            accent_color: content_theme.accent,
+                            search_matches: &self.md_search_matches,
+                            active_search_match: active_search_idx,
+                        };
 
-                        if spread_idx == 0 && cache.book_pages.get(left_idx).is_some_and(|p| p.is_cover) {
-                            // Dedicated centered Cover Page
-                            let cover_w = (spread_w / 2)
-                                .max(cache.col_w + (40.0 * s).round() as u32)
-                                .min(preview_w.saturating_sub(24));
-                            let cover_x = preview_x0 + ((preview_w.saturating_sub(cover_w)) / 2) as i32;
-                            anim_rect = (cover_x, spread_y, cover_w, spread_h);
-
-                            draw_soft_shadow(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                cover_x,
-                                spread_y,
-                                cover_w,
-                                spread_h,
-                                4.0 * s,
-                                (14.0 * s).round().max(4.0) as i32,
-                                (5.0 * s).round().max(2.0) as i32,
-                                (0, 0, 0),
-                                72,
-                            );
-                            fill_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, page_bg);
-                            stroke_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, content_theme.border_subtle);
-
-                            draw_distinct_epub_cover_card(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                cover_x,
-                                page_top,
-                                cover_w,
-                                (page_bot - page_top).max(60) as u32,
-                                cover_thumb_opt.as_ref(),
-                                &book_meta_title,
-                                book_meta_author.as_deref(),
-                                book_meta_pub.as_deref(),
-                                cache.book_font_family,
-                                &content_theme,
-                                s,
-                            );
-                            let lbl = "Cover";
-                            let f_style = TextStyle {
-                                family: cache.book_font_family,
-                                size_px: num_sz,
-                                bold: false,
-                                italic: true,
-                            };
-                            let lw = measure_text_styled(lbl, f_style);
-                            draw_text_styled_clipped(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32,
-                                num_y,
-                                cover_x + cover_w as i32 - 8,
-                                lbl,
-                                f_style,
-                                content_theme.text_muted,
-                            );
-                        } else {
-                            // Two-Page Open Book Spread
-                            let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
-                            let spine_x = spread_x + (spread_w / 2) as i32;
-                            anim_rect = (spread_x, spread_y, spread_w, spread_h);
-
-                            draw_soft_shadow(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                spread_x,
-                                spread_y,
-                                spread_w,
-                                spread_h,
-                                4.0 * s,
-                                (14.0 * s).round().max(4.0) as i32,
-                                (5.0 * s).round().max(2.0) as i32,
-                                (0, 0, 0),
-                                70,
-                            );
-                            fill_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, page_bg);
-                            stroke_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, content_theme.border_subtle);
-
-                            let half_w = (spread_w / 2) as i32;
-                            let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(16);
-                            let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(16);
-
-                            let rctx_base = BookDrawCtx {
-                                book_mode: true,
-                                font_family: cache.book_font_family,
-                                highlights: &highlights,
-                                sel_range,
-                                accent_color: content_theme.accent,
-                            };
-
-                            if let Some(left_pg) = cache.book_pages.get(left_idx) {
-                                draw_book_page_slices(
-                                    buffer,
-                                    buf_w,
-                                    buf_h,
-                                    left_pg,
-                                    &cache.blocks,
-                                    left_col_x,
-                                    cache.col_w as f32,
-                                    page_top,
-                                    page_bot,
-                                    &cache.code_h_scroll,
-                                    &cache.images,
-                                    &content_theme,
-                                    &self.hovered_widget,
-                                    s,
-                                    &mut self.md_active_hits,
-                                    &mut self.epub_word_rects,
-                                    rctx_base,
-                                );
-                                let l_bookmarked = bookmarks.iter().any(|b| b.page_num == left_idx);
-                                if l_bookmarked {
-                                    draw_bookmark_corner_ribbon(buffer, buf_w, buf_h, spread_x + (14.0 * s).round() as i32, spread_y, s, content_theme.accent);
-                                }
-                                let l_lbl = format!("Loc. {} of {}", left_idx, total_content);
-                                draw_text_styled_clipped(
-                                    buffer,
-                                    buf_w,
-                                    buf_h,
-                                    left_col_x,
-                                    num_y,
-                                    spine_x - 10,
-                                    &l_lbl,
-                                    TextStyle {
-                                        family: cache.book_font_family,
-                                        size_px: num_sz,
-                                        bold: false,
-                                        italic: false,
-                                    },
-                                    content_theme.text_muted,
-                                );
-                            }
-
-                            if let Some(right_idx) = right_idx_opt {
-                                if let Some(right_pg) = cache.book_pages.get(right_idx) {
-                                    draw_book_page_slices(
-                                        buffer,
-                                        buf_w,
-                                        buf_h,
-                                        right_pg,
-                                        &cache.blocks,
-                                        right_col_x,
-                                        cache.col_w as f32,
-                                        page_top,
-                                        page_bot,
-                                        &cache.code_h_scroll,
-                                        &cache.images,
-                                        &content_theme,
-                                        &self.hovered_widget,
-                                        s,
-                                        &mut self.md_active_hits,
-                                        &mut self.epub_word_rects,
-                                        rctx_base,
-                                    );
-                                    let r_bookmarked = bookmarks.iter().any(|b| b.page_num == right_idx);
-                                    if r_bookmarked {
-                                        draw_bookmark_corner_ribbon(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (26.0 * s).round() as i32, spread_y, s, content_theme.accent);
-                                    }
-                                    let r_lbl = format!("Loc. {} of {}", right_idx, total_content);
-                                    let r_style = TextStyle {
-                                        family: cache.book_font_family,
-                                        size_px: num_sz,
-                                        bold: false,
-                                        italic: false,
-                                    };
-                                    let rw = measure_text_styled(&r_lbl, r_style);
-                                    draw_text_styled_clipped(
-                                        buffer,
-                                        buf_w,
-                                        buf_h,
-                                        right_col_x + cache.col_w as i32 - rw.round() as i32,
-                                        num_y,
-                                        spread_x + spread_w as i32 - 8,
-                                        &r_lbl,
-                                        r_style,
-                                        content_theme.text_muted,
-                                    );
-                                }
-                            }
-
-                            draw_book_spine_crease(
-                                buffer,
-                                buf_w,
-                                buf_h,
-                                spine_x,
-                                spread_y,
-                                spread_h,
-                                (18.0 * s).round().max(6.0) as i32,
-                            );
-                        }
-                    }
-
-                    if let Some((eased, dir)) = self.page_turn_anim_progress() {
-                        draw_magazine_page_turn_overlay(
+                        // Draw the live destination spread directly into `buffer`
+                        render_distinct_epub_spread_surface(
                             buffer,
                             buf_w,
                             buf_h,
-                            anim_rect.0,
-                            anim_rect.1,
-                            anim_rect.2,
-                            anim_rect.3,
-                            eased,
-                            dir,
+                            spread_x,
+                            spread_y,
+                            spread_w,
+                            spread_h,
+                            top_pad,
+                            bot_pad,
+                            scroll_y,
+                            cache,
+                            embedded_imgs,
+                            &mut self.md_image_cache,
+                            cover_thumb_opt.as_ref(),
+                            &book_meta_title,
+                            book_meta_author.as_deref(),
+                            book_meta_pub.as_deref(),
+                            &bookmarks,
+                            theme.canvas_bg,
+                            page_bg,
+                            &content_theme,
+                            &self.hovered_widget,
                             s,
+                            Some(&mut self.md_active_hits),
+                            Some(&mut self.epub_word_rects),
+                            rctx_base,
+                            true,
                         );
+
+                        // Iconic Apple Books 3D curved hand page-curl animation (zero idle RAM once done)
+                        let mut anim_done = false;
+                        if let Some(ref mut anim) = self.page_turn_anim {
+                            let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
+                            let linear_t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+                            if linear_t >= 1.0 {
+                                anim_done = true;
+                            } else if let Some(old_y) = anim.from_scroll_y {
+                                let need_snap = anim
+                                    .prev_spread
+                                    .as_ref()
+                                    .is_none_or(|(pw, ph, _)| *pw != spread_w || *ph != spread_h);
+                                if need_snap {
+                                    let mut snap = vec![theme.canvas_bg; (spread_w as usize) * (spread_h as usize)];
+                                    let snap_ctx = BookDrawCtx {
+                                        book_mode: true,
+                                        font_family: cache.book_font_family,
+                                        highlights: &highlights,
+                                        sel_range: None,
+                                        accent_color: content_theme.accent,
+                                        search_matches: &self.md_search_matches,
+                                        active_search_match: active_search_idx,
+                                    };
+                                    render_distinct_epub_spread_surface(
+                                        &mut snap,
+                                        spread_w,
+                                        spread_h,
+                                        0,
+                                        0,
+                                        spread_w,
+                                        spread_h,
+                                        top_pad,
+                                        bot_pad,
+                                        old_y,
+                                        cache,
+                                        embedded_imgs,
+                                        &mut self.md_image_cache,
+                                        cover_thumb_opt.as_ref(),
+                                        &book_meta_title,
+                                        book_meta_author.as_deref(),
+                                        book_meta_pub.as_deref(),
+                                        &bookmarks,
+                                        theme.canvas_bg,
+                                        page_bg,
+                                        &content_theme,
+                                        &None,
+                                        s,
+                                        None,
+                                        None,
+                                        snap_ctx,
+                                        false,
+                                    );
+                                    anim.prev_spread = Some((spread_w, spread_h, snap));
+                                }
+                                if let Some((_, _, ref prev_px)) = anim.prev_spread {
+                                    draw_apple_books_page_curl(
+                                        buffer,
+                                        buf_w,
+                                        buf_h,
+                                        prev_px,
+                                        spread_x,
+                                        spread_y,
+                                        spread_w,
+                                        spread_h,
+                                        linear_t,
+                                        anim.direction,
+                                        page_bg,
+                                        s,
+                                    );
+                                }
+                            } else {
+                                let eased = 1.0 - (1.0 - linear_t).powi(3);
+                                draw_magazine_page_turn_overlay(
+                                    buffer,
+                                    buf_w,
+                                    buf_h,
+                                    spread_x,
+                                    spread_y,
+                                    spread_w,
+                                    spread_h,
+                                    eased,
+                                    anim.direction,
+                                    s,
+                                );
+                            }
+                        }
+                        if anim_done {
+                            self.page_turn_anim = None;
+                        }
                     }
                 } else if let Some(ref cache) = self.md_layout {
                     // 1-Page centered Distinct Book Flow
-                    let pad = ((preview_w.min((840.0 * s).round() as u32) as f32) * self.epub_prefs.margins.pad_ratio()).max(20.0 * s);
+                    let pad = ((preview_w.min((840.0 * s).round() as u32) as f32) * self.epub_prefs.effective_margin_ratio()).max(20.0 * s);
                     let sheet_w = (cache.col_w as f32 + pad * 2.0).round() as u32;
                     let sheet_x = preview_x0 + ((preview_w.saturating_sub(sheet_w)) / 2) as i32;
                     let sheet_y = content_top + (8.0 * s).round() as i32;
@@ -1982,12 +2041,25 @@ impl<'a> PdfViewerApp<'a> {
                     let view_top = scroll_y;
                     let view_bot = scroll_y + (content_bottom - content_top) as f32;
                     let highlights = self.epub_book_data.highlights.clone();
+                    let active_search_idx = if !self.md_search_matches.is_empty() {
+                        Some(self.current_search_match.min(self.md_search_matches.len() - 1))
+                    } else {
+                        None
+                    };
+                    let empty_imgs: HashMap<String, Vec<u8>> = HashMap::new();
+                    let embedded_imgs = self
+                        .markdown_doc
+                        .as_ref()
+                        .map(|d| &d.embedded_images)
+                        .unwrap_or(&empty_imgs);
                     let rctx = BookDrawCtx {
                         book_mode: true,
                         font_family: cache.book_font_family,
                         highlights: &highlights,
                         sel_range,
                         accent_color: content_theme.accent,
+                        search_matches: &self.md_search_matches,
+                        active_search_match: active_search_idx,
                     };
                     for blk in &cache.blocks {
                         draw_laid_out_block(
@@ -2003,7 +2075,8 @@ impl<'a> PdfViewerApp<'a> {
                             view_top,
                             view_bot,
                             &cache.code_h_scroll,
-                            &cache.images,
+                            embedded_imgs,
+                            &mut self.md_image_cache,
                             &content_theme,
                             &self.hovered_widget,
                             s,
@@ -2016,6 +2089,23 @@ impl<'a> PdfViewerApp<'a> {
             } else {
                 let is_magazine = self.effective_scroll_mode() == super::state::ScrollMode::MagazineBook
                     && self.md_editor_mode == MdEditorMode::Preview;
+                let active_search_idx = if !self.md_search_matches.is_empty() {
+                    Some(self.current_search_match.min(self.md_search_matches.len() - 1))
+                } else {
+                    None
+                };
+                let empty_imgs: HashMap<String, Vec<u8>> = HashMap::new();
+                let embedded_imgs = self
+                    .markdown_doc
+                    .as_ref()
+                    .map(|d| &d.embedded_images)
+                    .unwrap_or(&empty_imgs);
+                let search_ctx = BookDrawCtx {
+                    search_matches: &self.md_search_matches,
+                    active_search_match: active_search_idx,
+                    accent_color: content_theme.accent,
+                    ..BookDrawCtx::default()
+                };
 
                 if is_magazine {
                     // Warm matte desk around the open book (Classic MagazineBook mode)
@@ -2074,9 +2164,9 @@ impl<'a> PdfViewerApp<'a> {
                                     draw_laid_out_block(
                                         buffer, buf_w, buf_h, blk, col_x, cache.col_w as f32,
                                         page_top, page_bot, start_y, start_y, end_y,
-                                        &cache.code_h_scroll, &cache.images, &content_theme,
+                                        &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
                                         &self.hovered_widget, s, &mut self.md_active_hits,
-                                        None, BookDrawCtx::default(),
+                                        None, search_ctx,
                                     );
                                 }
                             }
@@ -2112,9 +2202,9 @@ impl<'a> PdfViewerApp<'a> {
                                     draw_laid_out_block(
                                         buffer, buf_w, buf_h, blk, left_col_x, cache.col_w as f32,
                                         page_top, page_bot, left_start, left_start, left_end,
-                                        &cache.code_h_scroll, &cache.images, &content_theme,
+                                        &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
                                         &self.hovered_widget, s, &mut self.md_active_hits,
-                                        None, BookDrawCtx::default(),
+                                        None, search_ctx,
                                     );
                                 }
                             }
@@ -2130,9 +2220,9 @@ impl<'a> PdfViewerApp<'a> {
                                         draw_laid_out_block(
                                             buffer, buf_w, buf_h, blk, right_col_x, cache.col_w as f32,
                                             page_top, page_bot, right_start, right_start, right_end,
-                                            &cache.code_h_scroll, &cache.images, &content_theme,
+                                            &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
                                             &self.hovered_widget, s, &mut self.md_active_hits,
-                                            None, BookDrawCtx::default(),
+                                            None, search_ctx,
                                         );
                                     }
                                 }
@@ -2174,13 +2264,14 @@ impl<'a> PdfViewerApp<'a> {
                             view_top,
                             view_bot,
                             &cache.code_h_scroll,
-                            &cache.images,
+                            embedded_imgs,
+                            &mut self.md_image_cache,
                             &content_theme,
                             &self.hovered_widget,
                             s,
                             &mut self.md_active_hits,
                             None,
-                            BookDrawCtx::default(),
+                            search_ctx,
                         );
                     }
                 }
@@ -2357,6 +2448,8 @@ struct BookDrawCtx<'b> {
     highlights: &'b [EpubHighlight],
     sel_range: Option<((usize, usize), (usize, usize))>,
     accent_color: u32,
+    search_matches: &'b [MdSearchMatch],
+    active_search_match: Option<usize>,
 }
 
 impl<'b> Default for BookDrawCtx<'b> {
@@ -2367,7 +2460,256 @@ impl<'b> Default for BookDrawCtx<'b> {
             highlights: &[],
             sel_range: None,
             accent_color: 0x0025_63EB,
+            search_matches: &[],
+            active_search_match: None,
         }
+    }
+}
+
+/// Renders a complete Distinct EPUB spread (either centered Cover page or 2-Page Open Book)
+/// into `buffer` (`buf_w x buf_h`) at `(spread_x, spread_y, spread_w, spread_h)`.
+/// Used both for live frame rendering and for capturing the outgoing spread snapshot on frame 0
+/// of the Apple Books 3D page-curl animation.
+#[allow(clippy::too_many_arguments)]
+fn render_distinct_epub_spread_surface(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    spread_x: i32,
+    spread_y: i32,
+    spread_w: u32,
+    spread_h: u32,
+    top_pad: i32,
+    bot_pad: i32,
+    scroll_y: f32,
+    cache: &MdLayoutCache,
+    embedded_images: &HashMap<String, Vec<u8>>,
+    image_cache: &mut MdDecodedImageCache,
+    cover_thumb: Option<&(String, u32, u32, Vec<u32>)>,
+    book_meta_title: &str,
+    book_meta_author: Option<&str>,
+    book_meta_pub: Option<&str>,
+    bookmarks: &[super::book_ui::EpubBookmark],
+    desk_bg: u32,
+    page_bg: u32,
+    content_theme: &UiTheme,
+    hovered_widget: &Option<UiHit>,
+    s: f32,
+    mut hits: Option<&mut Vec<MdHitRect>>,
+    mut word_hits: Option<&mut Vec<EpubWordHit>>,
+    rctx_base: BookDrawCtx<'_>,
+    draw_outer_shadow: bool,
+) {
+    let total_pages = cache.book_pages.len().max(1);
+    let num_spreads = md_magazine_total_spreads(total_pages);
+    let mut page_idx = 0usize;
+    for (i, pg) in cache.book_pages.iter().enumerate() {
+        if pg.start_y <= scroll_y + 2.0 {
+            page_idx = i;
+        } else {
+            break;
+        }
+    }
+    let spread_idx = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
+    let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total_pages);
+    let page_top = spread_y + top_pad;
+    let page_bot = (spread_y + spread_h as i32 - bot_pad - (22.0 * s).round() as i32).max(page_top + 40);
+    let num_sz = (10.5 * s).clamp(9.0, 17.0);
+    let num_y = spread_y + spread_h as i32 - (22.0 * s).round() as i32;
+    let total_content = total_pages.saturating_sub(1).max(1);
+
+    if spread_idx == 0 && cache.book_pages.get(left_idx).is_some_and(|p| p.is_cover) {
+        if !draw_outer_shadow {
+            fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, desk_bg);
+        }
+        let cover_w = (spread_w / 2)
+            .max(cache.col_w + (40.0 * s).round() as u32)
+            .min(spread_w);
+        let cover_x = spread_x + ((spread_w.saturating_sub(cover_w)) / 2) as i32;
+
+        if draw_outer_shadow {
+            draw_soft_shadow(
+                buffer,
+                buf_w,
+                buf_h,
+                cover_x,
+                spread_y,
+                cover_w,
+                spread_h,
+                4.0 * s,
+                (14.0 * s).round().max(4.0) as i32,
+                (5.0 * s).round().max(2.0) as i32,
+                (0, 0, 0),
+                72,
+            );
+        }
+        fill_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, page_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, content_theme.border_subtle);
+
+        draw_distinct_epub_cover_card(
+            buffer,
+            buf_w,
+            buf_h,
+            cover_x,
+            page_top,
+            cover_w,
+            (page_bot - page_top).max(60) as u32,
+            cover_thumb,
+            book_meta_title,
+            book_meta_author,
+            book_meta_pub,
+            cache.book_font_family,
+            content_theme,
+            s,
+        );
+        let lbl = "Cover";
+        let f_style = TextStyle {
+            family: cache.book_font_family,
+            size_px: num_sz,
+            bold: false,
+            italic: true,
+        };
+        let lw = measure_text_styled(lbl, f_style);
+        draw_text_styled_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32,
+            num_y,
+            cover_x + cover_w as i32 - 8,
+            lbl,
+            f_style,
+            content_theme.text_muted,
+        );
+    } else {
+        let spine_x = spread_x + (spread_w / 2) as i32;
+        if draw_outer_shadow {
+            draw_soft_shadow(
+                buffer,
+                buf_w,
+                buf_h,
+                spread_x,
+                spread_y,
+                spread_w,
+                spread_h,
+                4.0 * s,
+                (14.0 * s).round().max(4.0) as i32,
+                (5.0 * s).round().max(2.0) as i32,
+                (0, 0, 0),
+                70,
+            );
+        }
+        fill_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, page_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, content_theme.border_subtle);
+
+        let half_w = (spread_w / 2) as i32;
+        let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(16);
+        let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(16);
+
+        let mut scratch_hits = Vec::new();
+        let mut scratch_words = Vec::new();
+
+        if let Some(left_pg) = cache.book_pages.get(left_idx) {
+            draw_book_page_slices(
+                buffer,
+                buf_w,
+                buf_h,
+                left_pg,
+                &cache.blocks,
+                left_col_x,
+                cache.col_w as f32,
+                page_top,
+                page_bot,
+                &cache.code_h_scroll,
+                embedded_images,
+                image_cache,
+                content_theme,
+                hovered_widget,
+                s,
+                hits.as_deref_mut().unwrap_or(&mut scratch_hits),
+                word_hits.as_deref_mut().unwrap_or(&mut scratch_words),
+                rctx_base,
+            );
+            let l_bookmarked = bookmarks.iter().any(|b| b.page_num == left_idx);
+            if l_bookmarked {
+                draw_bookmark_corner_ribbon(buffer, buf_w, buf_h, spread_x + (14.0 * s).round() as i32, spread_y, s, content_theme.accent);
+            }
+            let l_lbl = format!("Loc. {} of {}", left_idx, total_content);
+            draw_text_styled_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                left_col_x,
+                num_y,
+                spine_x - 10,
+                &l_lbl,
+                TextStyle {
+                    family: cache.book_font_family,
+                    size_px: num_sz,
+                    bold: false,
+                    italic: false,
+                },
+                content_theme.text_muted,
+            );
+        }
+
+        if let Some(right_idx) = right_idx_opt {
+            if let Some(right_pg) = cache.book_pages.get(right_idx) {
+                draw_book_page_slices(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    right_pg,
+                    &cache.blocks,
+                    right_col_x,
+                    cache.col_w as f32,
+                    page_top,
+                    page_bot,
+                    &cache.code_h_scroll,
+                    embedded_images,
+                    image_cache,
+                    content_theme,
+                    hovered_widget,
+                    s,
+                    hits.as_deref_mut().unwrap_or(&mut scratch_hits),
+                    word_hits.as_deref_mut().unwrap_or(&mut scratch_words),
+                    rctx_base,
+                );
+                let r_bookmarked = bookmarks.iter().any(|b| b.page_num == right_idx);
+                if r_bookmarked {
+                    draw_bookmark_corner_ribbon(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (26.0 * s).round() as i32, spread_y, s, content_theme.accent);
+                }
+                let r_lbl = format!("Loc. {} of {}", right_idx, total_content);
+                let r_style = TextStyle {
+                    family: cache.book_font_family,
+                    size_px: num_sz,
+                    bold: false,
+                    italic: false,
+                };
+                let rw = measure_text_styled(&r_lbl, r_style);
+                draw_text_styled_clipped(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    right_col_x + cache.col_w as i32 - rw.round() as i32,
+                    num_y,
+                    spread_x + spread_w as i32 - 8,
+                    &r_lbl,
+                    r_style,
+                    content_theme.text_muted,
+                );
+            }
+        }
+
+        draw_book_spine_crease(
+            buffer,
+            buf_w,
+            buf_h,
+            spine_x,
+            spread_y,
+            spread_h,
+            (18.0 * s).round().max(6.0) as i32,
+        );
     }
 }
 
@@ -2532,7 +2874,8 @@ fn draw_book_page_slices(
     page_top: i32,
     page_bot: i32,
     code_h_scroll: &[f32],
-    images: &[Option<(u32, u32, Vec<u32>)>],
+    embedded_images: &HashMap<String, Vec<u8>>,
+    image_cache: &mut MdDecodedImageCache,
     theme: &UiTheme,
     hovered: &Option<UiHit>,
     s: f32,
@@ -2616,7 +2959,7 @@ fn draw_book_page_slices(
                 draw_laid_out_block(
                     buffer, buf_w, buf_h, blk, col_x, col_w,
                     page_top, page_bot, virtual_scroll, by - 1.0, by + bh + 1.0,
-                    code_h_scroll, images, theme, hovered, s, hits,
+                    code_h_scroll, embedded_images, image_cache, theme, hovered, s, hits,
                     Some(&mut word_hits), rctx,
                 );
                 cur_y += bh + if si + 1 < page.slices.len() { next_gap } else { 0.0 };
@@ -2633,6 +2976,8 @@ struct BookDrawCtxWithJustify<'a> {
     highlights: &'a [EpubHighlight],
     sel_range: Option<((usize, usize), (usize, usize))>,
     accent_color: u32,
+    search_matches: &'a [MdSearchMatch],
+    active_search_match: Option<usize>,
 }
 
 impl<'a> BookDrawCtx<'a> {
@@ -2644,6 +2989,8 @@ impl<'a> BookDrawCtx<'a> {
             highlights: self.highlights,
             sel_range: self.sel_range,
             accent_color: self.accent_color,
+            search_matches: self.search_matches,
+            active_search_match: self.active_search_match,
         }
     }
 }
@@ -2728,7 +3075,8 @@ fn draw_laid_out_block(
     view_top: f32,
     view_bot: f32,
     code_h_scroll: &[f32],
-    images: &[Option<(u32, u32, Vec<u32>)>],
+    embedded_images: &HashMap<String, Vec<u8>>,
+    image_cache: &mut MdDecodedImageCache,
     theme: &UiTheme,
     hovered: &Option<UiHit>,
     s: f32,
@@ -2855,7 +3203,7 @@ fn draw_laid_out_block(
                 draw_laid_out_block(
                     buffer, buf_w, buf_h, child, col_x + (16.0 * s).round() as i32,
                     col_w - 24.0 * s, clip_top, clip_bot, scroll_y, view_top, view_bot,
-                    code_h_scroll, images, theme, hovered, s, hits,
+                    code_h_scroll, embedded_images, image_cache, theme, hovered, s, hits,
                     word_hits.as_deref_mut(), rctx,
                 );
             }
@@ -2935,6 +3283,17 @@ fn draw_laid_out_block(
                 fill_rect_clipped(buffer, buf_w, buf_h, col_x, sy, col_w.round() as u32, 1, theme.divider);
             }
         }
+        LaidOutBlock::PageBreak { y, .. } => {
+            if *y + 18.0 * s < view_top || *y > view_bot {
+                return;
+            }
+            let sy = clip_top + (*y + 9.0 * s - scroll_y).round() as i32;
+            if sy >= clip_top && sy < clip_bot {
+                let rw = (col_w * 0.22).round().max(24.0) as u32;
+                let cx = col_x + (col_w * 0.5).round() as i32;
+                fill_rect_clipped(buffer, buf_w, buf_h, cx - (rw as i32) / 2, sy, rw, 1, theme.divider);
+            }
+        }
         LaidOutBlock::MathBlock { y, h, tex, font_sz, .. } => {
             if y + h < view_top || *y > view_bot {
                 return;
@@ -2972,15 +3331,15 @@ fn draw_laid_out_block(
                 }
             }
         }
-        LaidOutBlock::Image { y, h, img_idx, w_px, h_px, caption, fallback_path, font_sz, is_cover, .. } => {
+        LaidOutBlock::Image { y, h, w_px, h_px, caption, fallback_path, font_sz, is_cover, .. } => {
             if y + h < view_top || *y > view_bot {
                 return;
             }
             let sy = clip_top + (*y - scroll_y).round() as i32;
             let ix = col_x + ((col_w - *w_px as f32) * 0.5).max(0.0).round() as i32;
-            if let Some(Some((sw, sh, src_px))) = images.get(*img_idx) {
-                let dw = (*w_px).max(1);
-                let dh = (*h_px).max(1);
+            let dw = (*w_px).max(1);
+            let dh = (*h_px).max(1);
+            if let Some((sw, sh, src_px)) = ensure_md_image_decoded(fallback_path, dw, dh, embedded_images, image_cache) {
                 if *is_cover {
                     draw_soft_shadow(
                         buffer,
@@ -3123,10 +3482,54 @@ fn draw_wrapped_lines(
         let span_count = line.spans.len();
         for (wi, w) in line.spans.iter().enumerate() {
             let step_w = if w.text == " " { w.w + extra_per_space } else { w.w };
+            let is_space = w.text == " ";
+            let band_h = (font_sz * 1.24).round().max(12.0) as u32;
+            let band_y = ly - (font_sz * 0.08).round() as i32;
+
+            // Highlight full-text search matches in EPUB, Markdown, and LaTeX
+            if !rctx.search_matches.is_empty() {
+                let mut hit_active = false;
+                let mut hit_any = false;
+                let check_match = |blk_idx: usize, word_idx: usize| -> (bool, bool) {
+                    let mut any = false;
+                    let mut active = false;
+                    for (mi, sm) in rctx.search_matches.iter().enumerate() {
+                        if sm.ast_block_idx == blk_idx
+                            && (sm.word_start == usize::MAX
+                                || (word_idx >= sm.word_start && word_idx <= sm.word_end))
+                        {
+                            any = true;
+                            if rctx.active_search_match == Some(mi) {
+                                active = true;
+                                break;
+                            }
+                        }
+                    }
+                    (any, active)
+                };
+                if !is_space && w.word_idx != usize::MAX {
+                    let (a, act) = check_match(w.ast_block_idx, w.word_idx);
+                    hit_any = a;
+                    hit_active = act;
+                } else if is_space && wi > 0 && wi + 1 < span_count {
+                    let prev = &line.spans[wi - 1];
+                    let next = &line.spans[wi + 1];
+                    if prev.word_idx != usize::MAX && next.word_idx != usize::MAX {
+                        let (pa, pact) = check_match(prev.ast_block_idx, prev.word_idx);
+                        let (na, nact) = check_match(next.ast_block_idx, next.word_idx);
+                        hit_any = pa && na;
+                        hit_active = pact && nact;
+                    }
+                }
+                if hit_active {
+                    blend_rect_clipped(buffer, buf_w, buf_h, cx.round() as i32, band_y, step_w.ceil().max(1.0) as u32, band_h, 0x00F9_7316, 138);
+                } else if hit_any {
+                    blend_rect_clipped(buffer, buf_w, buf_h, cx.round() as i32, band_y, step_w.ceil().max(1.0) as u32, band_h, 0x00FA_CC15, 96);
+                }
+            }
 
             // Check active EPUB highlights / drag selection behind word (and bridging spaces)
             if rctx.book_mode {
-                let is_space = w.text == " ";
                 let mut hl_color: Option<u32> = None;
                 let check_pos = |pos: (usize, usize)| -> Option<u32> {
                     for hl in rctx.highlights {
@@ -3163,8 +3566,6 @@ fn draw_wrapped_lines(
                     false
                 };
 
-                let band_h = (font_sz * 1.24).round().max(12.0) as u32;
-                let band_y = ly - (font_sz * 0.08).round() as i32;
                 if let Some(hc) = hl_color {
                     blend_rect_clipped(buffer, buf_w, buf_h, cx.round() as i32, band_y, step_w.ceil().max(1.0) as u32, band_h, hc, 92);
                 }
@@ -3381,7 +3782,7 @@ fn count_doc_words(blocks: &[crate::markdown::MdBlock]) -> usize {
             MdBlock::Image { caption: Some(cap), .. } => {
                 total += cap.split_whitespace().count();
             }
-            MdBlock::Image { caption: None, .. } | MdBlock::HorizontalRule => {}
+            MdBlock::Image { caption: None, .. } | MdBlock::HorizontalRule | MdBlock::PageBreak => {}
             MdBlock::Blockquote(inner) => {
                 total += count_doc_words(inner);
             }
@@ -3417,13 +3818,24 @@ fn md_block_y_h(blk: &LaidOutBlock) -> (f32, f32) {
         | LaidOutBlock::HorizontalRule { y, h, .. }
         | LaidOutBlock::MathBlock { y, h, .. }
         | LaidOutBlock::Image { y, h, .. } => (*y, *h),
+        LaidOutBlock::PageBreak { y, .. } => (*y, 0.0),
     }
 }
 
 fn md_paginate_blocks(blocks: &[LaidOutBlock], page_inner_h: f32) -> Vec<f32> {
     let mut pages = vec![0.0f32];
     let mut cur_start = 0.0f32;
-    for blk in blocks {
+    for (bi, blk) in blocks.iter().enumerate() {
+        if matches!(blk, LaidOutBlock::PageBreak { .. }) {
+            if let Some(next_blk) = blocks.get(bi + 1) {
+                let (ny, _) = md_block_y_h(next_blk);
+                if ny > cur_start + 1.0 {
+                    cur_start = ny;
+                    pages.push(cur_start);
+                }
+            }
+            continue;
+        }
         let (by, bh) = md_block_y_h(blk);
         if by > cur_start + 1.0 && (by - cur_start) + bh > page_inner_h {
             cur_start = by;
@@ -3431,6 +3843,251 @@ fn md_paginate_blocks(blocks: &[LaidOutBlock], page_inner_h: f32) -> Vec<f32> {
         }
     }
     pages
+}
+
+fn is_word_boundary_char(c: char) -> bool {
+    !(c.is_alphanumeric() || c == '_')
+}
+
+fn extract_span_words_indexed(spans: &[InlineSpan]) -> Vec<(usize, String)> {
+    let mut words = Vec::new();
+    let mut wi = 0usize;
+    for sp in spans {
+        match sp {
+            InlineSpan::Math(t) | InlineSpan::Code(t) => {
+                words.push((wi, t.clone()));
+                wi += 1;
+            }
+            _ => {
+                let txt = sp.as_plain_text();
+                let bytes = txt.as_bytes();
+                let mut cur_start = 0usize;
+                let mut i = 0usize;
+                while i < bytes.len() {
+                    if bytes[i].is_ascii_whitespace() {
+                        if i > cur_start {
+                            words.push((wi, txt[cur_start..i].to_string()));
+                            wi += 1;
+                        }
+                        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                            i += 1;
+                        }
+                        cur_start = i;
+                    } else {
+                        i += 1;
+                    }
+                }
+                if cur_start < bytes.len() {
+                    words.push((wi, txt[cur_start..].to_string()));
+                    wi += 1;
+                }
+            }
+        }
+    }
+    words
+}
+
+fn search_in_indexed_spans(
+    ast_block_idx: usize,
+    spans: &[InlineSpan],
+    q_chars: &[char],
+    case_sensitive: bool,
+    whole_word: bool,
+    out: &mut Vec<MdSearchMatch>,
+) {
+    let words = extract_span_words_indexed(spans);
+    if words.is_empty() || q_chars.is_empty() {
+        return;
+    }
+    // Build a flattened char vector alongside each char's owning `word_idx`
+    let mut flat_chars: Vec<char> = Vec::new();
+    let mut char_word: Vec<usize> = Vec::new();
+    let mut raw_text = String::new();
+    for (idx_in_list, (wi, wtxt)) in words.iter().enumerate() {
+        if idx_in_list > 0 {
+            flat_chars.push(' ');
+            char_word.push(*wi);
+            raw_text.push(' ');
+        }
+        raw_text.push_str(wtxt);
+        if case_sensitive {
+            for c in wtxt.chars() {
+                flat_chars.push(c);
+                char_word.push(*wi);
+            }
+        } else {
+            for c in wtxt.chars() {
+                for lc in c.to_lowercase() {
+                    flat_chars.push(lc);
+                    char_word.push(*wi);
+                }
+            }
+        }
+    }
+    let qlen = q_chars.len();
+    if flat_chars.len() < qlen {
+        return;
+    }
+    let mut i = 0usize;
+    while i + qlen <= flat_chars.len() {
+        if flat_chars[i..i + qlen] == *q_chars {
+            let ok_boundary = if whole_word {
+                let left_ok = i == 0 || is_word_boundary_char(flat_chars[i - 1]);
+                let right_ok =
+                    i + qlen == flat_chars.len() || is_word_boundary_char(flat_chars[i + qlen]);
+                left_ok && right_ok
+            } else {
+                true
+            };
+            if ok_boundary {
+                let w_start = char_word[i];
+                let w_end = char_word[i + qlen - 1];
+                let snippet: String = raw_text.chars().take(80).collect();
+                out.push(MdSearchMatch {
+                    ast_block_idx,
+                    word_start: w_start,
+                    word_end: w_end,
+                    snippet,
+                });
+                i += qlen;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn search_in_plain_block(
+    ast_block_idx: usize,
+    text: &str,
+    q_chars: &[char],
+    case_sensitive: bool,
+    whole_word: bool,
+    out: &mut Vec<MdSearchMatch>,
+) {
+    if text.is_empty() || q_chars.is_empty() {
+        return;
+    }
+    let flat_chars: Vec<char> = if case_sensitive {
+        text.chars().collect()
+    } else {
+        text.chars().flat_map(|c| c.to_lowercase()).collect()
+    };
+    let qlen = q_chars.len();
+    if flat_chars.len() < qlen {
+        return;
+    }
+    let mut i = 0usize;
+    while i + qlen <= flat_chars.len() {
+        if flat_chars[i..i + qlen] == *q_chars {
+            let ok_boundary = if whole_word {
+                let left_ok = i == 0 || is_word_boundary_char(flat_chars[i - 1]);
+                let right_ok =
+                    i + qlen == flat_chars.len() || is_word_boundary_char(flat_chars[i + qlen]);
+                left_ok && right_ok
+            } else {
+                true
+            };
+            if ok_boundary {
+                let snippet: String = text.chars().take(80).collect();
+                out.push(MdSearchMatch {
+                    ast_block_idx,
+                    word_start: usize::MAX,
+                    word_end: usize::MAX,
+                    snippet,
+                });
+                i += qlen;
+                continue;
+            }
+        }
+        i += 1;
+    }
+}
+
+fn search_list_items(
+    ast_block_idx: usize,
+    items: &[MdListItem],
+    q_chars: &[char],
+    case_sensitive: bool,
+    whole_word: bool,
+    out: &mut Vec<MdSearchMatch>,
+) {
+    for it in items {
+        search_in_indexed_spans(ast_block_idx, &it.spans, q_chars, case_sensitive, whole_word, out);
+        for sub in &it.sublists {
+            if let MdBlock::List { items: sub_items, .. } = sub {
+                search_list_items(ast_block_idx, sub_items, q_chars, case_sensitive, whole_word, out);
+            }
+        }
+    }
+}
+
+/// Full-text search across a `MarkdownDoc` (EPUB, Markdown, or LaTeX) supporting
+/// case-sensitive (`Aa`), whole-word (`W`), single-word substrings, and multi-word phrases.
+pub(super) fn search_markdown_doc(
+    doc: &crate::markdown::MarkdownDoc,
+    query: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<MdSearchMatch> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let q_chars: Vec<char> = if case_sensitive {
+        trimmed.chars().collect()
+    } else {
+        trimmed.chars().flat_map(|c| c.to_lowercase()).collect()
+    };
+    let mut out = Vec::new();
+
+    fn walk_block(
+        ast_block_idx: usize,
+        blk: &MdBlock,
+        q_chars: &[char],
+        case_sensitive: bool,
+        whole_word: bool,
+        out: &mut Vec<MdSearchMatch>,
+    ) {
+        match blk {
+            MdBlock::Heading { spans, .. } | MdBlock::Paragraph(spans) => {
+                search_in_indexed_spans(ast_block_idx, spans, q_chars, case_sensitive, whole_word, out);
+            }
+            MdBlock::CodeBlock { code, .. } => {
+                search_in_plain_block(ast_block_idx, code, q_chars, case_sensitive, whole_word, out);
+            }
+            MdBlock::MathBlock(tex) => {
+                search_in_plain_block(ast_block_idx, tex, q_chars, case_sensitive, whole_word, out);
+            }
+            MdBlock::Image { caption: Some(cap), .. } => {
+                search_in_plain_block(ast_block_idx, cap, q_chars, case_sensitive, whole_word, out);
+            }
+            MdBlock::Blockquote(inner) => {
+                for child in inner {
+                    walk_block(ast_block_idx, child, q_chars, case_sensitive, whole_word, out);
+                }
+            }
+            MdBlock::Table { headers, rows, .. } => {
+                for h in headers {
+                    search_in_indexed_spans(ast_block_idx, h, q_chars, case_sensitive, whole_word, out);
+                }
+                for row in rows {
+                    for cell in row {
+                        search_in_indexed_spans(ast_block_idx, cell, q_chars, case_sensitive, whole_word, out);
+                    }
+                }
+            }
+            MdBlock::List { items, .. } => {
+                search_list_items(ast_block_idx, items, q_chars, case_sensitive, whole_word, out);
+            }
+            MdBlock::Image { caption: None, .. } | MdBlock::HorizontalRule | MdBlock::PageBreak => {}
+        }
+    }
+
+    for (idx, blk) in doc.blocks.iter().enumerate() {
+        walk_block(idx, blk, &q_chars, case_sensitive, whole_word, &mut out);
+    }
+    out
 }
 
 fn split_math_eq_no(tex: &str) -> (&str, Option<&str>) {
@@ -3473,6 +4130,7 @@ fn md_magazine_pages_for_spread(spread_idx: usize, total_pages: usize) -> (usize
         (left, right)
     }
 }
+
 
 
 

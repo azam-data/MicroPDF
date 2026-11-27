@@ -46,11 +46,11 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Or click the blue 'Open PDF (O)' button (or 'Favorites (Ctrl+D)' for your starred folders) on the Welcome Screen.",
+                text: "Or click the blue 'Open Documents (O)' button (or 'Favorites (Ctrl+D)' for your starred folders) on the Welcome Screen.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
+                text: "Or click File -> Open Documents in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
             },
             GuideBlock::Heading("Organizing Favorites & Protecting Portable Settings"),
             GuideBlock::Step {
@@ -150,15 +150,15 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Reading EPUB E-Books in Distinct UI Skin"),
             GuideBlock::Step {
                 number: 1,
-                text: "With Help -> UI Skin: Classic / Distinct turned on, open any .epub file to read in a calm two-page open book spread with serif fonts, hyphenated full justification, soft page shadows, and 'Loc. X of Y' footers (flip pages with Arrow keys, mouse wheel, or the bottom scrubber bar).",
+                text: "With Help -> UI Skin: Classic / Distinct turned on, open any .epub file to read in a calm two-page open book spread with serif fonts, chapter-per-page breaks, optional 3D hand Page Curl turns, soft page shadows, and 'Loc. X of Y' footers (flip pages with Arrow keys, mouse wheel, or the bottom scrubber bar).",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Click Aa on the bottom bar to customize typography: choose Book Serif, UI Sans, or cycle installed system serif fonts (< / >); tap A- / A+; set spacing (Compact / Normal / Relaxed) and margins (Narrow / Normal / Wide); switch Justify / Left or Hyph: On / Off; pick 2-Page Book or 1-Page Scroll; or tap any of the 6 paper color swatches.",
+                text: "Click Aa on the bottom bar to customize typography: choose Book Serif, UI Sans, or cycle installed system serif fonts (< / >); tap A- / A+; set spacing (Compact / Normal / Relaxed); adjust both top and side page margins with Narrow / Normal / Wide presets or the continuous Margins slider; toggle Justify Text and Avoid Breaking Words (-); pick 2-Page Book or 1-Page Flow; toggle Curl: On / Off; or tap any of the 6 paper color swatches.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Click the Sidebar button (or press B) to open the Book Drawer showing the cover thumbnail, an (i) book details popup, and three tabs at the bottom: Contents (searchable collapsible chapters), Annotations, and Bookmarks. Click the star icon beside Aa on the bottom bar to bookmark the current page.",
+                text: "Click the Sidebar button on the far-left of the bottom bar (or top toolbar, or press B) to open the Book Drawer showing the cover thumbnail, an (i) book details popup, and three tabs: Contents (searchable collapsible Table of Contents, automatically kept out of the book body), Annotations, and Bookmarks. Click the magnifying-glass Find button (or press Ctrl+F) to search the entire book, or click the star icon beside Aa to bookmark the current page.",
             },
             GuideBlock::Step {
                 number: 4,
@@ -182,7 +182,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Opening & Switching Between Multiple Files"),
             GuideBlock::Step {
                 number: 1,
-                text: "Click the '+' button at the right end of the tab bar (or click File -> Open PDF in Tab) to open another document without closing your current one. Every tab (and every row in the '▾' tab list) displays a color-coded file-type icon — red PDF badge, warm amber EPUB book, indigo Markdown badge, or teal LaTeX badge — so you can tell files apart immediately in both Classic and Distinct skins.",
+                text: "Click the '+' button at the right end of the tab bar (or click File -> Open Documents in Tab) to open another document without closing your current one. Every tab (and every row in the '▾' tab list) displays a color-coded file-type icon — red PDF badge, warm amber EPUB book, indigo Markdown badge, or teal LaTeX badge — so you can tell files apart immediately in both Classic and Distinct skins.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -475,7 +475,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Writing & Editing Markdown (.md) and LaTeX (.tex) Files"),
             GuideBlock::Step {
                 number: 1,
-                text: "Open any .md, .markdown, or .tex file (drag-and-drop or File -> Open PDF in Tab (O)). With Help -> UI Skin: Classic / Distinct set to Distinct, the window adapts its palette and starts in Split view (code left, live preview right); Classic stays in Preview mode until you click Split or Edit on the toolbar.",
+                text: "Open any .md, .markdown, or .tex file (drag-and-drop or File -> Open Documents in Tab (O)). With Help -> UI Skin: Classic / Distinct set to Distinct, the window adapts its palette and starts in Split view (code left, live preview right); Classic stays in Preview mode until you click Split or Edit on the toolbar.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -560,10 +560,10 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
         title: "Search, Compare PDFs, Measure Ruler & Troubleshooting",
         summary: "Find exact words, visually spot differences between two PDF drafts, measure dimensions, and solve common issues.",
         blocks: &[
-            GuideBlock::Heading("Smart Text Search (Match Case & Whole Word)"),
+            GuideBlock::Heading("Smart Text Search (PDF, EPUB, Markdown & LaTeX)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Press Ctrl+F (Cmd+F on Mac) or click Edit -> Find Text in PDF... to open the search bar at the top right.",
+                text: "Press Ctrl+F (Cmd+F on Mac), click Edit -> Find in the document..., or click the Find magnifying-glass icon on the toolbar (or EPUB bottom bar) to open the search bar at the top right.",
             },
             GuideBlock::Step {
                 number: 2,

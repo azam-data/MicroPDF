@@ -633,7 +633,8 @@ fn resolve_eq_refs_in_blocks(blocks: &mut [MdBlock], labels: &std::collections::
             MdBlock::CodeBlock { .. }
             | MdBlock::MathBlock(_)
             | MdBlock::Image { .. }
-            | MdBlock::HorizontalRule => {}
+            | MdBlock::HorizontalRule
+            | MdBlock::PageBreak => {}
         }
     }
 }

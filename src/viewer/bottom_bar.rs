@@ -482,7 +482,7 @@ impl<'a> PdfViewerApp<'a> {
                 let (done, total) = job.job.progress();
                 (format!("Printing {done}/{total} (Esc cancels)"), theme.accent_soft_fg, true)
             } else if self.doc.is_none() {
-                ("Drop a PDF or press O".to_string(), theme.text_secondary, false)
+                ("Drop a document or press O".to_string(), theme.text_secondary, false)
             } else {
                 let mut fname = self.filename_display();
                 if self.has_unsaved_edits {

@@ -9,7 +9,7 @@ impl<'a> PdfViewerApp<'a> {
         match &self.input_mode {
             InputMode::Normal => None,
             InputMode::SearchText { query_input } => Some(format!(
-                "FIND TEXT IN PDF: {}_  (Enter to search, Esc to cancel, F3 / Cmd+G next)",
+                "FIND IN THE DOCUMENT: {}_  (Enter to search, Esc to cancel, F3 / Cmd+G next)",
                 query_input
             )),
             InputMode::JumpToPage { input } => Some(format!(
