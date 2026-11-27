@@ -67,7 +67,7 @@ jobs:
         shell: pwsh
         env:
           MICROPDF_PDFIUM_DIR: ${{ github.workspace }}\pdfium_dir
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
       - name: Package portable folder
         shell: pwsh
@@ -123,7 +123,7 @@ jobs:
         if: github.event_name == 'pull_request' || inputs.run_tests
         env:
           MICROPDF_PDFIUM_DIR: ${{ github.workspace }}/pdfium_dir
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
       - name: Package portable folder
         env:

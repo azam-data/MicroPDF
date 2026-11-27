@@ -1160,8 +1160,13 @@ mod tests {
         let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
         app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
 
-        // 1. Open Tools -> Optimize... (item 6 in Tools menu)
-        app.execute_menu_item(state::MenuCategory::Tools, 6);
+        // 1. Open Tools -> Optimize...
+        let opt_idx = state::MenuCategory::Tools
+            .items()
+            .iter()
+            .position(|&s| s == "Optimize...")
+            .expect("Optimize... must exist in Tools menu");
+        app.execute_menu_item(state::MenuCategory::Tools, opt_idx);
         assert_eq!(
             app.input_mode,
             state::InputMode::OptimizePrompt {
@@ -1232,7 +1237,7 @@ mod tests {
         assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
 
         // 5. Re-open Tools -> Optimize... and run all steps to completion
-        app.execute_menu_item(state::MenuCategory::Tools, 6);
+        app.execute_menu_item(state::MenuCategory::Tools, opt_idx);
         app.handle_key_input(
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
             None,

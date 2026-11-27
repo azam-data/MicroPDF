@@ -222,7 +222,7 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         if self.print_job.is_some() || self.lp_job.is_some() {
-            self.status_notice = Some("Already printing — press Esc to cancel".to_string());
+            self.status_notice = Some("A print job is still running — press Esc to cancel".to_string());
             self.request_redraw();
             return;
         }
