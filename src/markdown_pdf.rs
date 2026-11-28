@@ -593,6 +593,11 @@ impl Paginator {
                     });
                     self.cur_y += 14.0;
                 }
+                MdBlock::PageBreak => {
+                    if self.cur_y > MARGIN_PT + 4.0 {
+                        self.new_page();
+                    }
+                }
                 MdBlock::MathBlock(tex) => {
                     let readable = crate::math_render::math_to_readable_text(tex);
                     let size_pt = 11.5;

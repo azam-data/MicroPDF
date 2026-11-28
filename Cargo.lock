@@ -1058,6 +1058,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "hypher"
+version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45f2b4f6b5da34d400d4c112eadcc14512cc5d04307a8eee182586d9bebd7ce6"
+
+[[package]]
 name = "iana-time-zone"
 version = "0.1.65"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1437,17 +1443,19 @@ dependencies = [
 
 [[package]]
 name = "micro_pdf"
-version = "1.6.0"
+version = "1.7.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
  "docx-rs",
  "flate2",
+ "hypher",
  "image",
  "lopdf",
  "pdfium-render",
  "pulldown-cmark",
  "rfd",
+ "roxmltree",
  "rust_xlsxwriter",
  "softbuffer",
  "ttf-parser",
@@ -2224,6 +2232,12 @@ dependencies = [
  "web-sys",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "roxmltree"
+version = "0.20.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c20b6793b5c2fa6553b250154b78d6d0db37e72700ae35fad9387a46f487c97"
 
 [[package]]
 name = "rust_xlsxwriter"

@@ -550,6 +550,7 @@ pub fn parse_latex(src: &str, fallback_title: &str, base_dir: Option<&Path>) -> 
         blocks,
         headings,
         embedded_images: std::collections::HashMap::new(),
+        book_meta: None,
     }
 }
 
@@ -632,7 +633,8 @@ fn resolve_eq_refs_in_blocks(blocks: &mut [MdBlock], labels: &std::collections::
             MdBlock::CodeBlock { .. }
             | MdBlock::MathBlock(_)
             | MdBlock::Image { .. }
-            | MdBlock::HorizontalRule => {}
+            | MdBlock::HorizontalRule
+            | MdBlock::PageBreak => {}
         }
     }
 }

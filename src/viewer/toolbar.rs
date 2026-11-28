@@ -62,14 +62,14 @@ impl ToolbarItem {
         match self {
             Self::Sidebar => "Bookmarks Sidebar (B)",
             Self::Grid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open PDF (O)",
+            Self::Open => "Open Documents (O)",
             Self::Save => "Save PDF (S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview (Ctrl+P)",
             Self::Annotations => "Annotations (Highlight/Underline/Strike/Note/Pen/Text/Shapes)",
             Self::EditTools => "Edit Tools (Redact / Crop / Stamp)",
             Self::Rotate => "Rotate Page 90° (R)",
-            Self::Search => "Find Text (Ctrl+F)",
+            Self::Search => "Find in the document (Ctrl+F)",
             Self::UiScale => "Zoom Interface (UI Scale - / % / +)",
             Self::ThemeToggle => "Light / Dark UI Toggle",
         }
@@ -197,7 +197,7 @@ impl ToolbarAction {
         match self {
             Self::ToggleSidebar => "Bookmarks Sidebar (B)",
             Self::ToggleGrid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open PDF / MD / LaTeX / EPUB (O)",
+            Self::Open => "Open Documents (PDF / MD / LaTeX / EPUB) (O)",
             Self::Save => "Save (S / Ctrl+S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview / Export (Ctrl+P)",
@@ -216,7 +216,7 @@ impl ToolbarAction {
             Self::ToolCrop => "Crop Page Area (drag area)",
             Self::ToolStamp => "Stamp Signature / Image (P)",
             Self::RotatePage => "Rotate Page 90° (R)",
-            Self::FindText => "Find Text (Ctrl+F)",
+            Self::FindText => "Find in the document (Ctrl+F)",
             Self::MdModePreview => "Preview Mode",
             Self::MdModeSplit => "Split Editor & Live Preview",
             Self::MdModeEdit => "Source Editor Mode",
@@ -403,14 +403,17 @@ impl<'a> PdfViewerApp<'a> {
             accent_dot,
         };
 
+        let distinct_epub = self.is_distinct_epub_mode();
+        let distinct_reflowable = self.ui_skin == super::theme::UiSkin::Distinct && self.is_markdown_tab();
+
         // Group 1: Panels & File actions (Sidebar, Grid, Open, Save, SaveAs, Print)
         let mut g1 = 0usize;
-        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) || distinct_epub {
             if try_push(mk_ic(ToolbarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Grid) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Grid) && !distinct_reflowable {
             if try_push(mk_ic(ToolbarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -420,7 +423,7 @@ impl<'a> PdfViewerApp<'a> {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Save) {
+        if self.toolbar_config.is_enabled(ToolbarItem::Save) && !distinct_epub {
             if try_push(mk_ic(ToolbarAction::Save, UiIcon::Save, self.has_unsaved_edits, self.has_unsaved_edits), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -468,38 +471,48 @@ impl<'a> PdfViewerApp<'a> {
                 push_sep(&mut cur_x, &mut seps, g_md);
             }
 
-            let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
-            let zbtn_w = (22.0 * s).round() as u32;
-            let zlbl_w = (42.0 * s).round() as u32;
-            let mut g_zoom = 0usize;
-            for (act, lbl, pw) in [
-                (ToolbarAction::MdZoomOut, "-".to_string(), zbtn_w),
-                (ToolbarAction::MdZoomReset, z_pct, zlbl_w),
-                (ToolbarAction::MdZoomIn, "+".to_string(), zbtn_w),
-            ] {
-                if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
-                    g_zoom += 1;
+            if !distinct_epub {
+                let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
+                let zbtn_w = (22.0 * s).round() as u32;
+                let zlbl_w = (42.0 * s).round() as u32;
+                let mut g_zoom = 0usize;
+                for (act, lbl, pw) in [
+                    (ToolbarAction::MdZoomOut, "-".to_string(), zbtn_w),
+                    (ToolbarAction::MdZoomReset, z_pct, zlbl_w),
+                    (ToolbarAction::MdZoomIn, "+".to_string(), zbtn_w),
+                ] {
+                    if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
+                        g_zoom += 1;
+                    }
                 }
-            }
-            push_sep(&mut cur_x, &mut seps, g_zoom);
+                push_sep(&mut cur_x, &mut seps, g_zoom);
 
-            if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
+                if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
+                    try_push(
+                        mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
+                        &mut cur_x,
+                        &mut widgets,
+                    );
+                }
                 try_push(
-                    mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
+                    mk_pill(ToolbarAction::MdReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
                     &mut cur_x,
                     &mut widgets,
                 );
             }
             try_push(
-                mk_pill(ToolbarAction::MdReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
-                &mut cur_x,
-                &mut widgets,
-            );
-            try_push(
                 mk_pill(ToolbarAction::MdExportPrint, "Export / Print".to_string(), (90.0 * s).round() as u32, false, false),
                 &mut cur_x,
                 &mut widgets,
             );
+            if self.toolbar_config.is_enabled(ToolbarItem::Search) {
+                push_sep(&mut cur_x, &mut seps, 1);
+                try_push(
+                    mk_ic(ToolbarAction::FindText, UiIcon::Search, matches!(self.input_mode, InputMode::SearchText { .. }), false),
+                    &mut cur_x,
+                    &mut widgets,
+                );
+            }
         } else {
             // Group 2: Select + Full Annotations Suite + Color Swatch (PDF tabs only)
             let mut g2 = 0usize;
@@ -574,6 +587,50 @@ impl<'a> PdfViewerApp<'a> {
         (widgets, seps)
     }
 
+    pub(super) fn toolbar_action_enabled(&self, action: ToolbarAction) -> bool {
+        let is_md_doc = self.is_markdown_tab();
+        let is_epub = is_md_doc && Self::is_epub_path(&self.file_path);
+        let is_md_tex = is_md_doc && !is_epub;
+        let is_pdf = self.doc.is_some() && !is_md_doc;
+        let has_any = is_pdf || is_md_doc;
+        match action {
+            ToolbarAction::Open => true,
+            ToolbarAction::ToggleSidebar | ToolbarAction::FindText => has_any,
+            ToolbarAction::ToggleGrid => is_pdf,
+            ToolbarAction::Save => is_pdf || is_md_tex,
+            ToolbarAction::SaveAs
+            | ToolbarAction::Print
+            | ToolbarAction::ToolSelect
+            | ToolbarAction::ToolHand
+            | ToolbarAction::ToolHighlight
+            | ToolbarAction::ToolUnderline
+            | ToolbarAction::ToolStrikethrough
+            | ToolbarAction::ToolStickyNote
+            | ToolbarAction::ToolInkPen
+            | ToolbarAction::ToolFreeText
+            | ToolbarAction::ToolRectShape
+            | ToolbarAction::ToolArrowShape
+            | ToolbarAction::CycleAnnotationColor
+            | ToolbarAction::ToolRedact
+            | ToolbarAction::ToolCrop
+            | ToolbarAction::ToolStamp
+            | ToolbarAction::RotatePage => is_pdf,
+            ToolbarAction::MdModePreview
+            | ToolbarAction::MdModeSplit
+            | ToolbarAction::MdModeEdit
+            | ToolbarAction::MdSave
+            | ToolbarAction::MdReload => is_md_tex,
+            ToolbarAction::MdZoomOut
+            | ToolbarAction::MdZoomReset
+            | ToolbarAction::MdZoomIn
+            | ToolbarAction::MdExportPrint => is_md_doc,
+            ToolbarAction::UiScaleDown
+            | ToolbarAction::UiScaleReset
+            | ToolbarAction::UiScaleUp
+            | ToolbarAction::ToggleTheme => true,
+        }
+    }
+
     pub(super) fn draw_inline_toolbar(
         &self,
         buffer: &mut [u32],
@@ -600,7 +657,8 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         for w in &widgets {
-            let is_hov = self.hovered_widget == Some(UiHit::Toolbar(w.action));
+            let enabled = self.toolbar_action_enabled(w.action);
+            let is_hov = enabled && self.hovered_widget == Some(UiHit::Toolbar(w.action));
             let is_primary = w.action == ToolbarAction::MdExportPrint;
             let is_md_pill = matches!(
                 w.action,
@@ -613,7 +671,12 @@ impl<'a> PdfViewerApp<'a> {
                     | ToolbarAction::MdZoomIn
                     | ToolbarAction::MdReload
             );
-            if is_primary {
+            if !enabled {
+                if is_md_pill {
+                    fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.surface_elevated);
+                    stroke_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, theme.border_subtle);
+                }
+            } else if is_primary {
                 let bg = if is_hov { theme.accent_hover } else { theme.accent };
                 fill_rounded_rect(buffer, buf_w, buf_h, w.x, w.y, w.w, w.h, btn_rad, bg);
             } else if w.active {
@@ -634,11 +697,13 @@ impl<'a> PdfViewerApp<'a> {
                 let cy = w.y as f32 + w.h as f32 * 0.5;
                 let r = (5.5 * s).clamp(4.0, 10.0);
                 fill_circle_aa(buffer, buf_w, buf_h, cx, cy, r + 1.2, theme.input_border);
-                fill_circle_aa(buffer, buf_w, buf_h, cx, cy, r, swatch);
+                fill_circle_aa(buffer, buf_w, buf_h, cx, cy, r, if enabled { swatch } else { theme.text_muted });
                 continue;
             }
 
-            let fg = if is_primary {
+            let fg = if !enabled {
+                theme.text_muted
+            } else if is_primary {
                 theme.text_on_accent
             } else if w.active {
                 theme.accent_soft_fg
@@ -653,13 +718,13 @@ impl<'a> PdfViewerApp<'a> {
                 let iy = w.y + ((w.h.saturating_sub(icon_sz)) / 2) as i32;
                 draw_icon(buffer, buf_w, buf_h, ic, ix, iy, icon_sz, fg);
             } else if let Some(ref lbl) = w.label {
-                let bold = w.active || is_primary;
+                let bold = enabled && (w.active || is_primary);
                 let lw = measure_text(lbl, font_sz, bold);
                 let tx = w.x + ((w.w as f32 - lw) * 0.5).round() as i32;
                 draw_text_vcenter(buffer, buf_w, buf_h, tx, w.y, w.h, w.x + w.w as i32 - 2, lbl, font_sz, fg, bold);
             }
 
-            if w.accent_dot {
+            if enabled && w.accent_dot {
                 let dr = (2.5 * s).max(2.0);
                 fill_circle_aa(
                     buffer,
@@ -691,7 +756,10 @@ impl<'a> PdfViewerApp<'a> {
         let (widgets, _) = self.compute_inline_toolbar_layout(start_x, buf_w, bar_h, sf);
         for w in widgets {
             if ix >= w.x && ix < w.x + w.w as i32 && iy >= w.y && iy < w.y + w.h as i32 {
-                return Some(w.action);
+                if self.toolbar_action_enabled(w.action) {
+                    return Some(w.action);
+                }
+                return None;
             }
         }
         None
@@ -719,6 +787,10 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn execute_toolbar_action(&mut self, action: ToolbarAction) {
         self.open_menu = None;
         self.active_note_popover = None;
+        if !self.toolbar_action_enabled(action) {
+            self.request_redraw();
+            return;
+        }
         match action {
             ToolbarAction::ToggleSidebar => {
                 self.show_bookmarks = !self.show_bookmarks;
@@ -841,10 +913,11 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             ToolbarAction::FindText => {
-                if self.doc.is_some() {
+                if self.doc.is_some() || self.is_markdown_tab() {
                     self.input_mode = InputMode::SearchText {
                         query_input: self.search_query.clone(),
                     };
+                    self.search_bar_focused = true;
                 }
             }
             ToolbarAction::MdModePreview => {

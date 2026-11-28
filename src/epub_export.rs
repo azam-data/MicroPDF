@@ -254,6 +254,7 @@ fn render_block_xhtml(
             out.push_str("</tbody></table>\n");
         }
         MdBlock::HorizontalRule => out.push_str("<hr/>\n"),
+        MdBlock::PageBreak => out.push_str("<div style=\"page-break-before: always;\"></div>\n"),
         MdBlock::MathBlock(tex) => {
             let readable = crate::math_render::math_to_readable_text(tex);
             out.push_str(&format!("<div class=\"math-block\">{}</div>\n", xml_escape(&readable)));

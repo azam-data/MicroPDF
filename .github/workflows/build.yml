@@ -63,11 +63,11 @@ jobs:
           Copy-Item $dll.FullName -Destination "pdfium_dir/pdfium.dll"
 
       - name: Run unit tests
-        if: inputs.run_tests
+        if: github.event_name == 'pull_request' || inputs.run_tests
         shell: pwsh
         env:
           MICROPDF_PDFIUM_DIR: ${{ github.workspace }}\pdfium_dir
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
       - name: Package portable folder
         shell: pwsh
@@ -120,10 +120,10 @@ jobs:
           cp "$DYLIB" pdfium_dir/libpdfium.dylib
 
       - name: Run unit tests
-        if: inputs.run_tests
+        if: github.event_name == 'pull_request' || inputs.run_tests
         env:
           MICROPDF_PDFIUM_DIR: ${{ github.workspace }}/pdfium_dir
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=1
 
       - name: Package portable folder
         env:

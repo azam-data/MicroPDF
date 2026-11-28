@@ -6,6 +6,22 @@
 
 ---
 
+## Screenshots (`v1.7.0` — Distinct UI Skin)
+
+| EPUB Book Reader (Light · 2-Page Spread & Book Drawer) | EPUB `Aa` Typography & Reading Popover |
+| :---: | :---: |
+| ![EPUB Book Reader Light](docs/screenshots/01_epub_distinct_light.png) | ![EPUB Aa Typography Popover](docs/screenshots/02_epub_aa_typography_popover.png) |
+
+| EPUB Dark Mode · 3D Hand Page Curl & Document Search | PDF Precision Studio (Light) |
+| :---: | :---: |
+| ![EPUB Dark 3D Page Curl and Search](docs/screenshots/03_epub_page_curl_dark.png) | ![PDF Precision Studio Light](docs/screenshots/06_pdf_distinct_light.png) |
+
+| Markdown Split Studio (Light · Outline & Live Preview) | LaTeX Academic Studio (Dark · Numbered Equations) |
+| :---: | :---: |
+| ![Markdown Split Studio Light](docs/screenshots/04_markdown_studio_split.png) | ![LaTeX Academic Studio Dark](docs/screenshots/05_latex_studio_dark.png) |
+
+---
+
 ## Download & Portable Install (`v1.7.0`)
 
 Grab the latest portable release from **[GitHub Releases](https://github.com/azam-data/MicroPDF/releases/latest)**:
@@ -16,7 +32,8 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
    MicroPDF/
    ├── micro_pdf.exe          # Signed-metadata Windows executable (~2 MB)
    ├── pdfium.dll             # Bundled PDFium engine (~7.8 MB)
-   ├── micropdf.ini           # Auto-created portable settings & history
+   ├── micropdf.ini           # Auto-created portable settings, favorites & history
+   ├── micropdf_books.ini     # Auto-created portable EPUB highlights, notes & bookmarks
    └── micropdf_assets/       # Auto-created portable signatures & stamps
        ├── signatures/
        └── stamps/
@@ -32,12 +49,17 @@ Grab the latest portable release from **[GitHub Releases](https://github.com/aza
 
 ## What's New in v1.7.0
 
-- **Portable EPUB (`.epub`) Reader:** Open EPUB 2 & EPUB 3 e-books via File → Open, drag-and-drop, CLI, or Favorites with zero temp files — renders book covers with soft drop shadows & crisp resampled images, chapters, automatic Outline sidebar, tables, lists, reading progress %, word count, estimated reading time, and last-position memory across all 6 Eye-Care Reading Modes.
-- **Magazine / Book Mode with Customizable Page-Turn Animation (`View -> Scroll: Magazine / Book` & Bottom-Bar Scroll Picker):** Front Cover (Page 1 alone) followed by two-page open book spreads (`2–3`, `4–5`, ...) with a central spine crease and customizable page-turn animation duration (`View -> Magazine Page-Turn Speed...`, `0–3000 ms`, default `450 ms`) across **PDF**, **EPUB**, **Markdown**, and **LaTeX**, plus uniform **60%–300%** zoom.
+- **Classic vs. Distinct UI Skin + Multi-Family CPU Typography (`Help -> UI Skin: Classic / Distinct`):** Preserves MicroPDF's **Classic** UI 100%, while **Distinct** mode transforms the Light/Dark palette and workspace per document type using bundled zlib-compressed SIL OFL font families (`UiSans`, `BookSerif` Regular/Bold/Italic with kerning pairs, `CodeMono`, and lazy OS serif loading):
+  - **PDF**: Precision slate + cobalt blue studio palette and streamlined bottom controls, plus 3D hand **Page Curl** turns in **Magazine / Book** mode.
+  - **EPUB**: Warm Apple Books / Foliate book atmosphere with chapter-per-page 2-page spreads, automatic TOC-to-sidebar deduplication, optional CPU-rendered 3D hand **Page Curl** animation, `hypher` syllable hyphenation & justification, **`Aa`** typography popover (`Book Serif`, `UI Sans`, OS serif fonts, `A-`/`A+`, **Line / Word / Para spacing**, **Narrow/Normal/Wide** presets + **`4-Side ›`** sub-menu with independent **Top, Bottom, Outer Side, Inner Spine** margin sliders, **Justify Text** toggle, **Avoid Breaking Words (-)** toggle, `2-Page Book` / `1-Page Flow`, `Curl: On/Off`, 6 paper themes), quick bottom-bar **Sidebar**, **Find**, smooth gliding scrubber & `Loc. X of Y · Z min left` chapter time-left footer, wide scrollable Book Drawer (`Contents` with `Loc X`, `Notes`, `Marks`, `• Chapter X of Y`, cover thumbnail, `(i)` details), and drag-to-Highlight / Add Note / Copy stored portably in `micropdf_books.ini`.
+  - **Markdown & LaTeX**: Cool Writer/IDE (indigo) & Academic Studio (emerald-teal) palettes, active-heading **Outline / Document Structure** sidebar, live **Split** editor by default, **Code Font `A-`/`A+`** right on the editor bar plus a dedicated **`Aa`** bottom popover for independent **Preview Font**, **Code Font**, **Line / Word / Para spacing**, and 3D hand **Page Curl** in Magazine mode.
+- **Format-Aware Menu & Persistent 50%-Fade Find Bar:** Menus and toolbar buttons inapplicable to the active format (e.g. `Page` / `Tools` / PDF edits on EPUB/Markdown) automatically dim grey; **`Ctrl+F`** opens a persistent **Find in the document** bar where `Enter` steps through matches, clicking outside dims it to **50% opacity** while leaving controls interactive, and `×` (or `Esc`) closes it.
+- **Per-Tab File-Type Icons (Both `Classic` & `Distinct`):** Color-coded procedural badges (**PDF**, **EPUB** book, **Markdown**, **LaTeX**) appear on every open tab and row in the `▾` All-Tabs overflow list.
+- **Markdown & LaTeX Studio Editor (`Split` Divider & `Pop Out ↗` Window):** Resizable vertical Split divider (`25%–75%`, double-click resets `50/50`), `CodeMono` monospace font, multi-line fenced code & math highlighting, active-line & matching-bracket highlights, a one-click Formatting/Snippet bar (`B`, `I`, `Code`, `H1–H3`, `List`, `Link`, `Table` / `\section`, `\textbf`, `\emph`, `$math$`, `Equation`, `\frac`, `\sum`, plus **`A-` / `A+`** Code font size), and **`Pop Out ↗`** to edit in a dedicated second window (`Dock Back` or closing the window restores Split View) with zero idle RAM when closed. Also supports `Tab`/`Shift+Tab`, auto-pairing, `Ctrl+B`/`Ctrl+I`, `Ctrl+Shift+D`, `Alt+Up/Down`, `Ctrl+/`, and `Ctrl+S`.
+- **Magazine / Book Mode with 3D Hand Page Curl (`View -> Scroll: Magazine / Book` & Bottom-Bar Scroll Picker):** Front Cover (Page 1 alone) followed by two-page open book spreads (`2–3`, `4–5`, ...) with a central spine crease, Apple Books 3D hand **Page Curl** animation, and customizable speed (`View -> Magazine Page-Turn Speed...`, `0–3000 ms`, default `450 ms`) across **PDF**, **EPUB**, **Markdown**, and **LaTeX**, plus uniform **60%–300%** zoom.
 - **Export to EPUB (`.epub`):** Convert any PDF (`Export -> Export as EPUB (.epub)...`), Markdown, or LaTeX document into a spec-compliant EPUB 3 e-book with chapter splitting and clean typography.
 - **Favorites Menu, Tab `★` Stars & Nested Folders (`Ctrl+D`):** Dedicated **Favorites** top menu plus a clickable `★` star inside every open tab to organize PDFs, Markdown, LaTeX, and EPUB documents into unlimited nested folders & subfolders.
 - **Optional Encrypted Portable Config (`File -> Encrypt Portable Config (micropdf.ini)`):** Authenticated ChaCha20 + HMAC-SHA256 encryption so `micropdf.ini` (including Favorites, recent files, and session tabs) cannot be read in Notepad by anyone else while MicroPDF opens it automatically.
-- **Unified Contextual Toolbar & Live Markdown/LaTeX Editor (`Preview` | `Split` | `Edit`):** Seamless top-toolbar controls (`Preview | Split | Edit`, `Zoom`, `Save`, `Reload`, `Export`) with auto-indent & list continuation, `Tab`/`Shift+Tab` indent, bracket/quote/math auto-pairing, `Ctrl+B`/`Ctrl+I` formatting, `Ctrl+Shift+D` duplicate line, `Alt+Up/Down` move line, and `Ctrl+/` comment toggle.
 - **Markdown Math & LaTeX Equation Numbers:** Full `$...$` inline and `$$...$$` display math in Markdown, plus automatic `(1)`, `(2)` equation numbering and `\eqref`/`\ref` resolution for LaTeX `equation`/`align`/`gather` environments.
 - **Complex-Graph Failsafe Guard:** Automatically scans `.tex` files before opening for unsupported vector-graph environments (`tikzpicture`, `pgfpicture`, `circuitikz`, `pspicture`, `asy`, `axis`/PGFPlots) and shows a clear warning without breaking the active tab.
 - **Styled Markdown (`.md` / `.markdown`) Reader & Export (`PDF` + `.docx`):** Open Markdown files alongside PDFs via File → Open, drag-and-drop, or CLI. Features an editorial Light/Dark reading column, automatic `#`–`###` outline sidebar, GFM tables, code blocks with **Copy** button & horizontal scroll, clickable links, zoom (`Ctrl+`/`-`/`0`), live Reload, **Export to Styled PDF** (A4/Letter, repeated table headers, `Page X of Y`), and **Export to Styled Word (`.docx`)** via `docx-rs`.
@@ -71,8 +93,8 @@ Printing a 20-page 600-dpi scan adds ~25 MB at peak (one decoded scan image plus
 ## Key Features
 
 ### Reading, Navigation & UI
-- **Compact 720p-Ready CPU UI (Light Default + Dark Mode):** Unified 32px menu bar (`File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Help`) + customizable icon toolbar (`View -> Customize Toolbar...`, `View -> UI Scale`), antialiased proportional text (`ab_glyph`), and instant Light/Dark switching.
-- **Scalable Tabs & Unsaved-Changes Guard:** Multi-tab bar with overflow arrows, `▾` All-Tabs popover, tab right-click menu (`Close Other Tabs` / `Close Tabs to Right` / `Close All Tabs`), `Save / Discard / Cancel` guard on close, drag-and-drop Welcome Screen, and auto-reload on external file changes.
+- **Compact 720p-Ready CPU UI (Light Default + Dark Mode, Classic / Distinct Skin):** Unified 32px menu bar (`File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Favorites`, `Help`) + customizable icon toolbar (`View -> Customize Toolbar...`, `View -> UI Scale`), `Help -> UI Skin: Classic / Distinct`, multi-family antialiased typography (`ab_glyph`), and instant Light/Dark switching.
+- **Scalable Tabs & Unsaved-Changes Guard:** Multi-tab bar with color-coded per-tab file-type icons (`PDF`, `EPUB`, `Markdown`, `LaTeX`), overflow arrows, `▾` All-Tabs popover, tab right-click menu (`Close Other Tabs` / `Close Tabs to Right` / `Close All Tabs`), `Save / Discard / Cancel` guard on close, drag-and-drop Welcome Screen, and auto-reload on external file changes.
 - **Flexible Layouts & Pan/Scroll:** `FitPage` (`1`), `FitWidth` (`2`), `FitTextWidth` (`3`), `TwoPageSpread` (`4`), reflowable `TextView` (`T`), plus independent **Single Page**, **Continuous Vertical (`5`)**, and **Continuous Horizontal Book** flows, `25%–800%` cursor-centered zoom, **Hand Tool**, and draggable **Horizontal & Vertical Scrollbars**.
 - **6 Eye-Care Reading Modes (`V`):** `Normal`, `Paper E-Ink` (day), `Warm Sepia`, `Sage Eye-Care`, `Dark Invert`, and `Night Amber` (night), persisted in `micropdf.ini` alongside reading positions for up to 50 recent files.
 - **Fast Search & Built-In Beginner Manual:** Floating `Ctrl/Cmd+F` search (`Aa` Case, `W` Whole Word, `F3`/`Shift+F3`), `Alt+Left`/`Alt+Right` navigation history, Smart Jump (`G` — logical `5`, Roman `iii`, or physical `#5`), and a 10-chapter offline **Step-by-Step User Guide** (`Help -> User Guide (How to Use)`) with `.txt` export.
@@ -94,23 +116,27 @@ Printing a 20-page 600-dpi scan adds ~25 MB at peak (one decoded scan image plus
 
 | Shortcut / Action | Mode | Description |
 | :--- | :--- | :--- |
-| **Top Menu Bar Click** | Any | Open `File`, `View`, `Edit`, `Page`, `Tools`, `Export`, or `Help` |
+| **Top Menu Bar Click** | Any | Open `File`, `View`, `Edit`, `Page`, `Tools`, `Export`, `Favorites`, or `Help` |
+| `Help -> UI Skin` | Any | Toggle between **Classic** (original UI) and **Distinct** (per-document studio & book UI) |
 | `1` / `2` / `3` / `4` / `5` / `T` | Page View | `1` Fit Page, `2` Fit Width, `3` Fit Text, `4` Two-Page, `5` Continuous Scroll, `T` Text View |
-| `Ctrl/Cmd+Wheel` / `+` / `-` / `0` | Page View | Zoom (`25%–800%`) around cursor or reset zoom to `100%` (`0` / `Ctrl+0`) |
+| `Ctrl/Cmd+Wheel` / `+` / `-` / `0` | Any | Zoom (`25%–800%` PDF, `60%–300%` EPUB/MD/LaTeX) or reset to `100%` (`0` / `Ctrl+0`) |
 | **Hand Tool** / **Scrollbars** | Normal / Compare | Click the **Hand** icon to drag-pan in 2D, or drag bottom Horizontal / right Vertical scrollbars |
 | `Ctrl+Tab` / `Ctrl+1..9` / `Ctrl+W` | Any | Switch tabs, jump to tab 1–9, or close tab (with unsaved-changes guard) |
 | `F11` / `F5` / `Esc` | Any | Fullscreen (`F11`), Presentation Mode (`F5`), or return to Select / close modal (`Esc`) |
-| `Alt+Left` / `Alt+Right` | Page View | Navigate Back / Forward in link & page jump history (up to 50 entries) |
+| `Alt+Left` / `Alt+Right` / `Alt+Up/Down` | View / Editor | History Back/Fwd in Page View; Move current line Up/Down in `.md`/`.tex` Editor |
+| **Drag** / `Aa` / `★` | Distinct EPUB | Drag words to Highlight/Note/Copy; `Aa`: fonts, **Line/Word/Para**, **4-Side ›** margins; **Scrubber** glides smoothly; `★` bookmark |
+| **Split Drag** / `Aa` / `Pop Out ↗` | `.md` / `.tex` Studio | Drag Split (`25%–75%`, 2×=`50/50`); **`A-`/`A+`** Code size & **`Aa`** Preview/Spacing; **`Pop Out ↗`** window |
+| `Ctrl+B` / `I` / `Shift+D` / `/` / `S` | `.md` / `.tex` Editor | Bold, Italic, Duplicate line, Toggle comment, Save directly to disk |
 | **Left-Click / Drag / Right-Click** | Page View | Select text (`Ctrl+C`), fill Form Fields, or right-click annotations to Edit/Recolor/Delete |
 | `Tab` / `Ctrl+Click` / `Shift+Click` | Any / Grid | Toggle Thumbnail Grid (`Tab`); multi-select thumbnails for batch actions |
-| `Ctrl/Cmd+F` & `F3` / `Shift+F3` | Any | Incremental search (`Aa` Case, `W` Whole Word) & Next / Previous match |
+| `Ctrl/Cmd+F` & `Enter` / `F3` | Any | Persistent Find bar across PDF/EPUB/MD/LaTeX (`Enter`=Next match, Blur=50% opacity, `×`=Close) |
 | `V` | Page View | Cycle 6 Eye-Care Reading Modes (`Paper E-Ink`, `Night Amber`, Sepia, Sage, Dark, Normal) |
 | `W` / `P` / `N` / `H` | Normal | Detailed Watermark (`W`), Stamps & Signatures (`P`), Page Numbers (`N`), Header/Footer (`H`) |
 | `Shift+M` / `X` / `Z` / `U` | Any | Combine PDFs (`Shift+M`), Split/Extract (`X`), Optimize (`Z`), Flatten & Unlock (`U`) |
-| `B` / `A` / `L` / `G` | Any / Normal | Bookmarks Sidebar (`B`), Add Bookmark (`A`), Import `.txt` (`L`), Smart Jump (`G`) |
+| `B` / `A` / `L` / `G` | Any / Normal | Sidebar (Book Drawer / Outline / Bookmarks) (`B`), Add Bookmark (`A`), Import `.txt` (`L`), Smart Jump (`G`) |
 | `K` / `I` / `R` / `D` | Normal / Grid | Page B&W (`K`), Insert Blank (`I`), Rotate 90° (`R`), Delete Page (`D`) |
 | `Ctrl+Z` / `Ctrl+Y` (`Ctrl+Shift+Z`) | Normal | Undo / Redo up to 8 steps per tab |
-| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Print Preview or Export `.md`/`.tex` (`Ctrl+P`), Open PDF/`.md`/`.tex` (`O`), Save (`S`/`Ctrl+S`), Save As (`Ctrl+Shift+S`) |
+| `Ctrl/Cmd+P` / `O` / `S` / `Ctrl+Shift+S` | Any | Print Preview or Export (`Ctrl+P`), Open Documents (`O`), Save (`S`/`Ctrl+S`), Save As (`Ctrl+Shift+S`) |
 | `?` / `F1` / `Help -> User Guide` | Any | Shortcut Sheet (`?` / `F1`) or 10-chapter Step-by-Step User Guide |
 
 ---

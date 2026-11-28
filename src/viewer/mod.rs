@@ -1,3 +1,4 @@
+mod book_ui;
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
@@ -1159,8 +1160,13 @@ mod tests {
         let mut app = PdfViewerApp::new(&engine, Some(src_path.clone()))?;
         app.ensure_current_page_rendered(1024, 768, 0, 52, 22)?;
 
-        // 1. Open Tools -> Optimize... (item 6 in Tools menu)
-        app.execute_menu_item(state::MenuCategory::Tools, 6);
+        // 1. Open Tools -> Optimize...
+        let opt_idx = state::MenuCategory::Tools
+            .items()
+            .iter()
+            .position(|&s| s == "Optimize...")
+            .expect("Optimize... must exist in Tools menu");
+        app.execute_menu_item(state::MenuCategory::Tools, opt_idx);
         assert_eq!(
             app.input_mode,
             state::InputMode::OptimizePrompt {
@@ -1231,7 +1237,7 @@ mod tests {
         assert!(!opt_path.exists(), "Cancelled OptimizeJob must write nothing");
 
         // 5. Re-open Tools -> Optimize... and run all steps to completion
-        app.execute_menu_item(state::MenuCategory::Tools, 6);
+        app.execute_menu_item(state::MenuCategory::Tools, opt_idx);
         app.handle_key_input(
             winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter),
             None,
@@ -2545,13 +2551,182 @@ mod tests {
         draw_icon(&mut buf, 320, 120, UiIcon::Moon, 62, 64, 18, 0x001E_293B);
         assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
 
-        // Stress-test many sizes to verify the 256 KB glyph cache cap holds
+        // Stress-test many sizes to verify the glyph cache cap holds
         for sz in [10.0f32, 12.0, 14.0, 16.0, 18.0, 22.0, 28.0] {
             let _ = measure_text("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", sz, false);
         }
         assert!(
-            glyph_cache_bytes() <= 256 * 1024,
-            "glyph cache exceeded 256 KB cap: {} bytes",
+            glyph_cache_bytes() <= MAX_GLYPH_CACHE_BYTES,
+            "glyph cache exceeded {} byte cap: {} bytes",
+            MAX_GLYPH_CACHE_BYTES,
+            glyph_cache_bytes()
+        );
+    }
+
+    #[test]
+    fn test_phase1_ui_skin_doc_kind_and_help_menu() {
+        use super::state::{MenuCategory, PdfViewerApp, SessionConfig};
+        use super::theme::{DocKind, UiSkin};
+        use std::path::Path;
+
+        // UiSkin defaults, toggle, labels, and INI round-trip
+        assert_eq!(UiSkin::default(), UiSkin::Classic);
+        assert_eq!(UiSkin::Classic.label(), "Classic");
+        assert_eq!(UiSkin::Distinct.label(), "Distinct");
+        assert_eq!(UiSkin::Classic.toggle(), UiSkin::Distinct);
+        assert_eq!(UiSkin::Distinct.toggle(), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("distinct"), UiSkin::Distinct);
+        assert_eq!(UiSkin::from_ini_str("DISTINCT"), UiSkin::Distinct);
+        assert_eq!(UiSkin::from_ini_str("classic"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Classic);
+
+        let legacy_ini = "ui_theme=dark\nactive_tab=0\n";
+        let parsed_legacy = PdfViewerApp::parse_session_ini(legacy_ini);
+        assert_eq!(parsed_legacy.ui_skin, UiSkin::Classic);
+
+        let mut cfg = SessionConfig::default();
+        cfg.ui_skin = UiSkin::Distinct;
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        assert!(ini.contains("ui_skin=distinct"));
+        let roundtripped = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(roundtripped.ui_skin, UiSkin::Distinct);
+
+        // DocKind detection
+        assert_eq!(DocKind::from_path(Path::new("report.pdf")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("REPORT.PDF")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("notes.md")), DocKind::Markdown);
+        assert_eq!(DocKind::from_path(Path::new("README.MARKDOWN")), DocKind::Markdown);
+        assert_eq!(DocKind::from_path(Path::new("paper.tex")), DocKind::LaTeX);
+        assert_eq!(DocKind::from_path(Path::new("novel.EPUB")), DocKind::Epub);
+        assert!(!DocKind::Pdf.is_reflowable());
+        assert!(DocKind::Markdown.is_reflowable());
+        assert!(DocKind::LaTeX.is_reflowable());
+        assert!(DocKind::Epub.is_reflowable());
+
+        // Help menu contains UI Skin entry without breaking existing items
+        let help_items = MenuCategory::Help.items();
+        assert!(help_items.iter().any(|s| s.contains("User Guide")));
+        assert!(help_items.iter().any(|s| s.contains("Keyboard & Mouse Shortcuts")));
+        assert!(help_items.iter().any(|s| s.contains("Bookmark Import Format")));
+        assert!(help_items.iter().any(|s| s.contains("UI Skin: Classic / Distinct")));
+        assert!(help_items.iter().any(|s| s.contains("About MicroPDF")));
+    }
+
+    #[test]
+    fn test_phase1_multifamily_typography_kerning_custom_os_and_doc_icons() {
+        use super::theme::DocKind;
+        use super::ui_draw::*;
+
+        let serif_reg = TextStyle::book(24.0, false, false);
+        let serif_bold = TextStyle::book(24.0, true, false);
+        let serif_ital = TextStyle::book(24.0, false, true);
+        let mono = TextStyle::mono(16.0);
+
+        // Positive measurements across BookSerif & CodeMono
+        let w_reg = measure_text_styled("Hello Typography", serif_reg);
+        let w_bold = measure_text_styled("Hello Typography", serif_bold);
+        let w_ital = measure_text_styled("Hello Typography", serif_ital);
+        assert!(w_reg > 40.0 && w_bold > 40.0 && w_ital > 40.0);
+
+        // CodeMono is strictly monospaced: 'i' and 'W' have equal advance width
+        let w_mono_i = measure_text_styled("iiii", mono);
+        let w_mono_w = measure_text_styled("WWWW", mono);
+        assert!(
+            (w_mono_i - w_mono_w).abs() < 0.05,
+            "CodeMono must have uniform advance: iiii={w_mono_i}, WWWW={w_mono_w}"
+        );
+
+        // Real kerning pairs in BookSerif: "AV" and "To" tighten advance width vs unkerned sum
+        let av_kerned = measure_text_styled("AV", serif_reg);
+        let av_sum = measure_text_styled("A", serif_reg) + measure_text_styled("V", serif_reg);
+        assert!(
+            av_kerned < av_sum - 0.5,
+            "Expected negative kerning on BookSerif 'AV': kerned={av_kerned}, sum={av_sum}"
+        );
+
+        let to_kerned = measure_text_styled("To", serif_reg);
+        let to_sum = measure_text_styled("T", serif_reg) + measure_text_styled("o", serif_reg);
+        assert!(
+            to_kerned < to_sum - 0.3,
+            "Expected negative kerning on BookSerif 'To': kerned={to_kerned}, sum={to_sum}"
+        );
+
+        // Render BookSerif (regular/bold/italic), CodeMono, and all 4 DocKind icons
+        let mut buf = vec![0x00FF_FFFFu32; 360 * 180];
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 10, 348, "AV Book Serif", serif_reg, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 42, 348, "Bold Serif", serif_bold, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 74, 348, "Italic Serif", serif_ital, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 360, 180, 12, 108, 348, "fn main() {}", mono, 0x001E_293B);
+
+        for (i, (kind, icon)) in [
+            (DocKind::Pdf, UiIcon::DocPdf),
+            (DocKind::Epub, UiIcon::DocEpub),
+            (DocKind::Markdown, UiIcon::DocMarkdown),
+            (DocKind::LaTeX, UiIcon::DocLatex),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            draw_doc_type_icon(&mut buf, 360, 180, kind, 12 + (i as i32) * 24, 140, 16, false);
+            draw_doc_type_icon(&mut buf, 360, 180, kind, 120 + (i as i32) * 24, 140, 16, true);
+            draw_icon(&mut buf, 360, 180, icon, 228 + (i as i32) * 24, 140, 16, 0x001E_293B);
+        }
+        assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
+
+        // Lazy CustomOs slot: clears cleanly and falls back safely when unloaded
+        assert!(set_custom_os_font(None));
+        assert_eq!(active_custom_os_font_name(), None);
+        let fallback_w = measure_text_styled(
+            "Fallback Serif",
+            TextStyle {
+                family: FontFamily::CustomOs,
+                size_px: 18.0,
+                bold: false,
+                italic: false,
+            },
+        );
+        assert!(fallback_w > 30.0);
+
+        // If any OS font exists in catalog, verify CustomOs can load and unload it cleanly
+        if let Some(entry) = crate::fonts::global_system_fonts()
+            .iter()
+            .find(|e| e.path.is_some())
+        {
+            assert!(set_custom_os_font(Some(&entry.display_name)));
+            assert!(active_custom_os_font_name().is_some());
+            let os_w = measure_text_styled(
+                "Custom OS Font",
+                TextStyle {
+                    family: FontFamily::CustomOs,
+                    size_px: 18.0,
+                    bold: false,
+                    italic: false,
+                },
+            );
+            assert!(os_w > 20.0);
+            assert!(set_custom_os_font(None));
+            assert_eq!(active_custom_os_font_name(), None);
+        }
+
+        // Stress-test across families & sizes to ensure bounded 512 KB cache holds
+        for fam in [FontFamily::UiSans, FontFamily::BookSerif, FontFamily::CodeMono] {
+            for sz in [11.0f32, 14.0, 18.0, 24.0, 32.0] {
+                let _ = measure_text_styled(
+                    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
+                    TextStyle {
+                        family: fam,
+                        size_px: sz,
+                        bold: false,
+                        italic: fam == FontFamily::BookSerif,
+                    },
+                );
+            }
+        }
+        assert!(
+            glyph_cache_bytes() <= MAX_GLYPH_CACHE_BYTES,
+            "glyph cache exceeded {} byte cap: {} bytes",
+            MAX_GLYPH_CACHE_BYTES,
             glyph_cache_bytes()
         );
     }
@@ -3029,6 +3204,746 @@ mod tests {
         let (sigs, stamps) = ensure_asset_subdirs(&tmp);
         assert!(sigs.is_dir() && stamps.is_dir());
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_phase2_hypher_justified_wrapping_and_line_level_spread_pagination() {
+        use super::markdown_view::{
+            layout_blocks, paginate_book_pages, tokenize_spans, wrap_styled_words_ex,
+            BookLayoutOpts, LaidOutBlock,
+        };
+        use super::ui_draw::FontFamily;
+        use crate::markdown::{InlineSpan, MdBlock};
+        use std::collections::HashMap;
+
+        let opts = BookLayoutOpts {
+            book_mode: true,
+            font_family: FontFamily::BookSerif,
+            line_mult: 1.56,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
+            justify: true,
+            hyphenate: true,
+            hypher_lang: hypher::Lang::English,
+        };
+        let mut links = Vec::new();
+        let text = "Typography extraordinary international characteristics communication representation considerations.";
+        let words = tokenize_spans(&[InlineSpan::Text(text.to_string())], 16.0, &mut links, 0, opts);
+        let lines = wrap_styled_words_ex(words, 165.0, 24.0, 16.0, opts);
+        assert!(lines.len() >= 3, "Expected multi-line wrap, got {}", lines.len());
+        assert!(lines[0].first_line_indent > 0.0, "Consecutive paragraph first line indent missing");
+        assert!(!lines[0].is_last_in_para && lines.last().unwrap().is_last_in_para);
+        let has_hyphen_break = lines[..lines.len() - 1]
+            .iter()
+            .any(|ln| ln.spans.last().is_some_and(|w| w.text.ends_with('-')));
+        assert!(has_hyphen_break, "Expected hypher syllable hyphenation across narrow justified book column");
+
+        // Build two paragraphs where the second long paragraph MUST split at line level across 2 book pages
+        let long_sentence = "In the beginning the universe was created and every single carefully typeset line flows cleanly across the open spread without jarring empty gaps. ".repeat(6);
+        let ast = vec![
+            MdBlock::Paragraph(vec![InlineSpan::Text("Opening short paragraph.".to_string())]),
+            MdBlock::Paragraph(vec![InlineSpan::Text(long_sentence)]),
+        ];
+        let mut code_blocks = Vec::new();
+        let mut dims_cache = HashMap::new();
+        let embedded = HashMap::new();
+        let (blocks, _) = layout_blocks(
+            &ast, 280.0, 16.0, 1.0, 0.0, &mut links, &mut code_blocks, &mut dims_cache, &embedded, true, None, opts, None,
+        );
+        let total_p2_lines = match &blocks[1] {
+            LaidOutBlock::Paragraph { lines, .. } => lines.len(),
+            _ => panic!("expected paragraph"),
+        };
+        assert!(total_p2_lines >= 8, "Expected >= 8 lines in paragraph 2, got {total_p2_lines}");
+
+        // Choose a small page height (~5 lines tall) so paragraph 2 splits cleanly across multiple pages
+        let pages = paginate_book_pages(&blocks, 130.0, true);
+        assert!(pages.len() >= 3, "Expected cover + >=2 content pages, got {}", pages.len());
+        assert!(pages[0].is_cover);
+        let p2_slices: Vec<(usize, usize)> = pages[1..]
+            .iter()
+            .flat_map(|p| p.slices.iter())
+            .filter(|s| s.block_idx == 1)
+            .map(|s| (s.line_start, s.line_end))
+            .collect();
+        assert!(p2_slices.len() >= 2, "Long paragraph must split across >=2 pages at line granularity");
+        assert_eq!(p2_slices.first().unwrap().0, 0);
+        assert_eq!(p2_slices.last().unwrap().1, total_p2_lines);
+        for pair in p2_slices.windows(2) {
+            assert_eq!(pair[0].1, pair[1].0, "Line slices across page boundary must be contiguous with zero lost lines");
+        }
+    }
+
+    #[test]
+    fn test_phase2_epub_prefs_and_books_ini_roundtrip() {
+        use super::book_ui::{
+            parse_books_ini, serialize_books_ini, EpubBookData, EpubBookmark, EpubFontChoice,
+            EpubHighlight, EpubReaderPrefs, LineSpacingPreset, MarginPreset,
+        };
+        use super::state::{PdfViewerApp, SessionConfig};
+        use std::path::PathBuf;
+
+        let mut cfg = SessionConfig::default();
+        cfg.epub_prefs = EpubReaderPrefs {
+            font_choice: EpubFontChoice::OsSerif("Georgia".to_string()),
+            font_size_px: 19.5,
+            line_spacing: LineSpacingPreset::Relaxed,
+            line_spacing_mult: 1.75,
+            word_spacing_px: 1.5,
+            paragraph_spacing_mult: 1.30,
+            margins: MarginPreset::Wide,
+            margin_ratio: 0.22,
+            margin_top: 0.14,
+            margin_bottom: 0.12,
+            margin_outer: 0.22,
+            margin_inner: 0.15,
+            justify: false,
+            hyphenate: false,
+            two_page_spread: false,
+            page_curl_anim: false,
+        };
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert_eq!(parsed.epub_prefs, cfg.epub_prefs);
+
+        // Portable micropdf_books.ini annotations + bookmarks roundtrip
+        let mut all_books = std::collections::BTreeMap::new();
+        let mut book = EpubBookData::default();
+        book.next_id = 2;
+        book.highlights.push(EpubHighlight {
+            id: 1,
+            block_idx: 12,
+            start_word: 3,
+            end_word: 9,
+            quote: "Call me | Ishmael\nChapter 1".to_string(),
+            color_idx: 2,
+            note: Some("Famous opening | line\nKeep for essay".to_string()),
+        });
+        book.bookmarks.push(EpubBookmark {
+            block_idx: 12,
+            page_num: 4,
+            label: "Chapter 1: Loomings".to_string(),
+        });
+        all_books.insert("books/moby_dick.epub".to_string(), book.clone());
+        let _ = PathBuf::from("books/moby_dick.epub");
+        let saved_books = serialize_books_ini(&all_books);
+        let parsed_books = parse_books_ini(&saved_books);
+        assert_eq!(parsed_books.get("books/moby_dick.epub"), Some(&book));
+    }
+
+    #[test]
+    fn test_epub_feedback_margins_chapter_breaks_search_and_curl() {
+        use super::book_ui::{EpubReaderPrefs, MarginPreset};
+        use super::markdown_view::{
+            layout_blocks, paginate_book_pages, search_markdown_doc, BookLayoutOpts,
+        };
+        use super::state::MenuCategory;
+        use super::ui_draw::{draw_apple_books_page_curl, FontFamily};
+        use super::user_guide::USER_GUIDE_CHAPTERS;
+        use crate::markdown::{InlineSpan, MarkdownDoc, MdBlock};
+        use std::collections::HashMap;
+
+        // 1. Top/vertical padding scales cleanly with Narrow / Normal / Wide and 4-side margin controls
+        let mut prefs = EpubReaderPrefs::default();
+        prefs.set_margin_preset(MarginPreset::Narrow);
+        let (top_narrow, bot_narrow) = prefs.vertical_pad_px(800.0, 1.0);
+        prefs.set_margin_preset(MarginPreset::Normal);
+        let (top_normal, bot_normal) = prefs.vertical_pad_px(800.0, 1.0);
+        prefs.set_margin_preset(MarginPreset::Wide);
+        let (top_wide, bot_wide) = prefs.vertical_pad_px(800.0, 1.0);
+        assert!(top_narrow < top_normal && top_normal < top_wide);
+        assert!(bot_narrow < bot_normal && bot_normal < bot_wide);
+        assert!(top_normal >= 44.0, "Normal top margin should be generous, got {top_normal}");
+
+        prefs.set_margin_slider_norm(0.0);
+        let (top_min, _) = prefs.vertical_pad_px(800.0, 1.0);
+        prefs.set_margin_slider_norm(1.0);
+        let (top_max, _) = prefs.vertical_pad_px(800.0, 1.0);
+        assert!(top_min < top_max);
+
+        // 2. Chapters separated by MdBlock::PageBreak MUST start on separate book pages
+        // even when both chapters are tiny and page height is huge.
+        let ast = vec![
+            MdBlock::Heading { level: 1, spans: vec![InlineSpan::Text("Chapter 1".into())] },
+            MdBlock::Paragraph(vec![InlineSpan::Text("Short first chapter.".into())]),
+            MdBlock::PageBreak,
+            MdBlock::Heading { level: 1, spans: vec![InlineSpan::Text("Chapter 2".into())] },
+            MdBlock::Paragraph(vec![InlineSpan::Text("Short second chapter.".into())]),
+        ];
+        let opts = BookLayoutOpts {
+            book_mode: true,
+            font_family: FontFamily::BookSerif,
+            line_mult: 1.5,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
+            justify: true,
+            hyphenate: false,
+            hypher_lang: hypher::Lang::English,
+        };
+        let mut links = Vec::new();
+        let mut code_blocks = Vec::new();
+        let mut dims_cache = HashMap::new();
+        let embedded = HashMap::new();
+        let (blocks, _) = layout_blocks(
+            &ast, 400.0, 16.0, 1.0, 0.0, &mut links, &mut code_blocks, &mut dims_cache, &embedded, true, None, opts, None,
+        );
+        let pages = paginate_book_pages(&blocks, 900.0, false);
+        assert_eq!(pages.len(), 2, "Two chapters separated by PageBreak must produce 2 separate pages");
+        assert!(pages[0].slices.iter().all(|s| s.ast_block_idx < 2));
+        assert!(pages[1].slices.iter().all(|s| s.ast_block_idx >= 3));
+
+        // 3. Full-text search across MarkdownDoc (EPUB, Markdown, LaTeX)
+        let md_doc = MarkdownDoc {
+            title: "Search Book".into(),
+            blocks: vec![
+                MdBlock::Heading { level: 1, spans: vec![InlineSpan::Text("Quantum Mechanics".into())] },
+                MdBlock::Paragraph(vec![InlineSpan::Text("A cat sits in a catalog with another Cat.".into())]),
+                MdBlock::Blockquote(vec![MdBlock::Paragraph(vec![InlineSpan::Text("Every quantum state evolves.".into())])]),
+            ],
+            headings: Vec::new(),
+            embedded_images: HashMap::new(),
+            book_meta: None,
+        };
+        assert_eq!(search_markdown_doc(&md_doc, "quantum", false, false).len(), 2);
+        assert_eq!(search_markdown_doc(&md_doc, "Quantum", true, false).len(), 1);
+        assert_eq!(search_markdown_doc(&md_doc, "cat", false, false).len(), 3);
+        assert_eq!(search_markdown_doc(&md_doc, "cat", false, true).len(), 2);
+        assert_eq!(search_markdown_doc(&md_doc, "Cat", true, true).len(), 1);
+
+        // 4. Apple Books 3D hand page-curl renderer paints cleanly into CPU softbuffer
+        let (w, h) = (320u32, 200u32);
+        let mut cur_buf = vec![0x00FB_F8F1u32; (w * h) as usize];
+        let prev_buf = vec![0x00E8_E2D5u32; (w * h) as usize];
+        let before = cur_buf.clone();
+        draw_apple_books_page_curl(
+            &mut cur_buf, w, h, &prev_buf, 10, 10, 300, 180, 0.45, 1, 0x00FB_F8F1, 1.0,
+        );
+        assert_ne!(cur_buf, before, "Forward 3D page curl must render curved peel onto frame buffer");
+        draw_apple_books_page_curl(
+            &mut cur_buf, w, h, &prev_buf, 10, 10, 300, 180, 0.55, -1, 0x001B_1E24, 1.0,
+        );
+
+        // 5. Global wording: Open Documents & Find in the document
+        assert!(MenuCategory::File.items().iter().any(|it| it.contains("Open Documents")));
+        assert!(MenuCategory::Edit.items().iter().any(|it| it.contains("Find in the document")));
+        for ch in USER_GUIDE_CHAPTERS {
+            for b in ch.blocks {
+                let txt = match b {
+                    super::user_guide::GuideBlock::Heading(s)
+                    | super::user_guide::GuideBlock::Paragraph(s)
+                    | super::user_guide::GuideBlock::Tip(s) => *s,
+                    super::user_guide::GuideBlock::Step { text, .. } => *text,
+                };
+                assert!(!txt.contains("Open PDF"), "Stale 'Open PDF' wording in User Guide: {txt}");
+                assert!(!txt.contains("Find Text in PDF"), "Stale 'Find Text in PDF' wording in User Guide: {txt}");
+            }
+        }
+    }
+
+    /// Generates authentic pixel-accurate PNG screenshots of the new Distinct UI Skin
+    /// directly from MicroPDF's CPU `softbuffer` renderer into `docs/screenshots/`.
+    /// Run via:
+    /// `MICROPDF_PDFIUM_DIR=/path/to/pdfium cargo test --release --locked generate_distinct_ui_screenshots -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn generate_distinct_ui_screenshots() {
+        use super::state::{InputMode, PdfViewerApp, ReadingFilter};
+        use super::theme::{UiSkin, UiThemeMode};
+        use crate::engine::PdfEngine;
+        use crate::zip_mini::ZipWriter;
+        use std::path::PathBuf;
+        use std::time::{Duration, Instant};
+
+        fn save_u32_rgb_png(buf: &[u32], w: u32, h: u32, path: &std::path::Path) {
+            let mut rgb = Vec::with_capacity((w * h * 3) as usize);
+            for &px in buf {
+                rgb.push(((px >> 16) & 0xFF) as u8);
+                rgb.push(((px >> 8) & 0xFF) as u8);
+                rgb.push((px & 0xFF) as u8);
+            }
+            let img = image::RgbImage::from_raw(w, h, rgb).expect("valid rgb buffer");
+            img.save(path).expect("save screenshot png");
+        }
+
+        let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("screenshots");
+        std::fs::create_dir_all(&out_dir).expect("create docs/screenshots");
+
+        let tmp = std::env::temp_dir().join("micropdf_showcase_v17");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("create tmp showcase dir");
+
+        // 1. Sample Markdown document
+        let md_path = tmp.join("Architecture_Notes.md");
+        let md_text = r#"# MicroPDF v1.7 Architecture
+
+MicroPDF renders every menu, tab, sidebar, and document page directly into a CPU frame buffer with **zero GPU overhead** and *zero GUI toolkit bloat*.
+
+## Key Design Principles
+
+- **Portable-First**: All settings live in `micropdf.ini` beside the executable.
+- **Bounded Memory**: Inactive tabs hold zero bitmaps; image caches evict cleanly.
+- **Multi-Family Typography**: Embedded `BookSerif`, `UiSans`, and `CodeMono` fonts.
+
+## Performance Snapshot
+
+| Subsystem | Strategy | Peak Overhead |
+| :--- | :--- | ---: |
+| EPUB Layout | Lock-free font metrics + lazy images | 24 MB cap |
+| PDF Zoom | 512x512 LRU tile cache | 16 MB cap |
+| Page Curl | Single spread snapshot (freed on end) | 0 MB idle |
+
+## Equation Support
+
+Inline math like $E = mc^2$ and display equations render crisply offline:
+
+$$\int_0^\infty e^{-x^2}\,dx = \frac{\sqrt{\pi}}{2}$$
+
+```rust
+pub fn render_frame(buffer: &mut [u32], width: u32, height: u32) {
+    // Pure CPU antialiased rendering into 0x00RRGGBB
+    draw_distinct_workspace(buffer, width, height);
+}
+```
+"#;
+        std::fs::write(&md_path, md_text).expect("write md");
+
+        // 2. Sample LaTeX document
+        let tex_path = tmp.join("Quantum_Notes.tex");
+        let tex_text = r#"\title{Variational Principles in Quantum Mechanics}
+\author{Dr. Elena Vance}
+
+\section{Introduction}
+In quantum mechanics, the time evolution of a pure state vector $\psi(x, t)$ is governed by the Schrödinger equation. MicroPDF parses sections, inline math, numbered equations, and citations cleanly offline.
+
+\section{Hamiltonian Formulation}
+The stationary states satisfy the eigenvalue problem shown in Equation~\eqref{eq:schrodinger}:
+
+\begin{equation}
+\label{eq:schrodinger}
+\hat{H}\psi = \left(-\frac{\hbar^2}{2m}\nabla^2 + V(x)\right)\psi = E\psi
+\end{equation}
+
+\subsection{Expectation Value Bound}
+For any normalized trial wavefunction $\phi$, the variational energy satisfies:
+
+\begin{equation}
+\label{eq:variational}
+E_0 \le \frac{\langle \phi | \hat{H} | \phi \rangle}{\langle \phi | \phi \rangle}
+\end{equation}
+
+\section{Summary}
+Equation~\eqref{eq:variational} provides a rigorous upper bound on the ground-state energy $E_0$ across atomic and molecular systems.
+"#;
+        std::fs::write(&tex_path, tex_text).expect("write tex");
+
+        let engine = PdfEngine::new().expect("init pdfium");
+
+        // 3. Sample PDF generated from Markdown via MicroPDF's own PDF exporter
+        let pdf_path = tmp.join("Quarterly_Report.pdf");
+        let pdf_md = crate::markdown::parse_markdown(
+            r#"# Quarterly Engineering Report
+
+**Prepared by:** MicroPDF Core Team  
+**Quarter:** Q4 — Portable Release v1.7.0
+
+## Executive Summary
+
+MicroPDF delivers instant startup, crisp typography, and a unified reading and editing workflow across **PDF**, **EPUB**, **Markdown**, and **LaTeX** documents — all in a single portable folder with zero installer footprint.
+
+## Release Highlights
+
+| Feature | Status | Target Platforms |
+| :--- | :--- | :--- |
+| Distinct Contextual UI Skin | Shipped | Windows, macOS, Linux |
+| Apple Books-Style EPUB Reader | Shipped | Windows, macOS, Linux |
+| Markdown & LaTeX Split Studio | Shipped | Windows, macOS, Linux |
+| Universal Ctrl+F Document Search | Shipped | Windows, macOS, Linux |
+
+## Memory Discipline
+
+By probing image headers during layout and decoding visible figures into a bounded 24 MB cache, even 15 MB illustrated e-books reflow instantaneously when changing UI zoom or typography margins.
+"#,
+            "Quarterly Engineering Report",
+        );
+        crate::markdown_pdf::export_markdown_to_pdf(
+            &engine.pdfium,
+            &pdf_md,
+            &pdf_path,
+            crate::markdown_pdf::MdPdfPageSize::Letter,
+        )
+        .expect("export sample pdf");
+
+        // 4. Sample EPUB with generated cover PNG, nested TOC, and multi-chapter prose
+        let epub_path = tmp.join("The_Voyage_of_the_Horizon.epub");
+        let mut cover_img = image::RgbImage::new(240, 340);
+        for (x, y, px) in cover_img.enumerate_pixels_mut() {
+            let t = y as f32 / 340.0;
+            let r = (24.0 + t * 28.0) as u8;
+            let g = (48.0 + t * 54.0 + ((x as f32 / 240.0) * 18.0)) as u8;
+            let b = (84.0 + t * 62.0) as u8;
+            *px = image::Rgb([r, g, b]);
+        }
+        let mut cover_png = Vec::new();
+        cover_img
+            .write_to(&mut std::io::Cursor::new(&mut cover_png), image::ImageFormat::Png)
+            .expect("encode cover png");
+
+        let mut zw = ZipWriter::new();
+        zw.add_stored("mimetype", b"application/epub+zip");
+        zw.add_deflated(
+            "META-INF/container.xml",
+            br#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+</container>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/content.opf",
+            br#"<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>The Voyage of the Horizon</dc:title>
+    <dc:creator>Clara Sterling</dc:creator>
+    <dc:publisher>Meridian Press</dc:publisher>
+    <dc:language>en-US</dc:language>
+    <dc:description>An illustrated maritime chronicle of celestial navigation, quiet harbors, and the craft of bookmaking.</dc:description>
+  </metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="cover" href="images/cover.png" media-type="image/png" properties="cover-image"/>
+    <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch3" href="ch3.xhtml" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="ch1"/>
+    <itemref idref="ch2"/>
+    <itemref idref="ch3"/>
+  </spine>
+</package>"#,
+        );
+        zw.add_deflated("OEBPS/images/cover.png", &cover_png);
+        zw.add_deflated(
+            "OEBPS/nav.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+<body><nav epub:type="toc"><ol>
+  <li><a href="ch1.xhtml">Chapter I: Departure at Dawn</a>
+    <ol>
+      <li><a href="ch1.xhtml#harbor">The Quiet Harbor</a></li>
+      <li><a href="ch1.xhtml#compass">Setting the Compass</a></li>
+    </ol>
+  </li>
+  <li><a href="ch2.xhtml">Chapter II: Across the Open Meridian</a></li>
+  <li><a href="ch3.xhtml">Chapter III: Lanterns of the Far Coast</a></li>
+</ol></nav></body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/ch1.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1>Chapter I: Departure at Dawn</h1>
+  <p>Before the first silver light touched the breakwater, the harbor lay motionless beneath a pale amber sky. Along the timber wharf, brass lanterns swayed gently in the morning breeze while sailors coiled hemp lines and checked the chronometer for the long crossing ahead.</p>
+  <h2 id="harbor">The Quiet Harbor</h2>
+  <p>Every voyage begins in stillness. Inside the chartroom, leather-bound logbooks rested beside brass dividers and carefully annotated coastal charts. The navigator traced a delicate arc across the northern strait, noting prevailing currents, shoals, and the familiar rhythm of autumn tides.</p>
+  <blockquote>"A well-typeset page, like a calm horizon, invites the eye to travel effortlessly without noticing the craft that holds it steady."</blockquote>
+  <p>When the sails finally caught the offshore wind, the hull answered with a steady, reassuring murmur. Gulls wheeled above the stern, and the distant stone lighthouse shrank into a bright pinprick against the waking hills.</p>
+  <h2 id="compass">Setting the Compass</h2>
+  <p>By midmorning the open sea revealed its full expanse. Crisp whitecaps marched eastward under high cirrus clouds, and the crew settled into the familiar cadence of watches, sextant sightings, and quiet hours spent reading beneath the canvas awning.</p>
+  <p>In the afternoon, the barometer held steady at thirty inches. The helmsman kept the bowsprit aligned with the distant swell while the captain recorded latitude, wind bearing, and water temperature in neat italic ink.</p>
+  <p>As dusk gathered, the horizon softened from cobalt to slate violet, and the first stars emerged directly ahead of the masthead, promising a clear and unhurried night under sail.</p>
+</body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/ch2.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1>Chapter II: Across the Open Meridian</h1>
+  <p>Three days out from the coast, the ocean became a library of light and motion. Each morning brought a fresh chapter of trade winds, translucent turquoise swells, and long uninterrupted passages of reflection on deck.</p>
+  <p>Beneath the skylight of the aft cabin, the navigator compared antique celestial tables with fresh noon observations. The precision of the instruments mirrored the harmony of the stars overhead, turning an empty expanse of water into a readable map.</p>
+  <p>Toward evening a warm southerly breeze filled the mainsail, carrying the scent of distant rain and urging the vessel smoothly across the quiet meridian line toward the western islands.</p>
+</body></html>"#,
+        );
+        zw.add_deflated(
+            "OEBPS/ch3.xhtml",
+            br#"<html xmlns="http://www.w3.org/1999/xhtml">
+<body>
+  <h1>Chapter III: Lanterns of the Far Coast</h1>
+  <p>On the seventh night, a faint amber glow appeared along the western horizon. The lookout called from the crosstrees, and every hand gathered at the rail to watch the harbor beacons emerge through the coastal mist.</p>
+  <p>By sunrise the anchor chain rattled softly into clear green water, bringing the crossing to a peaceful close.</p>
+</body></html>"#,
+        );
+        std::fs::write(&epub_path, zw.finish()).expect("write epub");
+
+        let mut app = PdfViewerApp::new(&engine, None).expect("init app");
+        app.ui_skin = UiSkin::Distinct;
+        app.ui_theme_mode = UiThemeMode::Light;
+        app.reading_filter = ReadingFilter::WarmSepia;
+
+        // Open all 4 document types so the tab bar showcases all 4 file-type icons!
+        app.open_document_in_new_tab(pdf_path.clone()).expect("open pdf");
+        app.open_document_in_new_tab(md_path.clone()).expect("open md");
+        app.open_document_in_new_tab(tex_path.clone()).expect("open tex");
+        app.open_document_in_new_tab(epub_path.clone()).expect("open epub");
+
+        let (w, h) = (1440u32, 900u32);
+        let mut buf = vec![0u32; (w * h) as usize];
+
+        // Screenshot 1: Distinct EPUB Light (2-page open book spread + Book Drawer sidebar)
+        app.show_bookmarks = true;
+        app.show_aa_popover = false;
+        app.epub_prefs.two_page_spread = true;
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        // Step past cover onto first 2-page spread (Chapter I)
+        app.step_md_magazine_spread(1, w, h.saturating_sub(100), 1.0);
+        app.page_turn_anim = None;
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("01_epub_distinct_light.png"));
+
+        // Screenshot 2: Distinct EPUB with redesigned Aa Typography & Reading Popover open
+        app.show_bookmarks = true;
+        app.show_aa_popover = true;
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("02_epub_aa_typography_popover.png"));
+
+        // Screenshot 3: Distinct EPUB Dark Mode + Apple Books 3D Page Curl + Universal Search
+        app.show_aa_popover = false;
+        app.show_bookmarks = false;
+        app.ui_theme_mode = UiThemeMode::Dark;
+        app.reading_filter = ReadingFilter::DarkInvert;
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        app.execute_text_search("harbor");
+        app.input_mode = InputMode::SearchText {
+            query_input: "harbor".to_string(),
+        };
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        // Trigger a live 3D page-curl mid-frame (progress ~42%)
+        let prev_y = app.scroll_y;
+        app.step_md_magazine_spread(1, w, h.saturating_sub(100), 1.0);
+        if let Some(ref mut anim) = app.page_turn_anim {
+            anim.started_at = Instant::now() - Duration::from_millis(180);
+            anim.duration_ms = 450;
+            anim.from_scroll_y = Some(prev_y);
+        }
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("03_epub_page_curl_dark.png"));
+
+        // Clear search & anim for subsequent screenshots
+        app.page_turn_anim = None;
+        app.input_mode = InputMode::Normal;
+        app.md_search_matches.clear();
+        app.search_query.clear();
+
+        // Screenshot 4: Distinct Markdown Split Studio (Light)
+        app.ui_theme_mode = UiThemeMode::Light;
+        app.reading_filter = ReadingFilter::Normal;
+        app.switch_to_tab(1);
+        app.show_bookmarks = true;
+        app.md_editor_mode = super::text_editor::MdEditorMode::Split;
+        app.ensure_md_editor_initialized();
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("04_markdown_studio_split.png"));
+
+        // Screenshot 5: Distinct LaTeX Academic Studio (Dark)
+        app.ui_theme_mode = UiThemeMode::Dark;
+        app.switch_to_tab(2);
+        app.show_bookmarks = true;
+        app.md_editor_mode = super::text_editor::MdEditorMode::Split;
+        app.ensure_md_editor_initialized();
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("05_latex_studio_dark.png"));
+
+        // Screenshot 6: Distinct PDF Studio (Light)
+        app.ui_theme_mode = UiThemeMode::Light;
+        app.reading_filter = ReadingFilter::Normal;
+        app.switch_to_tab(0);
+        app.show_bookmarks = false;
+        app.render_frame_into_buffer(&mut buf, w, h, 1.0);
+        save_u32_rgb_png(&buf, w, h, &out_dir.join("06_pdf_distinct_light.png"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("Generated 6 screenshots in {}", out_dir.display());
+    }
+
+    #[test]
+    fn test_ten_ux_tweaks_regressions() {
+        use super::book_ui::{
+            AaPopoverHit, BookSidebarHit, BookSidebarTab, EpubBookmark, EpubHighlight,
+            EpubReaderPrefs,
+        };
+        use super::markdown_view::{layout_blocks, BookLayoutOpts, LaidOutBlock};
+        use super::state::{InputMode, MenuCategory, PdfViewerApp, SessionConfig};
+        use super::theme::UiSkin;
+        use super::toolbar::ToolbarAction;
+        use super::ui_draw::FontFamily;
+        use crate::markdown::{BookMetadata, InlineSpan, MarkdownDoc, MdBlock, TocEntry};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        // 1. Independent 4-side EPUB margins: changing Top must NOT alter Inner/Spine, Bottom, or Outer
+        let mut prefs = EpubReaderPrefs::default();
+        let orig_inner = prefs.effective_inner_margin_ratio();
+        let orig_outer = prefs.effective_margin_ratio();
+        let orig_bottom = prefs.margin_bottom;
+        prefs.set_margin_part_norm(0, 1.0); // Max Top margin
+        assert!(prefs.margin_top > orig_bottom);
+        assert!((prefs.effective_inner_margin_ratio() - orig_inner).abs() < 1e-5, "Top margin must not widen spine gap");
+        assert!((prefs.effective_margin_ratio() - orig_outer).abs() < 1e-5, "Top margin must not alter outer side");
+        assert!((prefs.margin_bottom - orig_bottom).abs() < 1e-5, "Top margin must not alter bottom");
+
+        // 2. Line, word & paragraph spacing + separate Code & Preview font INI roundtrip
+        let mut cfg = SessionConfig::default();
+        cfg.md_code_font_px = 16.5;
+        cfg.md_preview_font_px = 18.0;
+        cfg.md_line_spacing = 1.75;
+        cfg.md_word_spacing_px = 2.0;
+        cfg.md_para_spacing_mult = 1.60;
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert!((parsed.md_code_font_px - 16.5).abs() < 0.01);
+        assert!((parsed.md_preview_font_px - 18.0).abs() < 0.01);
+        assert!((parsed.md_line_spacing - 1.75).abs() < 0.01);
+        assert!((parsed.md_word_spacing_px - 2.0).abs() < 0.01);
+        assert!((parsed.md_para_spacing_mult - 1.60).abs() < 0.01);
+
+        // Verify paragraph spacing multiplier & word spacing increase layout height cleanly
+        let ast = vec![
+            MdBlock::Paragraph(vec![InlineSpan::Text("Alpha beta gamma delta.".into())]),
+            MdBlock::Paragraph(vec![InlineSpan::Text("Second paragraph after gap.".into())]),
+        ];
+        let base_opts = BookLayoutOpts {
+            book_mode: false,
+            font_family: FontFamily::BookSerif,
+            line_mult: 1.45,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
+            justify: false,
+            hyphenate: false,
+            hypher_lang: hypher::Lang::English,
+        };
+        let wide_opts = BookLayoutOpts {
+            line_mult: 1.85,
+            word_spacing_px: 3.0,
+            para_mult: 2.0,
+            ..base_opts
+        };
+        let mut l1 = Vec::new();
+        let mut cb1 = Vec::new();
+        let mut d1 = HashMap::new();
+        let emb = HashMap::new();
+        let (b_base, h_base) = layout_blocks(&ast, 300.0, 15.0, 1.0, 0.0, &mut l1, &mut cb1, &mut d1, &emb, false, None, base_opts, None);
+        let (_, h_wide) = layout_blocks(&ast, 300.0, 15.0, 1.0, 0.0, &mut l1, &mut cb1, &mut d1, &emb, false, None, wide_opts, None);
+        assert!(matches!(b_base[0], LaidOutBlock::Paragraph { .. }));
+        assert!(h_wide > h_base + 10.0, "Larger line/para spacing must increase total height");
+
+        // 3. PdfViewerApp-backed checks (runs whenever PDFium shared library is available)
+        let Ok(engine) = crate::engine::PdfEngine::new() else {
+            return;
+        };
+        let app_empty = PdfViewerApp::new(&engine, None).expect("init empty app");
+        assert!(!app_empty.menu_item_enabled(MenuCategory::Page, 0));
+        assert!(!app_empty.menu_item_enabled(MenuCategory::Tools, 0));
+        assert!(app_empty.toolbar_action_enabled(ToolbarAction::Open));
+        assert!(!app_empty.toolbar_action_enabled(ToolbarAction::Save));
+        assert!(!app_empty.toolbar_action_enabled(ToolbarAction::Print));
+
+        // Separate Code vs Preview font sizes on Markdown tab via Aa handler + persistent Find bar
+        let mut app = PdfViewerApp::new(&engine, None).expect("init app");
+        app.ui_skin = UiSkin::Distinct;
+        app.file_path = PathBuf::from("notes.md");
+        app.markdown_doc = Some(MarkdownDoc {
+            title: "Notes".into(),
+            blocks: ast,
+            headings: Vec::new(),
+            embedded_images: HashMap::new(),
+            book_meta: None,
+        });
+        assert!(app.menu_item_enabled(MenuCategory::File, 5)); // Save Document enabled for MD
+        assert!(!app.menu_item_enabled(MenuCategory::Page, 0)); // PDF Page menu disabled
+        assert!(app.toolbar_action_enabled(ToolbarAction::MdSave));
+
+        let orig_code = app.md_code_font_px;
+        let orig_prev = app.md_preview_font_px;
+        app.handle_aa_popover_click(AaPopoverHit::CodeSizePlus);
+        assert!(app.md_code_font_px > orig_code);
+        assert!((app.md_preview_font_px - orig_prev).abs() < 0.01);
+        app.handle_aa_popover_click(AaPopoverHit::SizePlus);
+        assert!(app.md_preview_font_px > orig_prev);
+
+        // Persistent Find bar stays open after handle_prompt_submission
+        app.input_mode = InputMode::SearchText {
+            query_input: "Alpha".to_string(),
+        };
+        app.handle_prompt_submission();
+        assert!(matches!(app.input_mode, InputMode::SearchText { ref query_input } if query_input == "Alpha"));
+        assert!(app.search_bar_focused);
+
+        // 4. EPUB sidebar width, scrollbar across tabs, chapter Loc labels & chapter time remaining
+        app.file_path = PathBuf::from("novel.epub");
+        let many_toc: Vec<TocEntry> = (0..40)
+            .map(|i| TocEntry {
+                title: format!("Chapter {}", i + 1),
+                level: 0,
+                block_idx: i % 2,
+                children: Vec::new(),
+            })
+            .collect();
+        let mut long_ast = Vec::new();
+        for i in 0..4 {
+            long_ast.push(MdBlock::Heading {
+                level: 1,
+                spans: vec![InlineSpan::Text(format!("Chapter {}", i + 1))],
+            });
+            long_ast.push(MdBlock::Paragraph(vec![InlineSpan::Text("word ".repeat(260))]));
+        }
+        app.markdown_doc = Some(MarkdownDoc {
+            title: "Novel".into(),
+            blocks: long_ast,
+            headings: Vec::new(),
+            embedded_images: HashMap::new(),
+            book_meta: Some(BookMetadata {
+                title: "Novel".into(),
+                author: Some("Author".into()),
+                publisher: None,
+                language: None,
+                description: None,
+                cover_image_key: None,
+                toc: many_toc,
+            }),
+        });
+        app.show_bookmarks = true;
+        assert!(app.sidebar_width_px(1.0) >= 315);
+        assert!(!app.menu_item_enabled(MenuCategory::File, 5)); // Save disabled for read-only EPUB
+
+        // Ensure scrollbar metrics overflow & click scrolls on Contents, Annotations & Bookmarks tabs
+        for i in 0..25u64 {
+            app.epub_book_data.highlights.push(EpubHighlight {
+                id: i + 1,
+                block_idx: 0,
+                start_word: 0,
+                end_word: 2,
+                quote: format!("Quote {i}"),
+                color_idx: 0,
+                note: Some("Note".into()),
+            });
+            app.epub_book_data.bookmarks.push(EpubBookmark {
+                block_idx: 0,
+                page_num: (i + 1) as usize,
+                label: format!("Bookmark {i}"),
+            });
+        }
+        for tab in [BookSidebarTab::Contents, BookSidebarTab::Annotations, BookSidebarTab::Bookmarks] {
+            app.book_sidebar_tab = tab;
+            app.bookmark_scroll_y = 0;
+            let (_, _, _, tot, vis) = app.epub_sidebar_list_metrics(420, 64, 1.0);
+            assert!(tot > vis, "Expected overflow for scrollbar on {tab:?}");
+            app.handle_distinct_epub_sidebar_click(BookSidebarHit::ScrollbarTrack(1.0), 420, 64, 1.0);
+            assert!(app.bookmark_scroll_y > 0, "Scrollbar click must scroll {tab:?}");
+        }
+
+        app.ensure_md_layout(1280, 1.0);
+        let time_lbl = app.epub_chapter_time_left_label().expect("Expected chapter time remaining");
+        assert!(time_lbl.contains("left"), "Unexpected time-left label: {time_lbl}");
+        let full_loc = app.epub_loc_and_time_label(1, 5);
+        assert!(full_loc.contains("Loc. 1 of 5 ·"), "Expected combined Loc + time-left, got {full_loc}");
+        assert!(app.epub_loc_for_block(0) >= 1);
     }
 }
 

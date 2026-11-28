@@ -2,7 +2,9 @@ use crate::engine::PdfEngine;
 use anyhow::Result;
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use super::book_ui::EpubBookData;
 use super::state::*;
+use super::theme::{DocKind, UiSkin};
 use super::render::fill_rect_clipped;
 
 impl<'a> PdfViewerApp<'a> {
@@ -40,6 +42,11 @@ impl<'a> PdfViewerApp<'a> {
             slot.md_source = self.md_source.take();
             slot.md_editor_mode = self.md_editor_mode;
             self.md_editor = None;
+            self.epub_cover_thumb = None;
+            self.epub_word_rects.clear();
+            self.epub_word_rects.shrink_to_fit();
+            self.epub_selection_drag = None;
+            self.epub_selection_pill_rect = None;
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
@@ -50,6 +57,70 @@ impl<'a> PdfViewerApp<'a> {
             };
             self.record_last_position(&path, pos, self.zoom_level);
         }
+    }
+
+    /// Loads per-book EPUB annotations/bookmarks and OS serif font when active tab is EPUB;
+    /// releases transient EPUB caches immediately otherwise (zero idle RAM).
+    pub(super) fn sync_epub_tab_resources(&mut self) {
+        self.epub_cover_thumb = None;
+        self.epub_word_rects.clear();
+        self.epub_word_rects.shrink_to_fit();
+        self.epub_selection_drag = None;
+        self.epub_selection_pill_rect = None;
+        self.book_info_popover = false;
+        self.show_aa_popover = false;
+        self.aa_margins_submenu = false;
+        self.book_toc_collapsed.clear();
+        self.book_toc_search = None;
+        self.md_split_drag = false;
+        self.epub_margin_slider_drag = None;
+        self.epub_scrubber_drag = false;
+        self.epub_sidebar_scrollbar_drag = false;
+        self.md_image_cache.clear();
+        self.md_search_matches.clear();
+        self.page_turn_anim = None;
+        if self.active_doc_kind() == DocKind::Epub {
+            self.load_epub_book_data();
+            if self.ui_skin == UiSkin::Distinct {
+                let _ = self.epub_prefs.font_choice.resolve_font_family();
+            } else {
+                super::ui_draw::set_custom_os_font(None);
+            }
+        } else {
+            self.epub_book_data = EpubBookData::default();
+            super::ui_draw::set_custom_os_font(None);
+        }
+        if !matches!(self.active_doc_kind(), DocKind::Markdown | DocKind::LaTeX) {
+            self.close_editor_popout(false);
+        } else if let Some(ref pop) = self.editor_popout {
+            let fname = self.filename_display();
+            pop.window.set_title(&format!("MicroPDF Editor — {fname}"));
+        }
+    }
+
+    pub(super) fn clamp_md_split_ratio(ratio: f32) -> f32 {
+        ratio.clamp(0.25, 0.75)
+    }
+
+    pub(super) fn active_editor_syntax(&self) -> super::text_editor::EditorSyntax {
+        if Self::is_latex_path(&self.file_path) {
+            super::text_editor::EditorSyntax::LaTeX
+        } else {
+            super::text_editor::EditorSyntax::Markdown
+        }
+    }
+
+    pub(super) fn close_editor_popout(&mut self, restore_split: bool) {
+        if let Some(mut pop) = self.editor_popout.take() {
+            pop.surface = None;
+        }
+        self.pending_open_editor_popout = false;
+        if restore_split && matches!(self.active_doc_kind(), DocKind::Markdown | DocKind::LaTeX) {
+            self.md_editor_mode = super::text_editor::MdEditorMode::Split;
+            self.ensure_md_editor_initialized();
+            self.md_layout = None;
+        }
+        self.request_redraw();
     }
 
     pub(super) fn load_slot_into_active(&mut self, index: usize) {
@@ -99,6 +170,7 @@ impl<'a> PdfViewerApp<'a> {
             self.search_matches.clear();
             self.current_search_match = 0;
             self.incremental_search = None;
+            self.sync_epub_tab_resources();
         }
     }
 
@@ -130,26 +202,21 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub(super) fn is_markdown_path(path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Markdown
     }
 
     pub(super) fn is_latex_path(path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("tex"))
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::LaTeX
     }
 
     pub(super) fn is_epub_path(path: &std::path::Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("epub"))
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Epub
     }
 
     pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
-        Self::is_markdown_path(path) || Self::is_latex_path(path) || Self::is_epub_path(path)
+        super::theme::DocKind::from_path(path).is_reflowable()
     }
 
     fn markdown_headings_to_bookmarks(doc: &crate::markdown::MarkdownDoc) -> Vec<crate::engine::Bookmark> {
@@ -389,10 +456,15 @@ impl<'a> PdfViewerApp<'a> {
         self.bookmarks = loaded_bookmarks.clone();
         self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
         self.bookmark_scroll_y = 0;
+        let initial_mode = if self.ui_skin == UiSkin::Distinct && !is_epub {
+            super::text_editor::MdEditorMode::Split
+        } else {
+            super::text_editor::MdEditorMode::Preview
+        };
         self.markdown_doc = Some(parsed);
         self.md_source = Some(raw);
         self.md_editor = None;
-        self.md_editor_mode = super::text_editor::MdEditorMode::Preview;
+        self.md_editor_mode = initial_mode;
         self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
         self.md_layout = None;
         self.md_active_hits.clear();
@@ -428,7 +500,7 @@ impl<'a> PdfViewerApp<'a> {
             last_file_mtime: file_mtime,
             markdown_doc: None,
             md_source: None,
-            md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            md_editor_mode: initial_mode,
         };
         if new_tab || self.tabs.is_empty() {
             self.tabs.push(slot);
@@ -437,6 +509,7 @@ impl<'a> PdfViewerApp<'a> {
             self.tabs[self.active_tab] = slot;
         }
 
+        self.sync_epub_tab_resources();
         self.update_title_bar();
         self.request_redraw();
         Ok(())
@@ -518,6 +591,7 @@ impl<'a> PdfViewerApp<'a> {
         };
         self.bookmark_scroll_y = 0;
         self.doc = Some(loaded);
+        self.sync_epub_tab_resources();
 
         self.record_recent_file(&path);
 
@@ -928,6 +1002,12 @@ impl<'a> PdfViewerApp<'a> {
         self.cached_text_view = None;
         self.active_note_popover = None;
         self.dragging_annotation = None;
+        self.markdown_doc = None;
+        self.md_source = None;
+        self.md_editor = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
+        self.sync_epub_tab_resources();
         self.status_notice = Some(notice);
         self.update_title_bar();
         self.request_redraw();
@@ -945,9 +1025,7 @@ impl<'a> PdfViewerApp<'a> {
         let closed_scroll = self.tabs[close_idx].scroll_y;
         let closed_zoom = self.tabs[close_idx].zoom_level;
         if !closed_path.as_os_str().is_empty() {
-            let closed_is_md = Self::is_markdown_path(&closed_path)
-                || Self::is_latex_path(&closed_path)
-                || Self::is_epub_path(&closed_path);
+            let closed_is_md = super::theme::DocKind::from_path(&closed_path).is_reflowable();
             let pos = if closed_is_md {
                 closed_scroll.round().clamp(0.0, 65535.0) as u16
             } else {
@@ -967,11 +1045,15 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("tab")
             .to_string();
+        let closed_is_active = close_idx == self.active_tab;
         self.tabs.remove(close_idx);
 
         if self.tabs.is_empty() {
             self.reset_to_welcome_screen(format!("Closed '{closed_name}' — Welcome Screen"));
             return true;
+        }
+        if closed_is_active {
+            self.close_editor_popout(false);
         }
 
         let next_active = if close_idx < self.active_tab {
@@ -1317,7 +1399,10 @@ impl<'a> PdfViewerApp<'a> {
                 "No PDF Open".to_string()
             };
 
-            let mut text_x = cur_x + (10.0 * s).round() as i32;
+            let is_dark = self.ui_theme_mode == super::theme::UiThemeMode::Dark;
+            let doc_kind = self.tab_doc_kind(idx);
+            let doc_ic_sz = (13.5 * s).round().clamp(11.0, 24.0) as u32;
+            let mut text_x = cur_x + (8.0 * s).round() as i32;
             if is_dirty {
                 let dot_r = (3.0 * s).clamp(2.5, 5.0);
                 super::ui_draw::fill_circle_aa(
@@ -1325,7 +1410,7 @@ impl<'a> PdfViewerApp<'a> {
                     text_x as f32 + dot_r, tab_y as f32 + (tab_h as f32) * 0.5,
                     dot_r, theme.accent,
                 );
-                text_x += (dot_r * 2.0 + 6.0 * s).round() as i32;
+                text_x += (dot_r * 2.0 + 5.0 * s).round() as i32;
             }
 
             let show_close = !self.tabs.is_empty();
@@ -1337,7 +1422,15 @@ impl<'a> PdfViewerApp<'a> {
             let star_y = close_y;
 
             let label_right = if show_close { star_x - 3 } else { cur_x + tab_w as i32 - 6 };
-            let label_budget = (label_right - text_x - (2.0 * s).round() as i32).max(20) as f32;
+            if text_x + doc_ic_sz as i32 + (4.0 * s).round() as i32 <= label_right {
+                let doc_ic_y = tab_y + ((tab_h.saturating_sub(doc_ic_sz)) / 2) as i32;
+                super::ui_draw::draw_doc_type_icon(
+                    buffer, buf_w, buf_h, doc_kind, text_x, doc_ic_y, doc_ic_sz, is_dark,
+                );
+                text_x += doc_ic_sz as i32 + (5.0 * s).round() as i32;
+            }
+
+            let label_budget = (label_right - text_x - (2.0 * s).round() as i32).max(12) as f32;
             let label = super::ui_draw::truncate_ellipsis(&fname, label_budget, font_sz, is_active);
             let text_col = if is_active { theme.text_primary } else { theme.text_secondary };
             super::ui_draw::draw_text_vcenter(
@@ -1569,7 +1662,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.tabs.is_empty() {
             super::ui_draw::draw_text_vcenter(
                 buffer, buf_w, buf_h, px + (12.0 * s).round() as i32, list_top, row_h,
-                px + pw as i32 - 12, "No open PDFs", body_sz, theme.text_muted, false,
+                px + pw as i32 - 12, "No open documents", body_sz, theme.text_muted, false,
             );
         } else {
             let max_scroll = self.tabs.len().saturating_sub(vis_rows);
@@ -1613,12 +1706,20 @@ impl<'a> PdfViewerApp<'a> {
                 } else {
                     self.tabs[idx].has_unsaved_edits
                 };
+                let is_dark = self.ui_theme_mode == super::theme::UiThemeMode::Dark;
+                let doc_kind = self.tab_doc_kind(idx);
+                let doc_ic_sz = (14.0 * s).round().clamp(11.0, 24.0) as u32;
                 let prefix = if is_active { "✓ " } else { "" };
                 let dirty = if is_dirty { "• " } else { "" };
                 let full_lbl = format!("{prefix}{dirty}{}. {fname}", idx + 1);
                 let cx = px + pw as i32 - close_sz as i32 - (10.0 * s).round() as i32;
                 let cy = ry + ((row_h.saturating_sub(close_sz)) / 2) as i32;
-                let tx = px + (12.0 * s).round() as i32;
+                let mut tx = px + (10.0 * s).round() as i32;
+                let doc_ic_y = ry + ((row_h.saturating_sub(doc_ic_sz)) / 2) as i32;
+                super::ui_draw::draw_doc_type_icon(
+                    buffer, buf_w, buf_h, doc_kind, tx, doc_ic_y, doc_ic_sz, is_dark,
+                );
+                tx += doc_ic_sz as i32 + (6.0 * s).round() as i32;
                 let clipped = super::ui_draw::truncate_ellipsis(&full_lbl, (cx - tx - 6).max(20) as f32, body_sz, is_active);
                 let fg = if is_active { theme.accent_soft_fg } else { theme.text_primary };
                 super::ui_draw::draw_text_vcenter(

@@ -15,5 +15,9 @@ MicroPDF depends on the following components. Each keeps its own license.
 | ab_glyph | Apache-2.0 | CPU TrueType font rasterizer for UI text |
 | flate2 | MIT OR Apache-2.0 | Zlib decompression for embedded UI fonts |
 | Liberation Sans (Latin subset) | SIL Open Font License 1.1 | Embedded UI font (`assets/ui_regular.ttf.z`, `assets/ui_bold.ttf.z`) |
+| Liberation Serif (Latin subset) | SIL Open Font License 1.1 | Embedded reading serif font (`assets/book_serif_regular.ttf.z`, `assets/book_serif_bold.ttf.z`, `assets/book_serif_italic.ttf.z`) |
+| Liberation Mono (Latin subset) | SIL Open Font License 1.1 | Embedded monospace code font (`assets/code_mono_regular.ttf.z`) |
+| roxmltree | MIT OR Apache-2.0 | Namespace-aware XML/XHTML DOM parser for EPUB |
+| hypher | MIT OR Apache-2.0 | Syllable hyphenation for justified book typography |
 
 Run `cargo tree` for the full dependency list. Tools such as `cargo-about` can generate a complete notice file for release builds.

@@ -143,7 +143,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let title_sz = (16.0 * s).clamp(13.0, 34.0);
         let sub_sz = (12.0 * s).clamp(10.0, 26.0);
-        let title = "Drop a PDF here to open";
+        let title = "Drop a document here to open";
         let tw = measure_text(title, title_sz, true);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - tw) * 0.5).round() as i32, cy + (84.0 * s).round() as i32, title, title_sz, theme.text_primary, true);
 
@@ -151,11 +151,11 @@ impl<'a> PdfViewerApp<'a> {
         let sw = measure_text(sub, sub_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + ((cw as f32 - sw) * 0.5).round() as i32, cy + (107.0 * s).round() as i32, sub, sub_sz, theme.text_muted, false);
 
-        // Open PDF & Favorites buttons
+        // Open Documents & Favorites buttons
         if let Some(btn) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeOpen) {
             let hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeOpen));
             fill_rounded_rect(buffer, buf_w, buf_h, btn.x, btn.y, btn.w, btn.h, (7.0 * s).max(4.0), if hov { theme.accent_hover } else { theme.accent });
-            let lbl = "Open PDF  (O)";
+            let lbl = "Open Documents  (O)";
             let lw = measure_text(lbl, sub_sz, true);
             draw_text_vcenter(buffer, buf_w, buf_h, btn.x + ((btn.w as f32 - lw) * 0.5).round() as i32, btn.y, btn.h, btn.x + btn.w as i32, lbl, sub_sz, theme.text_on_accent, true);
         }
@@ -284,19 +284,39 @@ impl<'a> PdfViewerApp<'a> {
             }
             InputMode::SearchText { query_input } => {
                 let ((px, py, pw, ph), hits) = self.layout_floating_search(buf_w, top_bars_h, sf);
+                let focused = self.search_bar_focused;
+                let margin = (12.0 * s).ceil() as i32;
+                let bx0 = (px - margin).max(0);
+                let by0 = (py - margin).max(0);
+                let bx1 = (px + pw as i32 + margin).min(buf_w as i32);
+                let by1 = (py + ph as i32 + margin).min(buf_h as i32);
+                let bw = (bx1 - bx0).max(0) as usize;
+                let bh = (by1 - by0).max(0) as usize;
+                let saved_bg = if !focused && bw > 0 && bh > 0 {
+                    let mut bg = Vec::with_capacity(bw * bh);
+                    for y in by0..by1 {
+                        let row = y as usize * buf_w as usize;
+                        bg.extend_from_slice(&buffer[row + bx0 as usize..row + bx1 as usize]);
+                    }
+                    Some(bg)
+                } else {
+                    None
+                };
+
                 let rad = (8.0 * s).clamp(5.0, 14.0);
                 draw_soft_shadow(buffer, buf_w, buf_h, px, py, pw, ph, rad, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
                 fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
-                stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.accent);
+                stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, if focused { theme.accent } else { theme.border_subtle });
 
                 let ic = (14.0 * s).round() as u32;
-                draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, theme.accent);
+                draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, if focused { theme.accent } else { theme.text_secondary });
 
                 let body_sz = (12.0 * s).clamp(10.0, 26.0);
                 let small_sz = (10.5 * s).clamp(9.0, 22.0);
                 let first_btn_x = hits[0].x;
-                let count_str = if !self.search_matches.is_empty() {
-                    format!("{}/{}", self.current_search_match + 1, self.search_matches.len())
+                let total_matches = self.active_search_match_count();
+                let count_str = if total_matches > 0 {
+                    format!("{}/{}", self.current_search_match + 1, total_matches)
                 } else {
                     String::new()
                 };
@@ -308,9 +328,11 @@ impl<'a> PdfViewerApp<'a> {
                 let input_x = px + (30.0 * s).round() as i32;
                 let input_max_x = (first_btn_x - count_w - 6).max(input_x + 20);
                 let display = if query_input.is_empty() {
-                    "Find in PDF... |".to_string()
-                } else {
+                    if focused { "Find in the document... |" } else { "Find in the document..." }.to_string()
+                } else if focused {
                     format!("{query_input}|")
+                } else {
+                    query_input.clone()
                 };
                 let fg = if query_input.is_empty() { theme.text_muted } else { theme.text_primary };
                 draw_text_vcenter(buffer, buf_w, buf_h, input_x, py, ph, input_max_x, &display, body_sz, fg, false);
@@ -369,6 +391,19 @@ impl<'a> PdfViewerApp<'a> {
                             draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
                         }
                         _ => {}
+                    }
+                }
+
+                if let Some(bg) = saved_bg {
+                    for row_i in 0..bh {
+                        let y = by0 + row_i as i32;
+                        let dst_off = y as usize * buf_w as usize + bx0 as usize;
+                        let bg_off = row_i * bw;
+                        for col_i in 0..bw {
+                            let fg_px = buffer[dst_off + col_i];
+                            let bg_px = bg[bg_off + col_i];
+                            buffer[dst_off + col_i] = ((fg_px >> 1) & 0x007F_7F7F) + ((bg_px >> 1) & 0x007F_7F7F);
+                        }
                     }
                 }
             }
@@ -556,6 +591,7 @@ impl<'a> PdfViewerApp<'a> {
             InputMode::AddBookmark { title_input } => ("Add Bookmark", "Bookmark title for current page", title_input.clone(), "Add", false),
             InputMode::EditBookmark { title_input, .. } => ("Edit Bookmark", "New bookmark title", title_input.clone(), "Save", false),
             InputMode::StickyNotePrompt { text_input, .. } => ("Add Sticky Note", "Type comment text to attach to this spot", text_input.clone(), "Attach", false),
+            InputMode::EpubNotePrompt { text_input, .. } => ("Add Highlight Note", "Type note for the highlighted passage and press Enter", text_input.clone(), "Save Note", false),
             InputMode::FreeTextPrompt { text_input, .. } => ("Add Text Box", "Type text to place directly on this PDF page", text_input.clone(), "Place", false),
             InputMode::EditAnnotationText { label, text_input, .. } => (
                 *label,
@@ -740,43 +776,43 @@ impl<'a> PdfViewerApp<'a> {
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let key_sz = (10.5 * s).clamp(9.0, 22.0);
 
-        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.4", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, cx + pad, cy + (14.0 * s).round() as i32, "Keyboard & Mouse Shortcuts — MicroPDF v1.7", title_sz, theme.text_primary, true);
         let close_hint = "Esc or Click to close";
         let chw = measure_text(close_hint, key_sz, false);
         draw_text(buffer, buf_w, buf_h, cx + cw as i32 - pad - chw.ceil() as i32, cy + (17.0 * s).round() as i32, close_hint, key_sz, theme.text_muted, false);
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book/Mag)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Flow (Vert/Book/Mag 3D Curl)"),
             ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
             ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
-            ("B / A / L", "Bookmark Sidebar / Add Bookmark / Import .txt"),
+            ("B / A / L", "Sidebar (Book Drawer/Outline/Bookmarks) / Add / Import"),
             ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V", "Cycle 6 Eye-Care Reading Modes (E-Ink/Night)"),
-            ("Ctrl+F", "Search (Aa Case, W Word, F3 / Shift+F3)"),
+            ("V / Aa", "Eye-Care Modes (V); Aa: 4-Side Margins, Spacing & Fonts"),
+            ("Ctrl+F", "Persistent Find Bar (Enter=Next, Focus=100%/Blur=50%, ×=Close)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open PDF/.md/.tex/.epub / Save / Watermark Dialog"),
+            ("O / S / W", "Open Documents / Save / Watermark Dialog"),
             ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
             ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
-            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup Line (Shift+D) / Comment (/)"),
-            ("Right-Click", "Edit/Recolor/Delete Annotation or Grid Page Menu"),
+            ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup (Shift+D) / Comment (/)"),
+            ("Pop Out ↗", "Detach .md/.tex Editor Window (Dock Back restores Split)"),
+            ("Drag / 2×Div", "EPUB Highlight/Note pill; Drag Split Divider (2×=50/50)"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
-            ("N / H", "Page Numbering (Skip Covers) & Header/Footer"),
-            ("P / Z / U", "Stamps & Signatures / Optimize / Flatten & Unlock"),
+            ("N / H / P / Z", "Page Numbers / Header & Footer / Stamps / Optimize"),
             ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
-            ("Help Menu", "Step-by-Step User Guide, Compare PDFs & Ruler"),
+            ("Help Menu", "User Guide, UI Skin (Classic/Distinct), Compare & Ruler"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;
         let row_h = (35.0 * s).round() as i32;
         let start_y = cy + (54.0 * s).round() as i32;
-        let key_w = (82.0 * s).round() as u32;
+        let key_w = (92.0 * s).round().min((col_w as f32 * 0.34).round()) as u32;
         let key_h = (22.0 * s).round() as u32;
 
         for (col_idx, list) in [left_items, right_items].iter().enumerate() {
@@ -924,8 +960,10 @@ impl<'a> PdfViewerApp<'a> {
             }
             OverlayHit::SearchClose => {
                 self.input_mode = InputMode::Normal;
+                self.search_bar_focused = false;
                 self.cancel_incremental_search();
                 self.search_matches.clear();
+                self.md_search_matches.clear();
                 self.search_query.clear();
             }
             OverlayHit::OptimizePreset(p) => {

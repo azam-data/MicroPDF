@@ -49,6 +49,7 @@ pub(super) struct TextEditorState {
     pub(super) scroll_y: f32,
     pub(super) dragging: bool,
     pub(super) scrollbar_drag: bool,
+    pub(super) font_size_px: f32,
     content_gen: u64,
     wrap_key: (u32, u32, u64),
     visual_rows: Vec<VisualRow>,
@@ -67,10 +68,10 @@ struct EditorMetrics {
     sb_reserve: u32,
 }
 
-fn compute_metrics(sf: f64, zoom: f32) -> EditorMetrics {
+fn compute_metrics(sf: f64, zoom: f32, base_font_px: f32) -> EditorMetrics {
     let s = sf as f32;
     let z = zoom.clamp(0.5, 3.0);
-    let font_sz = (13.5 * s * z).clamp(9.0, 34.0);
+    let font_sz = (base_font_px.clamp(10.0, 28.0) * s * z).clamp(9.0, 44.0);
     let line_h = (font_sz * 1.48).max(13.0);
     let gutter_w = ((32.0 * s + font_sz * 1.4).round() as u32).max(36);
     let pad_y = 12.0 * s;
@@ -91,10 +92,11 @@ fn compute_metrics(sf: f64, zoom: f32) -> EditorMetrics {
 /// so that no character overflows `max_w`. Prefers whitespace word boundaries and
 /// gracefully splits long unbroken tokens (URLs, long commands) by character boundary.
 fn wrap_single_line(line: &str, font_sz: f32, max_w: f32) -> Vec<(usize, usize)> {
+    let mono = TextStyle::mono(font_sz);
     if line.is_empty() || max_w <= 24.0 {
         return vec![(0, line.len())];
     }
-    if measure_text(line, font_sz, false) <= max_w {
+    if measure_text_styled(line, mono) <= max_w {
         return vec![(0, line.len())];
     }
 
@@ -130,7 +132,7 @@ fn wrap_single_line(line: &str, font_sz: f32, max_w: f32) -> Vec<(usize, usize)>
         let (ts, te) = tokens[ti];
         if row_start == row_end {
             // First token on this visual row
-            if measure_text(&line[ts..te], font_sz, false) <= max_w {
+            if measure_text_styled(&line[ts..te], mono) <= max_w {
                 row_start = ts;
                 row_end = te;
                 ti += 1;
@@ -141,7 +143,7 @@ fn wrap_single_line(line: &str, font_sz: f32, max_w: f32) -> Vec<(usize, usize)>
                     let mut seg_e = seg_s;
                     for (rel_idx, ch) in line[seg_s..te].char_indices() {
                         let cand_e = seg_s + rel_idx + ch.len_utf8();
-                        if cand_e > seg_s && measure_text(&line[seg_s..cand_e], font_sz, false) > max_w {
+                        if cand_e > seg_s && measure_text_styled(&line[seg_s..cand_e], mono) > max_w {
                             if seg_e == seg_s {
                                 // Always make progress by at least 1 char
                                 seg_e = cand_e;
@@ -168,7 +170,7 @@ fn wrap_single_line(line: &str, font_sz: f32, max_w: f32) -> Vec<(usize, usize)>
                 }
                 ti += 1;
             }
-        } else if measure_text(&line[row_start..te], font_sz, false) <= max_w {
+        } else if measure_text_styled(&line[row_start..te], mono) <= max_w {
             row_end = te;
             ti += 1;
         } else {
@@ -192,6 +194,14 @@ struct SyntaxPalette {
     env_name: u32,
     brace: u32,
     math: u32,
+    heading: u32,
+    emphasis: u32,
+    code: u32,
+    link: u32,
+    quote: u32,
+    list_marker: u32,
+    active_line_bg: u32,
+    bracket_match_bg: u32,
 }
 
 fn syntax_palette_for_bg(page_bg: u32, theme: &UiTheme) -> SyntaxPalette {
@@ -202,31 +212,141 @@ fn syntax_palette_for_bg(page_bg: u32, theme: &UiTheme) -> SyntaxPalette {
     if luma < 128.0 {
         SyntaxPalette {
             plain: theme.text_primary,
-            comment: 0x007A_A874,  // soft green
-            command: 0x007A_B8FF,  // bright sky blue
-            env_name: 0x00D8_96FF, // orchid purple
-            brace: 0x00F0_B266,    // warm amber
-            math: 0x0052_D1B8,     // crisp teal
+            comment: 0x007A_A874,      // soft sage green
+            command: 0x007A_B8FF,      // bright sky blue
+            env_name: 0x00D8_96FF,     // orchid purple
+            brace: 0x00F0_B266,        // warm amber
+            math: 0x0052_D1B8,         // crisp teal
+            heading: 0x0093_C5FD,      // luminous indigo-sky
+            emphasis: 0x00F4_A261,     // warm coral/gold
+            code: 0x0034_D399,         // emerald code
+            link: 0x0060_A5FA,         // sky link
+            quote: 0x0094_A3B8,        // muted slate
+            list_marker: 0x00C0_84FC,  // soft violet
+            active_line_bg: 0x0023_2736,
+            bracket_match_bg: 0x0036_4158,
         }
     } else {
         SyntaxPalette {
             plain: theme.text_primary,
-            comment: 0x004A_7544,  // forest green
-            command: 0x001A_53B5,  // cobalt blue
-            env_name: 0x007E_22CE, // deep purple
-            brace: 0x00B4_5309,    // burnt amber
-            math: 0x000F_766E,     // deep teal
+            comment: 0x004A_7544,      // forest green
+            command: 0x001A_53B5,      // cobalt blue
+            env_name: 0x007E_22CE,     // deep purple
+            brace: 0x00B4_5309,        // burnt amber
+            math: 0x000F_766E,         // deep teal
+            heading: 0x0037_30A3,      // crisp indigo
+            emphasis: 0x009D_174D,     // rich magenta-rose
+            code: 0x0004_7857,         // deep emerald
+            link: 0x001D_4ED8,         // cobalt link
+            quote: 0x0057_606F,        // muted charcoal
+            list_marker: 0x006D_28D9,  // rich violet
+            active_line_bg: 0x00ED_F1F7,
+            bracket_match_bg: 0x00D8_E4FA,
         }
     }
 }
 
+fn is_latex_math_env_name(name: &str) -> bool {
+    matches!(
+        name.trim(),
+        "equation"
+            | "equation*"
+            | "align"
+            | "align*"
+            | "alignat"
+            | "alignat*"
+            | "gather"
+            | "gather*"
+            | "multline"
+            | "multline*"
+            | "eqnarray"
+            | "eqnarray*"
+            | "displaymath"
+            | "math"
+            | "flalign"
+            | "flalign*"
+            | "split"
+            | "cases"
+    )
+}
+
+/// Computes per-line starting `in_math` state across multi-line LaTeX math environments / `\[...\]` / `$$...$$`.
+fn compute_latex_line_states(lines: &[String]) -> Vec<bool> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut in_math = false;
+    let mut math_env_depth = 0usize;
+    for line in lines {
+        out.push(in_math || math_env_depth > 0);
+        let code_part = match line.find('%') {
+            Some(idx) => &line[..idx],
+            None => line.as_str(),
+        };
+        let bytes = code_part.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' {
+                if bytes[i..].starts_with(b"\\begin{") {
+                    if let Some(end_b) = bytes[i + 7..].iter().position(|&b| b == b'}') {
+                        if let Ok(env) = std::str::from_utf8(&bytes[i + 7..i + 7 + end_b]) {
+                            if is_latex_math_env_name(env) {
+                                math_env_depth += 1;
+                            }
+                        }
+                        i += 7 + end_b + 1;
+                        continue;
+                    }
+                } else if bytes[i..].starts_with(b"\\end{") {
+                    if let Some(end_b) = bytes[i + 5..].iter().position(|&b| b == b'}') {
+                        if let Ok(env) = std::str::from_utf8(&bytes[i + 5..i + 5 + end_b]) {
+                            if is_latex_math_env_name(env) {
+                                math_env_depth = math_env_depth.saturating_sub(1);
+                            }
+                        }
+                        i += 5 + end_b + 1;
+                        continue;
+                    }
+                } else if bytes[i..].starts_with(b"\\[") {
+                    in_math = true;
+                    i += 2;
+                    continue;
+                } else if bytes[i..].starts_with(b"\\]") {
+                    in_math = false;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                if i < bytes.len() && bytes[i].is_ascii() {
+                    i += 1;
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"$$") {
+                in_math = !in_math;
+                i += 2;
+                continue;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Tokenizes a single logical LaTeX line into contiguous `(start_byte, end_byte, color)` spans.
+#[allow(dead_code)]
 fn highlight_latex_line(line: &str, pal: SyntaxPalette) -> Vec<(usize, usize, u32)> {
+    highlight_latex_line_with_state(line, pal, false)
+}
+
+fn highlight_latex_line_with_state(
+    line: &str,
+    pal: SyntaxPalette,
+    initial_in_math: bool,
+) -> Vec<(usize, usize, u32)> {
     let mut spans: Vec<(usize, usize, u32)> = Vec::new();
     let bytes = line.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
-    let mut in_math = false;
+    let mut in_math = initial_in_math;
     let mut expect_env_brace = false;
 
     while i < n {
@@ -327,44 +447,486 @@ fn highlight_latex_line(line: &str, pal: SyntaxPalette) -> Vec<(usize, usize, u3
     spans
 }
 
+/// Computes per-line starting `in_fenced_code` state across multi-line Markdown fenced blocks.
+fn compute_markdown_line_states(lines: &[String]) -> Vec<bool> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut in_fenced = false;
+    let mut fence_char = b'`';
+    for line in lines {
+        out.push(in_fenced);
+        let trimmed = line.trim_start();
+        if !in_fenced {
+            if trimmed.starts_with("```") {
+                in_fenced = true;
+                fence_char = b'`';
+            } else if trimmed.starts_with("~~~") {
+                in_fenced = true;
+                fence_char = b'~';
+            }
+        } else if (fence_char == b'`' && trimmed.starts_with("```"))
+            || (fence_char == b'~' && trimmed.starts_with("~~~"))
+        {
+            in_fenced = false;
+        }
+    }
+    out
+}
+
 /// Tokenizes a single logical Markdown line into contiguous `(start_byte, end_byte, color)` spans.
+#[allow(dead_code)]
 fn highlight_markdown_line(line: &str, pal: SyntaxPalette) -> Vec<(usize, usize, u32)> {
+    highlight_markdown_line_with_state(line, pal, false)
+}
+
+fn highlight_markdown_line_with_state(
+    line: &str,
+    pal: SyntaxPalette,
+    in_fenced: bool,
+) -> Vec<(usize, usize, u32)> {
     let trimmed = line.trim_start();
+    let indent_len = line.len().saturating_sub(trimmed.len());
+    if trimmed.starts_with("```") || trimmed.starts_with("~~~") || in_fenced {
+        return vec![(0, line.len(), pal.code)];
+    }
     if trimmed.starts_with('#') {
-        return vec![(0, line.len(), pal.command)];
-    }
-    if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-        return vec![(0, line.len(), pal.math)];
-    }
-    if trimmed.starts_with('>') {
-        return vec![(0, line.len(), pal.comment)];
+        return vec![(0, line.len(), pal.heading)];
     }
 
     let mut spans = Vec::new();
     let bytes = line.as_bytes();
     let n = bytes.len();
     let mut i = 0usize;
+
+    // Leading blockquote or list/checkbox prefix highlighting
+    if trimmed.starts_with('>') {
+        let marker_end = (indent_len + 1 + usize::from(bytes.get(indent_len + 1) == Some(&b' '))).min(n);
+        spans.push((0, marker_end, pal.quote));
+        i = marker_end;
+    } else if trimmed.starts_with("- [ ] ") || trimmed.starts_with("- [x] ") || trimmed.starts_with("- [X] ") {
+        let marker_end = (indent_len + 6).min(n);
+        spans.push((0, marker_end, pal.list_marker));
+        i = marker_end;
+    } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+        let marker_end = (indent_len + 2).min(n);
+        spans.push((0, marker_end, pal.list_marker));
+        i = marker_end;
+    } else {
+        let mut d = indent_len;
+        while d < n && bytes[d].is_ascii_digit() {
+            d += 1;
+        }
+        if d > indent_len && d + 1 < n && (bytes[d] == b'.' || bytes[d] == b')') && bytes[d + 1] == b' ' {
+            spans.push((0, d + 2, pal.list_marker));
+            i = d + 2;
+        }
+    }
+
+    let is_blockquote = trimmed.starts_with('>');
     let mut in_code = false;
+    let mut in_math = false;
+    let mut in_bold = false;
+    let mut in_italic = false;
+
     while i < n {
-        if bytes[i] == b'`' {
+        let b = bytes[i];
+        if b == b'`' {
             let start = i;
             i += 1;
             in_code = !in_code;
+            spans.push((start, i, pal.code));
+            continue;
+        }
+        if !in_code && b == b'$' {
+            let start = i;
+            i += 1;
+            if i < n && bytes[i] == b'$' {
+                i += 1;
+            }
+            in_math = !in_math;
             spans.push((start, i, pal.math));
             continue;
         }
-        if !in_code && matches!(bytes[i], b'[' | b']' | b'(' | b')') {
-            spans.push((i, i + 1, pal.brace));
-            i += 1;
-            continue;
+        if !in_code && !in_math {
+            if (i + 1 < n && bytes[i] == b'*' && bytes[i + 1] == b'*')
+                || (i + 1 < n && bytes[i] == b'_' && bytes[i + 1] == b'_')
+            {
+                spans.push((i, i + 2, pal.emphasis));
+                i += 2;
+                in_bold = !in_bold;
+                continue;
+            }
+            if b == b'*' {
+                spans.push((i, i + 1, pal.emphasis));
+                i += 1;
+                in_italic = !in_italic;
+                continue;
+            }
+            if b == b'[' {
+                // Highlight [text](url) cleanly when matched on this line
+                if let Some(close_rel) = line[i + 1..].find(']') {
+                    let close_idx = i + 1 + close_rel;
+                    if bytes.get(close_idx + 1) == Some(&b'(') {
+                        if let Some(paren_rel) = line[close_idx + 2..].find(')') {
+                            let paren_end = close_idx + 2 + paren_rel;
+                            spans.push((i, i + 1, pal.brace));
+                            if close_idx > i + 1 {
+                                spans.push((i + 1, close_idx, pal.link));
+                            }
+                            spans.push((close_idx, close_idx + 2, pal.brace));
+                            if paren_end > close_idx + 2 {
+                                spans.push((close_idx + 2, paren_end, pal.link));
+                            }
+                            spans.push((paren_end, paren_end + 1, pal.brace));
+                            i = paren_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            if matches!(b, b'[' | b']' | b'(' | b')') {
+                spans.push((i, i + 1, pal.brace));
+                i += 1;
+                continue;
+            }
         }
         let start = i;
-        while i < n && bytes[i] != b'`' && (in_code || !matches!(bytes[i], b'[' | b']' | b'(' | b')')) {
+        while i < n {
+            let cur = bytes[i];
+            if cur == b'`' {
+                break;
+            }
+            if !in_code && cur == b'$' {
+                break;
+            }
+            if !in_code && !in_math && matches!(cur, b'*' | b'_' | b'[' | b']' | b'(' | b')') {
+                if cur == b'_' && bytes.get(i + 1) != Some(&b'_') {
+                    // keep single '_' inside snake_case identifiers plain
+                } else {
+                    break;
+                }
+            }
             i += 1;
         }
-        spans.push((start, i, if in_code { pal.math } else { pal.plain }));
+        if i == start {
+            i += 1;
+        }
+        let col = if in_code {
+            pal.code
+        } else if in_math {
+            pal.math
+        } else if in_bold || in_italic {
+            pal.emphasis
+        } else if is_blockquote {
+            pal.quote
+        } else {
+            pal.plain
+        };
+        spans.push((start, i, col));
     }
     spans
+}
+
+/// Finds a matching `()`, `[]`, or `{}` bracket pair adjacent to `cursor` `(row, col)`.
+pub(super) fn find_matching_bracket(
+    lines: &[String],
+    cursor: (usize, usize),
+) -> Option<((usize, usize), (usize, usize))> {
+    let (r, c) = cursor;
+    let line = lines.get(r)?;
+    let bytes = line.as_bytes();
+    let is_delim = |b: u8| matches!(b, b'(' | b')' | b'[' | b']' | b'{' | b'}');
+    let anchor_c = if c < bytes.len() && is_delim(bytes[c]) {
+        c
+    } else if c > 0 && c - 1 < bytes.len() && is_delim(bytes[c - 1]) {
+        c - 1
+    } else {
+        return None;
+    };
+
+    let ch = bytes[anchor_c];
+    let (forward, close_ch) = match ch {
+        b'(' => (true, b')'),
+        b'[' => (true, b']'),
+        b'{' => (true, b'}'),
+        b')' => (false, b'('),
+        b']' => (false, b'['),
+        b'}' => (false, b'{'),
+        _ => return None,
+    };
+
+    const MAX_SCAN_LINES: usize = 500;
+    let mut depth = 0i32;
+
+    if forward {
+        let end_r = (r + MAX_SCAN_LINES).min(lines.len());
+        for rr in r..end_r {
+            let bs = lines[rr].as_bytes();
+            let start_c = if rr == r { anchor_c } else { 0 };
+            for cc in start_c..bs.len() {
+                if bs[cc] == ch {
+                    depth += 1;
+                } else if bs[cc] == close_ch {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(((r, anchor_c), (rr, cc)));
+                    }
+                }
+            }
+        }
+    } else {
+        let start_r = r.saturating_sub(MAX_SCAN_LINES);
+        for rr in (start_r..=r).rev() {
+            let bs = lines[rr].as_bytes();
+            let end_c = if rr == r { anchor_c } else { bs.len().saturating_sub(1) };
+            if bs.is_empty() {
+                continue;
+            }
+            for cc in (0..=end_c.min(bs.len() - 1)).rev() {
+                if bs[cc] == ch {
+                    depth += 1;
+                } else if bs[cc] == close_ch {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(((rr, cc), (r, anchor_c)));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Height in physical pixels of the single-row Contextual Formatting & Snippet Bar in Studio Editor panes.
+pub(super) fn editor_header_height_px(sf: f64) -> u32 {
+    (32.0 * sf as f32).round().clamp(26.0, 48.0) as u32
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum EditorBarAction {
+    Bold,
+    Italic,
+    Code,
+    H1,
+    H2,
+    H3,
+    List,
+    Link,
+    Table,
+    LatexSec,
+    LatexBold,
+    LatexEmph,
+    LatexMath,
+    LatexEq,
+    LatexFrac,
+    LatexSum,
+    LatexList,
+    CodeFontDown,
+    CodeFontUp,
+    ModeSplit,
+    ModeEdit,
+    ModePreview,
+    PopOutOrDock,
+}
+
+#[derive(Clone)]
+pub(super) struct EditorBarBtn {
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) w: u32,
+    pub(super) h: u32,
+    pub(super) action: EditorBarAction,
+    pub(super) label: &'static str,
+    pub(super) active: bool,
+    pub(super) is_primary: bool,
+}
+
+pub(super) fn layout_editor_header(
+    ex: i32,
+    ey: i32,
+    ew: u32,
+    hdr_h: u32,
+    syntax: EditorSyntax,
+    mode: MdEditorMode,
+    is_popout: bool,
+    sf: f64,
+) -> Vec<EditorBarBtn> {
+    let mut out = Vec::new();
+    if ew < 48 || hdr_h < 18 {
+        return out;
+    }
+    let s = sf as f32;
+    let font_sz = (10.5 * s).clamp(9.0, 18.0);
+    let btn_h = hdr_h.saturating_sub((8.0 * s).round().max(4.0) as u32).max(16);
+    let btn_y = ey + ((hdr_h.saturating_sub(btn_h)) / 2) as i32;
+    let pad_x = (8.0 * s).round() as i32;
+    let gap = (4.0 * s).round().max(2.0) as i32;
+
+    // Right-aligned controls first (Pop Out ↗ / Dock Back, Split/Edit/Preview, Code font A-/A+)
+    let mut right_specs: Vec<(EditorBarAction, &'static str, bool, bool)> = Vec::new();
+    right_specs.push((
+        EditorBarAction::PopOutOrDock,
+        if is_popout { "Dock Back" } else { "Pop Out ↗" },
+        false,
+        true,
+    ));
+    if !is_popout {
+        right_specs.push((EditorBarAction::ModePreview, "Preview", mode == MdEditorMode::Preview, false));
+        right_specs.push((EditorBarAction::ModeEdit, "Edit", mode == MdEditorMode::Edit, false));
+        right_specs.push((EditorBarAction::ModeSplit, "Split", mode == MdEditorMode::Split, false));
+    }
+    right_specs.push((EditorBarAction::CodeFontUp, "A+", false, false));
+    right_specs.push((EditorBarAction::CodeFontDown, "A-", false, false));
+
+    let mut right_edge = ex + ew as i32 - pad_x;
+    let mut right_btns = Vec::new();
+    for (act, lbl, active, is_primary) in right_specs {
+        let tw = measure_text(lbl, font_sz, active || is_primary).ceil() as u32;
+        let bw = tw + (14.0 * s).round().max(8.0) as u32;
+        let bx = right_edge - bw as i32;
+        if bx <= ex + pad_x + 40 {
+            break;
+        }
+        right_btns.push(EditorBarBtn {
+            x: bx,
+            y: btn_y,
+            w: bw,
+            h: btn_h,
+            action: act,
+            label: lbl,
+            active,
+            is_primary,
+        });
+        right_edge = bx - gap;
+    }
+
+    let max_left_x = right_edge - gap;
+    let left_specs: &[(EditorBarAction, &'static str)] = match syntax {
+        EditorSyntax::Markdown => &[
+            (EditorBarAction::Bold, "B"),
+            (EditorBarAction::Italic, "I"),
+            (EditorBarAction::Code, "Code"),
+            (EditorBarAction::H1, "H1"),
+            (EditorBarAction::H2, "H2"),
+            (EditorBarAction::H3, "H3"),
+            (EditorBarAction::List, "List"),
+            (EditorBarAction::Link, "Link"),
+            (EditorBarAction::Table, "Table"),
+        ],
+        EditorSyntax::LaTeX => &[
+            (EditorBarAction::LatexSec, "\\section"),
+            (EditorBarAction::LatexBold, "\\textbf"),
+            (EditorBarAction::LatexEmph, "\\emph"),
+            (EditorBarAction::LatexMath, "$math$"),
+            (EditorBarAction::LatexEq, "Equation"),
+            (EditorBarAction::LatexFrac, "\\frac"),
+            (EditorBarAction::LatexSum, "\\sum"),
+            (EditorBarAction::LatexList, "List"),
+        ],
+    };
+
+    let mut cur_x = ex + pad_x;
+    for &(act, lbl) in left_specs {
+        let tw = measure_text(lbl, font_sz, false).ceil() as u32;
+        let bw = (tw + (12.0 * s).round().max(8.0) as u32).max((22.0 * s).round() as u32);
+        if cur_x + bw as i32 > max_left_x {
+            break;
+        }
+        out.push(EditorBarBtn {
+            x: cur_x,
+            y: btn_y,
+            w: bw,
+            h: btn_h,
+            action: act,
+            label: lbl,
+            active: false,
+            is_primary: false,
+        });
+        cur_x += bw as i32 + gap;
+    }
+
+    out.extend(right_btns.into_iter().rev());
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn draw_editor_header(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    ex: i32,
+    ey: i32,
+    ew: u32,
+    hdr_h: u32,
+    syntax: EditorSyntax,
+    mode: MdEditorMode,
+    is_popout: bool,
+    hovered_action: Option<EditorBarAction>,
+    theme: &UiTheme,
+    sf: f64,
+) {
+    if ew == 0 || hdr_h == 0 {
+        return;
+    }
+    let s = sf as f32;
+    let font_sz = (10.5 * s).clamp(9.0, 18.0);
+    let rad = (4.5 * s).clamp(3.0, 7.0);
+    fill_rect_clipped(buffer, buf_w, buf_h, ex, ey, ew, hdr_h, theme.sidebar_header_bg);
+    fill_rect_clipped(buffer, buf_w, buf_h, ex, ey + hdr_h as i32 - 1, ew, 1, theme.divider);
+
+    let btns = layout_editor_header(ex, ey, ew, hdr_h, syntax, mode, is_popout, sf);
+    for b in btns {
+        let hov = hovered_action == Some(b.action);
+        if b.is_primary {
+            let bg = if hov { theme.accent_hover } else { theme.accent };
+            fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, bg);
+        } else if b.active {
+            fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.accent_soft_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.accent);
+        } else if hov {
+            fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.hover_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.border_subtle);
+        } else {
+            fill_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.surface_elevated);
+            stroke_rounded_rect(buffer, buf_w, buf_h, b.x, b.y, b.w, b.h, rad, theme.border_subtle);
+        }
+        let fg = if b.is_primary {
+            theme.text_on_accent
+        } else if b.active {
+            theme.accent_soft_fg
+        } else {
+            theme.text_primary
+        };
+        let bold = b.active || b.is_primary;
+        let tw = measure_text(b.label, font_sz, bold);
+        let tx = b.x + ((b.w as f32 - tw) * 0.5).round() as i32;
+        draw_text_vcenter(buffer, buf_w, buf_h, tx, b.y, b.h, b.x + b.w as i32 - 2, b.label, font_sz, fg, bold);
+    }
+}
+
+pub(super) fn hit_test_editor_header(
+    mx: f64,
+    my: f64,
+    ex: i32,
+    ey: i32,
+    ew: u32,
+    hdr_h: u32,
+    syntax: EditorSyntax,
+    mode: MdEditorMode,
+    is_popout: bool,
+    sf: f64,
+) -> Option<EditorBarAction> {
+    let ix = mx.round() as i32;
+    let iy = my.round() as i32;
+    if ix < ex || ix >= ex + ew as i32 || iy < ey || iy >= ey + hdr_h as i32 {
+        return None;
+    }
+    let btns = layout_editor_header(ex, ey, ew, hdr_h, syntax, mode, is_popout, sf);
+    for b in btns {
+        if ix >= b.x && ix < b.x + b.w as i32 && iy >= b.y && iy < b.y + b.h as i32 {
+            return Some(b.action);
+        }
+    }
+    None
 }
 
 impl TextEditorState {
@@ -380,6 +942,7 @@ impl TextEditorState {
             scroll_y: 0.0,
             dragging: false,
             scrollbar_drag: false,
+            font_size_px: 13.5,
             content_gen: 1,
             wrap_key: (0, 0, 0),
             visual_rows: Vec::new(),
@@ -792,7 +1355,7 @@ impl TextEditorState {
     }
 
     fn ensure_wrapped(&mut self, ew: u32, sf: f64, zoom: f32) -> EditorMetrics {
-        let m = compute_metrics(sf, zoom);
+        let m = compute_metrics(sf, zoom, self.font_size_px);
         let key = (ew, m.font_sz.to_bits(), self.content_gen);
         if self.wrap_key == key && !self.visual_rows.is_empty() {
             return m;
@@ -1055,10 +1618,11 @@ impl TextEditorState {
         let target_dx = (px - text_x).max(0) as f32;
 
         let seg = &self.lines[vr.line_idx][vr.start_byte..vr.end_byte];
+        let mono = TextStyle::mono(m.font_sz);
         let mut best_rel = seg.len();
         let mut prev_w = 0.0f32;
         for (idx, _) in seg.char_indices() {
-            let w = measure_text(&seg[..idx], m.font_sz, false);
+            let w = measure_text_styled(&seg[..idx], mono);
             if w >= target_dx {
                 if (target_dx - prev_w) < (w - target_dx) {
                     best_rel = seg[..idx].char_indices().last().map(|(i, _)| i).unwrap_or(0);
@@ -1070,6 +1634,110 @@ impl TextEditorState {
             prev_w = w;
         }
         (vr.line_idx, vr.start_byte + best_rel)
+    }
+
+    /// Executes a contextual formatting / snippet bar action on the editor text.
+    /// Returns `true` if the document text changed.
+    pub(super) fn apply_editor_bar_action(&mut self, action: EditorBarAction) -> bool {
+        match action {
+            EditorBarAction::Bold => {
+                self.wrap_selection("**", "**");
+                true
+            }
+            EditorBarAction::Italic => {
+                self.wrap_selection("*", "*");
+                true
+            }
+            EditorBarAction::Code => {
+                let has_nl = self.selected_text().is_some_and(|s| s.contains('\n'));
+                if has_nl {
+                    self.wrap_selection("```\n", "\n```");
+                } else {
+                    self.wrap_selection("`", "`");
+                }
+                true
+            }
+            EditorBarAction::H1 => {
+                self.cursor.1 = 0;
+                self.sel_anchor = None;
+                self.insert_str("# ");
+                true
+            }
+            EditorBarAction::H2 => {
+                self.cursor.1 = 0;
+                self.sel_anchor = None;
+                self.insert_str("## ");
+                true
+            }
+            EditorBarAction::H3 => {
+                self.cursor.1 = 0;
+                self.sel_anchor = None;
+                self.insert_str("### ");
+                true
+            }
+            EditorBarAction::List => {
+                self.cursor.1 = 0;
+                self.sel_anchor = None;
+                self.insert_str("- ");
+                true
+            }
+            EditorBarAction::Link => {
+                let sel = self.selected_text().unwrap_or_else(|| "link text".to_string());
+                if self.selected_text().is_some() {
+                    self.delete_selection();
+                }
+                self.insert_str(&format!("[{sel}](https://example.com)"));
+                true
+            }
+            EditorBarAction::Table => {
+                self.insert_str("\n| Column 1 | Column 2 |\n| --- | --- |\n| Cell 1 | Cell 2 |\n");
+                true
+            }
+            EditorBarAction::LatexSec => {
+                self.cursor.1 = 0;
+                self.sel_anchor = None;
+                self.insert_str("\\section{");
+                let r = self.cursor.0;
+                let end_c = self.lines[r].len();
+                self.cursor.1 = end_c;
+                self.insert_str("}");
+                true
+            }
+            EditorBarAction::LatexBold => {
+                self.wrap_selection("\\textbf{", "}");
+                true
+            }
+            EditorBarAction::LatexEmph => {
+                self.wrap_selection("\\emph{", "}");
+                true
+            }
+            EditorBarAction::LatexMath => {
+                self.wrap_selection("$", "$");
+                true
+            }
+            EditorBarAction::LatexEq => {
+                self.insert_str("\\begin{equation}\n  E = mc^2\n\\end{equation}\n");
+                true
+            }
+            EditorBarAction::LatexFrac => {
+                self.insert_str("\\frac{a}{b}");
+                true
+            }
+            EditorBarAction::LatexSum => {
+                self.insert_str("\\sum_{i=1}^{n} ");
+                true
+            }
+            EditorBarAction::LatexList => {
+                self.insert_str("\\begin{itemize}\n  \\item \n\\end{itemize}\n");
+                true
+            }
+            EditorBarAction::CodeFontDown
+            | EditorBarAction::CodeFontUp
+            | EditorBarAction::ModeSplit
+            | EditorBarAction::ModeEdit
+            | EditorBarAction::ModePreview
+            | EditorBarAction::PopOutOrDock => false,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1092,6 +1760,7 @@ impl TextEditorState {
             return;
         }
         let m = self.ensure_wrapped(ew, sf, zoom);
+        let mono = TextStyle::mono(m.font_sz);
         let max_s = self.max_scroll_y(ew, eh as f32, sf, zoom);
         self.scroll_y = self.scroll_y.clamp(0.0, max_s);
 
@@ -1105,6 +1774,11 @@ impl TextEditorState {
         let sel = self.selected_range();
         let pal = syntax_palette_for_bg(page_bg, theme);
         let cursor_vi = self.cursor_visual_row();
+        let match_brackets = find_matching_bracket(&self.lines, self.cursor);
+        let line_states = match syntax {
+            EditorSyntax::LaTeX => compute_latex_line_states(&self.lines),
+            EditorSyntax::Markdown => compute_markdown_line_states(&self.lines),
+        };
 
         let first_vi = ((self.scroll_y - m.pad_y) / m.line_h).floor().max(0.0) as usize;
         let vis_count = ((eh as f32 / m.line_h).ceil() as usize) + 2;
@@ -1121,8 +1795,20 @@ impl TextEditorState {
                 continue;
             }
 
+            // Subtle active-line background highlight
+            if vr.line_idx == self.cursor.0 {
+                let row_x = ex + m.gutter_w as i32;
+                let row_w = ew.saturating_sub(m.gutter_w);
+                fill_rect_clipped(buffer, buf_w, buf_h, row_x, ly, row_w, m.line_h.round() as u32, pal.active_line_bg);
+            }
+
             if vr.is_first_of_line {
                 let num = format!("{}", vr.line_idx + 1);
+                let num_col = if vr.line_idx == self.cursor.0 {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                };
                 let nw = measure_text(&num, m.font_sz * 0.84, false);
                 let nx = ex + m.gutter_w as i32 - nw.round() as i32 - (8.0 * m.s).round() as i32;
                 draw_text_clipped(
@@ -1134,13 +1820,27 @@ impl TextEditorState {
                     ex + m.gutter_w as i32 - 4,
                     &num,
                     m.font_sz * 0.84,
-                    theme.text_muted,
-                    false,
+                    num_col,
+                    vr.line_idx == self.cursor.0,
                 );
             }
 
             let full_line = &self.lines[vr.line_idx];
             let seg = &full_line[vr.start_byte..vr.end_byte];
+
+            // Matching bracket pair background highlight
+            if let Some((b0, b1)) = match_brackets {
+                for (br, bc) in [b0, b1] {
+                    if br == vr.line_idx && bc >= vr.start_byte && bc < vr.end_byte && bc + 1 <= full_line.len() {
+                        let rel_b = bc - vr.start_byte;
+                        if let Some(ch_s) = seg.get(rel_b..rel_b + 1) {
+                            let bx = text_x + measure_text_styled(&seg[..rel_b], mono).round() as i32;
+                            let bw = measure_text_styled(ch_s, mono).round().max(4.0) as u32;
+                            fill_rect_clipped(buffer, buf_w, buf_h, bx, ly, bw, m.line_h.round() as u32, pal.bracket_match_bg);
+                        }
+                    }
+                }
+            }
 
             // Selection highlight clipped to this visual row
             if let Some(((r0, c0), (r1, c1))) = sel {
@@ -1154,9 +1854,9 @@ impl TextEditorState {
                     if intersects {
                         let rel_sc = seg_sc - vr.start_byte;
                         let rel_ec = seg_ec - vr.start_byte;
-                        let sx = text_x + measure_text(&seg[..rel_sc], m.font_sz, false).round() as i32;
+                        let sx = text_x + measure_text_styled(&seg[..rel_sc], mono).round() as i32;
                         let sw = if rel_ec > rel_sc {
-                            measure_text(&seg[rel_sc..rel_ec], m.font_sz, false).round().max(4.0) as u32
+                            measure_text_styled(&seg[rel_sc..rel_ec], mono).round().max(4.0) as u32
                         } else {
                             (6.0 * m.s).round() as u32
                         };
@@ -1171,9 +1871,10 @@ impl TextEditorState {
             // Syntax-highlighted drawing of this visual row
             if vr.line_idx != cached_line_idx {
                 cached_line_idx = vr.line_idx;
+                let init_state = line_states.get(vr.line_idx).copied().unwrap_or(false);
                 cached_tokens = match syntax {
-                    EditorSyntax::LaTeX => highlight_latex_line(full_line, pal),
-                    EditorSyntax::Markdown => highlight_markdown_line(full_line, pal),
+                    EditorSyntax::LaTeX => highlight_latex_line_with_state(full_line, pal, init_state),
+                    EditorSyntax::Markdown => highlight_markdown_line_with_state(full_line, pal, init_state),
                 };
             }
 
@@ -1187,8 +1888,8 @@ impl TextEditorState {
                     continue;
                 }
                 let rel_s = cs - vr.start_byte;
-                let tx = text_x + measure_text(&seg[..rel_s], m.font_sz, false).round() as i32;
-                draw_text_clipped(
+                let tx = text_x + measure_text_styled(&seg[..rel_s], mono).round() as i32;
+                draw_text_styled_clipped(
                     buffer,
                     buf_w,
                     buf_h,
@@ -1196,16 +1897,15 @@ impl TextEditorState {
                     ly,
                     text_max_x,
                     &full_line[cs..ce],
-                    m.font_sz,
+                    mono,
                     col,
-                    false,
                 );
             }
 
             // Caret on active visual row
             if vi == cursor_vi {
                 let rel_c = self.cursor.1.clamp(vr.start_byte, vr.end_byte) - vr.start_byte;
-                let cx = text_x + measure_text(&seg[..rel_c], m.font_sz, false).round() as i32;
+                let cx = text_x + measure_text_styled(&seg[..rel_c], mono).round() as i32;
                 if cx >= text_x && cx <= text_max_x {
                     fill_rect_clipped(buffer, buf_w, buf_h, cx, ly, 2, m.line_h.round() as u32, theme.accent);
                 }
@@ -1284,6 +1984,14 @@ mod tests {
             env_name: 4,
             brace: 5,
             math: 6,
+            heading: 7,
+            emphasis: 8,
+            code: 9,
+            link: 10,
+            quote: 11,
+            list_marker: 12,
+            active_line_bg: 13,
+            bracket_match_bg: 14,
         };
         let tex = "\\begin{equation} \\frac{a}{b} = $x^2$ % note";
         let toks = highlight_latex_line(tex, pal);
@@ -1329,5 +2037,73 @@ mod tests {
         assert_eq!(ed2.lines[0], "  beta");
         ed2.indent_or_outdent(true);
         assert_eq!(ed2.lines[0], "beta");
+    }
+
+    #[test]
+    fn test_phase3_multiline_syntax_brackets_snippets_and_palettes() {
+        use crate::viewer::theme::{DocKind, UiSkin, UiThemeMode};
+
+        let pal = syntax_palette_for_bg(0x00FB_FCFE, &UiTheme::LIGHT);
+
+        // Multi-line Markdown fenced code block tracking
+        let md_lines = vec![
+            "# Heading".to_string(),
+            "```rust".to_string(),
+            "let x = 1; // inside fence".to_string(),
+            "```".to_string(),
+            "Normal **bold** and `inline` $math$".to_string(),
+        ];
+        let md_states = compute_markdown_line_states(&md_lines);
+        assert_eq!(md_states, vec![false, false, true, true, false]);
+        let fence_body = highlight_markdown_line_with_state(&md_lines[2], pal, md_states[2]);
+        assert_eq!(fence_body, vec![(0, md_lines[2].len(), pal.code)]);
+        let head_spans = highlight_markdown_line_with_state(&md_lines[0], pal, md_states[0]);
+        assert_eq!(head_spans, vec![(0, md_lines[0].len(), pal.heading)]);
+
+        // Multi-line LaTeX math environment tracking
+        let tex_lines = vec![
+            "\\begin{equation}".to_string(),
+            "  a + b = c".to_string(),
+            "\\end{equation}".to_string(),
+            "Outside math".to_string(),
+        ];
+        let tex_states = compute_latex_line_states(&tex_lines);
+        assert_eq!(tex_states, vec![false, true, true, false]);
+        let eq_body = highlight_latex_line_with_state(&tex_lines[1], pal, tex_states[1]);
+        assert!(eq_body.iter().all(|&(_, _, col)| col == pal.math));
+
+        // Matching bracket finder across lines
+        let br_lines = vec!["\\frac{a".to_string(), "  + (b)}".to_string()];
+        assert_eq!(find_matching_bracket(&br_lines, (0, 5)), Some(((0, 5), (1, 7))));
+        assert_eq!(find_matching_bracket(&br_lines, (1, 7)), Some(((0, 5), (1, 7))));
+
+        // Contextual formatting / snippet bar actions
+        let mut ed = TextEditorState::from_text("hello");
+        ed.select_all();
+        assert!(ed.apply_editor_bar_action(EditorBarAction::Bold));
+        assert_eq!(ed.to_text(), "**hello**");
+
+        let mut tex_ed = TextEditorState::from_text("");
+        assert!(tex_ed.apply_editor_bar_action(EditorBarAction::LatexFrac));
+        assert_eq!(tex_ed.to_text(), "\\frac{a}{b}");
+
+        let btns_main = layout_editor_header(0, 0, 700, 32, EditorSyntax::Markdown, MdEditorMode::Split, false, 1.0);
+        assert!(btns_main.iter().any(|b| b.action == EditorBarAction::PopOutOrDock && b.label == "Pop Out ↗"));
+        assert!(btns_main.iter().any(|b| b.action == EditorBarAction::ModeSplit && b.active));
+
+        let btns_pop = layout_editor_header(0, 0, 700, 32, EditorSyntax::LaTeX, MdEditorMode::Preview, true, 1.0);
+        assert!(btns_pop.iter().any(|b| b.action == EditorBarAction::PopOutOrDock && b.label == "Dock Back"));
+
+        // Distinct palettes differ cleanly across DocKind while Classic stays identical
+        let classic = UiThemeMode::Light.theme();
+        assert_eq!(UiThemeMode::Light.theme_for(UiSkin::Classic, DocKind::Markdown).accent, classic.accent);
+        let d_pdf = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::Pdf);
+        let d_md = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::Markdown);
+        let d_tex = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::LaTeX);
+        assert_ne!(d_pdf.accent, d_md.accent);
+        assert_ne!(d_md.accent, d_tex.accent);
+        assert_ne!(d_pdf.accent, d_tex.accent);
+        assert_eq!(crate::viewer::state::PdfViewerApp::clamp_md_split_ratio(0.10), 0.25);
+        assert_eq!(crate::viewer::state::PdfViewerApp::clamp_md_split_ratio(0.95), 0.75);
     }
 }

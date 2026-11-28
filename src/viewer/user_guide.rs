@@ -46,11 +46,11 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Or click the blue 'Open PDF (O)' button (or 'Favorites (Ctrl+D)' for your starred folders) on the Welcome Screen.",
+                text: "Or click the blue 'Open Documents (O)' button (or 'Favorites (Ctrl+D)' for your starred folders) on the Welcome Screen.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Or click File -> Open PDF in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
+                text: "Or click File -> Open Documents in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
             },
             GuideBlock::Heading("Organizing Favorites & Protecting Portable Settings"),
             GuideBlock::Step {
@@ -116,7 +116,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and customizable page-turn animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
+                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and smooth 3D hand Page Curl animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
             },
             GuideBlock::Heading("Zooming In & Out"),
             GuideBlock::Step {
@@ -136,8 +136,34 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 "• Paper E-Ink (Best for day): Soft matte gray paper that cuts white screen glare.\n• Night Amber (Best for night): Deep dark background with warm amber text to minimize blue light.\n• Also available: Normal, Warm Sepia, Sage Eye-Care, and Dark Invert.",
             ),
             GuideBlock::Tip(
-                "MicroPDF automatically remembers your favorite Reading Mode and the last page & zoom for up to 50 files you have read! You can also make all menus and buttons bigger anytime via View -> UI Scale: Larger (+10%) or switch Light / Dark UI.",
+                "MicroPDF automatically remembers your favorite Reading Mode and the last page & zoom for up to 50 files you have read! You can also make all menus and buttons bigger anytime via View -> UI Scale: Larger (+10%) or switch between Light and Dark mode via View -> Dark Mode.",
             ),
+            GuideBlock::Heading("Switching Between Classic and Distinct UI Skin"),
+            GuideBlock::Step {
+                number: 1,
+                text: "Click Help -> UI Skin: Classic / Distinct in the top menu bar (a checkmark means Distinct skin is active; uncheck anytime to return to the familiar Classic look).",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "In Distinct skin, MicroPDF automatically adapts its colors and workspace to match the file you are reading: crisp slate & cobalt for PDFs, warm paper & serif type for EPUB e-books, indigo Studio tools for Markdown, and teal academic layout for LaTeX.",
+            },
+            GuideBlock::Heading("Reading EPUB E-Books in Distinct UI Skin"),
+            GuideBlock::Step {
+                number: 1,
+                text: "With Help -> UI Skin: Classic / Distinct turned on, open any .epub file to read in a calm two-page open book spread with serif fonts, chapter-per-page breaks, optional 3D hand Page Curl turns, soft page shadows, and 'Loc. X of Y · Z min left' footers (flip pages with Arrow keys, mouse wheel, or glide smoothly along the bottom scrubber slider).",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Click Aa on the bottom bar to customize typography: choose Book Serif, UI Sans, or cycle installed system serif fonts (< / >); tap A- / A+; pick Compact / Normal / Relaxed line spacing; fine-tune Word spacing and Para spacing (- / +); pick Narrow / Normal / Wide margins or click 4-Side > for independent Top Margin, Bottom, Outer Side, and Inner Spine sliders; toggle Justify Text and Avoid Breaking Words (-); pick 2-Page Book or 1-Page Flow; toggle Curl: On / Off; or tap any paper swatch.",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Click the Sidebar button on the far-left of the bottom bar (or top toolbar, or press B) to open the wide Book Drawer showing cover art, '• Chapter X of Y', an (i) book details popup, a vertical scrollbar across all three tabs — Contents (with 'Loc X' labels), Notes, and Marks — plus a magnifying-glass Find button (Ctrl+F) and star Bookmark toggle on the bottom bar.",
+            },
+            GuideBlock::Step {
+                number: 4,
+                text: "Drag across words on any EPUB page to select text, then pick a color dot to Highlight, click Add Note to write a study note, or click Copy. All highlights, notes, and bookmarks save automatically in portable micropdf_books.ini without touching the original .epub file.",
+            },
             GuideBlock::Heading("Distraction-Free Reading & Presentations"),
             GuideBlock::Paragraph(
                 "Press F11 for Fullscreen (hides all toolbars) or F5 for Presentation Mode (full black background, click or press Arrow keys to advance slides). Press Esc anytime to return.",
@@ -153,10 +179,10 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
         title: "Working with Multiple Tabs",
         summary: "Open many PDFs at once, jump between them quickly, and keep your tab strip tidy.",
         blocks: &[
-            GuideBlock::Heading("Opening & Switching Between Multiple PDFs"),
+            GuideBlock::Heading("Opening & Switching Between Multiple Files"),
             GuideBlock::Step {
                 number: 1,
-                text: "Click the '+' button at the right end of the tab bar (or click File -> Open PDF in Tab) to open another PDF without closing your current one.",
+                text: "Click the '+' button at the right end of the tab bar (or click File -> Open Documents in Tab) to open another document without closing your current one. Every tab (and every row in the '▾' tab list) displays a color-coded file-type icon — red PDF badge, warm amber EPUB book, indigo Markdown badge, or teal LaTeX badge — so you can tell files apart immediately in both Classic and Distinct skins.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -347,7 +373,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Building & Using the Bookmark Sidebar (Table of Contents)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Press B (or click View -> Toggle Bookmark Sidebar) to open the left Table of Contents panel. Click any entry to jump straight to that chapter.",
+                text: "Press B (or click View -> Toggle Bookmark Sidebar) to open the left panel. For PDFs it shows your bookmarks; in Distinct skin it opens the Book Drawer for EPUBs or the clean Outline / Document Structure panel for Markdown and LaTeX. Click any entry to jump straight there.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -446,12 +472,33 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "Click 'Choose Folder & Export' to save numbered images straight into your chosen folder.",
             },
-            GuideBlock::Heading("Markdown (.md), LaTeX (.tex) & EPUB (.epub) Reader, Editor & Export"),
+            GuideBlock::Heading("Writing & Editing Markdown (.md) and LaTeX (.tex) Files"),
+            GuideBlock::Step {
+                number: 1,
+                text: "Open any .md, .markdown, or .tex file (drag-and-drop or File -> Open Documents in Tab (O)). With Help -> UI Skin: Classic / Distinct set to Distinct, the window adapts its palette and starts in Split view (code left, live preview right); Classic stays in Preview mode until you click Split or Edit on the toolbar.",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Click the Sidebar icon (or press B) to view the Outline (Markdown) or Document Structure (LaTeX, with an equation counter pill), and click any heading to jump straight to that section.",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Drag the vertical divider line between the editor and preview panes left or right (25%–75%) to resize your workspace, or double-click the divider to reset it to 50/50.",
+            },
+            GuideBlock::Step {
+                number: 4,
+                text: "Click buttons on the editor's single-row formatting bar to insert markup without memorizing codes — B, I, Code, H1, H2, H3, List, Link, Table (Markdown) or \\section, \\textbf, \\emph, $math$, Equation, \\frac, \\sum, List (LaTeX), plus A- / A+ to resize the code font directly — or click Aa on the bottom bar for separate Preview Font, Code Font, Line Spacing, Word Spacing, and Para Spacing steppers.",
+            },
+            GuideBlock::Step {
+                number: 5,
+                text: "Want a separate editing window? Click Pop Out ↗ at the right end of the editor bar to open a dedicated MicroPDF Editor window while the main window expands to full live preview. Click Dock Back (or close the pop-out window) anytime to return to Split view, and press Ctrl+S to save changes to disk.",
+            },
+            GuideBlock::Heading("EPUB Export, Stamps & Watermarks"),
             GuideBlock::Paragraph(
-                "• EPUB (.epub) Reader & Export: open any EPUB e-book to read chapters with a book-cover drop shadow, crisp resampled images, automatic outline navigation, reading progress %, word count, estimated reading time, and automatic last-position memory. Click Export -> Export as EPUB (.epub)... (or Export EPUB (.epub)... from Markdown/LaTeX) to turn any PDF, Markdown, or LaTeX file into a portable EPUB e-book!\n• Markdown (.md) & LaTeX (.tex) Reader & Live Editor: open any Markdown or LaTeX file for automatic outline headings, inline/display math ($...$, $$...$$), numbered LaTeX equations with \\eqref/\\ref, tables, images, and uniform 60%–300% zoom (Ctrl+ / Ctrl-). Use the contextual Preview | Split | Edit, Zoom, Save, Reload, and Export buttons on the top toolbar to edit side-by-side with auto-indent, Tab/Shift+Tab, bracket/quote pairing, Ctrl+B/I, Ctrl+Shift+D (duplicate line), Alt+Up/Down (move line), and Ctrl+/ (comment).\n• Portable LaTeX Safety Guard: MicroPDF reads standard LaTeX articles, math, tables, and images with zero external software required. If a .tex file contains complex vector diagrams (like TikZ or PGFPlots), MicroPDF will warn you instead of showing a broken page.\n• Writers & students can also export PDF pages to Markdown (.md) or LaTeX (.tex) from the Export menu (or directly inside Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with a scrollable System Font Dropdown, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
+                "• Export to EPUB (.epub): click Export -> Export as EPUB (.epub)... (or Export / Print from Markdown/LaTeX) to package any PDF, Markdown, or LaTeX document as a portable EPUB e-book.\n• Portable LaTeX Safety Guard: if a .tex file contains complex drawn diagrams (such as TikZ or PGFPlots), MicroPDF warns you cleanly before opening.\n• Exporting PDFs to Markdown/LaTeX: click Export -> Export to Markdown (.md)... or Export to LaTeX (.tex)... (or export directly from Text View).\n• Stamps & Signatures (P): click Tools -> Stamps & Signatures... (P) to draw a signature on the built-in freehand pad (Black or Blue ink), import a transparent PNG, or customize APPROVED / CONFIDENTIAL / DRAFT / REVIEWED / COPY stamps — saved portably in ./micropdf_assets/ — then click 'Place' and drag on any page!\n• Detailed Watermarks (W): click Tools -> Add Watermark... (W) for a live-preview dialog with a scrollable System Font Dropdown, font size, color swatches, rotation (-180° to +180°), opacity, Centered/Custom/Tiled placement, and page range.",
             ),
             GuideBlock::Tip(
-                "For the cleanest handwritten signature stamp, use a PNG image with a transparent background — MicroPDF preserves transparency automatically!",
+                "Editor shortcuts also work automatically: Ctrl+B (Bold), Ctrl+I (Italic), Ctrl+Shift+D (Duplicate line), Alt+Up/Down (Move line), Ctrl+/ (Toggle comment), Ctrl+Z (Undo), and Ctrl+S (Save). For the cleanest handwritten signature stamp, use a PNG image with a transparent background!",
             ),
         ],
     },
@@ -513,10 +560,10 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
         title: "Search, Compare PDFs, Measure Ruler & Troubleshooting",
         summary: "Find exact words, visually spot differences between two PDF drafts, measure dimensions, and solve common issues.",
         blocks: &[
-            GuideBlock::Heading("Smart Text Search (Match Case & Whole Word)"),
+            GuideBlock::Heading("Smart Text Search (PDF, EPUB, Markdown & LaTeX)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Press Ctrl+F (Cmd+F on Mac) or click Edit -> Find Text in PDF... to open the search bar at the top right.",
+                text: "Press Ctrl+F (Cmd+F on Mac), click Edit -> Find in the document..., or click the Find magnifying-glass icon on the toolbar (or EPUB bottom bar) to open the search bar at the top right.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -524,7 +571,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Click the ▲ / ▼ arrows (or press F3 for next match and Shift+F3 for previous match) to jump cleanly through every occurrence.",
+                text: "Press Enter repeatedly (or click the ▲ / ▼ arrows / press F3) to jump cleanly through every match — the Find bar stays open until you click × (and fades smoothly to half transparency when you click the document, remaining ready for one-click controls).",
             },
             GuideBlock::Heading("Comparing Two PDF Versions Side-by-Side"),
             GuideBlock::Step {

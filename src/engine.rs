@@ -1133,29 +1133,57 @@ impl PdfEngine {
     }
 
     /// Detects `(skip_pages, roman_end)` through PDFium from the already-open document without
-    /// re-parsing the file with `lopdf`.
+    /// re-parsing the file with `lopdf` or eagerly loading unviewed pages when `/PageLabels` is absent.
     pub fn read_page_labels_skip_and_roman_from_doc(doc: &PdfDocument) -> (usize, usize) {
         let total = doc.pages().len();
         if total == 0 {
             return (0, 0);
         }
-        let mut skip: u16 = 0;
-        while skip < total {
-            let Ok(page) = doc.pages().get(skip) else { break };
-            let lbl = page.label().unwrap_or("").trim();
-            if !lbl.is_empty() {
-                break;
-            }
-            skip += 1;
-        }
-        if skip == total {
+        let Ok(page0) = doc.pages().get(0) else {
             return (0, 0);
+        };
+        let Some(lbl0_raw) = page0.label() else {
+            // No `/PageLabels` entry on page 0 -> standard 1..N numbering; do not touch later pages.
+            return (0, 0);
+        };
+        let mut cur_lbl = lbl0_raw.trim().to_string();
+        drop(page0);
+
+        let mut skip: u16 = 0;
+        if cur_lbl.is_empty() {
+            skip = 1;
+            while skip < total {
+                let Ok(page) = doc.pages().get(skip) else {
+                    return (0, 0);
+                };
+                match page.label() {
+                    Some(l) if l.trim().is_empty() => {
+                        skip += 1;
+                    }
+                    Some(l) => {
+                        cur_lbl = l.trim().to_string();
+                        break;
+                    }
+                    None => return (0, 0),
+                }
+            }
+            if skip == total {
+                return (0, 0);
+            }
         }
+
         let mut roman: u16 = 0;
         while skip + roman < total {
-            let Ok(page) = doc.pages().get(skip + roman) else { break };
             let expected = Self::to_roman(roman + 1);
-            if page.label().map(str::trim) != Some(expected.as_str()) {
+            let matched = if roman == 0 {
+                cur_lbl == expected
+            } else {
+                let Ok(page) = doc.pages().get(skip + roman) else {
+                    break;
+                };
+                page.label().map(str::trim) == Some(expected.as_str())
+            };
+            if !matched {
                 break;
             }
             roman += 1;
