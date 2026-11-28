@@ -13,7 +13,7 @@ winit = "0.30"
 softbuffer = "0.4"
 rfd = "0.15"
 lopdf = "0.34"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 ab_glyph = "0.2"
 ttf-parser = "0.25"
 flate2 = "1"

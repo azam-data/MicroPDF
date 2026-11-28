@@ -1400,6 +1400,10 @@ pub enum UiIcon {
     DocMarkdown,
     #[allow(dead_code)]
     DocLatex,
+    #[allow(dead_code)]
+    DocWord,
+    #[allow(dead_code)]
+    DocComic,
 }
 
 /// Draws `icon` inside the square `(x, y, size, size)` with stroke scaled proportionally.
@@ -1845,6 +1849,41 @@ pub fn draw_icon(
             line(buffer, 0.54, 0.50, 0.32, 0.70);
             line(buffer, 0.32, 0.70, 0.68, 0.70);
         }
+        UiIcon::DocWord => {
+            // Rounded Word badge + 'W'
+            stroke_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.06).round() as i32,
+                y + (s * 0.12).round() as i32,
+                (s * 0.88).round().max(4.0) as u32,
+                (s * 0.76).round().max(4.0) as u32,
+                (s * 0.18).max(1.5),
+                color,
+            );
+            line(buffer, 0.21, 0.32, 0.32, 0.68);
+            line(buffer, 0.32, 0.68, 0.50, 0.42);
+            line(buffer, 0.50, 0.42, 0.68, 0.68);
+            line(buffer, 0.68, 0.68, 0.79, 0.32);
+        }
+        UiIcon::DocComic => {
+            // Comic multi-panel grid badge
+            stroke_rounded_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + (s * 0.06).round() as i32,
+                y + (s * 0.12).round() as i32,
+                (s * 0.88).round().max(4.0) as u32,
+                (s * 0.76).round().max(4.0) as u32,
+                (s * 0.18).max(1.5),
+                color,
+            );
+            line(buffer, 0.08, 0.48, 0.92, 0.48);
+            line(buffer, 0.45, 0.14, 0.45, 0.48);
+            line(buffer, 0.62, 0.48, 0.62, 0.86);
+        }
     }
 }
 
@@ -1853,6 +1892,8 @@ pub fn draw_icon(
 /// - **EPUB**: warm amber/brown open-book icon
 /// - **Markdown**: indigo/blue `M↓` badge
 /// - **LaTeX**: emerald/teal `Σ` math-doc badge
+/// - **Word**: azure blue `W` document badge
+/// - **Comic**: vivid rose multi-panel comic badge
 #[allow(clippy::too_many_arguments)]
 pub fn draw_doc_type_icon(
     buffer: &mut [u32],
@@ -1965,6 +2006,35 @@ pub fn draw_doc_type_icon(
             line(buffer, 0.31, 0.70, 0.69, 0.70, fg);
             line(buffer, 0.69, 0.30, 0.69, 0.37, fg);
             line(buffer, 0.69, 0.70, 0.69, 0.63, fg);
+        }
+        super::theme::DocKind::Word => {
+            let bg = if dark_ui { 0x000E_3A56 } else { 0x00E0_F2FE };
+            let fg = if dark_ui { 0x0038_BDF8 } else { 0x0003_69A1 };
+            let bx = x + (s * 0.05).round() as i32;
+            let by = y + (s * 0.11).round() as i32;
+            let bw = (s * 0.90).round().max(4.0) as u32;
+            let bh = (s * 0.78).round().max(4.0) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, fg);
+            // Crisp 'W' Word document emblem
+            line(buffer, 0.20, 0.31, 0.31, 0.69, fg);
+            line(buffer, 0.31, 0.69, 0.50, 0.42, fg);
+            line(buffer, 0.50, 0.42, 0.69, 0.69, fg);
+            line(buffer, 0.69, 0.69, 0.80, 0.31, fg);
+        }
+        super::theme::DocKind::Comic => {
+            let bg = if dark_ui { 0x004A_1725 } else { 0x00FF_E4E6 };
+            let fg = if dark_ui { 0x00FB_7185 } else { 0x00E1_1D48 };
+            let bx = x + (s * 0.05).round() as i32;
+            let by = y + (s * 0.11).round() as i32;
+            let bw = (s * 0.90).round().max(4.0) as u32;
+            let bh = (s * 0.78).round().max(4.0) as u32;
+            fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, fg);
+            // Staggered comic-panel grid gutters
+            line(buffer, 0.08, 0.48, 0.92, 0.48, fg);
+            line(buffer, 0.45, 0.14, 0.45, 0.48, fg);
+            line(buffer, 0.62, 0.48, 0.62, 0.86, fg);
         }
     }
 }

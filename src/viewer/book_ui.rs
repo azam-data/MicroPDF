@@ -3176,4 +3176,302 @@ impl<'a> PdfViewerApp<'a> {
             None
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Distinct Word (.docx): Executive Document Reader Navigation Pane
+    // -----------------------------------------------------------------------
+
+    pub(super) fn is_distinct_word_mode(&self) -> bool {
+        self.ui_skin == UiSkin::Distinct && self.active_doc_kind() == DocKind::Word
+    }
+
+    fn distinct_word_metrics(s: f32) -> (u32, u32, u32, u32, i32) {
+        let hdr_h = (34.0 * s).round().max(26.0) as u32;
+        let card_h = (82.0 * s).round().max(64.0) as u32;
+        let sec_h = (22.0 * s).round().max(18.0) as u32;
+        let row_h = (28.0 * s).round().max(22.0) as u32;
+        let pad = (10.0 * s).round() as i32;
+        (hdr_h, card_h, sec_h, row_h, pad)
+    }
+
+    pub(super) fn draw_distinct_word_sidebar(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        scale_factor: f64,
+    ) {
+        let theme = self.ui_theme();
+        let s = scale_factor as f32;
+        let top_y = top_bars_h as i32;
+        let total_h = buf_h.saturating_sub(top_bars_h);
+        if total_h == 0 || sidebar_w < 32 {
+            return;
+        }
+        let (hdr_h, card_h, sec_h, row_h, pad) = Self::distinct_word_metrics(s);
+
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w, total_h, theme.sidebar_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, sidebar_w.saturating_sub(1) as i32, top_y, 1, total_h, theme.divider);
+
+        // Header strip
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w.saturating_sub(1), hdr_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y + hdr_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+
+        let title_sz = (12.0 * s).clamp(10.0, 20.0);
+        let badge_sz = (10.0 * s).clamp(8.5, 16.0);
+        let badge_txt = format!("{} H", self.bookmarks.len());
+        let bw = (measure_text(&badge_txt, badge_sz, true).ceil() as u32 + (12.0 * s).round() as u32)
+            .max((30.0 * s).round() as u32);
+        let bh = (18.0 * s).round().clamp(14.0, (hdr_h as f32 - 6.0).max(14.0)) as u32;
+        let bx = (sidebar_w as i32 - pad - bw as i32).max(pad);
+        let by = top_y + ((hdr_h.saturating_sub(bh)) / 2) as i32;
+        fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, (bh as f32) * 0.5, theme.accent_soft_bg);
+        let btw = measure_text(&badge_txt, badge_sz, true);
+        draw_text_vcenter(
+            buffer,
+            buf_w,
+            buf_h,
+            bx + ((bw as f32 - btw) * 0.5).round() as i32,
+            by,
+            bh,
+            bx + bw as i32 - 2,
+            &badge_txt,
+            badge_sz,
+            theme.accent_soft_fg,
+            true,
+        );
+        draw_text_vcenter(
+            buffer,
+            buf_w,
+            buf_h,
+            pad,
+            top_y,
+            hdr_h,
+            (bx - 6).max(pad + 16),
+            "Navigation",
+            title_sz,
+            theme.text_primary,
+            true,
+        );
+
+        // Document Info Card
+        let card_x = (8.0 * s).round() as i32;
+        let card_y = top_y + hdr_h as i32 + (8.0 * s).round() as i32;
+        let card_w = sidebar_w.saturating_sub((17.0 * s).round() as u32);
+        let card_rad = (7.0 * s).clamp(4.0, 10.0);
+        fill_rounded_rect(buffer, buf_w, buf_h, card_x, card_y, card_w, card_h, card_rad, theme.surface_bg);
+        stroke_rounded_rect(buffer, buf_w, buf_h, card_x, card_y, card_w, card_h, card_rad, theme.border_subtle);
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            card_x + 1,
+            card_y + (8.0 * s).round() as i32,
+            (3.0 * s).round().max(2.0) as u32,
+            card_h.saturating_sub((16.0 * s).round() as u32),
+            theme.accent,
+        );
+
+        let tx = card_x + (12.0 * s).round() as i32;
+        let max_tx = card_x + card_w as i32 - (8.0 * s).round() as i32;
+        let doc_title = self
+            .markdown_doc
+            .as_ref()
+            .map(|d| d.title.as_str())
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or("Word Document");
+        let author_line = self
+            .markdown_doc
+            .as_ref()
+            .and_then(|d| d.book_meta.as_ref())
+            .and_then(|m| m.author.as_deref())
+            .map(|a| format!("By {a}"))
+            .unwrap_or_else(|| "Word Document (.docx)".to_string());
+        let words = self.md_layout.as_ref().map(|c| c.word_count).unwrap_or(0);
+        let mins = (words / 230).max(1);
+        let stats_line = if words > 0 {
+            format!("{words} words · ~{mins} min read")
+        } else {
+            "Ready to read".to_string()
+        };
+
+        let card_title_sz = (12.0 * s).clamp(10.0, 19.0);
+        let card_sub_sz = (10.5 * s).clamp(9.0, 17.0);
+        draw_text_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            tx,
+            card_y + (11.0 * s).round() as i32,
+            max_tx,
+            doc_title,
+            card_title_sz,
+            theme.text_primary,
+            true,
+        );
+        draw_text_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            tx,
+            card_y + (34.0 * s).round() as i32,
+            max_tx,
+            &author_line,
+            card_sub_sz,
+            theme.text_secondary,
+            false,
+        );
+        draw_text_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            tx,
+            card_y + (56.0 * s).round() as i32,
+            max_tx,
+            &stats_line,
+            card_sub_sz,
+            theme.accent_soft_fg,
+            true,
+        );
+
+        // Section label
+        let sec_y = card_y + card_h as i32 + (8.0 * s).round() as i32;
+        let sec_sz = (10.0 * s).clamp(8.5, 16.0);
+        draw_text_vcenter(
+            buffer,
+            buf_w,
+            buf_h,
+            pad,
+            sec_y,
+            sec_h,
+            sidebar_w as i32 - pad,
+            "HEADINGS",
+            sec_sz,
+            theme.text_muted,
+            true,
+        );
+
+        let list_y = sec_y + sec_h as i32 + (2.0 * s).round() as i32;
+        if self.bookmarks.is_empty() {
+            let hint_sz = (11.0 * s).clamp(9.0, 18.0);
+            draw_text_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                pad,
+                list_y + (10.0 * s).round() as i32,
+                sidebar_w as i32 - pad,
+                "No headings in document",
+                hint_sz,
+                theme.text_muted,
+                false,
+            );
+            return;
+        }
+
+        let cur_blk = self.epub_book_current_first_block();
+        let active_idx = cur_blk
+            .and_then(|blk| {
+                self.bookmarks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, bm)| bm.page_index <= blk)
+                    .max_by_key(|(_, bm)| bm.page_index)
+                    .map(|(i, _)| i)
+            })
+            .or(self.selected_bookmark);
+
+        let text_sz = (11.5 * s).clamp(9.5, 20.0);
+        let tag_sz = (9.5 * s).clamp(8.0, 16.0);
+        let rad = (5.0 * s).clamp(3.0, 8.0);
+        let max_rows = ((buf_h as i32 - list_y).max(0) as u32 / row_h.max(1)) as usize;
+        let start = self.bookmark_scroll_y.min(self.bookmarks.len().saturating_sub(1));
+
+        for (vis_i, bm_idx) in (start..self.bookmarks.len()).take(max_rows).enumerate() {
+            let bm = &self.bookmarks[bm_idx];
+            let ry = list_y + (vis_i as u32 * row_h) as i32;
+            let rx = (6.0 * s).round() as i32;
+            let rw = sidebar_w.saturating_sub((14.0 * s).round() as u32);
+            let rh = row_h.saturating_sub((3.0 * s).round().max(2.0) as u32);
+            let is_active = active_idx == Some(bm_idx);
+            let is_hov = self.hovered_widget == Some(UiHit::SidebarRow(bm_idx));
+
+            if is_active {
+                fill_rounded_rect(buffer, buf_w, buf_h, rx, ry + 1, rw, rh, rad, theme.active_row_bg);
+                fill_rect_clipped(buffer, buf_w, buf_h, rx + 1, ry + 4, (3.0 * s).round().max(2.0) as u32, rh.saturating_sub(6), theme.accent);
+            } else if is_hov {
+                fill_rounded_rect(buffer, buf_w, buf_h, rx, ry + 1, rw, rh, rad, theme.hover_bg);
+            }
+
+            let indent = ((bm.level.saturating_sub(1).min(3) as f32) * 11.0 * s).round() as i32;
+            let tag = match bm.level {
+                0 => "H1",
+                1 => "H2",
+                2 => "H3",
+                _ => "•",
+            };
+            let tx0 = rx + (8.0 * s).round() as i32 + indent;
+            let tag_w = measure_text(tag, tag_sz, true).ceil() as i32 + (5.0 * s).round() as i32;
+            let tag_col = if is_active { theme.accent_soft_fg } else { theme.text_muted };
+            draw_text_vcenter(buffer, buf_w, buf_h, tx0, ry + 1, rh, rx + rw as i32 - 4, tag, tag_sz, tag_col, true);
+
+            let lbl_x = tx0 + tag_w;
+            let lbl_max = rx + rw as i32 - (6.0 * s).round() as i32;
+            if lbl_x < lbl_max {
+                let title_col = if is_active { theme.text_primary } else { theme.text_secondary };
+                draw_text_vcenter(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    lbl_x,
+                    ry + 1,
+                    rh,
+                    lbl_max,
+                    &bm.title,
+                    text_sz,
+                    title_col,
+                    is_active || bm.level == 0,
+                );
+            }
+        }
+    }
+
+    pub(super) fn hit_test_distinct_word_sidebar(
+        &self,
+        mx: f64,
+        my: f64,
+        sidebar_w: u32,
+        top_bars_h: u32,
+        scale_factor: f64,
+    ) -> Option<SidebarHit> {
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < 0 || ix >= sidebar_w as i32 {
+            return None;
+        }
+        let s = scale_factor as f32;
+        let (hdr_h, card_h, sec_h, row_h, _) = Self::distinct_word_metrics(s);
+        let list_y = top_bars_h as i32
+            + hdr_h as i32
+            + (8.0 * s).round() as i32
+            + card_h as i32
+            + (8.0 * s).round() as i32
+            + sec_h as i32
+            + (2.0 * s).round() as i32;
+        if iy < list_y || self.bookmarks.is_empty() {
+            return None;
+        }
+        let vis_i = ((iy - list_y) as u32 / row_h.max(1)) as usize;
+        let idx = self.bookmark_scroll_y + vis_i;
+        if idx < self.bookmarks.len() {
+            Some(SidebarHit::BookmarkRow {
+                index: idx,
+                on_delete: false,
+            })
+        } else {
+            None
+        }
+    }
 }

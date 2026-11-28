@@ -41,12 +41,14 @@ impl<'a> PdfViewerApp<'a> {
             slot.markdown_doc = self.markdown_doc.take();
             slot.md_source = self.md_source.take();
             slot.md_editor_mode = self.md_editor_mode;
+            slot.comic_doc = self.comic_doc.take();
             self.md_editor = None;
             self.epub_cover_thumb = None;
             self.epub_word_rects.clear();
             self.epub_word_rects.shrink_to_fit();
             self.epub_selection_drag = None;
             self.epub_selection_pill_rect = None;
+            self.comic_scrubber_drag = false;
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
@@ -131,6 +133,9 @@ impl<'a> PdfViewerApp<'a> {
             self.markdown_doc = slot.markdown_doc.take();
             self.md_source = slot.md_source.take();
             self.md_editor_mode = slot.md_editor_mode;
+            self.comic_doc = slot.comic_doc.take();
+            self.comic_scrubber_drag = false;
+            self.comic_sidebar_scroll = 0;
             self.md_editor = None;
             self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
             self.md_layout = None;
@@ -215,6 +220,14 @@ impl<'a> PdfViewerApp<'a> {
         super::theme::DocKind::from_path(path) == super::theme::DocKind::Epub
     }
 
+    pub(super) fn is_word_path(path: &std::path::Path) -> bool {
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Word
+    }
+
+    pub(super) fn is_comic_path(path: &std::path::Path) -> bool {
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Comic
+    }
+
     pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
         super::theme::DocKind::from_path(path).is_reflowable()
     }
@@ -266,7 +279,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_active_markdown(&mut self) {
-        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() || Self::is_epub_path(&self.file_path) {
+        if !self.is_markdown_tab()
+            || self.file_path.as_os_str().is_empty()
+            || Self::is_epub_path(&self.file_path)
+            || Self::is_word_path(&self.file_path)
+        {
             return;
         }
         let text = if let Some(ref ed) = self.md_editor {
@@ -310,6 +327,7 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("Document");
         let is_epub = Self::is_epub_path(&self.file_path);
+        let is_word = Self::is_word_path(&self.file_path);
         let is_tex = Self::is_latex_path(&self.file_path);
 
         let (raw_opt, parsed) = if is_epub {
@@ -317,6 +335,18 @@ impl<'a> PdfViewerApp<'a> {
                 return false;
             };
             match crate::epub::parse_epub_bytes(&bytes, fallback) {
+                Ok(doc) => (None, doc),
+                Err(e) => {
+                    self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                    self.request_redraw();
+                    return false;
+                }
+            }
+        } else if is_word {
+            let Ok(bytes) = std::fs::read(&self.file_path) else {
+                return false;
+            };
+            match crate::docx_reader::parse_docx_bytes(&bytes, fallback) {
                 Ok(doc) => (None, doc),
                 Err(e) => {
                     self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
@@ -363,6 +393,8 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.status_notice = Some(if is_epub {
             "Reloaded EPUB document".to_string()
+        } else if is_word {
+            "Reloaded Word document".to_string()
         } else if is_tex {
             "Reloaded LaTeX document".to_string()
         } else {
@@ -379,11 +411,16 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("Document");
         let is_epub = Self::is_epub_path(&path);
+        let is_word = Self::is_word_path(&path);
         let is_tex = Self::is_latex_path(&path);
 
         let (raw_opt, parsed) = if is_epub {
             let bytes = std::fs::read(&path)?;
             let doc = crate::epub::parse_epub_bytes(&bytes, fallback)?;
+            (None, doc)
+        } else if is_word {
+            let bytes = std::fs::read(&path)?;
+            let doc = crate::docx_reader::parse_docx_bytes(&bytes, fallback)?;
             (None, doc)
         } else {
             let raw = std::fs::read_to_string(&path)?;
@@ -412,6 +449,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
+        self.comic_doc = None;
 
         let restored = self.lookup_last_position(&path);
         let restored_zoom = restored.map(|(_, z)| z.clamp(0.6, 3.0)).unwrap_or(1.0);
@@ -456,7 +494,7 @@ impl<'a> PdfViewerApp<'a> {
         self.bookmarks = loaded_bookmarks.clone();
         self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
         self.bookmark_scroll_y = 0;
-        let initial_mode = if self.ui_skin == UiSkin::Distinct && !is_epub {
+        let initial_mode = if self.ui_skin == UiSkin::Distinct && !is_epub && !is_word {
             super::text_editor::MdEditorMode::Split
         } else {
             super::text_editor::MdEditorMode::Preview
@@ -501,6 +539,7 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: initial_mode,
+            comic_doc: None,
         };
         if new_tab || self.tabs.is_empty() {
             self.tabs.push(slot);
@@ -515,6 +554,173 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    pub(super) fn reload_active_comic(&mut self) -> bool {
+        if !self.is_comic_tab() || self.file_path.as_os_str().is_empty() {
+            return false;
+        }
+        let fallback = self
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Comic");
+        let archive = match crate::comic::ComicArchive::open(&self.file_path) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                self.request_redraw();
+                return false;
+            }
+        };
+        let count = archive.page_count();
+        self.invalidate_page_caches();
+        self.comic_doc = Some(archive);
+        if count > 0 {
+            let max_idx = count.min(u16::MAX as usize).saturating_sub(1) as u16;
+            self.current_page_index = self.current_page_index.min(max_idx);
+        } else {
+            self.current_page_index = 0;
+        }
+        let mtime = Self::read_file_mtime(&self.file_path);
+        self.last_file_mtime = mtime;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].last_file_mtime = mtime;
+            self.tabs[self.active_tab].current_page_index = self.current_page_index;
+        }
+        self.status_notice = Some("Reloaded Comic archive".to_string());
+        self.update_title_bar();
+        self.request_redraw();
+        true
+    }
+
+    fn load_comic_document(&mut self, path: PathBuf, new_tab: bool) -> Result<()> {
+        let archive = crate::comic::ComicArchive::open(&path)?;
+        let page_count = archive.page_count();
+        let file_mtime = Self::read_file_mtime(&path);
+
+        if new_tab && !self.tabs.is_empty() {
+            self.sync_active_tab_to_slot();
+        }
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+        self.doc = None;
+        self.markdown_doc = None;
+        self.md_source = None;
+        self.md_editor = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
+
+        let restored = self.lookup_last_position(&path);
+        let (restored_page, restored_zoom) = restored
+            .map(|(p, z)| {
+                let max_p = page_count.min(u16::MAX as usize).saturating_sub(1) as u16;
+                (
+                    if page_count > 0 { p.min(max_p) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
+
+        // Respect ComicInfo.xml Manga RTL flag automatically when opening a file fresh
+        if restored.is_none() {
+            if let Some(ref info) = archive.info {
+                if info.manga_rtl {
+                    self.comic_prefs.rtl_manga = true;
+                }
+            }
+        }
+
+        self.file_path = path.clone();
+        self.current_page_index = restored_page;
+        self.view_mode = ViewMode::FitPage;
+        self.last_page_view_mode = ViewMode::FitPage;
+        self.zoom_level = restored_zoom;
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
+        self.deskew_bar = None;
+        self.roman_end = 0;
+        self.skip_pages = 0;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
+        self.redacted = false;
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = file_mtime;
+        self.flatten_confirm_at = None;
+        self.input_mode = InputMode::Normal;
+        self.drag_start = None;
+        self.grid_drag_page = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
+        self.grid_scroll_y = 0.0;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.incremental_search = None;
+        self.bookmarks.clear();
+        self.selected_bookmark = None;
+        self.bookmark_scroll_y = 0;
+        self.comic_scrubber_drag = false;
+        self.comic_sidebar_scroll = 0;
+        self.comic_doc = Some(archive);
+
+        self.record_recent_file(&path);
+
+        let slot = DocumentTab {
+            doc: None,
+            file_path: path,
+            current_page_index: restored_page,
+            view_mode: ViewMode::FitPage,
+            last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: self.scroll_mode,
+            zoom_level: restored_zoom,
+            pan_x: 0.0,
+            scroll_y: 0.0,
+            scroll_x: 0.0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
+            roman_end: 0,
+            skip_pages: 0,
+            bookmarks: Vec::new(),
+            selected_bookmark: None,
+            bookmark_scroll_y: 0,
+            grid_scroll_y: 0.0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
+            redacted: false,
+            has_unsaved_edits: false,
+            last_file_mtime: file_mtime,
+            markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
+        };
+        if new_tab || self.tabs.is_empty() {
+            self.tabs.push(slot);
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab] = slot;
+        }
+
+        self.sync_epub_tab_resources();
+        self.ensure_active_tab_scrolled_into_view();
+        self.update_title_bar();
+        self.request_redraw();
+        Ok(())
+    }
+
     /// Loads `path` into the current tab using an optional `password` (never stored after loading).
     pub(super) fn load_document_with_password(
         &mut self,
@@ -523,6 +729,9 @@ impl<'a> PdfViewerApp<'a> {
     ) -> Result<()> {
         if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, false);
+        }
+        if Self::is_comic_path(&path) {
+            return self.load_comic_document(path, false);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
         let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
@@ -535,6 +744,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
 
@@ -626,6 +836,7 @@ impl<'a> PdfViewerApp<'a> {
                 markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
             });
             self.active_tab = 0;
             self.tab_scroll_offset = 0;
@@ -698,6 +909,9 @@ impl<'a> PdfViewerApp<'a> {
         if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, true);
         }
+        if Self::is_comic_path(&path) {
+            return self.load_comic_document(path, true);
+        }
         if self.tabs.is_empty() {
             return self.load_document_with_password(path, password);
         }
@@ -761,11 +975,13 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
         self.file_path = path;
@@ -853,11 +1069,13 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
         self.file_path = virtual_path;
@@ -1003,10 +1221,12 @@ impl<'a> PdfViewerApp<'a> {
         self.active_note_popover = None;
         self.dragging_annotation = None;
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_source = None;
         self.md_editor = None;
         self.md_layout = None;
         self.md_active_hits.clear();
+        self.invalidate_page_caches();
         self.sync_epub_tab_resources();
         self.status_notice = Some(notice);
         self.update_title_bar();
@@ -1115,7 +1335,7 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Closes all open tabs and returns cleanly to the Welcome Screen.
     pub(super) fn close_all_tabs(&mut self) {
-        if self.tabs.is_empty() && self.doc.is_none() {
+        if self.tabs.is_empty() && !self.has_any_document() {
             self.tab_context_menu = None;
             self.show_tab_list_popover = false;
             return;

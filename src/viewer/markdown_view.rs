@@ -1728,7 +1728,10 @@ impl<'a> PdfViewerApp<'a> {
         self.page_turn_anim = None;
         self.scroll_to_md_heading(m.ast_block_idx);
         // If Markdown/LaTeX editor is visible, also scroll/jump the source editor to the query
-        if self.md_editor_mode != MdEditorMode::Preview && !Self::is_epub_path(&self.file_path) {
+        if self.md_editor_mode != MdEditorMode::Preview
+            && !Self::is_epub_path(&self.file_path)
+            && !Self::is_word_path(&self.file_path)
+        {
             if let Some(ref mut ed) = self.md_editor {
                 let q = self.search_query.clone();
                 if !q.is_empty() {
@@ -1786,6 +1789,7 @@ impl<'a> PdfViewerApp<'a> {
         if self.ui_skin == super::theme::UiSkin::Distinct
             && self.is_markdown_tab()
             && !Self::is_epub_path(&self.file_path)
+            && !Self::is_word_path(&self.file_path)
             && self.md_editor_mode != MdEditorMode::Preview
         {
             super::text_editor::editor_header_height_px(sf)
@@ -1840,6 +1844,7 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn md_split_divider_x(&self, sidebar_w: u32, win_w: u32) -> Option<i32> {
         if !self.is_markdown_tab()
             || Self::is_epub_path(&self.file_path)
+            || Self::is_word_path(&self.file_path)
             || self.md_editor_mode != MdEditorMode::Split
             || self.ui_skin != super::theme::UiSkin::Distinct
         {
@@ -2435,14 +2440,14 @@ impl<'a> PdfViewerApp<'a> {
                 self.save_session_to_ini();
             }
             EditorBarAction::ModeSplit => {
-                if !Self::is_epub_path(&self.file_path) {
+                if !Self::is_epub_path(&self.file_path) && !Self::is_word_path(&self.file_path) {
                     self.md_editor_mode = MdEditorMode::Split;
                     self.ensure_md_editor_initialized();
                     self.md_layout = None;
                 }
             }
             EditorBarAction::ModeEdit => {
-                if !Self::is_epub_path(&self.file_path) {
+                if !Self::is_epub_path(&self.file_path) && !Self::is_word_path(&self.file_path) {
                     self.md_editor_mode = MdEditorMode::Edit;
                     self.ensure_md_editor_initialized();
                 }

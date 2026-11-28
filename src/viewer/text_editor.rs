@@ -2097,12 +2097,20 @@ mod tests {
         // Distinct palettes differ cleanly across DocKind while Classic stays identical
         let classic = UiThemeMode::Light.theme();
         assert_eq!(UiThemeMode::Light.theme_for(UiSkin::Classic, DocKind::Markdown).accent, classic.accent);
-        let d_pdf = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::Pdf);
-        let d_md = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::Markdown);
-        let d_tex = UiThemeMode::Light.theme_for(UiSkin::Distinct, DocKind::LaTeX);
-        assert_ne!(d_pdf.accent, d_md.accent);
-        assert_ne!(d_md.accent, d_tex.accent);
-        assert_ne!(d_pdf.accent, d_tex.accent);
+        assert_eq!(UiThemeMode::Light.theme_for(UiSkin::Classic, DocKind::Word).accent, classic.accent);
+        assert_eq!(UiThemeMode::Light.theme_for(UiSkin::Classic, DocKind::Comic).accent, classic.accent);
+        for mode in [UiThemeMode::Light, UiThemeMode::Dark] {
+            let accents = [
+                mode.theme_for(UiSkin::Distinct, DocKind::Pdf).accent,
+                mode.theme_for(UiSkin::Distinct, DocKind::Markdown).accent,
+                mode.theme_for(UiSkin::Distinct, DocKind::LaTeX).accent,
+                mode.theme_for(UiSkin::Distinct, DocKind::Epub).accent,
+                mode.theme_for(UiSkin::Distinct, DocKind::Word).accent,
+                mode.theme_for(UiSkin::Distinct, DocKind::Comic).accent,
+            ];
+            let unique: std::collections::HashSet<u32> = accents.iter().copied().collect();
+            assert_eq!(unique.len(), 6, "Expected 6 unique Distinct accents for {mode:?}");
+        }
         assert_eq!(crate::viewer::state::PdfViewerApp::clamp_md_split_ratio(0.10), 0.25);
         assert_eq!(crate::viewer::state::PdfViewerApp::clamp_md_split_ratio(0.95), 0.75);
     }

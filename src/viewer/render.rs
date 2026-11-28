@@ -1520,7 +1520,7 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         scale_factor: f64,
     ) -> Option<(i32, i32, u32, u32, i32, u32)> {
-        if (self.doc.is_none() && !self.is_markdown_tab()) || self.is_presentation {
+        if !self.has_any_document() || self.is_presentation {
             return None;
         }
         let s = scale_factor as f32;
@@ -1530,6 +1530,25 @@ impl<'a> PdfViewerApp<'a> {
         let content_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
         if content_h < 40 {
             return None;
+        }
+        if self.is_comic_tab() {
+            let canvas_w = buf_w.saturating_sub(self.sidebar_width_px(scale_factor));
+            let max_scroll = self.comic_max_scroll_y(canvas_w, content_h, scale_factor);
+            if max_scroll <= 1.0 {
+                return None;
+            }
+            let track_x = buf_w as i32 - track_w as i32 - pad_r;
+            let track_y = top_bars_h as i32 + pad_v;
+            let track_h = content_h.saturating_sub((pad_v * 2) as u32);
+            if track_h < 24 {
+                return None;
+            }
+            let total_h = content_h as f32 + max_scroll;
+            let visible_ratio = (content_h as f32 / total_h).clamp(0.08, 0.92);
+            let fraction = (self.scroll_y / max_scroll).clamp(0.0, 1.0);
+            let thumb_h = ((track_h as f32 * visible_ratio).round() as u32).clamp(24, track_h);
+            let thumb_y = track_y + ((track_h.saturating_sub(thumb_h)) as f32 * fraction).round() as i32;
+            return Some((track_x, track_y, track_w, track_h, thumb_y, thumb_h));
         }
         if self.is_markdown_tab() {
             if self.md_editor_mode == super::text_editor::MdEditorMode::Edit {
@@ -1766,7 +1785,7 @@ impl<'a> PdfViewerApp<'a> {
         self.request_redraw();
     }
 
-    fn draw_page_frame_chrome(
+    pub(super) fn draw_page_frame_chrome(
         &self,
         buffer: &mut [u32],
         buf_w: u32,
@@ -1851,7 +1870,7 @@ impl<'a> PdfViewerApp<'a> {
             .status_bar_height_px(scale_factor)
             .min(height.saturating_sub(top_bars_h + 16));
 
-        if self.compare_mode.is_none() && !self.is_markdown_tab() {
+        if self.compare_mode.is_none() && !self.is_markdown_tab() && !self.is_comic_tab() {
             if self.view_mode.is_page_view() {
                 self.render_page_view_or_notice(width, height, sidebar_w, top_bars_h, status_bar_h);
                 self.ensure_deskew_preview_pixels();
@@ -1879,6 +1898,10 @@ impl<'a> PdfViewerApp<'a> {
 
         if self.is_markdown_tab() {
             self.draw_markdown_view(
+                buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
+            );
+        } else if self.is_comic_tab() {
+            self.draw_comic_view(
                 buffer, width, height, sidebar_w, top_bars_h, status_bar_h, scale_factor,
             );
         } else if self.doc.is_none() {
@@ -2212,6 +2235,24 @@ impl<'a> PdfViewerApp<'a> {
         if self.show_bookmarks && sidebar_w > 0 {
             if self.is_distinct_epub_mode() {
                 self.draw_distinct_epub_sidebar(
+                    buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
+                    scale_factor,
+                );
+            } else if self.is_distinct_comic_mode() {
+                self.draw_distinct_comic_sidebar(
+                    buffer,
+                    width,
+                    height.saturating_sub(status_bar_h),
+                    sidebar_w,
+                    top_bars_h,
+                    scale_factor,
+                );
+            } else if self.is_distinct_word_mode() {
+                self.draw_distinct_word_sidebar(
                     buffer,
                     width,
                     height.saturating_sub(status_bar_h),
@@ -2569,6 +2610,15 @@ impl<'a> PdfViewerApp<'a> {
                     return;
                 };
                 (act.tooltip(), rect, false)
+            }
+            Some(UiHit::ComicBottom(cb)) => {
+                if matches!(cb, ComicBottomHit::Scrubber(_)) {
+                    return;
+                }
+                let Some(rect) = self.comic_bottom_widget_rect(cb, buf_w, buf_h, status_bar_h, sf) else {
+                    return;
+                };
+                (cb.tooltip(), rect, false)
             }
             _ => return,
         };

@@ -71,6 +71,7 @@ Whenever you modify any file below, update the corresponding chapter in `src/vie
 | Word/Excel/Markdown/LaTeX/Image Export, Stamps, Watermarks (`export.rs`, `image_tools_modal.rs`) | **Chapter 8** (*Converting & Exporting*) | `README.md` |
 | Redaction, Document Properties & Privacy Scrubber, Flatten/Unlock, Optimize (`engine.rs`, `doc_props_modal.rs`, `optimize.rs`) | **Chapter 9** (*Privacy & Shrinking PDF Size*) | `README.md` |
 | Search (`Aa`/`W`/`▲▼`), Side-by-Side Compare + Visual Diff, Ruler Measure Tool (`overlays.rs`, `compare_mode.rs`, `measure.rs`) | **Chapter 10** (*Compare, Measure & Quick Troubleshooting*) | `overlays.rs` Shortcuts |
+| Word `.docx` Reader & Navigation Pane, Comic `.cbz` Studio, Thumbnails, RTL Manga, Spreads & WebP (`docx_reader.rs`, `comic.rs`, `comic_view.rs`, `book_ui.rs`) | **Chapter 1** (*Welcome & Opening Files*) & **Chapter 11** (*Word & Comic Readers*) | `overlays.rs` Shortcuts & `README.md` |
 | Any top menu rename (`MenuCategory::items()` in `src/viewer/state.rs`) | Search `user_guide.rs` for the old menu label and update every match | `docs/USER_GUIDE_FRAMEWORK.md` & `README.md` |
 
 ---

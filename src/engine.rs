@@ -5395,6 +5395,7 @@ pub struct DeskewMatrix {
 
 impl DeskewMatrix {
     /// Applies this affine matrix to a PDF-space point `(x, y)`.
+    #[allow(dead_code)]
     pub fn apply_point(self, x: f32, y: f32) -> (f32, f32) {
         (
             self.a * x + self.c * y + self.e,
@@ -5405,6 +5406,7 @@ impl DeskewMatrix {
 
 /// Computes the centered PDFium 2D affine matrix for `Translate(cx, cy) -> Rotate(cw_deg) -> Translate(-cx, -cy)`
 /// around `(page_w / 2, page_h / 2)` in PDF Y-up coordinates (`positive = CW`, `negative = CCW`).
+#[allow(dead_code)]
 pub fn compute_deskew_affine_matrix(page_w: f32, page_h: f32, cw_deg: f32) -> DeskewMatrix {
     compute_deskew_affine_matrix_around(page_w * 0.5, page_h * 0.5, cw_deg)
 }

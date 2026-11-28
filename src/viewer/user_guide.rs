@@ -34,15 +34,15 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
         number: 1,
         short_title: "1. Welcome & Opening Files",
         title: "Welcome & Opening Files",
-        summary: "How to open a PDF, create a PDF from photos, save safely, and undo mistakes.",
+        summary: "How to open PDFs, Word documents, comics, e-books, or notes, create PDFs from photos, and save safely.",
         blocks: &[
             GuideBlock::Paragraph(
-                "MicroPDF is a fast, private PDF reader and editor. Everything runs directly on your computer — your files are never uploaded to the internet, and nothing is installed into Windows or macOS.",
+                "MicroPDF is a fast, private reader and editor for PDF, Word (.docx), Comic (.cbz), EPUB, Markdown, and LaTeX files. Everything runs directly on your computer — your files are never uploaded to the internet, and nothing is installed into Windows or macOS.",
             ),
-            GuideBlock::Heading("How to Open a PDF, Markdown, LaTeX, or EPUB File (3 Easy Ways)"),
+            GuideBlock::Heading("How to Open a Document, E-Book, or Comic (3 Easy Ways)"),
             GuideBlock::Step {
                 number: 1,
-                text: "Drag and drop any PDF (.pdf), Markdown (.md / .markdown), LaTeX (.tex), or EPUB (.epub) file right onto the MicroPDF window.",
+                text: "Drag and drop any PDF (.pdf), Word (.docx), Comic Book (.cbz), EPUB (.epub), Markdown (.md / .markdown), or LaTeX (.tex) file right onto the MicroPDF window.",
             },
             GuideBlock::Step {
                 number: 2,
@@ -50,7 +50,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Or click File -> Open Documents in Tab (O) at the top-left corner, pick any PDF, Markdown, LaTeX, or EPUB file, and click Open.",
+                text: "Or click File -> Open Documents in Tab (O) at the top-left corner, pick any supported document or comic file, and click Open.",
             },
             GuideBlock::Heading("Organizing Favorites & Protecting Portable Settings"),
             GuideBlock::Step {
@@ -608,6 +608,57 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             ),
         ],
     },
+    // =========================================================================
+    // Chapter 11
+    // =========================================================================
+    GuideChapter {
+        number: 11,
+        short_title: "11. Word & Comic Readers",
+        title: "Reading Word (.docx) & Comic (.cbz) Files",
+        summary: "Open Word documents with a Navigation Pane and read comics or manga with spreads, thumbnails, and WebP images.",
+        blocks: &[
+            GuideBlock::Paragraph(
+                "MicroPDF includes dedicated, clutter-free reading workspaces for both Word (.docx) documents and Comic Book (.cbz) archives — complete with custom themes when Help -> UI Skin: Classic / Distinct is set to Distinct.",
+            ),
+            GuideBlock::Heading("How to Read & Print Word (.docx) Documents"),
+            GuideBlock::Step {
+                number: 1,
+                text: "Click File -> Open Documents in Tab (O) (or drag a .docx file onto the window) to open headings, tables, lists, footnotes, and embedded images without launching another office app.",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Click View -> Toggle Bookmark Sidebar (B) (or the Sidebar icon at the top-left) to browse the Navigation Pane outline and jump straight to any heading.",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Use the bottom Aa button to adjust font size, line spacing, and reading flow, press Ctrl+F to search words, or click Export / Print (Ctrl+P) to save a clean PDF copy.",
+            },
+            GuideBlock::Heading("How to Read Comics & Manga (.cbz with PNG, JPEG & WebP)"),
+            GuideBlock::Step {
+                number: 1,
+                text: "Open any .cbz comic archive via File -> Open Documents in Tab (O) or drag-and-drop. MicroPDF reads only the pages you are viewing so even huge archives stay light on memory.",
+            },
+            GuideBlock::Step {
+                number: 2,
+                text: "Turn pages using the Left/Right arrow keys, Space, Page Up/Down, the clickable left/right edges of the page, or by dragging the page scrubber slider along the bottom bar.",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Press R (or click LTR / RTL on the bottom bar or top toolbar) to switch into Right-to-Left Manga reading order — Left Arrow now advances forward and the scrubber glides right-to-left.",
+            },
+            GuideBlock::Step {
+                number: 4,
+                text: "Press D (or click Single / 2-Page / Strip) to switch between Single Page, 2-Page Spread (with Cover 1st pairing), and continuous Vertical Strip for webtoons.",
+            },
+            GuideBlock::Step {
+                number: 5,
+                text: "Press B to open the Thumbnail Drawer with embedded comic details (series, issue, creator) and page previews, press F / W for Fit Page / Fit Width, Ctrl+Wheel or +/- to zoom (drag to pan when zoomed), G to jump to a page number, and V for eye-care modes.",
+            },
+            GuideBlock::Tip(
+                "Both Word (.docx) and Comic (.cbz) tabs open read-only, so your original files are never altered. MicroPDF remembers the exact comic page you stopped on!",
+            ),
+        ],
+    },
 ];
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -637,7 +688,7 @@ pub(super) enum UserGuideHit {
     InsideModal,
 }
 
-/// Formats all 10 chapters of the built-in User Guide into a clean, printable plain-text manual.
+/// Formats all 11 chapters of the built-in User Guide into a clean, printable plain-text manual.
 pub(super) fn format_full_user_guide_txt() -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("========================================================================\n");
