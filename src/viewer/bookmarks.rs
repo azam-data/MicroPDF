@@ -21,6 +21,13 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) {
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_x = rail_w as i32;
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        if panel_w < 48 {
+            return;
+        }
+        let panel_r = panel_x + panel_w as i32;
         let theme = self.ui_theme();
         let s = scale_factor as f32;
         let row_h = (28.0 * s).round() as u32;
@@ -35,9 +42,9 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            0,
+            panel_x,
             top_y,
-            sidebar_w,
+            panel_w,
             buf_h.saturating_sub(top_bars_h),
             theme.sidebar_bg,
         );
@@ -45,7 +52,7 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            sidebar_w.saturating_sub(1) as i32,
+            panel_r - 1,
             top_y,
             1,
             buf_h.saturating_sub(top_bars_h),
@@ -53,19 +60,19 @@ impl<'a> PdfViewerApp<'a> {
         );
 
         // Header strip
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w.saturating_sub(1), header_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y + header_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w.saturating_sub(1), header_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y + header_h as i32 - 1, panel_w.saturating_sub(1), 1, theme.divider);
 
         let title_sz = (12.0 * s).clamp(10.5, 26.0);
         let body_sz = (11.5 * s).clamp(10.0, 24.0);
         let sub_sz = (10.0 * s).clamp(8.5, 20.0);
-        draw_text(buffer, buf_w, buf_h, pad, top_y + (9.0 * s).round() as i32, "Bookmarks", title_sz, theme.text_primary, true);
+        draw_text(buffer, buf_w, buf_h, panel_x + pad, top_y + (9.0 * s).round() as i32, "Bookmarks", title_sz, theme.text_primary, true);
         let count_lbl = format!("({})", self.bookmarks.len());
         let cw = measure_text(&count_lbl, sub_sz, false).ceil() as i32;
-        draw_text(buffer, buf_w, buf_h, sidebar_w as i32 - pad - cw - 2, top_y + (10.0 * s).round() as i32, &count_lbl, sub_sz, theme.text_muted, false);
+        draw_text(buffer, buf_w, buf_h, panel_r - pad - cw - 2, top_y + (10.0 * s).round() as i32, &count_lbl, sub_sz, theme.text_muted, false);
 
         // Row 1 buttons: `+ Add` | `Import` | `Export` | `Auto`
-        let inner_w = sidebar_w.saturating_sub((pad * 2 + 1) as u32);
+        let inner_w = panel_w.saturating_sub((pad * 2 + 1) as u32);
         let btn_h = (22.0 * s).round() as u32;
         let row1_y = top_y + (32.0 * s).round() as i32;
         let b1_w = (inner_w.saturating_sub((gap * 3) as u32)) / 4;
@@ -76,9 +83,9 @@ impl<'a> PdfViewerApp<'a> {
             ("Auto", UiHit::SidebarAuto, false),
         ];
         for (i, &(lbl, hit, primary)) in row1_btns.iter().enumerate() {
-            let bx = pad + (i as i32) * (b1_w as i32 + gap);
+            let bx = panel_x + pad + (i as i32) * (b1_w as i32 + gap);
             let bw = if i == 3 {
-                (sidebar_w as i32 - pad - 1 - bx).max(20) as u32
+                (panel_r - pad - 1 - bx).max(20) as u32
             } else {
                 b1_w
             };
@@ -106,9 +113,9 @@ impl<'a> PdfViewerApp<'a> {
             ("→ In", UiHit::SidebarIndent),
         ];
         for (i, &(lbl, hit)) in row2_btns.iter().enumerate() {
-            let bx = pad + (i as i32) * (b1_w as i32 + gap);
+            let bx = panel_x + pad + (i as i32) * (b1_w as i32 + gap);
             let bw = if i == 3 {
-                (sidebar_w as i32 - pad - 1 - bx).max(20) as u32
+                (panel_r - pad - 1 - bx).max(20) as u32
             } else {
                 b1_w
             };
@@ -123,9 +130,9 @@ impl<'a> PdfViewerApp<'a> {
 
         if self.bookmarks.is_empty() {
             let empty_y = top_y + header_h as i32 + (18.0 * s).round() as i32;
-            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y, "No bookmarks yet.", body_sz, theme.text_muted, false);
-            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y + (20.0 * s).round() as i32, "Click + Add (A), Import,", sub_sz, theme.text_muted, false);
-            draw_text(buffer, buf_w, buf_h, pad + 2, empty_y + (36.0 * s).round() as i32, "or Auto to detect headings.", sub_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, panel_x + pad + 2, empty_y, "No bookmarks yet.", body_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, panel_x + pad + 2, empty_y + (20.0 * s).round() as i32, "Click + Add (A), Import,", sub_sz, theme.text_muted, false);
+            draw_text(buffer, buf_w, buf_h, panel_x + pad + 2, empty_y + (36.0 * s).round() as i32, "or Auto to detect headings.", sub_sz, theme.text_muted, false);
             return;
         }
 
@@ -152,20 +159,20 @@ impl<'a> PdfViewerApp<'a> {
             );
 
             if is_current_page || is_selected {
-                fill_rounded_rect(buffer, buf_w, buf_h, (4.0 * s).round() as i32, ry + 1, sidebar_w.saturating_sub((9.0 * s).round() as u32), row_h.saturating_sub(2), (5.0 * s).max(3.0), theme.active_row_bg);
+                fill_rounded_rect(buffer, buf_w, buf_h, panel_x + (4.0 * s).round() as i32, ry + 1, panel_w.saturating_sub((9.0 * s).round() as u32), row_h.saturating_sub(2), (5.0 * s).max(3.0), theme.active_row_bg);
             } else if is_hovered {
-                fill_rounded_rect(buffer, buf_w, buf_h, (4.0 * s).round() as i32, ry + 1, sidebar_w.saturating_sub((9.0 * s).round() as u32), row_h.saturating_sub(2), (5.0 * s).max(3.0), theme.hover_bg);
+                fill_rounded_rect(buffer, buf_w, buf_h, panel_x + (4.0 * s).round() as i32, ry + 1, panel_w.saturating_sub((9.0 * s).round() as u32), row_h.saturating_sub(2), (5.0 * s).max(3.0), theme.hover_bg);
             }
 
             if is_current_page {
-                fill_rounded_rect(buffer, buf_w, buf_h, (4.0 * s).round() as i32, ry + (5.0 * s).round() as i32, (3.0 * s).round().max(2.0) as u32, row_h.saturating_sub((10.0 * s).round() as u32), 1.5, theme.accent);
+                fill_rounded_rect(buffer, buf_w, buf_h, panel_x + (4.0 * s).round() as i32, ry + (5.0 * s).round() as i32, (3.0 * s).round().max(2.0) as u32, row_h.saturating_sub((10.0 * s).round() as u32), 1.5, theme.accent);
             }
 
             let indent_px = if bm.level > 0 {
-                fill_rect_clipped(buffer, buf_w, buf_h, (14.0 * s).round() as i32, ry, 1, row_h, theme.divider);
-                (22.0 * s).round() as i32
+                fill_rect_clipped(buffer, buf_w, buf_h, panel_x + (14.0 * s).round() as i32, ry, 1, row_h, theme.divider);
+                panel_x + (22.0 * s).round() as i32
             } else {
-                (12.0 * s).round() as i32
+                panel_x + (12.0 * s).round() as i32
             };
 
             let prefix = if bm.serial.is_empty() {
@@ -179,8 +186,8 @@ impl<'a> PdfViewerApp<'a> {
                 format!("{}", bm.page_index + 1)
             };
             let page_w = measure_text(&page_tag, sub_sz, false).ceil() as i32;
-            let del_x = sidebar_w as i32 - del_w as i32 - (6.0 * s).round() as i32;
-            let right_edge = if is_hovered { del_x - 4 } else { sidebar_w as i32 - (10.0 * s).round() as i32 };
+            let del_x = panel_r - del_w as i32 - (6.0 * s).round() as i32;
+            let right_edge = if is_hovered { del_x - 4 } else { panel_r - (10.0 * s).round() as i32 };
             let page_x = right_edge - page_w;
             let title_budget = (page_x - indent_px - (6.0 * s).round() as i32).max(20) as f32;
             let full_title = format!("{prefix}{}", bm.title);
@@ -224,9 +231,11 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) -> Option<SidebarHit> {
-        let ix = mx.round() as i32;
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        let ix = (mx - rail_w as f64).round() as i32;
         let iy = my.round() as i32;
-        if !self.show_bookmarks || ix < 0 || ix >= sidebar_w as i32 || iy < top_bars_h as i32 {
+        if !self.show_bookmarks || panel_w < 48 || ix < 0 || ix >= panel_w as i32 || iy < top_bars_h as i32 {
             return None;
         }
         let s = scale_factor as f32;
@@ -236,20 +245,20 @@ impl<'a> PdfViewerApp<'a> {
         if rel_y < header_h {
             let pad = (8.0 * s).round() as i32;
             let gap = (4.0 * s).round() as i32;
-            let inner_w = sidebar_w.saturating_sub((pad * 2 + 1) as u32);
+            let inner_w = panel_w.saturating_sub((pad * 2 + 1) as u32);
             let btn_h = (22.0 * s).round() as i32;
             let b1_w = ((inner_w.saturating_sub((gap * 3) as u32)) / 4) as i32;
             let row1_y = (32.0 * s).round() as i32;
             let row2_y = row1_y + btn_h + (6.0 * s).round() as i32;
 
             let hit_col = |x: i32| -> Option<usize> {
-                if x < pad || x >= sidebar_w as i32 - pad {
+                if x < pad || x >= panel_w as i32 - pad {
                     return None;
                 }
                 for i in 0..4 {
                     let bx = pad + (i as i32) * (b1_w + gap);
                     let bw = if i == 3 {
-                        (sidebar_w as i32 - pad - 1 - bx).max(20)
+                        (panel_w as i32 - pad - 1 - bx).max(20)
                     } else {
                         b1_w
                     };
@@ -283,7 +292,7 @@ impl<'a> PdfViewerApp<'a> {
         let vis_row = ((rel_y - header_h) / row_h) as usize;
         let bm_idx = self.bookmark_scroll_y + vis_row;
         if bm_idx < self.bookmarks.len() {
-            let del_x = sidebar_w as i32 - (28.0 * s).round() as i32;
+            let del_x = panel_w as i32 - (28.0 * s).round() as i32;
             let on_delete = ix >= del_x;
             Some(SidebarHit::BookmarkRow {
                 index: bm_idx,

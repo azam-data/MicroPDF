@@ -4128,6 +4128,110 @@ By probing image headers during layout and decoding visible figures into a bound
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn test_format_drawers_scratchpad_and_cbz_curl_polish() {
+        use super::state::PdfViewerApp;
+        use super::theme::{DocKind, UiSkin};
+        use crate::comic::ComicArchive;
+
+        // 1. Multiline scratchpad word-wrapping & authenticated encryption roundtrip
+        let wrapped = PdfViewerApp::wrap_scratchpad_lines(
+            "Line one has several words that wrap cleanly\nSecond paragraph",
+            120.0,
+            12.0,
+        );
+        assert!(wrapped.len() >= 3, "Long line + explicit newline should wrap cleanly");
+        assert_eq!(wrapped.last().map(String::as_str), Some("Second paragraph"));
+
+        let sample_notes = "To read:\n- Chapter 4\n- Review annotations";
+        let enc = crate::config_crypto::encrypt_config(sample_notes);
+        assert!(crate::config_crypto::is_encrypted_config(&enc));
+        let dec = crate::config_crypto::decrypt_config(&enc).expect("decrypt scratchpad");
+        assert_eq!(dec, sample_notes);
+
+        // 2. Comic RTL & LTR spread pairing
+        assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, false), (Some(1), Some(2)));
+        assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, true), (Some(2), Some(1)));
+
+        // 3. Full PdfViewerApp integration (when libpdfium is available)
+        let Ok(engine) = crate::engine::PdfEngine::new() else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("micropdf_polish_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let pdf_path = tmp.join("a.pdf");
+        let md_path = tmp.join("b.md");
+        let docx_path = tmp.join("c.docx");
+        let cbz_path = tmp.join("d.cbz");
+        engine.create_sample_pdf(&pdf_path, 3).expect("create sample pdf");
+        std::fs::write(&md_path, "# Title\n\nBody.\n").unwrap();
+
+        let md_for_docx = crate::markdown::parse_markdown("# Report\n\nWord body.\n", "Report");
+        crate::markdown_docx::export_markdown_to_docx(&md_for_docx, &docx_path).expect("export docx");
+
+        // Build valid 2-page CBZ
+        let mut img_a = image::RgbaImage::new(24, 32);
+        for p in img_a.pixels_mut() {
+            *p = image::Rgba([220, 40, 40, 255]);
+        }
+        let mut png_a = Vec::new();
+        image::DynamicImage::ImageRgba8(img_a)
+            .write_to(&mut std::io::Cursor::new(&mut png_a), image::ImageFormat::Png)
+            .unwrap();
+        let mut zw = crate::zip_mini::ZipWriter::new();
+        zw.add_deflated(
+            "ComicInfo.xml",
+            b"<ComicInfo><Series>CurlTest</Series><Manga>YesAndRightToLeft</Manga></ComicInfo>",
+        );
+        zw.add_stored("01.png", &png_a);
+        zw.add_stored("02.png", &png_a);
+        std::fs::write(&cbz_path, zw.finish()).unwrap();
+        let _ = ComicArchive::open(&cbz_path).expect("valid cbz");
+
+        let mut app = PdfViewerApp::new(&engine, None).expect("init empty app");
+        app.scratchpad_text = sample_notes.to_string();
+        assert_eq!(app.format_rail_width_px(1.0), 0, "Rail hidden when no tabs are open");
+
+        app.open_document_in_new_tab(pdf_path).expect("open pdf");
+        app.open_document_in_new_tab(md_path).expect("open md");
+        app.open_document_in_new_tab(docx_path).expect("open docx");
+        app.open_document_in_new_tab(cbz_path).expect("open cbz");
+
+        let rail = app.format_rail_items();
+        assert_eq!(rail[0], (None, 4));
+        assert!(rail.contains(&(Some(DocKind::Pdf), 1)));
+        assert!(rail.contains(&(Some(DocKind::Word), 1)));
+        assert!(rail.contains(&(Some(DocKind::Comic), 1)));
+        assert!(rail.contains(&(Some(DocKind::Markdown), 1)));
+        assert_eq!(app.format_rail_width_px(1.0), 38);
+
+        // Filter to Word drawer -> only tab 2 shown
+        app.set_tab_format_filter(Some(DocKind::Word));
+        assert_eq!(app.visible_tab_indices(), vec![2]);
+        assert_eq!(app.active_tab, 2);
+
+        // Switch back to All drawer -> all 4 tabs shown
+        app.set_tab_format_filter(None);
+        assert_eq!(app.visible_tab_indices(), vec![0, 1, 2, 3]);
+
+        // Filter to Comic and verify RTL step triggers spread curl snapshot when cached
+        app.ui_skin = UiSkin::Distinct;
+        app.set_tab_format_filter(Some(DocKind::Comic));
+        assert_eq!(app.active_tab, 3);
+        app.comic_prefs.layout_mode = super::state::ComicLayoutMode::SinglePage;
+        app.page_turn_anim_ms = 220;
+        let _ = app.ensure_comic_page_cached(0);
+        app.page_draw_rect = (100, 80, 240, 320);
+        app.second_page_draw_rect = None;
+        app.comic_step_page(1);
+        assert_eq!(app.current_page_index, 1);
+        let anim = app.page_turn_anim.as_ref().expect("CBZ single-page step must trigger spread curl");
+        assert!(anim.prev_spread.is_some());
+        assert_eq!(anim.direction, -1, "RTL Manga next-page visual curl sweeps left-to-right (-1)");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 

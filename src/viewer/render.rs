@@ -2014,48 +2014,34 @@ impl<'a> PdfViewerApp<'a> {
                         let bot_y = (r1.1 + r1.3 as i32).min(bottom_limit as i32);
                         (r1.0, top_y, r1.2, (bot_y - top_y).max(0) as u32)
                     };
-                    if let Some((eased, dir)) = self.page_turn_anim_progress() {
-                        let canvas_x = sidebar_w as i32;
-                        let canvas_y = top_bars_h as i32;
-                        let canvas_w = width.saturating_sub(sidebar_w);
-                        let canvas_h = bottom_limit.saturating_sub(top_bars_h);
-                        let prev_canvas = self.page_turn_anim.as_ref().and_then(|a| a.prev_spread.as_ref());
-                        if let Some((sw, sh, prev_px)) = prev_canvas {
-                            if *sw == canvas_w && *sh == canvas_h && !prev_px.is_empty() {
-                                super::ui_draw::draw_apple_books_page_curl(
-                                    buffer,
-                                    width,
-                                    bottom_limit,
-                                    prev_px,
-                                    canvas_x,
-                                    canvas_y,
-                                    canvas_w,
-                                    canvas_h,
-                                    eased,
-                                    dir,
-                                    theme.canvas_bg,
-                                    s,
-                                );
-                            } else {
-                                super::ui_draw::draw_magazine_page_turn_overlay(
-                                    buffer, width, bottom_limit, spread_x, spread_y, spread_w, spread_h, eased, dir, s,
-                                );
-                            }
-                        } else {
-                            super::ui_draw::draw_magazine_page_turn_overlay(
-                                buffer,
-                                width,
-                                bottom_limit,
-                                spread_x,
-                                spread_y,
-                                spread_w,
-                                spread_h,
-                                eased,
-                                dir,
-                                s,
-                            );
-                        }
-                    }
+                    let canvas_rect = (
+                        sidebar_w as i32,
+                        top_bars_h as i32,
+                        width.saturating_sub(sidebar_w),
+                        bottom_limit.saturating_sub(top_bars_h),
+                    );
+                    let cur_rect = (
+                        spread_x.max(canvas_rect.0),
+                        spread_y.max(canvas_rect.1),
+                        spread_w.min(canvas_rect.2),
+                        spread_h.min(canvas_rect.3),
+                    );
+                    let canvas_bg = match self.reading_filter {
+                        ReadingFilter::DarkInvert => 0x0014_161A,
+                        ReadingFilter::NightAmber => 0x0014_0F0B,
+                        _ => theme.canvas_bg,
+                    };
+                    let paper_bg = self.curl_paper_bg_color(&theme);
+                    self.render_active_spread_curl(
+                        buffer,
+                        width,
+                        bottom_limit,
+                        cur_rect,
+                        canvas_rect,
+                        canvas_bg,
+                        paper_bg,
+                        s,
+                    );
                 }
             }
 
@@ -2228,6 +2214,19 @@ impl<'a> PdfViewerApp<'a> {
             let th_col = (thm.0 << 16) | (thm.1 << 8) | thm.2;
             super::ui_draw::fill_rounded_rect_alpha(
                 buffer, width, height, tbx, ty, tbw, th, (th as f32) * 0.5, th_col, thm.3,
+            );
+        }
+
+        // Leftmost Format Drawer Rail (`All` + open document format drawers)
+        let format_rail_bot = height.saturating_sub(status_bar_h);
+        if self.format_rail_width_px(scale_factor) > 0 && format_rail_bot > top_bars_h {
+            self.draw_format_drawer_rail(
+                buffer,
+                width,
+                height,
+                top_bars_h,
+                format_rail_bot,
+                scale_factor,
             );
         }
 
@@ -2467,7 +2466,101 @@ impl<'a> PdfViewerApp<'a> {
         }
     }
 
-    pub(super) fn capture_pdf_magazine_canvas_snapshot(&self) -> Option<(u32, u32, Vec<u32>)> {
+    pub(super) fn curl_paper_bg_color(&self, theme: &super::theme::UiTheme) -> u32 {
+        match self.reading_filter {
+            ReadingFilter::DarkInvert => 0x001E_222B,
+            ReadingFilter::NightAmber => 0x0024_1A12,
+            ReadingFilter::WarmSepia => 0x00F4_ECD8,
+            ReadingFilter::SageEyeCare => 0x00DF_ECE2,
+            ReadingFilter::PaperEInk => 0x00F5_F5F2,
+            ReadingFilter::Normal => {
+                if self.ui_theme_mode == super::theme::UiThemeMode::Dark {
+                    theme.surface_bg
+                } else {
+                    0x00F8_F9FB
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_active_spread_curl(
+        &mut self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        cur_rect: (i32, i32, u32, u32),
+        canvas_rect: (i32, i32, u32, u32),
+        canvas_bg: u32,
+        paper_bg: u32,
+        s: f32,
+    ) {
+        let Some((linear_t, dir)) = self.page_turn_anim_linear() else {
+            return;
+        };
+        let Some(ref mut anim) = self.page_turn_anim else {
+            return;
+        };
+        if anim.prev_rect != Some(cur_rect) && cur_rect.2 >= 8 && cur_rect.3 >= 8 {
+            if let (Some((ox, oy, _, _)), Some((ow, oh, old_px))) =
+                (anim.prev_rect, anim.prev_spread.take())
+            {
+                let cx0 = canvas_rect.0;
+                let cy0 = canvas_rect.1;
+                let cx1 = cx0 + canvas_rect.2 as i32;
+                let cy1 = cy0 + canvas_rect.3 as i32;
+                let ux = ox.min(cur_rect.0).clamp(cx0, cx1);
+                let uy = oy.min(cur_rect.1).clamp(cy0, cy1);
+                let ur = (ox + ow as i32).max(cur_rect.0 + cur_rect.2 as i32).clamp(ux, cx1);
+                let ub = (oy + oh as i32).max(cur_rect.1 + cur_rect.3 as i32).clamp(uy, cy1);
+                let uw = (ur - ux) as u32;
+                let uh = (ub - uy) as u32;
+                if uw >= 8 && uh >= 8 {
+                    let mut merged = vec![canvas_bg; (uw as usize).saturating_mul(uh as usize)];
+                    let src_w = ow as usize;
+                    let dst_w = uw as usize;
+                    for sy in 0..oh as usize {
+                        let dy = (oy + sy as i32) - uy;
+                        if dy < 0 || dy >= uh as i32 {
+                            continue;
+                        }
+                        let dst_row = (dy as usize) * dst_w;
+                        let src_row = sy * src_w;
+                        for sx in 0..ow as usize {
+                            let dx = (ox + sx as i32) - ux;
+                            if dx >= 0 && dx < uw as i32 {
+                                merged[dst_row + dx as usize] = old_px[src_row + sx];
+                            }
+                        }
+                    }
+                    anim.prev_spread = Some((uw, uh, merged));
+                    anim.prev_rect = Some((ux, uy, uw, uh));
+                } else {
+                    anim.prev_spread = Some((ow, oh, old_px));
+                }
+            }
+        }
+        if let (Some((aw, ah, prev_px)), Some((ax, ay, _, _))) =
+            (&anim.prev_spread, anim.prev_rect)
+        {
+            super::ui_draw::draw_apple_books_page_curl(
+                buffer,
+                buf_w,
+                buf_h,
+                prev_px,
+                ax,
+                ay,
+                *aw,
+                *ah,
+                linear_t,
+                dir,
+                paper_bg,
+                s,
+            );
+        }
+    }
+
+    pub(super) fn capture_pdf_spread_snapshot(&self) -> Option<((i32, i32, u32, u32), Vec<u32>)> {
         let win = self.window.as_ref()?;
         let sz = win.inner_size();
         let width = sz.width;
@@ -2480,41 +2573,55 @@ impl<'a> PdfViewerApp<'a> {
         let top_bars_h = self.top_bars_height_px(scale_factor).min(height.saturating_sub(48));
         let status_bar_h = self.status_bar_height_px(scale_factor).min(height.saturating_sub(top_bars_h + 16));
         let bottom_limit = height.saturating_sub(status_bar_h);
-        let canvas_w = width.saturating_sub(sidebar_w);
-        let canvas_h = bottom_limit.saturating_sub(top_bars_h);
-        if canvas_w == 0 || canvas_h == 0 {
+
+        let r1 = self.page_draw_rect;
+        if r1.2 == 0 || r1.3 == 0 {
             return None;
         }
+        let (raw_x, raw_y, raw_r, raw_b) = if let Some(r2) = self.second_page_draw_rect {
+            (
+                r1.0.min(r2.0),
+                r1.1.min(r2.1),
+                (r1.0 + r1.2 as i32).max(r2.0 + r2.2 as i32),
+                (r1.1 + r1.3 as i32).max(r2.1 + r2.3 as i32),
+            )
+        } else {
+            (r1.0, r1.1, r1.0 + r1.2 as i32, r1.1 + r1.3 as i32)
+        };
+        let sx = raw_x.max(sidebar_w as i32);
+        let sy = raw_y.max(top_bars_h as i32);
+        let sr = raw_r.min(width as i32);
+        let sb = raw_b.min(bottom_limit as i32);
+        if sr <= sx + 8 || sb <= sy + 8 {
+            return None;
+        }
+        let sw = (sr - sx) as u32;
+        let sh = (sb - sy) as u32;
+
         let theme = self.ui_theme();
         let canvas_bg = match self.reading_filter {
             ReadingFilter::DarkInvert => 0x0014_161A,
             ReadingFilter::NightAmber => 0x0014_0F0B,
             _ => theme.canvas_bg,
         };
-        let mut snap = vec![canvas_bg; (canvas_w as usize).saturating_mul(canvas_h as usize)];
-        let dx = -(sidebar_w as i32);
-        let dy = -(top_bars_h as i32);
+        let mut snap = vec![canvas_bg; (sw as usize).saturating_mul(sh as usize)];
         if let Some(ref cache) = self.cached_page {
-            let r1 = self.page_draw_rect;
-            if r1.2 > 0 && r1.3 > 0 {
-                let local_r1 = (r1.0 + dx, r1.1 + dy, r1.2, r1.3);
-                self.draw_page_frame_chrome(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r1, scale_factor);
-                self.blit_page_or_tiles(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r1, cache);
-            }
+            let local_r1 = (r1.0 - sx, r1.1 - sy, r1.2, r1.3);
+            self.draw_page_frame_chrome(&mut snap, sw, sh, 0, 0, 0, local_r1, scale_factor);
+            self.blit_page_or_tiles(&mut snap, sw, sh, 0, 0, 0, local_r1, cache);
         }
         if let (Some(second_cache), Some(r2)) = (&self.cached_second_page, self.second_page_draw_rect) {
             if r2.2 > 0 && r2.3 > 0 {
-                let local_r2 = (r2.0 + dx, r2.1 + dy, r2.2, r2.3);
-                self.draw_page_frame_chrome(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r2, scale_factor);
-                self.blit_page_or_tiles(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r2, second_cache);
+                let local_r2 = (r2.0 - sx, r2.1 - sy, r2.2, r2.3);
+                self.draw_page_frame_chrome(&mut snap, sw, sh, 0, 0, 0, local_r2, scale_factor);
+                self.blit_page_or_tiles(&mut snap, sw, sh, 0, 0, 0, local_r2, second_cache);
                 let s = scale_factor as f32;
-                let r1 = self.page_draw_rect;
-                let top_y = (r1.1 + dy).min(local_r2.1).max(0);
-                let bot_y = (r1.1 + dy + r1.3 as i32).max(local_r2.1 + local_r2.3 as i32).min(canvas_h as i32);
+                let top_y = (r1.1 - sy).min(local_r2.1).max(0);
+                let bot_y = (r1.1 - sy + r1.3 as i32).max(local_r2.1 + local_r2.3 as i32).min(sh as i32);
                 super::ui_draw::draw_book_spine_crease(
                     &mut snap,
-                    canvas_w,
-                    canvas_h,
+                    sw,
+                    sh,
                     local_r2.0,
                     top_y,
                     (bot_y - top_y).max(0) as u32,
@@ -2522,7 +2629,7 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
         }
-        Some((canvas_w, canvas_h, snap))
+        Some(((sx, sy, sw, sh), snap))
     }
 
     /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`
@@ -2588,13 +2695,13 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         sf: f64,
     ) {
-        let (label, anchor_rect, below) = match self.hovered_widget {
+        let (label, anchor_rect, below, beside_right): (String, _, _, _) = match self.hovered_widget {
             Some(UiHit::Toolbar(act)) => {
                 let tb_x = self.toolbar_start_x(sf);
                 let Some(rect) = self.toolbar_widget_rect(act, tb_x, buf_w, menu_bar_h, sf) else {
                     return;
                 };
-                (act.tooltip(), rect, true)
+                (act.tooltip().to_string(), rect, true, false)
             }
             Some(UiHit::BottomBar(act)) => {
                 if self.show_notifications && act == super::bottom_bar::BottomBarAction::NotificationBoard {
@@ -2609,7 +2716,7 @@ impl<'a> PdfViewerApp<'a> {
                 let Some(rect) = self.bottom_bar_widget_rect(act, buf_w, buf_h, status_bar_h, sf) else {
                     return;
                 };
-                (act.tooltip(), rect, false)
+                (act.tooltip().to_string(), rect, false, false)
             }
             Some(UiHit::ComicBottom(cb)) => {
                 if matches!(cb, ComicBottomHit::Scrubber(_)) {
@@ -2618,7 +2725,14 @@ impl<'a> PdfViewerApp<'a> {
                 let Some(rect) = self.comic_bottom_widget_rect(cb, buf_w, buf_h, status_bar_h, sf) else {
                     return;
                 };
-                (cb.tooltip(), rect, false)
+                (cb.tooltip().to_string(), rect, false, false)
+            }
+            Some(UiHit::FormatDrawer(opt_kind)) => {
+                let top_bars_h = self.top_bars_height_px(sf).min(buf_h.saturating_sub(48));
+                let Some(rect) = self.format_drawer_rect_for(opt_kind, buf_h, top_bars_h, status_bar_h, sf) else {
+                    return;
+                };
+                (self.format_drawer_tooltip(opt_kind), rect, false, true)
             }
             _ => return,
         };
@@ -2627,16 +2741,25 @@ impl<'a> PdfViewerApp<'a> {
         let font_sz = (11.0 * s).clamp(9.5, 20.0);
         let pad_x = (9.0 * s).round() as u32;
         let tip_h = (22.0 * s).round().clamp(18.0, 38.0) as u32;
-        let tw = super::ui_draw::measure_text(label, font_sz, false).ceil() as u32;
+        let tw = super::ui_draw::measure_text(&label, font_sz, false).ceil() as u32;
         let tip_w = (tw + pad_x * 2).min(buf_w.saturating_sub(16));
-        let cx = anchor_rect.0 + (anchor_rect.2 as i32) / 2;
-        let max_tx = (buf_w as i32 - tip_w as i32 - 8).max(8);
-        let tx = (cx - (tip_w as i32) / 2).clamp(8, max_tx);
         let gap = (6.0 * s).round() as i32;
-        let ty = if below {
-            (anchor_rect.1 + anchor_rect.3 as i32 + gap).min(buf_h as i32 - tip_h as i32 - 6)
+        let (tx, ty) = if beside_right {
+            let tx = (anchor_rect.0 + anchor_rect.2 as i32 + (8.0 * s).round() as i32)
+                .min((buf_w as i32 - tip_w as i32 - 8).max(8));
+            let ty = (anchor_rect.1 + (anchor_rect.3 as i32 - tip_h as i32) / 2)
+                .clamp(6, (buf_h as i32 - tip_h as i32 - 6).max(6));
+            (tx, ty)
         } else {
-            (anchor_rect.1 - tip_h as i32 - gap).max(6)
+            let cx = anchor_rect.0 + (anchor_rect.2 as i32) / 2;
+            let max_tx = (buf_w as i32 - tip_w as i32 - 8).max(8);
+            let tx = (cx - (tip_w as i32) / 2).clamp(8, max_tx);
+            let ty = if below {
+                (anchor_rect.1 + anchor_rect.3 as i32 + gap).min(buf_h as i32 - tip_h as i32 - 6)
+            } else {
+                (anchor_rect.1 - tip_h as i32 - gap).max(6)
+            };
+            (tx, ty)
         };
         let rad = (5.0 * s).clamp(4.0, 9.0);
         // Dark crisp tooltip pill in Light mode, elevated slate in Dark mode (high contrast in both!)
@@ -2654,7 +2777,7 @@ impl<'a> PdfViewerApp<'a> {
         super::ui_draw::draw_text_vcenter(
             buffer, buf_w, buf_h,
             tx + pad_x as i32, ty, tip_h, tx + tip_w as i32 - 4,
-            label, font_sz, fg, false,
+            &label, font_sz, fg, false,
         );
     }
 

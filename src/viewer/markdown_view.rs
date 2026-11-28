@@ -1714,6 +1714,7 @@ impl<'a> PdfViewerApp<'a> {
                     direction: dir,
                     from_scroll_y: Some(old_scroll_y),
                     prev_spread: None,
+                    prev_rect: None,
                 });
             }
             self.request_redraw();
@@ -2127,20 +2128,6 @@ impl<'a> PdfViewerApp<'a> {
                                         s,
                                     );
                                 }
-                            } else {
-                                let eased = 1.0 - (1.0 - linear_t).powi(3);
-                                draw_magazine_page_turn_overlay(
-                                    buffer,
-                                    buf_w,
-                                    buf_h,
-                                    spread_x,
-                                    spread_y,
-                                    spread_w,
-                                    spread_h,
-                                    eased,
-                                    anim.direction,
-                                    s,
-                                );
                             }
                         }
                         if anim_done {
@@ -2317,13 +2304,6 @@ impl<'a> PdfViewerApp<'a> {
                                         buffer, buf_w, buf_h, prev_px, ax, ay, aw, ah, linear_t, anim.direction, page_bg, s,
                                     );
                                 }
-                            } else {
-                                let eased = 1.0 - (1.0 - linear_t).powi(3);
-                                draw_magazine_page_turn_overlay(
-                                    buffer, buf_w, buf_h,
-                                    anim_rect.0, anim_rect.1, anim_rect.2, anim_rect.3,
-                                    eased, anim.direction, s,
-                                );
                             }
                         }
                         if anim_done {

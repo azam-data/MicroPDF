@@ -266,12 +266,156 @@ impl<'a> PdfViewerApp<'a> {
         );
         let next_u16 = next.min(u16::MAX as usize) as u16;
         if next_u16 != self.current_page_index {
+            if self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip
+                && self.page_turn_anim_ms > 0
+            {
+                let raw_dir: i8 = if next_u16 > self.current_page_index { 1 } else { -1 };
+                let visual_dir: i8 = if self.comic_prefs.rtl_manga { -raw_dir } else { raw_dir };
+                if let Some((rect, pixels)) = self.capture_comic_spread_snapshot() {
+                    self.trigger_spread_curl(visual_dir, rect, pixels);
+                }
+            }
             self.current_page_index = next_u16;
             self.scroll_y = 0.0;
             self.pan_x = 0.0;
             self.update_title_bar();
             self.request_redraw();
         }
+    }
+
+    pub(super) fn comic_active_spread_rect(&self) -> Option<(i32, i32, u32, u32)> {
+        if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+            return None;
+        }
+        let r0 = self.page_draw_rect;
+        if r0.2 == 0 || r0.3 == 0 {
+            return None;
+        }
+        if let Some(r1) = self.second_page_draw_rect.filter(|r| r.2 > 0 && r.3 > 0) {
+            let x0 = r0.0.min(r1.0);
+            let y0 = r0.1.min(r1.1);
+            let x1 = (r0.0 + r0.2 as i32).max(r1.0 + r1.2 as i32);
+            let y1 = (r0.1 + r0.3 as i32).max(r1.1 + r1.3 as i32);
+            Some((x0, y0, (x1 - x0).max(1) as u32, (y1 - y0).max(1) as u32))
+        } else {
+            Some(r0)
+        }
+    }
+
+    pub(super) fn capture_comic_spread_snapshot(&self) -> Option<((i32, i32, u32, u32), Vec<u32>)> {
+        let raw_rect = self.comic_active_spread_rect()?;
+        let spread_rect = if let Some(win) = self.window.as_ref() {
+            let sz = win.inner_size();
+            let sf = self.effective_scale_factor(win.scale_factor());
+            let cx0 = self.sidebar_width_px(sf).min(sz.width.saturating_sub(64)) as i32;
+            let cy0 = self.top_bars_height_px(sf).min(sz.height.saturating_sub(48)) as i32;
+            let cx1 = sz.width as i32;
+            let cy1 = sz.height.saturating_sub(self.status_bar_height_px(sf)) as i32;
+            let sx = raw_rect.0.max(cx0);
+            let sy = raw_rect.1.max(cy0);
+            let sr = (raw_rect.0 + raw_rect.2 as i32).min(cx1);
+            let sb = (raw_rect.1 + raw_rect.3 as i32).min(cy1);
+            if sr <= sx + 4 || sb <= sy + 4 {
+                return None;
+            }
+            (sx, sy, (sr - sx) as u32, (sb - sy) as u32)
+        } else {
+            raw_rect
+        };
+        let (sx, sy, sw, sh) = spread_rect;
+        if sw == 0 || sh == 0 || (sw as usize).saturating_mul(sh as usize) > 16_000_000 {
+            return None;
+        }
+        let total = self.comic_doc.as_ref().map(|c| c.page_count()).unwrap_or(0);
+        if total == 0 {
+            return None;
+        }
+        let theme = self.ui_theme();
+        let mut buf = vec![theme.canvas_bg; (sw as usize) * (sh as usize)];
+        let filter = self.reading_filter;
+        let cur = (self.current_page_index as usize).min(total - 1);
+        match self.comic_prefs.layout_mode {
+            ComicLayoutMode::SinglePage => {
+                let entry = self.comic_page_cache.get(&cur)?;
+                let r0 = self.page_draw_rect;
+                Self::blit_comic_bitmap(
+                    &mut buf,
+                    sw,
+                    sh,
+                    &entry.bitmap,
+                    r0.0 - sx,
+                    r0.1 - sy,
+                    r0.2,
+                    r0.3,
+                    0,
+                    0,
+                    sw as i32,
+                    sh as i32,
+                    filter,
+                );
+            }
+            ComicLayoutMode::TwoPageSpread => {
+                let (left_opt, right_opt) = Self::comic_spread_visual_pages_for(
+                    total,
+                    cur,
+                    self.comic_prefs.cover_first,
+                    self.comic_prefs.rtl_manga,
+                );
+                let mut drew_any = false;
+                if let Some(l_idx) = left_opt {
+                    if let Some(entry) = self.comic_page_cache.get(&l_idx) {
+                        let r0 = self.page_draw_rect;
+                        Self::blit_comic_bitmap(
+                            &mut buf,
+                            sw,
+                            sh,
+                            &entry.bitmap,
+                            r0.0 - sx,
+                            r0.1 - sy,
+                            r0.2,
+                            r0.3,
+                            0,
+                            0,
+                            sw as i32,
+                            sh as i32,
+                            filter,
+                        );
+                        drew_any = true;
+                    }
+                }
+                if let Some(r_idx) = right_opt {
+                    if let Some(r1) = self.second_page_draw_rect.filter(|r| r.2 > 0 && r.3 > 0) {
+                        if let Some(entry) = self.comic_page_cache.get(&r_idx) {
+                            Self::blit_comic_bitmap(
+                                &mut buf,
+                                sw,
+                                sh,
+                                &entry.bitmap,
+                                r1.0 - sx,
+                                r1.1 - sy,
+                                r1.2,
+                                r1.3,
+                                0,
+                                0,
+                                sw as i32,
+                                sh as i32,
+                                filter,
+                            );
+                            drew_any = true;
+                        }
+                    }
+                }
+                if !drew_any {
+                    return None;
+                }
+                if let Some(r1) = self.second_page_draw_rect.filter(|r| r.2 > 0 && r.3 > 0) {
+                    let spine_x = (r1.0 - sx).clamp(0, sw as i32 - 1);
+                    fill_rect_clipped(&mut buf, sw, sh, spine_x, 0, 1, sh, theme.divider);
+                }
+            }
+            ComicLayoutMode::VerticalStrip => return None,
+        }
+        Some((spread_rect, buf))
     }
 
     fn compute_comic_fitted_size(
@@ -761,6 +905,35 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
         }
+        if self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip {
+            if let Some(raw_rect) = self.comic_active_spread_rect() {
+                let cx0 = raw_rect.0.max(canvas_x0);
+                let cy0 = raw_rect.1.max(canvas_y0);
+                let cx1 = (raw_rect.0 + raw_rect.2 as i32).min(canvas_x1);
+                let cy1 = (raw_rect.1 + raw_rect.3 as i32).min(canvas_y1);
+                if cx1 > cx0 + 4 && cy1 > cy0 + 4 {
+                    let cur_rect = (cx0, cy0, (cx1 - cx0) as u32, (cy1 - cy0) as u32);
+                    let canvas_rect = (
+                        canvas_x0,
+                        canvas_y0,
+                        (canvas_x1 - canvas_x0).max(0) as u32,
+                        (canvas_y1 - canvas_y0).max(0) as u32,
+                    );
+                    let theme = self.ui_theme();
+                    let paper_bg = self.curl_paper_bg_color(&theme);
+                    self.render_active_spread_curl(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        cur_rect,
+                        canvas_rect,
+                        theme.canvas_bg,
+                        paper_bg,
+                        s,
+                    );
+                }
+            }
+        }
     }
 
     pub(super) fn is_distinct_comic_mode(&self) -> bool {
@@ -843,7 +1016,10 @@ impl<'a> PdfViewerApp<'a> {
         sf: f64,
     ) {
         let buf_h = (buffer.len() / (buf_w.max(1) as usize)) as u32;
-        if sidebar_w < 48 || content_bot <= top_bars_h {
+        let rail_w = self.format_rail_width_px(sf);
+        let panel_x = rail_w as i32;
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        if panel_w < 48 || content_bot <= top_bars_h {
             return;
         }
         let s = sf as f32;
@@ -856,9 +1032,9 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            0,
+            panel_x,
             top_bars_h as i32,
-            sidebar_w.saturating_sub(1),
+            panel_w.saturating_sub(1),
             content_bot.saturating_sub(top_bars_h),
             theme.sidebar_bg,
         );
@@ -866,7 +1042,7 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            sidebar_w.saturating_sub(1) as i32,
+            panel_x + panel_w.saturating_sub(1) as i32,
             top_bars_h as i32,
             1,
             content_bot.saturating_sub(top_bars_h),
@@ -879,9 +1055,9 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            0,
+            panel_x,
             hdr_y,
-            sidebar_w.saturating_sub(1),
+            panel_w.saturating_sub(1),
             header_h,
             theme.sidebar_header_bg,
         );
@@ -889,15 +1065,16 @@ impl<'a> PdfViewerApp<'a> {
             buffer,
             buf_w,
             buf_h,
-            0,
+            panel_x,
             hdr_y + header_h as i32 - 1,
-            sidebar_w.saturating_sub(1),
+            panel_w.saturating_sub(1),
             1,
             theme.divider,
         );
 
-        let pad_x = (10.0 * s).round() as i32;
-        let max_tx = sidebar_w as i32 - pad_x;
+        let inner_pad = (10.0 * s).round() as i32;
+        let pad_x = panel_x + inner_pad;
+        let max_tx = panel_x + panel_w as i32 - inner_pad;
         let title_sz = (12.0 * s).clamp(10.0, 22.0);
         let sub_sz = (10.0 * s).clamp(8.5, 18.0);
 
@@ -1003,8 +1180,8 @@ impl<'a> PdfViewerApp<'a> {
         } else {
             0
         };
-        let card_x = (10.0 * s).round() as i32;
-        let card_w = (sidebar_w as i32 - card_x * 2 - scrollbar_reserve).max(40) as u32;
+        let card_x = panel_x + inner_pad;
+        let card_w = (panel_w as i32 - inner_pad * 2 - scrollbar_reserve).max(40) as u32;
         let radius = (6.0 * s).clamp(3.0, 10.0);
         let footer_h = (22.0 * s).round().max(16.0) as u32;
         let img_pad = (6.0 * s).round().max(3.0) as u32;
@@ -1114,7 +1291,7 @@ impl<'a> PdfViewerApp<'a> {
 
         // Thin vertical scrollbar when thumbnails overflow
         if total_pages > visible_rows {
-            let sb_x = sidebar_w as i32 - (6.0 * s).round().max(4.0) as i32;
+            let sb_x = panel_x + panel_w as i32 - (6.0 * s).round().max(4.0) as i32;
             let sb_w = (4.0 * s).round().max(3.0) as u32;
             let track_h = (clip_y1 - clip_y0).max(20) as u32;
             let thumb_h = ((visible_rows as f32 / total_pages as f32) * track_h as f32)
@@ -1173,6 +1350,11 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         sf: f64,
     ) -> Option<ComicSidebarHit> {
+        let rail_w = self.format_rail_width_px(sf);
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        if panel_w < 48 || mx < rail_w as f64 {
+            return None;
+        }
         let has_meta = self.comic_doc.as_ref().and_then(|c| c.info.as_ref()).is_some_and(|info| {
             info.series.is_some()
                 || info.title.is_some()
@@ -1181,9 +1363,9 @@ impl<'a> PdfViewerApp<'a> {
         });
         let total_pages = self.comic_doc.as_ref().map(|c| c.page_count()).unwrap_or(0);
         Self::hit_test_comic_sidebar_at(
-            mx,
+            mx - rail_w as f64,
             my,
-            sidebar_w,
+            panel_w,
             content_bot,
             top_bars_h,
             sf,

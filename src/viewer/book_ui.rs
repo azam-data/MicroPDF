@@ -969,6 +969,13 @@ impl<'a> PdfViewerApp<'a> {
         scale_factor: f64,
     ) {
         self.ensure_epub_cover_thumb();
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_x = rail_w as i32;
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        if panel_w < 48 {
+            return;
+        }
+        let panel_r = panel_x + panel_w as i32;
         let theme = self.ui_theme();
         let s = scale_factor as f32;
         let top_y = top_bars_h as i32;
@@ -979,17 +986,18 @@ impl<'a> PdfViewerApp<'a> {
         } else {
             0
         };
-        let pad = (14.0 * s).round() as i32;
-        let left_margin = (18.0 * s).round() as i32;
+        let base_pad = (14.0 * s).round() as i32;
+        let pad = panel_x + base_pad;
+        let left_margin = panel_x + (18.0 * s).round() as i32;
         let rad = (6.0 * s).max(4.0);
 
         // Background + right subtle border
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w, total_h, theme.sidebar_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, sidebar_w.saturating_sub(1) as i32, top_y, 1, total_h, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w, total_h, theme.sidebar_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_r - 1, top_y, 1, total_h, theme.divider);
 
         // 1. Top utility row: Search | Expand/Collapse | Pin/Close
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w.saturating_sub(1), util_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y + util_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w.saturating_sub(1), util_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y + util_h as i32 - 1, panel_w.saturating_sub(1), 1, theme.divider);
 
         let btn_sz = (22.0 * s).round() as u32;
         let ic_sz = (12.0 * s).round() as u32;
@@ -997,7 +1005,7 @@ impl<'a> PdfViewerApp<'a> {
 
         let search_x = pad;
         let exp_x = search_x + btn_sz as i32 + (4.0 * s).round() as i32;
-        let pin_x = sidebar_w as i32 - pad - btn_sz as i32;
+        let pin_x = panel_r - base_pad - btn_sz as i32;
 
         for (bx, ic, hit, active) in [
             (search_x, UiIcon::Search, BookSidebarHit::ToggleSearch, self.book_toc_search.is_some()),
@@ -1021,8 +1029,8 @@ impl<'a> PdfViewerApp<'a> {
 
         // 2. Book Header Card (Cover thumbnail + Title + Author + Chapter X of Y + (i) info button)
         let card_y = top_y + util_h as i32;
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, card_y, sidebar_w.saturating_sub(1), card_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, card_y + card_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, card_y, panel_w.saturating_sub(1), card_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, card_y + card_h as i32 - 1, panel_w.saturating_sub(1), 1, theme.divider);
 
         let thumb_w = (46.0 * s).round() as u32;
         let thumb_h = (66.0 * s).round() as u32;
@@ -1085,10 +1093,10 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         let info_sz = (18.0 * s).round() as u32;
-        let info_x = sidebar_w as i32 - pad - info_sz as i32;
+        let info_x = panel_r - base_pad - info_sz as i32;
         let info_y = card_y + card_h as i32 - info_sz as i32 - (10.0 * s).round() as i32;
         let text_x = thumb_x + thumb_w as i32 + (10.0 * s).round() as i32;
-        let text_max_x = sidebar_w as i32 - pad - 4;
+        let text_max_x = panel_r - base_pad - 4;
         let title_sz = (13.5 * s).clamp(11.0, 22.0);
         let auth_sz = (11.5 * s).clamp(9.5, 19.0);
         let chap_sub_sz = (11.0 * s).clamp(9.0, 18.0);
@@ -1148,7 +1156,7 @@ impl<'a> PdfViewerApp<'a> {
             if self.book_sidebar_tab == BookSidebarTab::Contents {
                 let sy = card_y + card_h as i32 + (4.0 * s).round() as i32;
                 let sh = search_bar_h.saturating_sub((8.0 * s).round() as u32);
-                let sw_box = sidebar_w.saturating_sub((pad * 2 + 1) as u32);
+                let sw_box = panel_w.saturating_sub((base_pad * 2 + 1) as u32);
                 fill_rounded_rect(buffer, buf_w, buf_h, pad, sy, sw_box, sh, 5.0 * s, theme.input_bg);
                 stroke_rounded_rect(buffer, buf_w, buf_h, pad, sy, sw_box, sh, 5.0 * s, theme.input_focus_border);
                 let display = if q.is_empty() { "Filter contents..." } else { q.as_str() };
@@ -1159,13 +1167,13 @@ impl<'a> PdfViewerApp<'a> {
 
         // Bottom 3-tab segmented switcher: Contents | Notes | Marks
         let seg_y = top_y + total_h as i32 - seg_h as i32;
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, seg_y, sidebar_w.saturating_sub(1), seg_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, seg_y, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, seg_y, panel_w.saturating_sub(1), seg_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, seg_y, panel_w.saturating_sub(1), 1, theme.divider);
 
         let pill_pad = (8.0 * s).round() as i32;
-        let track_x = pill_pad;
+        let track_x = panel_x + pill_pad;
         let track_y = seg_y + (5.0 * s).round() as i32;
-        let track_w = sidebar_w.saturating_sub((pill_pad * 2 + 1) as u32);
+        let track_w = panel_w.saturating_sub((pill_pad * 2 + 1) as u32);
         let track_h = seg_h.saturating_sub((10.0 * s).round() as u32);
         fill_rounded_rect(buffer, buf_w, buf_h, track_x, track_y, track_w, track_h, rad, theme.surface_elevated);
         stroke_rounded_rect(buffer, buf_w, buf_h, track_x, track_y, track_w, track_h, rad, theme.border_subtle);
@@ -1206,7 +1214,7 @@ impl<'a> PdfViewerApp<'a> {
         let has_scrollbar = metric_tot > metric_vis;
         let sb_w = (7.0 * s).round().max(5.0) as u32;
         let sb_reserve = if has_scrollbar { (14.0 * s).round() as i32 } else { (6.0 * s).round() as i32 };
-        let content_right = sidebar_w as i32 - sb_reserve;
+        let content_right = panel_r - sb_reserve;
 
         match self.book_sidebar_tab {
             BookSidebarTab::Contents => {
@@ -1243,11 +1251,11 @@ impl<'a> PdfViewerApp<'a> {
                             Some(UiHit::BookSidebar(BookSidebarHit::TocRow(i)))
                                 | Some(UiHit::BookSidebar(BookSidebarHit::TocToggle(i))) if i == vis_i
                         );
-                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_x = panel_x + (10.0 * s).round() as i32;
                         let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
                         if is_cur {
                             fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.accent_soft_bg);
-                            fill_circle_aa(buffer, buf_w, buf_h, 15.0 * s, ry as f32 + row_h as f32 * 0.5, 3.0 * s, theme.accent);
+                            fill_circle_aa(buffer, buf_w, buf_h, panel_x as f32 + 15.0 * s, ry as f32 + row_h as f32 * 0.5, 3.0 * s, theme.accent);
                         } else if is_hov {
                             fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
                         }
@@ -1295,7 +1303,7 @@ impl<'a> PdfViewerApp<'a> {
                             Some(UiHit::BookSidebar(BookSidebarHit::AnnotRow(idx)))
                                 | Some(UiHit::BookSidebar(BookSidebarHit::AnnotDelete(idx))) if idx == vis_i
                         );
-                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_x = panel_x + (10.0 * s).round() as i32;
                         let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
                         if hov {
                             fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, list_item_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
@@ -1336,7 +1344,7 @@ impl<'a> PdfViewerApp<'a> {
                             Some(UiHit::BookSidebar(BookSidebarHit::BookmarkRow(idx)))
                                 | Some(UiHit::BookSidebar(BookSidebarHit::BookmarkDelete(idx))) if idx == vis_i
                         );
-                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_x = panel_x + (10.0 * s).round() as i32;
                         let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
                         if hov {
                             fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
@@ -1360,7 +1368,7 @@ impl<'a> PdfViewerApp<'a> {
         let avail_h = (list_bot_y - list_top_y).max(0) as u32;
         let visible_rows = ((avail_h / list_item_h.max(1)) as usize).max(1);
         if list_total > visible_rows && avail_h > 20 {
-            let track_x = sidebar_w as i32 - sb_w as i32 - (4.0 * s).round() as i32;
+            let track_x = panel_r - sb_w as i32 - (4.0 * s).round() as i32;
             let track_y = list_top_y + (4.0 * s).round() as i32;
             let track_h = avail_h.saturating_sub((8.0 * s).round() as u32).max(16);
             fill_rounded_rect(buffer, buf_w, buf_h, track_x, track_y, sb_w, track_h, sb_w as f32 * 0.5, theme.surface_elevated);
@@ -1389,9 +1397,11 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) -> Option<BookSidebarHit> {
-        let ix = mx.round() as i32;
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_w = sidebar_w.saturating_sub(rail_w);
+        let ix = (mx - rail_w as f64).round() as i32;
         let iy = my.round() as i32;
-        if !self.show_bookmarks || ix < 0 || ix >= sidebar_w as i32 || iy < top_bars_h as i32 {
+        if !self.show_bookmarks || panel_w < 48 || ix < 0 || ix >= panel_w as i32 || iy < top_bars_h as i32 {
             return None;
         }
         let s = scale_factor as f32;
@@ -1405,7 +1415,7 @@ impl<'a> PdfViewerApp<'a> {
             let btn_sz = (22.0 * s).round() as i32;
             let search_x = pad;
             let exp_x = search_x + btn_sz + (4.0 * s).round() as i32;
-            let pin_x = sidebar_w as i32 - pad - btn_sz;
+            let pin_x = panel_w as i32 - pad - btn_sz;
             if ix >= search_x && ix < search_x + btn_sz {
                 return Some(BookSidebarHit::ToggleSearch);
             }
@@ -1422,7 +1432,7 @@ impl<'a> PdfViewerApp<'a> {
         let card_y = top_y + util_h as i32;
         if iy < card_y + card_h as i32 {
             let info_sz = (18.0 * s).round() as i32;
-            let info_x = sidebar_w as i32 - pad - info_sz - 4;
+            let info_x = panel_w as i32 - pad - info_sz - 4;
             let info_y = card_y + card_h as i32 - info_sz - (12.0 * s).round() as i32;
             if ix >= info_x && iy >= info_y {
                 return Some(BookSidebarHit::BookInfo);
@@ -1434,7 +1444,7 @@ impl<'a> PdfViewerApp<'a> {
         let seg_y = top_y + total_h - seg_h as i32;
         if iy >= seg_y {
             let pill_pad = (8.0 * s).round() as i32;
-            let track_w = (sidebar_w as i32 - pill_pad * 2 - 1).max(30);
+            let track_w = (panel_w as i32 - pill_pad * 2 - 1).max(30);
             let rel_x = (ix - pill_pad).clamp(0, track_w - 1);
             let seg = ((rel_x * 3) / track_w).clamp(0, 2);
             return Some(match seg {
@@ -1450,13 +1460,13 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
         let has_scrollbar = total_items > visible_items;
-        let sb_hit_x = sidebar_w as i32 - (16.0 * s).round().max(12.0) as i32;
+        let sb_hit_x = panel_w as i32 - (16.0 * s).round().max(12.0) as i32;
         if has_scrollbar && ix >= sb_hit_x {
             let ratio = ((iy - list_top_y) as f32 / (list_bot_y - list_top_y).max(1) as f32).clamp(0.0, 1.0);
             return Some(BookSidebarHit::ScrollbarTrack(ratio));
         }
 
-        let content_right = sidebar_w as i32 - if has_scrollbar { (14.0 * s).round() as i32 } else { (6.0 * s).round() as i32 };
+        let content_right = panel_w as i32 - if has_scrollbar { (14.0 * s).round() as i32 } else { (6.0 * s).round() as i32 };
         let item_h = item_h_u as i32;
         let start = self.bookmark_scroll_y.min(total_items.saturating_sub(1));
         let vis_idx = ((iy - list_top_y) / item_h.max(1)) as usize;
@@ -2981,22 +2991,27 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) {
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_x = rail_w as i32;
+        let panel_w = sidebar_w.saturating_sub(rail_w);
         let theme = self.ui_theme();
         let s = scale_factor as f32;
         let top_y = top_bars_h as i32;
         let total_h = buf_h.saturating_sub(top_bars_h);
-        if total_h == 0 || sidebar_w < 32 {
+        if total_h == 0 || panel_w < 32 {
             return;
         }
-        let (hdr_h, row_h, pad) = Self::distinct_outline_metrics(s);
+        let panel_r = panel_x + panel_w as i32;
+        let (hdr_h, row_h, base_pad) = Self::distinct_outline_metrics(s);
+        let pad = panel_x + base_pad;
         let is_tex = self.active_doc_kind() == DocKind::LaTeX;
 
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w, total_h, theme.sidebar_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, sidebar_w.saturating_sub(1) as i32, top_y, 1, total_h, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w, total_h, theme.sidebar_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_r - 1, top_y, 1, total_h, theme.divider);
 
         // Header strip
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w.saturating_sub(1), hdr_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y + hdr_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w.saturating_sub(1), hdr_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y + hdr_h as i32 - 1, panel_w.saturating_sub(1), 1, theme.divider);
 
         let title = if is_tex { "Document Structure" } else { "Outline" };
         let title_sz = (12.0 * s).clamp(10.0, 20.0);
@@ -3020,7 +3035,7 @@ impl<'a> PdfViewerApp<'a> {
         let bw = (measure_text(&badge_txt, badge_sz, true).ceil() as u32 + (12.0 * s).round() as u32)
             .max((30.0 * s).round() as u32);
         let bh = (18.0 * s).round().clamp(14.0, (hdr_h as f32 - 6.0).max(14.0)) as u32;
-        let bx = (sidebar_w as i32 - pad - bw as i32).max(pad);
+        let bx = (panel_r - base_pad - bw as i32).max(pad);
         let by = top_y + ((hdr_h.saturating_sub(bh)) / 2) as i32;
         fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, (bh as f32) * 0.5, theme.accent_soft_bg);
         let btw = measure_text(&badge_txt, badge_sz, true);
@@ -3062,7 +3077,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_h,
                 pad,
                 list_y + (12.0 * s).round() as i32,
-                sidebar_w as i32 - pad,
+                panel_r - base_pad,
                 hint,
                 hint_sz,
                 theme.text_muted,
@@ -3093,8 +3108,8 @@ impl<'a> PdfViewerApp<'a> {
         for (vis_i, bm_idx) in (start..self.bookmarks.len()).take(max_rows).enumerate() {
             let bm = &self.bookmarks[bm_idx];
             let ry = list_y + (vis_i as u32 * row_h) as i32;
-            let rx = (6.0 * s).round() as i32;
-            let rw = sidebar_w.saturating_sub((14.0 * s).round() as u32);
+            let rx = panel_x + (6.0 * s).round() as i32;
+            let rw = panel_w.saturating_sub((14.0 * s).round() as u32);
             let rh = row_h.saturating_sub((3.0 * s).round().max(2.0) as u32);
             let is_active = active_idx == Some(bm_idx);
             let is_hov = self.hovered_widget == Some(UiHit::SidebarRow(bm_idx));
@@ -3154,9 +3169,10 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) -> Option<SidebarHit> {
+        let rail_w = self.format_rail_width_px(scale_factor);
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
-        if ix < 0 || ix >= sidebar_w as i32 {
+        if ix < rail_w as i32 || ix >= sidebar_w as i32 {
             return None;
         }
         let s = scale_factor as f32;
@@ -3203,21 +3219,26 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) {
+        let rail_w = self.format_rail_width_px(scale_factor);
+        let panel_x = rail_w as i32;
+        let panel_w = sidebar_w.saturating_sub(rail_w);
         let theme = self.ui_theme();
         let s = scale_factor as f32;
         let top_y = top_bars_h as i32;
         let total_h = buf_h.saturating_sub(top_bars_h);
-        if total_h == 0 || sidebar_w < 32 {
+        if total_h == 0 || panel_w < 32 {
             return;
         }
-        let (hdr_h, card_h, sec_h, row_h, pad) = Self::distinct_word_metrics(s);
+        let panel_r = panel_x + panel_w as i32;
+        let (hdr_h, card_h, sec_h, row_h, base_pad) = Self::distinct_word_metrics(s);
+        let pad = panel_x + base_pad;
 
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w, total_h, theme.sidebar_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, sidebar_w.saturating_sub(1) as i32, top_y, 1, total_h, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w, total_h, theme.sidebar_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_r - 1, top_y, 1, total_h, theme.divider);
 
         // Header strip
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y, sidebar_w.saturating_sub(1), hdr_h, theme.sidebar_header_bg);
-        fill_rect_clipped(buffer, buf_w, buf_h, 0, top_y + hdr_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y, panel_w.saturating_sub(1), hdr_h, theme.sidebar_header_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, panel_x, top_y + hdr_h as i32 - 1, panel_w.saturating_sub(1), 1, theme.divider);
 
         let title_sz = (12.0 * s).clamp(10.0, 20.0);
         let badge_sz = (10.0 * s).clamp(8.5, 16.0);
@@ -3225,7 +3246,7 @@ impl<'a> PdfViewerApp<'a> {
         let bw = (measure_text(&badge_txt, badge_sz, true).ceil() as u32 + (12.0 * s).round() as u32)
             .max((30.0 * s).round() as u32);
         let bh = (18.0 * s).round().clamp(14.0, (hdr_h as f32 - 6.0).max(14.0)) as u32;
-        let bx = (sidebar_w as i32 - pad - bw as i32).max(pad);
+        let bx = (panel_r - base_pad - bw as i32).max(pad);
         let by = top_y + ((hdr_h.saturating_sub(bh)) / 2) as i32;
         fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, (bh as f32) * 0.5, theme.accent_soft_bg);
         let btw = measure_text(&badge_txt, badge_sz, true);
@@ -3257,9 +3278,9 @@ impl<'a> PdfViewerApp<'a> {
         );
 
         // Document Info Card
-        let card_x = (8.0 * s).round() as i32;
+        let card_x = panel_x + (8.0 * s).round() as i32;
         let card_y = top_y + hdr_h as i32 + (8.0 * s).round() as i32;
-        let card_w = sidebar_w.saturating_sub((17.0 * s).round() as u32);
+        let card_w = panel_w.saturating_sub((17.0 * s).round() as u32);
         let card_rad = (7.0 * s).clamp(4.0, 10.0);
         fill_rounded_rect(buffer, buf_w, buf_h, card_x, card_y, card_w, card_h, card_rad, theme.surface_bg);
         stroke_rounded_rect(buffer, buf_w, buf_h, card_x, card_y, card_w, card_h, card_rad, theme.border_subtle);
@@ -3346,7 +3367,7 @@ impl<'a> PdfViewerApp<'a> {
             pad,
             sec_y,
             sec_h,
-            sidebar_w as i32 - pad,
+            panel_r - base_pad,
             "HEADINGS",
             sec_sz,
             theme.text_muted,
@@ -3362,7 +3383,7 @@ impl<'a> PdfViewerApp<'a> {
                 buf_h,
                 pad,
                 list_y + (10.0 * s).round() as i32,
-                sidebar_w as i32 - pad,
+                panel_r - base_pad,
                 "No headings in document",
                 hint_sz,
                 theme.text_muted,
@@ -3392,8 +3413,8 @@ impl<'a> PdfViewerApp<'a> {
         for (vis_i, bm_idx) in (start..self.bookmarks.len()).take(max_rows).enumerate() {
             let bm = &self.bookmarks[bm_idx];
             let ry = list_y + (vis_i as u32 * row_h) as i32;
-            let rx = (6.0 * s).round() as i32;
-            let rw = sidebar_w.saturating_sub((14.0 * s).round() as u32);
+            let rx = panel_x + (6.0 * s).round() as i32;
+            let rw = panel_w.saturating_sub((14.0 * s).round() as u32);
             let rh = row_h.saturating_sub((3.0 * s).round().max(2.0) as u32);
             let is_active = active_idx == Some(bm_idx);
             let is_hov = self.hovered_widget == Some(UiHit::SidebarRow(bm_idx));
@@ -3446,9 +3467,10 @@ impl<'a> PdfViewerApp<'a> {
         top_bars_h: u32,
         scale_factor: f64,
     ) -> Option<SidebarHit> {
+        let rail_w = self.format_rail_width_px(scale_factor);
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
-        if ix < 0 || ix >= sidebar_w as i32 {
+        if ix < rail_w as i32 || ix >= sidebar_w as i32 {
             return None;
         }
         let s = scale_factor as f32;

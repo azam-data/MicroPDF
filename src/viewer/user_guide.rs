@@ -52,14 +52,22 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
                 number: 3,
                 text: "Or click File -> Open Documents in Tab (O) at the top-left corner, pick any supported document or comic file, and click Open.",
             },
-            GuideBlock::Heading("Organizing Favorites & Protecting Portable Settings"),
+            GuideBlock::Heading("Format Drawers, Welcome Scratchpad & Favorites"),
             GuideBlock::Step {
                 number: 1,
-                text: "Click the Favorites menu on the top menu bar, click the ★ star right beside any open tab's filename, or press Ctrl+D to save favorite documents into custom folders and subfolders.",
+                text: "Leftmost Format Drawers: whenever you have tabs open, a slim icon rail appears on the far left for 'All' open files plus an icon for each open file type. Hover any icon to see its format name and count, or click it to show only that format in the tab bar (click the top All grid icon to show every tab again).",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Optional Privacy: click File -> Encrypt Portable Config (micropdf.ini) so your saved tabs, recent files, and favorites cannot be read in Notepad by anyone else (MicroPDF opens it automatically).",
+                text: "Welcome Screen Scratchpad: when no tab is focused on the start card, click inside the Scratchpad box to jot quick notes, reading lists, or reminders (saved automatically beside micropdf.ini, and encrypted too if Portable Encryption is enabled). Click Clear to erase it.",
+            },
+            GuideBlock::Step {
+                number: 3,
+                text: "Click the Favorites menu on the top menu bar, click the ★ star right beside any open tab's filename, or press Ctrl+D to save favorite documents into custom folders and subfolders.",
+            },
+            GuideBlock::Step {
+                number: 4,
+                text: "Optional Privacy: click File -> Encrypt Portable Config (micropdf.ini) so your saved tabs, recent files, scratchpad notes, and favorites cannot be read in Notepad by anyone else (MicroPDF opens it automatically).",
             },
             GuideBlock::Heading("How to Create a New PDF from Photos or Scanned Images"),
             GuideBlock::Step {
@@ -640,7 +648,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Turn pages using the Left/Right arrow keys, Space, Page Up/Down, the clickable left/right edges of the page, or by dragging the page scrubber slider along the bottom bar.",
+                text: "Turn pages with Left/Right arrow keys, Space, Page Up/Down, the mouse wheel, by clicking the left or right half of the page (right-click also steps back; drag to pan when zoomed in), or by dragging the bottom scrubber slider — complete with smooth 3D page-curl animation in Single Page and 2-Page Spread views.",
             },
             GuideBlock::Step {
                 number: 3,

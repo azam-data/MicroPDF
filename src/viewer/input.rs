@@ -780,8 +780,9 @@ impl<'a> PdfViewerApp<'a> {
                 && self.page_turn_anim_ms > 0
                 && self.view_mode.is_page_view()
                 && !self.is_markdown_tab()
+                && !self.is_comic_tab()
             {
-                self.capture_pdf_magazine_canvas_snapshot()
+                self.capture_pdf_spread_snapshot()
             } else {
                 None
             };
@@ -790,11 +791,10 @@ impl<'a> PdfViewerApp<'a> {
             self.scroll_y = 0.0;
             self.scroll_x = 0.0;
             self.invalidate_page_caches();
-            self.trigger_page_turn_anim(dir);
-            if let Some(prev) = mag_prev {
-                if let Some(ref mut anim) = self.page_turn_anim {
-                    anim.prev_spread = Some(prev);
-                }
+            if let Some((rect, px)) = mag_prev {
+                self.trigger_spread_curl(dir, rect, px);
+            } else {
+                self.trigger_page_turn_anim(dir);
             }
             self.status_notice = None;
             self.update_title_bar();
@@ -1128,7 +1128,7 @@ impl<'a> PdfViewerApp<'a> {
             let bmp_h = self.second_page_draw_rect.map_or(self.page_draw_rect.3, |r| self.page_draw_rect.3.max(r.3));
             let pad = (24.0 * sf as f32).round();
             let max_s = ((bmp_h as f32 + pad * 2.0) - ch as f32).max(0.0);
-            if max_s > 0.5 {
+            if max_s > 4.0 {
                 let next_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
                 if (next_y - self.scroll_y).abs() > 0.5 {
                     self.scroll_y = next_y;
@@ -5109,6 +5109,108 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
+        // 2c. Welcome Screen persistent scratchpad keyboard capture when focused
+        if !self.has_any_document()
+            && self.scratchpad_focused
+            && self.open_menu.is_none()
+            && !self.show_help_overlay
+            && !self.has_blocking_modal()
+            && !self.has_open_popover()
+        {
+            if self.cmd_or_ctrl_pressed {
+                if let Key::Character(ch) = &logical_key {
+                    let s = ch.as_str();
+                    if s.eq_ignore_ascii_case("c") {
+                        let _ = Self::copy_text_to_os_clipboard(&self.scratchpad_text);
+                        self.status_notice = Some("Copied scratchpad notes to clipboard".to_string());
+                        self.request_redraw();
+                        return;
+                    } else if s.eq_ignore_ascii_case("v") {
+                        if let Ok(clip) = Self::read_text_from_os_clipboard() {
+                            let normalized = clip.replace("\r\n", "\n").replace('\r', "\n");
+                            let clean: String = normalized
+                                .chars()
+                                .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
+                                .take(8192)
+                                .collect();
+                            if !clean.is_empty() {
+                                let room = 16384usize.saturating_sub(self.scratchpad_text.len());
+                                for ch in clean.chars() {
+                                    if self.scratchpad_text.len() + ch.len_utf8() <= 16384 && room > 0 {
+                                        self.scratchpad_text.push(ch);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                self.save_scratchpad();
+                                self.request_redraw();
+                            }
+                        }
+                        return;
+                    } else if s.eq_ignore_ascii_case("backspace") {
+                        self.scratchpad_text.clear();
+                        self.save_scratchpad();
+                        self.request_redraw();
+                        return;
+                    }
+                }
+            } else if !self.alt_pressed {
+                match &logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.scratchpad_focused = false;
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Backspace) => {
+                        self.scratchpad_text.pop();
+                        self.save_scratchpad();
+                        self.request_redraw();
+                        return;
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if self.scratchpad_text.len() < 16384 {
+                            self.scratchpad_text.push('\n');
+                            self.save_scratchpad();
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        if self.scratchpad_text.len() + 2 <= 16384 {
+                            self.scratchpad_text.push_str("  ");
+                            self.save_scratchpad();
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    Key::Named(NamedKey::Space) => {
+                        if self.scratchpad_text.len() < 16384 {
+                            self.scratchpad_text.push(' ');
+                            self.save_scratchpad();
+                            self.request_redraw();
+                        }
+                        return;
+                    }
+                    Key::Named(NamedKey::F1 | NamedKey::F5 | NamedKey::F11) => {}
+                    _ => {
+                        if let Some(t) = text {
+                            let clean: String = t.chars().filter(|c| !c.is_control()).collect();
+                            if !clean.is_empty() {
+                                for ch in clean.chars() {
+                                    if self.scratchpad_text.len() + ch.len_utf8() <= 16384 {
+                                        self.scratchpad_text.push(ch);
+                                    }
+                                }
+                                self.save_scratchpad();
+                                self.request_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 3. OS-native modifier shortcuts: Cmd/Ctrl + Z/C/F/G/P/S/W/0/+/-/Tab/1..9.
         // Any unrecognized Ctrl/Cmd or Alt+Character combo returns early so e.g. Ctrl+D NEVER triggers bare 'D' (Delete Page)!
         if self.cmd_or_ctrl_pressed {
@@ -7036,7 +7138,26 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         } else if let Some(act) = self.hit_test_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                             new_hover = Some(UiHit::BottomBar(act));
                         }
-                    } else if new_hover.is_none() && self.show_bookmarks && (position.x as u32) < sidebar_w {
+                    } else if new_hover.is_none()
+                        && self.format_rail_width_px(sf) > 0
+                        && (position.x as u32) < self.format_rail_width_px(sf)
+                        && (position.y as i32) >= top_bars_h as i32
+                        && (position.y as i32) < win_h.saturating_sub(status_bar_h) as i32
+                    {
+                        if let Some(filter) = self.hit_test_format_drawer_rail(
+                            position.x,
+                            position.y,
+                            win_h.saturating_sub(status_bar_h),
+                            top_bars_h,
+                            sf,
+                        ) {
+                            new_hover = Some(UiHit::FormatDrawer(filter));
+                        }
+                    } else if new_hover.is_none()
+                        && self.show_bookmarks
+                        && (position.x as u32) >= self.format_rail_width_px(sf)
+                        && (position.x as u32) < sidebar_w
+                    {
                         if self.is_distinct_epub_mode() {
                             if let Some(bh) = self.hit_test_distinct_epub_sidebar(position.x, position.y, sidebar_w, win_h.saturating_sub(status_bar_h), top_bars_h, sf) {
                                 new_hover = Some(UiHit::BookSidebar(bh));
@@ -7296,6 +7417,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
                 if state == ElementState::Released && self.hand_pan_drag_last.is_some() {
+                    let comic_tap = self.is_comic_tab()
+                        && button == MouseButton::Left
+                        && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip
+                        && self
+                            .drag_start
+                            .as_ref()
+                            .is_some_and(|&(sx, sy)| (self.cursor_pos.0 - sx).hypot(self.cursor_pos.1 - sy) < 6.0);
                     self.hand_pan_drag_last = None;
                     if let Some(w) = self.window.as_ref() {
                         w.set_cursor(if self.mouse_mode == MouseMode::Hand {
@@ -7304,8 +7432,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             CursorIcon::Default
                         });
                     }
-                    self.request_redraw();
-                    return;
+                    if !comic_tap {
+                        self.drag_start = None;
+                        self.request_redraw();
+                        return;
+                    }
                 }
                 if state == ElementState::Released && self.deskew_bar.as_ref().is_some_and(|d| d.dragging_slider) {
                     if let Some(ref mut d) = self.deskew_bar {
@@ -8043,6 +8174,24 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
+                if self.scratchpad_focused
+                    && state == ElementState::Pressed
+                    && button == MouseButton::Left
+                    && !self.has_any_document()
+                    && self.hit_test_welcome(
+                        self.cursor_pos.0,
+                        self.cursor_pos.1,
+                        win_w,
+                        win_h,
+                        top_bars_h,
+                        status_bar_h,
+                        scale_factor,
+                    ) != Some(super::overlays::OverlayHit::WelcomeScratchpad)
+                {
+                    self.scratchpad_focused = false;
+                    self.request_redraw();
+                }
+
                 // 0b. Unified Top Bar clicks (Menus on left + Inline Customizable Toolbar beside Help)
                 if (self.cursor_pos.1 as i32) < menu_bar_h as i32 {
                     if state == ElementState::Pressed && button == MouseButton::Left {
@@ -8251,6 +8400,28 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             return;
                         }
                     }
+                }
+
+                // 0d0. Leftmost Format Drawer Rail clicks (`All` or open-format drawer buttons)
+                let rail_w = self.format_rail_width_px(scale_factor);
+                let content_bot = win_h.saturating_sub(status_bar_h);
+                if rail_w > 0
+                    && (self.cursor_pos.0 as u32) < rail_w
+                    && (self.cursor_pos.1 as i32) >= top_bars_h as i32
+                    && (self.cursor_pos.1 as i32) < content_bot as i32
+                {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(filter) = self.hit_test_format_drawer_rail(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            content_bot,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.set_tab_format_filter(filter);
+                        }
+                    }
+                    return;
                 }
 
                 // 0d1. Side-by-Side Compare Mode top control bar + synced drag-to-pan
@@ -8914,26 +9085,21 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     if button == MouseButton::Left {
                         match state {
                             ElementState::Pressed => {
+                                self.drag_start = Some(self.cursor_pos);
                                 let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
                                 let canvas_h = win_h.saturating_sub(top_bars_h + status_bar_h).max(1);
-                                let fits_viewport = self.comic_prefs.layout_mode
-                                    != ComicLayoutMode::VerticalStrip
-                                    && self.page_draw_rect.2 <= canvas_w
-                                    && self.second_page_draw_rect.map_or(true, |r| {
-                                        self.page_draw_rect.2 + r.2 + 8 <= canvas_w
-                                    })
-                                    && self.page_draw_rect.3 <= canvas_h;
-                                if fits_viewport {
-                                    let rel_x = (self.cursor_pos.0 - sidebar_w as f64)
-                                        / (canvas_w as f64);
-                                    if rel_x <= 0.35 {
-                                        let delta = if self.comic_prefs.rtl_manga { 1 } else { -1 };
-                                        self.comic_step_page(delta);
-                                    } else if rel_x >= 0.65 {
-                                        let delta = if self.comic_prefs.rtl_manga { -1 } else { 1 };
-                                        self.comic_step_page(delta);
-                                    }
+                                let total_bmp_w = if let Some(r2) = self.second_page_draw_rect {
+                                    self.page_draw_rect.2 + r2.2 + 8
                                 } else {
+                                    self.page_draw_rect.2
+                                };
+                                let max_bmp_h = self
+                                    .second_page_draw_rect
+                                    .map_or(self.page_draw_rect.3, |r| self.page_draw_rect.3.max(r.3));
+                                let overflows = self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip
+                                    || total_bmp_w > canvas_w
+                                    || max_bmp_h > canvas_h;
+                                if overflows {
                                     self.hand_pan_drag_last = Some(self.cursor_pos);
                                     if let Some(w) = self.window.as_ref() {
                                         w.set_cursor(CursorIcon::Grabbing);
@@ -8941,15 +9107,37 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 }
                             }
                             ElementState::Released => {
-                                if self.hand_pan_drag_last.is_some() {
-                                    self.hand_pan_drag_last = None;
+                                let drag_start = self.drag_start.take();
+                                if self.hand_pan_drag_last.take().is_some() {
                                     if let Some(w) = self.window.as_ref() {
                                         w.set_cursor(CursorIcon::Default);
                                     }
+                                }
+                                let is_tap = drag_start.is_none_or(|(sx, sy)| {
+                                    (self.cursor_pos.0 - sx).hypot(self.cursor_pos.1 - sy) < 6.0
+                                });
+                                if is_tap && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip {
+                                    let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
+                                    let rel_x = (self.cursor_pos.0 - sidebar_w as f64)
+                                        / (canvas_w as f64);
+                                    let delta = if rel_x < 0.50 {
+                                        if self.comic_prefs.rtl_manga { 1 } else { -1 }
+                                    } else if self.comic_prefs.rtl_manga {
+                                        -1
+                                    } else {
+                                        1
+                                    };
+                                    self.comic_step_page(delta);
+                                } else {
                                     self.request_redraw();
                                 }
                             }
                         }
+                    } else if button == MouseButton::Right
+                        && state == ElementState::Pressed
+                        && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip
+                    {
+                        self.comic_step_page(-1);
                     }
                     return;
                 }

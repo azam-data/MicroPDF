@@ -1276,11 +1276,20 @@ impl<'a> PdfViewerApp<'a> {
             self.close_editor_popout(false);
         }
 
-        let next_active = if close_idx < self.active_tab {
+        let mut next_active = if close_idx < self.active_tab {
             self.active_tab - 1
         } else {
             self.active_tab.min(self.tabs.len() - 1)
         };
+        if let Some(kind) = self.tab_format_filter {
+            if self.tab_doc_kind(next_active) != kind {
+                if let Some(sib) = (0..self.tabs.len()).find(|&i| self.tab_doc_kind(i) == kind) {
+                    next_active = sib;
+                } else {
+                    self.tab_format_filter = None;
+                }
+            }
+        }
         self.load_slot_into_active(next_active);
         self.ensure_active_tab_scrolled_into_view();
         self.status_notice = Some(format!("Closed tab '{closed_name}'"));
@@ -1355,7 +1364,12 @@ impl<'a> PdfViewerApp<'a> {
         scale_factor: f64,
     ) -> (bool, usize, usize, u32, i32, i32, i32, i32, i32, u32, u32) {
         let s = scale_factor as f32;
-        let num_tabs = self.tabs.len().max(1);
+        let vis_count_total = if self.tabs.is_empty() {
+            0
+        } else {
+            self.visible_tab_indices().len()
+        };
+        let num_tabs = vis_count_total.max(1);
         let pad_l = (8.0 * s).round() as i32;
         let pad_r = (8.0 * s).round() as i32;
         let tab_gap = (3.0 * s).round() as i32;
@@ -1379,7 +1393,7 @@ impl<'a> PdfViewerApp<'a> {
             .max(min_tab_w);
 
         let needed_at_min = (num_tabs as u32) * min_tab_w + (num_tabs.saturating_sub(1) as u32) * (tab_gap as u32);
-        let overflowing = self.tabs.len() > 1 && needed_at_min > base_avail;
+        let overflowing = vis_count_total > 1 && needed_at_min > base_avail;
 
         let (strip_x, strip_avail, left_arr_x, right_arr_x) = if overflowing {
             let sx = pad_l + arr_w as i32 + 3;
@@ -1435,6 +1449,14 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn ensure_active_tab_scrolled_into_view(&mut self) {
+        if let Some(kind) = self.tab_format_filter {
+            if !self.tabs.is_empty()
+                && self.active_tab < self.tabs.len()
+                && self.tab_doc_kind(self.active_tab) != kind
+            {
+                self.tab_format_filter = None;
+            }
+        }
         let (buf_w, sf) = if let Some(w) = self.window.as_ref() {
             (w.inner_size().width.max(320), self.effective_scale_factor(w.scale_factor()))
         } else {
@@ -1445,11 +1467,13 @@ impl<'a> PdfViewerApp<'a> {
             self.tab_scroll_offset = 0;
             return;
         }
+        let vis_tabs = self.visible_tab_indices();
+        let active_vis = vis_tabs.iter().position(|&i| i == self.active_tab).unwrap_or(0);
         let vis_count = vis_end.saturating_sub(vis_start).max(1);
-        if self.active_tab < self.tab_scroll_offset {
-            self.tab_scroll_offset = self.active_tab;
-        } else if self.active_tab >= self.tab_scroll_offset + vis_count {
-            self.tab_scroll_offset = self.active_tab + 1 - vis_count;
+        if active_vis < self.tab_scroll_offset {
+            self.tab_scroll_offset = active_vis;
+        } else if active_vis >= self.tab_scroll_offset + vis_count {
+            self.tab_scroll_offset = active_vis + 1 - vis_count;
         }
     }
 
@@ -1465,7 +1489,8 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         let vis_count = vis_end.saturating_sub(vis_start).max(1);
-        let max_off = self.tabs.len().saturating_sub(vis_count);
+        let total_vis = self.visible_tab_indices().len();
+        let max_off = total_vis.saturating_sub(vis_count);
         let next = (self.tab_scroll_offset as isize + delta).clamp(0, max_off as isize) as usize;
         if next != self.tab_scroll_offset {
             self.tab_scroll_offset = next;
@@ -1528,10 +1553,11 @@ impl<'a> PdfViewerApp<'a> {
         let arr_w = (22.0 * s).round() as u32;
         let arr_ic = (11.0 * s).round() as u32;
 
+        let vis_tabs = self.visible_tab_indices();
         // Scroll arrows `<` and `>` only when tabs overflow the window width
         if overflowing {
             let can_left = vis_start > 0;
-            let can_right = vis_end < self.tabs.len();
+            let can_right = vis_end < vis_tabs.len();
             let l_hov = can_left && self.hovered_widget == Some(UiHit::TabScrollLeft);
             if l_hov {
                 super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, left_arr_x, btn_y, arr_w, btn_h, (4.0 * s).max(3.0), theme.hover_bg);
@@ -1558,7 +1584,8 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         let mut cur_x = strip_x;
-        for idx in vis_start..vis_end {
+        for vis_pos in vis_start..vis_end {
+            let idx = if vis_tabs.is_empty() { 0 } else { vis_tabs[vis_pos] };
             let is_active = idx == self.active_tab;
             let is_tab_hov = matches!(
                 self.hovered_widget,
@@ -1797,10 +1824,12 @@ impl<'a> PdfViewerApp<'a> {
             return Some(TabBarHit::NewTab);
         }
 
+        let vis_tabs = self.visible_tab_indices();
         let tab_gap = (3.0 * s).round() as i32;
         let close_sz = (16.0 * s).round() as i32;
         let mut cur_x = strip_x;
-        for idx in vis_start..vis_end {
+        for vis_pos in vis_start..vis_end {
+            let idx = if vis_tabs.is_empty() { 0 } else { vis_tabs[vis_pos] };
             if ix >= cur_x && ix < cur_x + tab_w as i32 {
                 let close_x = cur_x + tab_w as i32 - close_sz - (6.0 * s).round() as i32;
                 let star_x = close_x - close_sz - (2.0 * s).round() as i32;
@@ -2158,5 +2187,235 @@ impl<'a> PdfViewerApp<'a> {
                 let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseAllTabs);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Leftmost Format Drawer Rail (`All` + open format drawers)
+    // -------------------------------------------------------------------------
+
+    fn format_drawer_item_rect(
+        rail_w: u32,
+        top_bars_h: u32,
+        content_bot: u32,
+        slot: usize,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return None;
+        }
+        let s = sf as f32;
+        let btn_sz = (28.0 * s)
+            .round()
+            .min((rail_w.saturating_sub(6)) as f32)
+            .max(18.0) as u32;
+        let bx = ((rail_w.saturating_sub(btn_sz)) / 2) as i32;
+        let pad_top = (8.0 * s).round() as i32;
+        let gap = (6.0 * s).round() as i32;
+        let by = top_bars_h as i32 + pad_top + (slot as i32) * (btn_sz as i32 + gap);
+        if by + (btn_sz as i32) > content_bot as i32 {
+            return None;
+        }
+        Some((bx, by, btn_sz, btn_sz))
+    }
+
+    pub(super) fn format_drawer_rect_for(
+        &self,
+        target: Option<DocKind>,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let rail_w = self.format_rail_width_px(sf);
+        let content_bot = buf_h.saturating_sub(status_bar_h);
+        let items = self.format_rail_items();
+        let slot = items.iter().position(|&(k, _)| k == target)?;
+        Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+    }
+
+    pub(super) fn format_drawer_tooltip(&self, filter: Option<DocKind>) -> String {
+        let items = self.format_rail_items();
+        let count = items
+            .iter()
+            .find(|&&(k, _)| k == filter)
+            .map(|&(_, c)| c)
+            .unwrap_or(0);
+        match filter {
+            None => format!("All Open Files ({count})"),
+            Some(DocKind::Pdf) => format!("PDF Documents ({count})"),
+            Some(DocKind::Word) => format!("Word Documents (.docx) ({count})"),
+            Some(DocKind::Comic) => format!("Comic Archives (.cbz) ({count})"),
+            Some(DocKind::Epub) => format!("EPUB Books ({count})"),
+            Some(DocKind::Markdown) => format!("Markdown Notes ({count})"),
+            Some(DocKind::LaTeX) => format!("LaTeX Documents ({count})"),
+        }
+    }
+
+    pub(super) fn draw_format_drawer_rail(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        content_bot: u32,
+        sf: f64,
+    ) {
+        let rail_w = self.format_rail_width_px(sf);
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return;
+        }
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let top_y = top_bars_h as i32;
+        let rail_h = content_bot.saturating_sub(top_bars_h);
+
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            top_y,
+            rail_w.saturating_sub(1),
+            rail_h,
+            theme.sidebar_header_bg,
+        );
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            rail_w.saturating_sub(1) as i32,
+            top_y,
+            1,
+            rail_h,
+            theme.divider,
+        );
+
+        let items = self.format_rail_items();
+        let is_dark = self.ui_theme_mode == super::theme::UiThemeMode::Dark;
+        let rad = (6.0 * s).clamp(4.0, 9.0);
+        let ic_sz = (17.0 * s).round().clamp(12.0, 26.0) as u32;
+
+        for (slot, &(opt_kind, _count)) in items.iter().enumerate() {
+            let Some((bx, by, bw, bh)) =
+                Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+            else {
+                break;
+            };
+            let is_active = self.tab_format_filter == opt_kind;
+            let is_hov = self.hovered_widget == Some(UiHit::FormatDrawer(opt_kind));
+            let bg = if is_active {
+                theme.accent_soft_bg
+            } else if is_hov {
+                theme.hover_bg
+            } else {
+                theme.surface_elevated
+            };
+            let border = if is_active {
+                theme.accent
+            } else {
+                theme.border_subtle
+            };
+            super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, border);
+
+            if is_active {
+                let bar_w = (3.0 * s).round().max(2.0) as u32;
+                let bar_pad = (5.0 * s).round() as i32;
+                super::ui_draw::fill_rounded_rect(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    1,
+                    by + bar_pad,
+                    bar_w,
+                    bh.saturating_sub((bar_pad * 2) as u32).max(6),
+                    1.5,
+                    theme.accent,
+                );
+            }
+
+            let ix = bx + ((bw.saturating_sub(ic_sz)) / 2) as i32;
+            let iy = by + ((bh.saturating_sub(ic_sz)) / 2) as i32;
+            match opt_kind {
+                None => {
+                    let gap_px = (2.0 * s).round().max(1.0) as i32;
+                    let cell = ((ic_sz as i32 - gap_px) / 2).max(4) as u32;
+                    let cr = (1.5 * s).max(1.0);
+                    let col = if is_active {
+                        theme.accent
+                    } else if is_hov {
+                        theme.text_primary
+                    } else {
+                        theme.text_secondary
+                    };
+                    for gx in 0..2 {
+                        for gy in 0..2 {
+                            super::ui_draw::fill_rounded_rect(
+                                buffer,
+                                buf_w,
+                                buf_h,
+                                ix + gx * (cell as i32 + gap_px),
+                                iy + gy * (cell as i32 + gap_px),
+                                cell,
+                                cell,
+                                cr,
+                                col,
+                            );
+                        }
+                    }
+                }
+                Some(kind) => {
+                    super::ui_draw::draw_doc_type_icon(
+                        buffer, buf_w, buf_h, kind, ix, iy, ic_sz, is_dark,
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) fn hit_test_format_drawer_rail(
+        &self,
+        mx: f64,
+        my: f64,
+        content_bot: u32,
+        top_bars_h: u32,
+        sf: f64,
+    ) -> Option<Option<DocKind>> {
+        let rail_w = self.format_rail_width_px(sf);
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return None;
+        }
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < 0 || ix >= rail_w as i32 || iy < top_bars_h as i32 || iy >= content_bot as i32 {
+            return None;
+        }
+        let items = self.format_rail_items();
+        for (slot, &(opt_kind, _)) in items.iter().enumerate() {
+            if let Some((bx, by, bw, bh)) =
+                Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+            {
+                if ix >= bx && ix < bx + bw as i32 && iy >= by && iy < by + bh as i32 {
+                    return Some(opt_kind);
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn set_tab_format_filter(&mut self, filter: Option<DocKind>) {
+        self.tab_format_filter = filter;
+        self.tab_scroll_offset = 0;
+        if let Some(kind) = filter {
+            if self.active_tab >= self.tabs.len() || self.tab_doc_kind(self.active_tab) != kind {
+                if let Some(first_match) = (0..self.tabs.len()).find(|&i| self.tab_doc_kind(i) == kind) {
+                    self.switch_to_tab(first_match);
+                } else {
+                    self.tab_format_filter = None;
+                }
+            }
+        }
+        self.ensure_active_tab_scrolled_into_view();
+        self.request_redraw();
     }
 }

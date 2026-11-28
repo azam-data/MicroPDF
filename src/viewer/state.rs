@@ -482,6 +482,8 @@ pub(super) struct PageTurnAnim {
     pub(super) from_scroll_y: Option<f32>,
     /// Temporary outgoing spread pixel buffer `(w, h, pixels)` freed when animation ends.
     pub(super) prev_spread: Option<(u32, u32, Vec<u32>)>,
+    /// Screen rectangle `(x, y, w, h)` corresponding to `prev_spread`.
+    pub(super) prev_rect: Option<(i32, i32, u32, u32)>,
 }
 
 /// Full-text search hit inside an EPUB, Markdown, or LaTeX `MarkdownDoc`.
@@ -993,6 +995,7 @@ pub(super) enum UiHit {
     TabScrollRight,
     TabNew,
     TabListToggle,
+    FormatDrawer(Option<super::theme::DocKind>),
     TabList(TabListHit),
     TabContext(TabContextHit),
     ThumbContext(ThumbContextHit),
@@ -1377,8 +1380,13 @@ pub struct PdfViewerApp<'a> {
     /// Open document tabs; inactive tabs hold zero rendered bitmaps.
     pub(super) tabs: Vec<DocumentTab<'a>>,
     pub(super) active_tab: usize,
+    /// Active leftmost format drawer filter (`None` = All open files, `Some(kind)` = only tabs of that format).
+    pub(super) tab_format_filter: Option<super::theme::DocKind>,
     /// First visible tab index when tabs overflow the horizontal tab strip.
     pub(super) tab_scroll_offset: usize,
+    /// Persistent landing-page scratchpad text + focus state (`micropdf_scratchpad.txt`).
+    pub(super) scratchpad_text: String,
+    pub(super) scratchpad_focused: bool,
     /// True when the `▾` All-Tabs overflow dropdown is open.
     pub(super) show_tab_list_popover: bool,
     /// Scroll offset (first visible row) inside the `▾` All-Tabs dropdown.
@@ -1821,8 +1829,33 @@ impl<'a> PdfViewerApp<'a> {
                 direction,
                 from_scroll_y: None,
                 prev_spread: None,
+                prev_rect: None,
             });
         }
+    }
+
+    pub(super) fn trigger_spread_curl(
+        &mut self,
+        direction: i8,
+        rect: (i32, i32, u32, u32),
+        pixels: Vec<u32>,
+    ) {
+        let dur = if self.page_turn_anim_ms == 0 {
+            0
+        } else {
+            self.page_turn_anim_ms.clamp(180, 1400)
+        };
+        if dur == 0 || pixels.is_empty() || rect.2 < 8 || rect.3 < 8 {
+            return;
+        }
+        self.page_turn_anim = Some(PageTurnAnim {
+            started_at: Instant::now(),
+            duration_ms: dur,
+            direction,
+            from_scroll_y: None,
+            prev_spread: Some((rect.2, rect.3, pixels)),
+            prev_rect: Some(rect),
+        });
     }
 
     pub(super) fn trigger_epub_page_curl(&mut self, direction: i8, from_scroll_y: f32) {
@@ -1840,12 +1873,12 @@ impl<'a> PdfViewerApp<'a> {
             direction,
             from_scroll_y: Some(from_scroll_y),
             prev_spread: None,
+            prev_rect: None,
         });
     }
 
-    /// Returns `Some((eased_t, direction))` while the page-turn animation is active,
-    /// or `None` once finished.
-    pub(super) fn page_turn_anim_progress(&mut self) -> Option<(f32, i8)> {
+    /// Returns linear `(t, direction)` in `0.0..1.0` while active, or `None` once finished.
+    pub(super) fn page_turn_anim_linear(&mut self) -> Option<(f32, i8)> {
         let anim = self.page_turn_anim.as_ref()?;
         let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
         let t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
@@ -1853,8 +1886,7 @@ impl<'a> PdfViewerApp<'a> {
             self.page_turn_anim = None;
             None
         } else {
-            let eased = 1.0 - (1.0 - t).powi(3);
-            Some((eased, anim.direction))
+            Some((t, anim.direction))
         }
     }
 
@@ -1884,7 +1916,10 @@ impl<'a> PdfViewerApp<'a> {
             engine,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_format_filter: None,
             tab_scroll_offset: 0,
+            scratchpad_text: String::new(),
+            scratchpad_focused: false,
             show_tab_list_popover: false,
             tab_list_scroll: 0,
             tab_context_menu: None,
@@ -2087,6 +2122,7 @@ impl<'a> PdfViewerApp<'a> {
         };
         app.record_status_notice_if_new();
         app.load_session_from_ini(initial_path.is_none());
+        app.load_scratchpad();
         if let Some(path) = initial_path {
             app.load_document(path)?;
         }
@@ -2249,6 +2285,49 @@ impl<'a> PdfViewerApp<'a> {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("micropdf.ini")))
             .unwrap_or_else(|| PathBuf::from("micropdf.ini"))
+    }
+
+    pub(super) fn portable_scratchpad_path(&self) -> PathBuf {
+        self.portable_session_ini_path()
+            .with_file_name("micropdf_scratchpad.txt")
+    }
+
+    pub(super) fn fallback_os_scratchpad_path() -> PathBuf {
+        Self::fallback_os_config_ini_path().with_file_name("micropdf_scratchpad.txt")
+    }
+
+    pub(super) fn load_scratchpad(&mut self) {
+        let primary = self.portable_scratchpad_path();
+        let fallback = Self::fallback_os_scratchpad_path();
+        let raw = std::fs::read_to_string(&primary)
+            .or_else(|_| std::fs::read_to_string(&fallback));
+        let Ok(raw_text) = raw else {
+            return;
+        };
+        if crate::config_crypto::is_encrypted_config(&raw_text) {
+            if let Ok(plain) = crate::config_crypto::decrypt_config(&raw_text) {
+                self.scratchpad_text = plain;
+            }
+        } else {
+            self.scratchpad_text = raw_text;
+        }
+    }
+
+    pub(super) fn save_scratchpad(&self) {
+        let payload = if self.encrypt_config {
+            crate::config_crypto::encrypt_config(&self.scratchpad_text)
+        } else {
+            self.scratchpad_text.clone()
+        };
+        let primary = self.portable_scratchpad_path();
+        if std::fs::write(&primary, &payload).is_ok() {
+            return;
+        }
+        let fallback = Self::fallback_os_scratchpad_path();
+        if let Some(dir) = fallback.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(fallback, payload);
     }
 
     /// Returns the fallback OS config folder `micropdf.ini` path when the executable folder is not writable.
@@ -3394,22 +3473,65 @@ impl<'a> PdfViewerApp<'a> {
             .to_string()
     }
 
+    pub(super) fn format_rail_width_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation || self.tabs.is_empty() {
+            return 0;
+        }
+        (38.0 * scale_factor).round() as u32
+    }
+
+    pub(super) fn format_rail_items(&self) -> Vec<(Option<super::theme::DocKind>, usize)> {
+        use super::theme::DocKind;
+        if self.tabs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![(None, self.tabs.len())];
+        for kind in [
+            DocKind::Pdf,
+            DocKind::Word,
+            DocKind::Comic,
+            DocKind::Epub,
+            DocKind::Markdown,
+            DocKind::LaTeX,
+        ] {
+            let count = (0..self.tabs.len())
+                .filter(|&i| self.tab_doc_kind(i) == kind)
+                .count();
+            if count > 0 {
+                out.push((Some(kind), count));
+            }
+        }
+        out
+    }
+
+    pub(super) fn visible_tab_indices(&self) -> Vec<usize> {
+        match self.tab_format_filter {
+            None => (0..self.tabs.len()).collect(),
+            Some(kind) => (0..self.tabs.len())
+                .filter(|&i| self.tab_doc_kind(i) == kind)
+                .collect(),
+        }
+    }
+
+    pub(super) fn sidebar_panel_width_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation || !self.show_bookmarks {
+            return 0;
+        }
+        let base_w = if self.is_distinct_epub_mode() {
+            320.0
+        } else if self.is_distinct_comic_mode() {
+            220.0
+        } else {
+            SIDEBAR_WIDTH_LOGICAL as f64
+        };
+        (base_w * scale_factor).round() as u32
+    }
+
     pub(super) fn sidebar_width_px(&self, scale_factor: f64) -> u32 {
         if self.is_fullscreen || self.is_presentation {
             return 0;
         }
-        if self.show_bookmarks {
-            let base_w = if self.is_distinct_epub_mode() {
-                320.0
-            } else if self.is_distinct_comic_mode() {
-                220.0
-            } else {
-                SIDEBAR_WIDTH_LOGICAL as f64
-            };
-            (base_w * scale_factor).round() as u32
-        } else {
-            0
-        }
+        self.format_rail_width_px(scale_factor) + self.sidebar_panel_width_px(scale_factor)
     }
 
     pub(super) fn menu_bar_height_px(&self, scale_factor: f64) -> u32 {
