@@ -482,6 +482,8 @@ pub(super) struct PageTurnAnim {
     pub(super) from_scroll_y: Option<f32>,
     /// Temporary outgoing spread pixel buffer `(w, h, pixels)` freed when animation ends.
     pub(super) prev_spread: Option<(u32, u32, Vec<u32>)>,
+    /// Screen rectangle `(x, y, w, h)` corresponding to `prev_spread`.
+    pub(super) prev_rect: Option<(i32, i32, u32, u32)>,
 }
 
 /// Full-text search hit inside an EPUB, Markdown, or LaTeX `MarkdownDoc`.
@@ -579,6 +581,136 @@ impl ViewMode {
     }
 }
 
+/// Comic Book (.cbz) page fitting mode.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(super) enum ComicFitMode {
+    #[default]
+    FitPage,
+    FitWidth,
+    FitHeight,
+}
+
+#[allow(dead_code)]
+impl ComicFitMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ComicFitMode::FitPage => "Fit Page",
+            ComicFitMode::FitWidth => "Fit Width",
+            ComicFitMode::FitHeight => "Fit Height",
+        }
+    }
+
+    pub(super) fn short_label(self) -> &'static str {
+        match self {
+            ComicFitMode::FitPage => "Fit",
+            ComicFitMode::FitWidth => "Width",
+            ComicFitMode::FitHeight => "Height",
+        }
+    }
+
+    pub(super) fn next(self) -> Self {
+        match self {
+            ComicFitMode::FitPage => ComicFitMode::FitWidth,
+            ComicFitMode::FitWidth => ComicFitMode::FitHeight,
+            ComicFitMode::FitHeight => ComicFitMode::FitPage,
+        }
+    }
+
+    pub(super) fn to_ini_str(self) -> &'static str {
+        match self {
+            ComicFitMode::FitPage => "page",
+            ComicFitMode::FitWidth => "width",
+            ComicFitMode::FitHeight => "height",
+        }
+    }
+
+    pub(super) fn from_ini_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "width" => ComicFitMode::FitWidth,
+            "height" => ComicFitMode::FitHeight,
+            _ => ComicFitMode::FitPage,
+        }
+    }
+}
+
+/// Comic Book (.cbz) layout mode: Single Page, 2-Page Spread, or Vertical Strip (Webtoon).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub(super) enum ComicLayoutMode {
+    #[default]
+    SinglePage,
+    TwoPageSpread,
+    VerticalStrip,
+}
+
+#[allow(dead_code)]
+impl ComicLayoutMode {
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            ComicLayoutMode::SinglePage => "Single Page",
+            ComicLayoutMode::TwoPageSpread => "2-Page Spread",
+            ComicLayoutMode::VerticalStrip => "Vertical Strip",
+        }
+    }
+
+    pub(super) fn short_label(self) -> &'static str {
+        match self {
+            ComicLayoutMode::SinglePage => "Single",
+            ComicLayoutMode::TwoPageSpread => "2-Page",
+            ComicLayoutMode::VerticalStrip => "Strip",
+        }
+    }
+
+    pub(super) fn next(self) -> Self {
+        match self {
+            ComicLayoutMode::SinglePage => ComicLayoutMode::TwoPageSpread,
+            ComicLayoutMode::TwoPageSpread => ComicLayoutMode::VerticalStrip,
+            ComicLayoutMode::VerticalStrip => ComicLayoutMode::SinglePage,
+        }
+    }
+
+    pub(super) fn to_ini_str(self) -> &'static str {
+        match self {
+            ComicLayoutMode::SinglePage => "single",
+            ComicLayoutMode::TwoPageSpread => "spread",
+            ComicLayoutMode::VerticalStrip => "strip",
+        }
+    }
+
+    pub(super) fn from_ini_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "spread" | "twopage" | "2page" => ComicLayoutMode::TwoPageSpread,
+            "strip" | "vertical" | "webtoon" => ComicLayoutMode::VerticalStrip,
+            _ => ComicLayoutMode::SinglePage,
+        }
+    }
+}
+
+/// Persisted Comic Book (.cbz) reader preferences.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ComicPrefs {
+    pub(super) rtl_manga: bool,
+    pub(super) layout_mode: ComicLayoutMode,
+    pub(super) cover_first: bool,
+    pub(super) fit_mode: ComicFitMode,
+}
+
+impl Default for ComicPrefs {
+    fn default() -> Self {
+        Self {
+            rtl_manga: false,
+            layout_mode: ComicLayoutMode::SinglePage,
+            cover_first: true,
+            fit_mode: ComicFitMode::FitPage,
+        }
+    }
+}
+
+/// Bounded LRU cached decoded comic page or thumbnail bitmap.
+pub(super) struct ComicCachedEntry {
+    pub(super) bitmap: crate::comic::ComicPageBitmap,
+    pub(super) last_tick: u64,
+}
+
 /// Saved tab state persisted in `micropdf.ini` on exit.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct SavedSessionTab {
@@ -609,6 +741,7 @@ pub(super) struct SessionConfig {
     pub(super) page_turn_anim_ms: u64,
     pub(super) reading_filter: ReadingFilter,
     pub(super) epub_prefs: EpubReaderPrefs,
+    pub(super) comic_prefs: ComicPrefs,
     pub(super) md_code_font_px: f32,
     pub(super) md_preview_font_px: f32,
     pub(super) md_line_spacing: f32,
@@ -629,12 +762,13 @@ impl Default for SessionConfig {
             recent_files: Vec::new(),
             last_positions: Vec::new(),
             ui_theme: UiThemeMode::Light,
-            ui_skin: UiSkin::Classic,
+            ui_skin: UiSkin::Distinct,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
             page_turn_anim_ms: 450,
             reading_filter: ReadingFilter::Normal,
             epub_prefs: EpubReaderPrefs::default(),
+            comic_prefs: ComicPrefs::default(),
             md_code_font_px: 13.5,
             md_preview_font_px: 14.5,
             md_line_spacing: 1.56,
@@ -762,6 +896,8 @@ pub(super) struct DocumentTab<'a> {
     /// Raw Markdown/LaTeX source text when editing or inspecting source.
     pub(super) md_source: Option<String>,
     pub(super) md_editor_mode: super::text_editor::MdEditorMode,
+    /// Lightweight `.cbz` archive index (zero decoded pixel buffers).
+    pub(super) comic_doc: Option<crate::comic::ComicArchive>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -859,6 +995,7 @@ pub(super) enum UiHit {
     TabScrollRight,
     TabNew,
     TabListToggle,
+    FormatDrawer(Option<super::theme::DocKind>),
     TabList(TabListHit),
     TabContext(TabContextHit),
     ThumbContext(ThumbContextHit),
@@ -907,10 +1044,46 @@ pub(super) enum UiHit {
     AaPopover(AaPopoverHit),
     BookSelectionPill(BookSelectionPillHit),
     EpubBottom(EpubBottomHit),
+    ComicBottom(ComicBottomHit),
+    ComicSidebar(ComicSidebarHit),
     Overlay(OverlayHit),
     BookmarkFormatSaveSample,
     BookmarkFormatClose,
     NotificationClear,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(super) enum ComicBottomHit {
+    ToggleSidebar,
+    PageJump,
+    ToggleRtl,
+    CycleLayout,
+    CycleFit,
+    ToggleFilter,
+    ToggleFullscreen,
+    Scrubber(f32),
+}
+
+impl Eq for ComicBottomHit {}
+
+impl ComicBottomHit {
+    pub(super) fn tooltip(self) -> &'static str {
+        match self {
+            Self::ToggleSidebar => "Thumbnails Sidebar (B)",
+            Self::PageJump => "Jump to Page (G)",
+            Self::ToggleRtl => "Toggle LTR / RTL Manga Reading Direction (R)",
+            Self::CycleLayout => "Cycle Layout: Single / 2-Page Spread / Vertical Strip (D)",
+            Self::CycleFit => "Cycle Image Fit: Fit Page / Fit Width / Fit Height (F)",
+            Self::ToggleFilter => "Cycle Eye-Care Reading Filter (V)",
+            Self::ToggleFullscreen => "Toggle Fullscreen (F11)",
+            Self::Scrubber(_) => "Drag or Click to Scrub Comic Pages",
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) enum ComicSidebarHit {
+    PageThumb(usize),
 }
 
 /// One timestamped session notification stored in the bottom-left Notification Board (capped at 50).
@@ -1207,6 +1380,8 @@ pub struct PdfViewerApp<'a> {
     /// Open document tabs; inactive tabs hold zero rendered bitmaps.
     pub(super) tabs: Vec<DocumentTab<'a>>,
     pub(super) active_tab: usize,
+    /// Active leftmost format drawer filter (`None` = All open files, `Some(kind)` = only tabs of that format).
+    pub(super) tab_format_filter: Option<super::theme::DocKind>,
     /// First visible tab index when tabs overflow the horizontal tab strip.
     pub(super) tab_scroll_offset: usize,
     /// True when the `▾` All-Tabs overflow dropdown is open.
@@ -1255,6 +1430,16 @@ pub struct PdfViewerApp<'a> {
     pub(super) epub_word_rects: Vec<EpubWordHit>,
     pub(super) epub_selection_drag: Option<((usize, usize), (usize, usize))>,
     pub(super) epub_selection_pill_rect: Option<(i32, i32, u32, u32)>,
+    /// Active `.cbz` comic archive and strictly bounded LRU pixel caches.
+    pub(super) comic_doc: Option<crate::comic::ComicArchive>,
+    pub(super) comic_prefs: ComicPrefs,
+    pub(super) comic_page_cache: HashMap<usize, ComicCachedEntry>,
+    pub(super) comic_thumb_cache: HashMap<usize, ComicCachedEntry>,
+    pub(super) comic_page_dims: HashMap<usize, (u32, u32)>,
+    pub(super) comic_lru_tick: u64,
+    pub(super) comic_strip_rects: Vec<(usize, (i32, i32, u32, u32))>,
+    pub(super) comic_scrubber_drag: bool,
+    pub(super) comic_sidebar_scroll: usize,
     pub(super) file_path: PathBuf,
     pub(super) current_page_index: u16,
     pub(super) roman_end: usize,
@@ -1424,7 +1609,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) show_customize_toolbar: bool,
     /// Bright Light default UI theme with Dark Mode toggle.
     pub(super) ui_theme_mode: UiThemeMode,
-    /// Visual skin mode (`Classic` default vs `Distinct`).
+    /// Visual skin mode (`Distinct` default vs `Classic`).
     pub(super) ui_skin: UiSkin,
     /// User-adjustable UI interface scale multiplier (`0.80..=1.60`, persisted in `micropdf.ini`).
     pub(super) ui_scale: f32,
@@ -1523,7 +1708,9 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn active_doc_kind(&self) -> DocKind {
         let by_path = DocKind::from_path(&self.file_path);
-        if self.markdown_doc.is_some() && by_path == DocKind::Pdf {
+        if self.comic_doc.is_some() && by_path == DocKind::Pdf {
+            DocKind::Comic
+        } else if self.markdown_doc.is_some() && by_path == DocKind::Pdf {
             DocKind::Markdown
         } else {
             by_path
@@ -1535,7 +1722,9 @@ impl<'a> PdfViewerApp<'a> {
             self.active_doc_kind()
         } else if let Some(slot) = self.tabs.get(tab_idx) {
             let by_path = DocKind::from_path(&slot.file_path);
-            if slot.markdown_doc.is_some() && by_path == DocKind::Pdf {
+            if slot.comic_doc.is_some() && by_path == DocKind::Pdf {
+                DocKind::Comic
+            } else if slot.markdown_doc.is_some() && by_path == DocKind::Pdf {
                 DocKind::Markdown
             } else {
                 by_path
@@ -1637,8 +1826,33 @@ impl<'a> PdfViewerApp<'a> {
                 direction,
                 from_scroll_y: None,
                 prev_spread: None,
+                prev_rect: None,
             });
         }
+    }
+
+    pub(super) fn trigger_spread_curl(
+        &mut self,
+        direction: i8,
+        rect: (i32, i32, u32, u32),
+        pixels: Vec<u32>,
+    ) {
+        let dur = if self.page_turn_anim_ms == 0 {
+            0
+        } else {
+            self.page_turn_anim_ms.clamp(180, 1400)
+        };
+        if dur == 0 || pixels.is_empty() || rect.2 < 8 || rect.3 < 8 {
+            return;
+        }
+        self.page_turn_anim = Some(PageTurnAnim {
+            started_at: Instant::now(),
+            duration_ms: dur,
+            direction,
+            from_scroll_y: None,
+            prev_spread: Some((rect.2, rect.3, pixels)),
+            prev_rect: Some(rect),
+        });
     }
 
     pub(super) fn trigger_epub_page_curl(&mut self, direction: i8, from_scroll_y: f32) {
@@ -1656,12 +1870,12 @@ impl<'a> PdfViewerApp<'a> {
             direction,
             from_scroll_y: Some(from_scroll_y),
             prev_spread: None,
+            prev_rect: None,
         });
     }
 
-    /// Returns `Some((eased_t, direction))` while the page-turn animation is active,
-    /// or `None` once finished.
-    pub(super) fn page_turn_anim_progress(&mut self) -> Option<(f32, i8)> {
+    /// Returns linear `(t, direction)` in `0.0..1.0` while active, or `None` once finished.
+    pub(super) fn page_turn_anim_linear(&mut self) -> Option<(f32, i8)> {
         let anim = self.page_turn_anim.as_ref()?;
         let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
         let t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
@@ -1669,8 +1883,7 @@ impl<'a> PdfViewerApp<'a> {
             self.page_turn_anim = None;
             None
         } else {
-            let eased = 1.0 - (1.0 - t).powi(3);
-            Some((eased, anim.direction))
+            Some((t, anim.direction))
         }
     }
 
@@ -1700,6 +1913,7 @@ impl<'a> PdfViewerApp<'a> {
             engine,
             tabs: Vec::new(),
             active_tab: 0,
+            tab_format_filter: None,
             tab_scroll_offset: 0,
             show_tab_list_popover: false,
             tab_list_scroll: 0,
@@ -1740,6 +1954,15 @@ impl<'a> PdfViewerApp<'a> {
             epub_word_rects: Vec::new(),
             epub_selection_drag: None,
             epub_selection_pill_rect: None,
+            comic_doc: None,
+            comic_prefs: ComicPrefs::default(),
+            comic_page_cache: HashMap::new(),
+            comic_thumb_cache: HashMap::new(),
+            comic_page_dims: HashMap::new(),
+            comic_lru_tick: 0,
+            comic_strip_rects: Vec::new(),
+            comic_scrubber_drag: false,
+            comic_sidebar_scroll: 0,
             file_path: initial_path.clone().unwrap_or_default(),
             current_page_index: 0,
             roman_end: 0,
@@ -1841,7 +2064,7 @@ impl<'a> PdfViewerApp<'a> {
             show_about_overlay: false,
             show_customize_toolbar: false,
             ui_theme_mode: UiThemeMode::Light,
-            ui_skin: UiSkin::Classic,
+            ui_skin: UiSkin::Distinct,
             ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
@@ -2113,6 +2336,10 @@ impl<'a> PdfViewerApp<'a> {
         out.push_str(&format!("epub_hyphenate={}\n", if cfg.epub_prefs.hyphenate { 1 } else { 0 }));
         out.push_str(&format!("epub_spread={}\n", if cfg.epub_prefs.two_page_spread { 1 } else { 0 }));
         out.push_str(&format!("epub_page_curl={}\n", if cfg.epub_prefs.page_curl_anim { 1 } else { 0 }));
+        out.push_str(&format!("comic_rtl={}\n", if cfg.comic_prefs.rtl_manga { 1 } else { 0 }));
+        out.push_str(&format!("comic_layout={}\n", cfg.comic_prefs.layout_mode.to_ini_str()));
+        out.push_str(&format!("comic_cover_first={}\n", if cfg.comic_prefs.cover_first { 1 } else { 0 }));
+        out.push_str(&format!("comic_fit={}\n", cfg.comic_prefs.fit_mode.to_ini_str()));
         out.push_str(&format!("md_code_font_size={:.1}\n", cfg.md_code_font_px.clamp(10.0, 28.0)));
         out.push_str(&format!("md_preview_font_size={:.1}\n", cfg.md_preview_font_px.clamp(10.0, 30.0)));
         out.push_str(&format!("md_line_spacing={:.2}\n", cfg.md_line_spacing.clamp(1.20, 2.20)));
@@ -2266,6 +2493,16 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("epub_page_curl=") {
                 let v = val.trim();
                 cfg.epub_prefs.page_curl_anim = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("comic_rtl=") {
+                let v = val.trim();
+                cfg.comic_prefs.rtl_manga = v == "1" || v.eq_ignore_ascii_case("true");
+            } else if let Some(val) = line.strip_prefix("comic_layout=") {
+                cfg.comic_prefs.layout_mode = ComicLayoutMode::from_ini_str(val);
+            } else if let Some(val) = line.strip_prefix("comic_cover_first=") {
+                let v = val.trim();
+                cfg.comic_prefs.cover_first = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("comic_fit=") {
+                cfg.comic_prefs.fit_mode = ComicFitMode::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("md_code_font_size=") {
                 if let Ok(v) = val.trim().parse::<f32>() {
                     if v.is_finite() {
@@ -2514,6 +2751,7 @@ impl<'a> PdfViewerApp<'a> {
             encrypt_config: self.encrypt_config,
             favorites: self.favorites.clone(),
             epub_prefs: self.epub_prefs.clone(),
+            comic_prefs: self.comic_prefs.clone(),
             md_code_font_px: self.md_code_font_px,
             md_preview_font_px: self.md_preview_font_px,
             md_line_spacing: self.md_line_spacing,
@@ -2583,6 +2821,7 @@ impl<'a> PdfViewerApp<'a> {
         self.encrypt_config = was_encrypted || cfg.encrypt_config;
         self.favorites = cfg.favorites;
         self.epub_prefs = cfg.epub_prefs;
+        self.comic_prefs = cfg.comic_prefs;
         self.md_code_font_px = cfg.md_code_font_px;
         self.md_preview_font_px = cfg.md_preview_font_px;
         self.md_line_spacing = cfg.md_line_spacing;
@@ -2790,7 +3029,7 @@ impl<'a> PdfViewerApp<'a> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("document.pdf")
                 .to_string();
-            let res = if self.doc.is_none() {
+            let res = if !self.has_any_document() {
                 self.load_document(path)
             } else {
                 self.open_document_in_new_tab(path)
@@ -2819,11 +3058,19 @@ impl<'a> PdfViewerApp<'a> {
         self.markdown_doc.is_some()
     }
 
+    pub(super) fn is_comic_tab(&self) -> bool {
+        self.comic_doc.is_some()
+    }
+
+    pub(super) fn has_any_document(&self) -> bool {
+        self.doc.is_some() || self.is_markdown_tab() || self.is_comic_tab()
+    }
+
     /// Checks if the active tab's file changed on disk (`mtime > self.last_file_mtime`).
     /// - If `self.has_unsaved_edits` is false, reloads the file from disk keeping `current_page_index` and `scroll_y`.
     /// - If `self.has_unsaved_edits` is true, shows a status-bar notice instead of reloading.
     pub(super) fn check_and_auto_reload_active_file(&mut self) -> bool {
-        if (self.doc.is_none() && self.markdown_doc.is_none()) || self.file_path.as_os_str().is_empty() {
+        if !self.has_any_document() || self.file_path.as_os_str().is_empty() {
             return false;
         }
         let Some(disk_mtime) = Self::read_file_mtime(&self.file_path) else {
@@ -2839,6 +3086,9 @@ impl<'a> PdfViewerApp<'a> {
 
         if self.markdown_doc.is_some() {
             return self.reload_active_markdown();
+        }
+        if self.comic_doc.is_some() {
+            return self.reload_active_comic();
         }
 
         if self.has_unsaved_edits {
@@ -2932,7 +3182,7 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Polls the active file's modification time every 1 s while the window is focused.
     pub(super) fn poll_auto_reload_if_due(&mut self) {
-        if !self.window_focused || self.doc.is_none() {
+        if !self.window_focused || !self.has_any_document() {
             return;
         }
         if self.last_mtime_poll.elapsed() >= Duration::from_secs(1) {
@@ -2963,6 +3213,14 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.tile_cache.shrink_to_fit();
         self.tile_form_copy = None;
+        self.comic_page_cache.clear();
+        self.comic_page_cache.shrink_to_fit();
+        self.comic_thumb_cache.clear();
+        self.comic_thumb_cache.shrink_to_fit();
+        self.comic_page_dims.clear();
+        self.comic_page_dims.shrink_to_fit();
+        self.comic_strip_rects.clear();
+        self.comic_strip_rects.shrink_to_fit();
         // RAM rule: Character boxes for the current page only; free immediately on page/cache invalidation.
         self.cached_char_boxes = None;
         self.cached_text_view = None;
@@ -3129,7 +3387,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn total_pages(&self) -> u16 {
-        self.doc.as_ref().map(|d| d.pages().len()).unwrap_or(0)
+        if let Some(ref c) = self.comic_doc {
+            c.page_count().min(u16::MAX as usize) as u16
+        } else {
+            self.doc.as_ref().map(|d| d.pages().len()).unwrap_or(0)
+        }
     }
 
     pub(super) fn rotation_degrees_of_page(page: &PdfPage<'_>) -> i32 {
@@ -3152,7 +3414,7 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn filename_display(&self) -> String {
-        if self.doc.is_none() && self.file_path.as_os_str().is_empty() {
+        if !self.has_any_document() && self.file_path.as_os_str().is_empty() {
             return "No PDF Open".to_string();
         }
         self.file_path
@@ -3162,20 +3424,65 @@ impl<'a> PdfViewerApp<'a> {
             .to_string()
     }
 
+    pub(super) fn format_rail_width_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation || self.tabs.is_empty() {
+            return 0;
+        }
+        (38.0 * scale_factor).round() as u32
+    }
+
+    pub(super) fn format_rail_items(&self) -> Vec<(Option<super::theme::DocKind>, usize)> {
+        use super::theme::DocKind;
+        if self.tabs.is_empty() {
+            return Vec::new();
+        }
+        let mut out = vec![(None, self.tabs.len())];
+        for kind in [
+            DocKind::Pdf,
+            DocKind::Word,
+            DocKind::Comic,
+            DocKind::Epub,
+            DocKind::Markdown,
+            DocKind::LaTeX,
+        ] {
+            let count = (0..self.tabs.len())
+                .filter(|&i| self.tab_doc_kind(i) == kind)
+                .count();
+            if count > 0 {
+                out.push((Some(kind), count));
+            }
+        }
+        out
+    }
+
+    pub(super) fn visible_tab_indices(&self) -> Vec<usize> {
+        match self.tab_format_filter {
+            None => (0..self.tabs.len()).collect(),
+            Some(kind) => (0..self.tabs.len())
+                .filter(|&i| self.tab_doc_kind(i) == kind)
+                .collect(),
+        }
+    }
+
+    pub(super) fn sidebar_panel_width_px(&self, scale_factor: f64) -> u32 {
+        if self.is_fullscreen || self.is_presentation || !self.show_bookmarks {
+            return 0;
+        }
+        let base_w = if self.is_distinct_epub_mode() {
+            320.0
+        } else if self.is_distinct_comic_mode() {
+            220.0
+        } else {
+            SIDEBAR_WIDTH_LOGICAL as f64
+        };
+        (base_w * scale_factor).round() as u32
+    }
+
     pub(super) fn sidebar_width_px(&self, scale_factor: f64) -> u32 {
         if self.is_fullscreen || self.is_presentation {
             return 0;
         }
-        if self.show_bookmarks {
-            let base_w = if self.is_distinct_epub_mode() {
-                320.0
-            } else {
-                SIDEBAR_WIDTH_LOGICAL as f64
-            };
-            (base_w * scale_factor).round() as u32
-        } else {
-            0
-        }
+        self.format_rail_width_px(scale_factor) + self.sidebar_panel_width_px(scale_factor)
     }
 
     pub(super) fn menu_bar_height_px(&self, scale_factor: f64) -> u32 {
@@ -3291,14 +3598,18 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
 
-        let title = if self.doc.is_none() {
+        let title = if !self.has_any_document() {
             "MicroPDF".to_string()
-        } else {
+        } else if self.doc.is_some() || self.comic_doc.is_some() {
             let filename = self.filename_display();
             let dirty = if self.has_unsaved_edits { "• " } else { "" };
             let total = self.total_pages();
             let cur = if total > 0 { self.current_page_index + 1 } else { 0 };
             format!("{dirty}{filename} ({cur}/{total}) — MicroPDF")
+        } else {
+            let filename = self.filename_display();
+            let dirty = if self.has_unsaved_edits { "• " } else { "" };
+            format!("{dirty}{filename} — MicroPDF")
         };
 
         window.set_title(&title);

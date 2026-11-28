@@ -780,8 +780,9 @@ impl<'a> PdfViewerApp<'a> {
                 && self.page_turn_anim_ms > 0
                 && self.view_mode.is_page_view()
                 && !self.is_markdown_tab()
+                && !self.is_comic_tab()
             {
-                self.capture_pdf_magazine_canvas_snapshot()
+                self.capture_pdf_spread_snapshot()
             } else {
                 None
             };
@@ -790,11 +791,10 @@ impl<'a> PdfViewerApp<'a> {
             self.scroll_y = 0.0;
             self.scroll_x = 0.0;
             self.invalidate_page_caches();
-            self.trigger_page_turn_anim(dir);
-            if let Some(prev) = mag_prev {
-                if let Some(ref mut anim) = self.page_turn_anim {
-                    anim.prev_spread = Some(prev);
-                }
+            if let Some((rect, px)) = mag_prev {
+                self.trigger_spread_curl(dir, rect, px);
+            } else {
+                self.trigger_page_turn_anim(dir);
             }
             self.status_notice = None;
             self.update_title_bar();
@@ -803,6 +803,10 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn step_pages_forward(&mut self) {
+        if self.is_comic_tab() {
+            self.comic_step_page(1);
+            return;
+        }
         let total = self.total_pages();
         if total == 0 {
             return;
@@ -837,6 +841,10 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn step_pages_backward(&mut self) {
+        if self.is_comic_tab() {
+            self.comic_step_page(-1);
+            return;
+        }
         if self.effective_scroll_mode() == ScrollMode::MagazineBook {
             if self.current_page_index == 0 {
                 return;
@@ -992,6 +1000,14 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn zoom_by_step(&mut self, factor: f32) {
+        if self.is_comic_tab() {
+            self.zoom_level = (self.zoom_level * factor).clamp(0.25, 6.0);
+            let pct = (self.zoom_level * 100.0).round() as u32;
+            self.status_notice = Some(format!("Comic Zoom: {pct}%"));
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         if self.is_markdown_tab() {
             self.zoom_level = (self.zoom_level * factor).clamp(0.6, 3.0);
             let pct = (self.zoom_level * 100.0).round() as u32;
@@ -1010,6 +1026,12 @@ impl<'a> PdfViewerApp<'a> {
         self.pan_x = 0.0;
         self.scroll_y = 0.0;
         self.scroll_x = 0.0;
+        if self.is_comic_tab() {
+            self.status_notice = Some("Comic Zoom reset to 100%".to_string());
+            self.update_title_bar();
+            self.request_redraw();
+            return;
+        }
         if self.is_markdown_tab() {
             self.status_notice = Some("Markdown Zoom reset to 100%".to_string());
             self.update_title_bar();
@@ -1031,6 +1053,29 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn pan_horizontal(&mut self, delta_x: f32) -> bool {
+        if self.is_comic_tab() {
+            let Some(w) = self.window.as_ref() else {
+                return false;
+            };
+            let sz = w.inner_size();
+            let sf = self.effective_scale_factor(w.scale_factor());
+            let cw = sz.width.saturating_sub(self.sidebar_width_px(sf)).max(1);
+            let total_w = if let Some(r2) = self.second_page_draw_rect {
+                (r2.0 + r2.2 as i32 - self.page_draw_rect.0).max(0) as u32
+            } else {
+                self.page_draw_rect.2
+            };
+            if total_w > cw {
+                let max_pan = ((total_w as f32 + 24.0) - cw as f32).max(0.0) * 0.5;
+                let next_pan = (self.pan_x - delta_x).clamp(-max_pan, max_pan);
+                if (next_pan - self.pan_x).abs() > 0.5 {
+                    self.pan_x = next_pan;
+                    self.request_redraw();
+                    return true;
+                }
+            }
+            return false;
+        }
         if !self.view_mode.is_page_view() {
             return false;
         }
@@ -1066,6 +1111,37 @@ impl<'a> PdfViewerApp<'a> {
     /// or in any page view when the page bitmap exceeds the viewport height,
     /// seamlessly transitioning to the next/previous page when scrolling past the bottom/top!
     pub(super) fn scroll_or_turn_page_vertical(&mut self, scroll_delta_px: f32) -> bool {
+        if self.is_comic_tab() {
+            let Some(w) = self.window.as_ref() else {
+                return false;
+            };
+            let sz = w.inner_size();
+            let sf = self.effective_scale_factor(w.scale_factor());
+            let cw = sz.width.saturating_sub(self.sidebar_width_px(sf)).max(1);
+            let ch = sz.height.saturating_sub(self.top_bars_height_px(sf) + self.status_bar_height_px(sf)).max(1);
+            if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                let max_s = self.comic_max_scroll_y(cw, ch, sf);
+                self.scroll_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
+                self.request_redraw();
+                return true;
+            }
+            let bmp_h = self.second_page_draw_rect.map_or(self.page_draw_rect.3, |r| self.page_draw_rect.3.max(r.3));
+            let pad = if self.is_presentation || self.is_fullscreen {
+                0.0
+            } else {
+                (18.0 * sf as f32).round()
+            };
+            let max_s = ((bmp_h as f32 + pad * 2.0) - ch as f32).max(0.0);
+            if max_s > 4.0 {
+                let next_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
+                if (next_y - self.scroll_y).abs() > 0.5 {
+                    self.scroll_y = next_y;
+                    self.request_redraw();
+                    return true;
+                }
+            }
+            return false;
+        }
         if self.is_markdown_tab() {
             if let Some(w) = self.window.as_ref() {
                 let sz = w.inner_size();
@@ -1928,8 +2004,10 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn open_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .set_title("Open Documents")
-            .add_filter("Supported Documents (PDF, Markdown, LaTeX, EPUB)", &["pdf", "md", "markdown", "tex", "epub"])
+            .add_filter("Supported Documents (PDF, Markdown, LaTeX, EPUB, Word, Comic)", &["pdf", "md", "markdown", "tex", "epub", "docx", "cbz"])
             .add_filter("PDF Document", &["pdf"])
+            .add_filter("Word Document", &["docx"])
+            .add_filter("Comic Book Archive", &["cbz"])
             .add_filter("EPUB E-Book", &["epub"])
             .add_filter("Markdown Document", &["md", "markdown"])
             .add_filter("LaTeX Document", &["tex"])
@@ -3383,7 +3461,22 @@ impl<'a> PdfViewerApp<'a> {
                 ) {
                     self.push_nav_history();
                     self.current_page_index = target_idx as u16;
-                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    if self.is_comic_tab() && self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                        if let Some(w) = self.window.as_ref() {
+                            let sz = w.inner_size();
+                            let sf = self.effective_scale_factor(w.scale_factor());
+                            let cw = sz.width.saturating_sub(self.sidebar_width_px(sf)).max(1);
+                            let ch = sz.height.saturating_sub(self.top_bars_height_px(sf) + self.status_bar_height_px(sf)).max(1);
+                            let max_s = self.comic_max_scroll_y(cw, ch, sf);
+                            let norm = if total <= 1 { 0.0 } else { target_idx as f32 / (total - 1) as f32 };
+                            self.scroll_y = max_s * norm;
+                        } else {
+                            self.scroll_y = 0.0;
+                        }
+                    } else {
+                        self.scroll_y = 0.0;
+                    }
                     self.invalidate_page_caches();
                     let lbl = PdfEngine::format_logical_page_label_with_skip(
                         target_idx,
@@ -5310,6 +5403,11 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowRight) => {
                 if self.alt_pressed {
                     self.navigate_forward();
+                } else if self.is_comic_tab() {
+                    if !self.pan_horizontal(64.0) {
+                        let delta = if self.comic_prefs.rtl_manga { -1 } else { 1 };
+                        self.comic_step_page(delta);
+                    }
                 } else if self.is_markdown_tab() {
                     let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
                     self.scroll_or_turn_page_vertical(step);
@@ -5318,7 +5416,14 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             Key::Named(NamedKey::PageDown) | Key::Named(NamedKey::Space) => {
-                if self.is_markdown_tab() {
+                if self.is_comic_tab() {
+                    if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                        let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                        self.scroll_or_turn_page_vertical(step);
+                    } else {
+                        self.comic_step_page(1);
+                    }
+                } else if self.is_markdown_tab() {
                     let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
                     self.scroll_or_turn_page_vertical(step);
                 } else {
@@ -5328,6 +5433,11 @@ impl<'a> PdfViewerApp<'a> {
             Key::Named(NamedKey::ArrowLeft) => {
                 if self.alt_pressed {
                     self.navigate_back();
+                } else if self.is_comic_tab() {
+                    if !self.pan_horizontal(-64.0) {
+                        let delta = if self.comic_prefs.rtl_manga { 1 } else { -1 };
+                        self.comic_step_page(delta);
+                    }
                 } else if self.is_markdown_tab() {
                     let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
                     self.scroll_or_turn_page_vertical(-step);
@@ -5336,7 +5446,14 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             Key::Named(NamedKey::PageUp) => {
-                if self.is_markdown_tab() {
+                if self.is_comic_tab() {
+                    if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                        let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
+                        self.scroll_or_turn_page_vertical(-step);
+                    } else {
+                        self.comic_step_page(-1);
+                    }
+                } else if self.is_markdown_tab() {
                     let step = self.window.as_ref().map(|w| (w.inner_size().height as f32 * 0.80).max(240.0)).unwrap_or(480.0);
                     self.scroll_or_turn_page_vertical(-step);
                 } else {
@@ -5344,7 +5461,13 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             Key::Named(NamedKey::Home) => {
-                if self.is_markdown_tab() {
+                if self.is_comic_tab() {
+                    self.current_page_index = 0;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.update_title_bar();
+                    self.request_redraw();
+                } else if self.is_markdown_tab() {
                     self.scroll_y = 0.0;
                     self.request_redraw();
                 } else {
@@ -5352,7 +5475,26 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             Key::Named(NamedKey::End) => {
-                if self.is_markdown_tab() {
+                if self.is_comic_tab() {
+                    let total = self.total_pages();
+                    if total > 0 {
+                        self.current_page_index = total - 1;
+                    }
+                    if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                        if let Some(w) = self.window.as_ref() {
+                            let sz = w.inner_size();
+                            let sf = self.effective_scale_factor(w.scale_factor());
+                            let cw = sz.width.saturating_sub(self.sidebar_width_px(sf)).max(1);
+                            let ch = sz.height.saturating_sub(self.top_bars_height_px(sf) + self.status_bar_height_px(sf)).max(1);
+                            self.scroll_y = self.comic_max_scroll_y(cw, ch, sf);
+                        }
+                    } else {
+                        self.scroll_y = 0.0;
+                    }
+                    self.pan_x = 0.0;
+                    self.update_title_bar();
+                    self.request_redraw();
+                } else if self.is_markdown_tab() {
                     if let Some(w) = self.window.as_ref() {
                         let sz = w.inner_size();
                         let sf = self.effective_scale_factor(w.scale_factor());
@@ -5369,6 +5511,82 @@ impl<'a> PdfViewerApp<'a> {
             }
             Key::Character(ch) => {
                 let s = ch.as_str();
+                if self.is_comic_tab() {
+                    if s == "?" || s == "/" {
+                        self.show_help_overlay = !self.show_help_overlay;
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("r") {
+                        self.comic_prefs.rtl_manga = !self.comic_prefs.rtl_manga;
+                        self.save_session_to_ini();
+                        self.status_notice = Some(if self.comic_prefs.rtl_manga {
+                            "Comic Reading Direction: Right-to-Left (Manga)".to_string()
+                        } else {
+                            "Comic Reading Direction: Left-to-Right".to_string()
+                        });
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("d") {
+                        self.comic_prefs.layout_mode = if self.comic_prefs.layout_mode == ComicLayoutMode::TwoPageSpread {
+                            ComicLayoutMode::SinglePage
+                        } else {
+                            ComicLayoutMode::TwoPageSpread
+                        };
+                        self.scroll_y = 0.0;
+                        self.pan_x = 0.0;
+                        self.save_session_to_ini();
+                        self.status_notice = Some(format!("Comic Layout: {}", self.comic_prefs.layout_mode.label()));
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("f") {
+                        self.comic_prefs.fit_mode = ComicFitMode::FitPage;
+                        self.zoom_level = 1.0;
+                        self.scroll_y = 0.0;
+                        self.pan_x = 0.0;
+                        self.save_session_to_ini();
+                        self.status_notice = Some("Comic Fit: Fit Page".to_string());
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("w") {
+                        self.comic_prefs.fit_mode = ComicFitMode::FitWidth;
+                        self.zoom_level = 1.0;
+                        self.scroll_y = 0.0;
+                        self.pan_x = 0.0;
+                        self.save_session_to_ini();
+                        self.status_notice = Some("Comic Fit: Fit Width".to_string());
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("b") {
+                        self.show_bookmarks = !self.show_bookmarks;
+                        self.status_notice = Some(if self.show_bookmarks {
+                            "Page Thumbnails Sidebar ON".to_string()
+                        } else {
+                            "Page Thumbnails Sidebar OFF".to_string()
+                        });
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("v") {
+                        self.set_reading_filter(self.reading_filter.next());
+                    } else if s == "+" || s == "=" {
+                        self.zoom_by_step(1.25);
+                    } else if s == "-" || s == "_" {
+                        self.zoom_by_step(0.8);
+                    } else if s == "0" {
+                        self.reset_zoom();
+                    } else if s.eq_ignore_ascii_case("g") {
+                        self.input_mode = InputMode::JumpToPage { input: String::new() };
+                        self.status_notice = None;
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+                        self.input_mode = InputMode::JumpToPage { input: s.to_string() };
+                        self.status_notice = None;
+                        self.update_title_bar();
+                        self.request_redraw();
+                    } else if s.eq_ignore_ascii_case("o") {
+                        self.pending_dialog = Some(PendingDialog::Open);
+                    }
+                    return;
+                }
                 if s == "?" || s == "/" {
                     self.show_help_overlay = !self.show_help_overlay;
                     self.request_redraw();
@@ -5924,15 +6142,16 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                     return;
                 }
-                if Self::is_doc_reader_path(&dropped_path) {
+                if Self::is_doc_reader_path(&dropped_path) || Self::is_comic_path(&dropped_path) {
                     let fname = dropped_path
                         .file_name()
                         .and_then(|s| s.to_str())
-                        .unwrap_or("document.md")
+                        .unwrap_or("document")
                         .to_string();
+                    let kind_lbl = super::theme::DocKind::from_path(&dropped_path).label();
                     match self.open_document_in_new_tab(dropped_path) {
                         Ok(()) => {
-                            self.status_notice = Some(format!("Opened Markdown '{fname}'"));
+                            self.status_notice = Some(format!("Opened {kind_lbl} '{fname}'"));
                         }
                         Err(e) => {
                             self.status_notice = Some(format!("Error opening '{fname}': {e}"));
@@ -5944,7 +6163,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
                 if !ext.eq_ignore_ascii_case("pdf") {
                     self.status_notice = Some(format!(
-                        "Dropped file {:?} is not a .pdf, .md, .txt, or .png/.jpg",
+                        "Dropped file {:?} is not a .pdf, .docx, .cbz, .epub, .md, .tex, .txt, or .png/.jpg",
                         dropped_path
                     ));
                     self.update_title_bar();
@@ -5963,7 +6182,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 if self.view_mode.is_page_view()
                     || self.view_mode == ViewMode::TextView
                     || self.shift_pressed
-                    || self.doc.is_none()
+                    || !self.has_any_document()
                 {
                     match self.open_document_in_new_tab(dropped_path) {
                         Ok(()) => {
@@ -6190,6 +6409,22 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             }
                             return;
                         }
+                        if (self.is_distinct_word_mode() || self.is_distinct_outline_mode())
+                            && self.show_bookmarks
+                            && cx >= 0
+                            && (cx as u32) < sidebar_w
+                            && cy >= top_bars_h as i32
+                            && cy < sz.height.saturating_sub(status_bar_h) as i32
+                        {
+                            if dy < -0.5 && self.bookmark_scroll_y + 1 < self.bookmarks.len() {
+                                self.bookmark_scroll_y += 1;
+                                self.request_redraw();
+                            } else if dy > 0.5 && self.bookmark_scroll_y > 0 {
+                                self.bookmark_scroll_y -= 1;
+                                self.request_redraw();
+                            }
+                            return;
+                        }
                         if let Some((ex, ey, ew, eh)) = self.md_editor_rect(sidebar_w, top_bars_h, sz.width, sz.height, status_bar_h, sf) {
                             if cx >= ex && cx < ex + ew as i32 && cy >= ey && cy < ey + eh as i32 {
                                 let zoom = self.zoom_level;
@@ -6226,6 +6461,14 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
 
+                if self.is_comic_tab() && self.cmd_or_ctrl_pressed {
+                    if dy.abs() > 0.1 {
+                        let factor = if dy > 0.0 { 1.15 } else { 1.0 / 1.15 };
+                        self.zoom_by_step(factor);
+                    }
+                    return;
+                }
+
                 // Ctrl/Cmd + MouseWheel zooms around the cursor position (25%..=800%)
                 if self.cmd_or_ctrl_pressed && (self.view_mode.is_page_view() || self.compare_mode.is_some()) {
                     if dy.abs() > 0.1 {
@@ -6258,10 +6501,21 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                 }
 
-                // If cursor is over the Bookmark Sidebar, scroll bookmarks
+                // If cursor is over the Bookmark / Comic Sidebar, scroll it
                 if let Some(w) = self.window.as_ref() {
                     let sidebar_w = self.sidebar_width_px(self.effective_scale_factor(w.scale_factor()));
                     if self.show_bookmarks && (self.cursor_pos.0 as u32) < sidebar_w {
+                        if self.is_distinct_comic_mode() {
+                            let total = self.total_pages() as usize;
+                            if dy < -4.0 && self.comic_sidebar_scroll + 1 < total {
+                                self.comic_sidebar_scroll += 1;
+                                self.request_redraw();
+                            } else if dy > 4.0 && self.comic_sidebar_scroll > 0 {
+                                self.comic_sidebar_scroll -= 1;
+                                self.request_redraw();
+                            }
+                            return;
+                        }
                         if dy < -4.0 && self.bookmark_scroll_y + 1 < self.bookmarks.len() {
                             self.bookmark_scroll_y += 1;
                             self.request_redraw();
@@ -6359,6 +6613,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     }
                     return;
                 }
+                if self.comic_scrubber_drag {
+                    if let Some((tx0, tx1)) = self.comic_scrubber_track_x(win_w, status_bar_h, sf) {
+                        let ratio = ((position.x as f32 - tx0 as f32) / ((tx1 - tx0).max(1) as f32)).clamp(0.0, 1.0);
+                        self.jump_comic_to_progress_ratio(ratio, win_w, win_h, sf);
+                    }
+                    return;
+                }
                 if self.epub_sidebar_scrollbar_drag {
                     let (list_top_y, list_bot_y, _, total_items, visible_items) =
                         self.epub_sidebar_list_metrics(win_h.saturating_sub(status_bar_h), top_bars_h, sf);
@@ -6397,6 +6658,32 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
                 if let Some((lx, ly)) = self.hand_pan_drag_last {
+                    if self.is_comic_tab() {
+                        let drag_dx = (position.x - lx) as f32;
+                        let scroll_dy = (ly - position.y) as f32;
+                        self.hand_pan_drag_last = Some((position.x, position.y));
+                        let mut changed = false;
+                        if drag_dx.abs() > 0.25 {
+                            self.pan_x += drag_dx;
+                            changed = true;
+                        }
+                        if scroll_dy.abs() > 0.25 {
+                            let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
+                            let canvas_h = win_h.saturating_sub(top_bars_h + status_bar_h).max(1);
+                            let max_s = if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                                self.comic_max_scroll_y(canvas_w, canvas_h, sf)
+                            } else {
+                                let bmp_h = self.page_draw_rect.3;
+                                bmp_h.saturating_sub(canvas_h) as f32
+                            };
+                            self.scroll_y = (self.scroll_y + scroll_dy).clamp(0.0, max_s.max(0.0));
+                            changed = true;
+                        }
+                        if changed {
+                            self.request_redraw();
+                        }
+                        return;
+                    }
                     let dx = (lx - position.x) as f32;
                     let dy = (ly - position.y) as f32;
                     self.hand_pan_drag_last = Some((position.x, position.y));
@@ -6746,13 +7033,44 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             if let Some(eb) = self.hit_test_distinct_epub_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                                 new_hover = Some(UiHit::EpubBottom(eb));
                             }
+                        } else if self.is_distinct_comic_mode() {
+                            if let Some(cb) = self.hit_test_distinct_comic_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
+                                new_hover = Some(UiHit::ComicBottom(cb));
+                            }
                         } else if let Some(act) = self.hit_test_bottom_bar(position.x, position.y, win_w, win_h, status_bar_h, sf) {
                             new_hover = Some(UiHit::BottomBar(act));
                         }
-                    } else if new_hover.is_none() && self.show_bookmarks && (position.x as u32) < sidebar_w {
+                    } else if new_hover.is_none()
+                        && self.format_rail_width_px(sf) > 0
+                        && (position.x as u32) < self.format_rail_width_px(sf)
+                        && (position.y as i32) >= top_bars_h as i32
+                        && (position.y as i32) < win_h.saturating_sub(status_bar_h) as i32
+                    {
+                        if let Some(filter) = self.hit_test_format_drawer_rail(
+                            position.x,
+                            position.y,
+                            win_h.saturating_sub(status_bar_h),
+                            top_bars_h,
+                            sf,
+                        ) {
+                            new_hover = Some(UiHit::FormatDrawer(filter));
+                        }
+                    } else if new_hover.is_none()
+                        && self.show_bookmarks
+                        && (position.x as u32) >= self.format_rail_width_px(sf)
+                        && (position.x as u32) < sidebar_w
+                    {
                         if self.is_distinct_epub_mode() {
                             if let Some(bh) = self.hit_test_distinct_epub_sidebar(position.x, position.y, sidebar_w, win_h.saturating_sub(status_bar_h), top_bars_h, sf) {
                                 new_hover = Some(UiHit::BookSidebar(bh));
+                            }
+                        } else if self.is_distinct_comic_mode() {
+                            if let Some(ch) = self.hit_test_distinct_comic_sidebar(position.x, position.y, sidebar_w, win_h.saturating_sub(status_bar_h), top_bars_h, sf) {
+                                new_hover = Some(UiHit::ComicSidebar(ch));
+                            }
+                        } else if self.is_distinct_word_mode() {
+                            if let Some(SidebarHit::BookmarkRow { index, .. }) = self.hit_test_distinct_word_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
+                                new_hover = Some(UiHit::SidebarRow(index));
                             }
                         } else if self.is_distinct_outline_mode() {
                             if let Some(SidebarHit::BookmarkRow { index, .. }) = self.hit_test_distinct_outline_sidebar(position.x, position.y, sidebar_w, top_bars_h, sf) {
@@ -6772,7 +7090,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                 SidebarHit::BookmarkRow { index, on_delete: false } => UiHit::SidebarRow(index),
                             });
                         }
-                    } else if new_hover.is_none() && self.doc.is_none() && !self.is_markdown_tab() {
+                    } else if new_hover.is_none() && !self.has_any_document() {
                         if let Some(oh) = self.hit_test_welcome(position.x, position.y, win_w, win_h, top_bars_h, status_bar_h, sf) {
                             new_hover = Some(UiHit::Overlay(oh));
                         }
@@ -6977,6 +7295,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     self.request_redraw();
                     return;
                 }
+                if state == ElementState::Released && self.comic_scrubber_drag {
+                    self.comic_scrubber_drag = false;
+                    self.request_redraw();
+                    return;
+                }
                 if state == ElementState::Released && self.epub_sidebar_scrollbar_drag {
                     self.epub_sidebar_scrollbar_drag = false;
                     self.request_redraw();
@@ -6996,6 +7319,13 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                     return;
                 }
                 if state == ElementState::Released && self.hand_pan_drag_last.is_some() {
+                    let comic_tap = self.is_comic_tab()
+                        && button == MouseButton::Left
+                        && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip
+                        && self
+                            .drag_start
+                            .as_ref()
+                            .is_some_and(|&(sx, sy)| (self.cursor_pos.0 - sx).hypot(self.cursor_pos.1 - sy) < 6.0);
                     self.hand_pan_drag_last = None;
                     if let Some(w) = self.window.as_ref() {
                         w.set_cursor(if self.mouse_mode == MouseMode::Hand {
@@ -7004,8 +7334,11 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             CursorIcon::Default
                         });
                     }
-                    self.request_redraw();
-                    return;
+                    if !comic_tap {
+                        self.drag_start = None;
+                        self.request_redraw();
+                        return;
+                    }
                 }
                 if state == ElementState::Released && self.deskew_bar.as_ref().is_some_and(|d| d.dragging_slider) {
                     if let Some(ref mut d) = self.deskew_bar {
@@ -7863,6 +8196,20 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                                     self.handle_distinct_epub_bottom_click(hit, win_w, win_h, scale_factor);
                                 }
                             }
+                        } else if self.is_distinct_comic_mode() {
+                            if let Some(hit) = self.hit_test_distinct_comic_bottom_bar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                win_w,
+                                win_h,
+                                status_bar_h,
+                                scale_factor,
+                            ) {
+                                if matches!(hit, ComicBottomHit::Scrubber(_)) {
+                                    self.comic_scrubber_drag = true;
+                                }
+                                self.handle_distinct_comic_bottom_click(hit, win_w, win_h, scale_factor);
+                            }
                         } else if let Some(action) = self.hit_test_bottom_bar(
                             self.cursor_pos.0,
                             self.cursor_pos.1,
@@ -7878,7 +8225,7 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 // 0d. Welcome Screen clicks when no document is open
-                if self.doc.is_none() && !self.is_markdown_tab() {
+                if !self.has_any_document() {
                     if state == ElementState::Pressed && button == MouseButton::Left {
                         if let Some(oh) = self.hit_test_welcome(
                             self.cursor_pos.0,
@@ -7937,6 +8284,28 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             return;
                         }
                     }
+                }
+
+                // 0d0. Leftmost Format Drawer Rail clicks (`All` or open-format drawer buttons)
+                let rail_w = self.format_rail_width_px(scale_factor);
+                let content_bot = win_h.saturating_sub(status_bar_h);
+                if rail_w > 0
+                    && (self.cursor_pos.0 as u32) < rail_w
+                    && (self.cursor_pos.1 as i32) >= top_bars_h as i32
+                    && (self.cursor_pos.1 as i32) < content_bot as i32
+                {
+                    if state == ElementState::Pressed && button == MouseButton::Left {
+                        if let Some(filter) = self.hit_test_format_drawer_rail(
+                            self.cursor_pos.0,
+                            self.cursor_pos.1,
+                            content_bot,
+                            top_bars_h,
+                            scale_factor,
+                        ) {
+                            self.set_tab_format_filter(filter);
+                        }
+                    }
+                    return;
                 }
 
                 // 0d1. Side-by-Side Compare Mode top control bar + synced drag-to-pan
@@ -8216,8 +8585,53 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                         }
                         return;
                     }
+                    if self.is_distinct_comic_mode() {
+                        if state == ElementState::Pressed && button == MouseButton::Left {
+                            let content_bot = win_h.saturating_sub(status_bar_h);
+                            if let Some(ComicSidebarHit::PageThumb(idx)) =
+                                self.hit_test_distinct_comic_sidebar(
+                                    self.cursor_pos.0,
+                                    self.cursor_pos.1,
+                                    sidebar_w,
+                                    content_bot,
+                                    top_bars_h,
+                                    scale_factor,
+                                )
+                            {
+                                let total = self.total_pages() as usize;
+                                if total > 0 && idx < total {
+                                    self.current_page_index = idx.min(u16::MAX as usize) as u16;
+                                    self.pan_x = 0.0;
+                                    if self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip {
+                                        let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
+                                        let canvas_h = win_h.saturating_sub(top_bars_h + status_bar_h).max(1);
+                                        let max_s = self.comic_max_scroll_y(canvas_w, canvas_h, scale_factor);
+                                        let norm = if total <= 1 {
+                                            0.0
+                                        } else {
+                                            idx as f32 / (total - 1) as f32
+                                        };
+                                        self.scroll_y = max_s * norm;
+                                    } else {
+                                        self.scroll_y = 0.0;
+                                    }
+                                    self.update_title_bar();
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                        return;
+                    }
                     if state == ElementState::Pressed {
-                        let sidebar_hit = if self.is_distinct_outline_mode() {
+                        let sidebar_hit = if self.is_distinct_word_mode() {
+                            self.hit_test_distinct_word_sidebar(
+                                self.cursor_pos.0,
+                                self.cursor_pos.1,
+                                sidebar_w,
+                                top_bars_h,
+                                scale_factor,
+                            )
+                        } else if self.is_distinct_outline_mode() {
                             self.hit_test_distinct_outline_sidebar(
                                 self.cursor_pos.0,
                                 self.cursor_pos.1,
@@ -8548,6 +8962,67 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                 }
 
                 if self.view_mode == ViewMode::TextView {
+                    return;
+                }
+
+                if self.is_comic_tab() {
+                    if button == MouseButton::Left {
+                        match state {
+                            ElementState::Pressed => {
+                                self.drag_start = Some(self.cursor_pos);
+                                let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
+                                let canvas_h = win_h.saturating_sub(top_bars_h + status_bar_h).max(1);
+                                let total_bmp_w = if let Some(r2) = self.second_page_draw_rect {
+                                    self.page_draw_rect.2 + r2.2 + 8
+                                } else {
+                                    self.page_draw_rect.2
+                                };
+                                let max_bmp_h = self
+                                    .second_page_draw_rect
+                                    .map_or(self.page_draw_rect.3, |r| self.page_draw_rect.3.max(r.3));
+                                let overflows = self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip
+                                    || total_bmp_w > canvas_w
+                                    || max_bmp_h > canvas_h;
+                                if overflows {
+                                    self.hand_pan_drag_last = Some(self.cursor_pos);
+                                    if let Some(w) = self.window.as_ref() {
+                                        w.set_cursor(CursorIcon::Grabbing);
+                                    }
+                                }
+                            }
+                            ElementState::Released => {
+                                let drag_start = self.drag_start.take();
+                                if self.hand_pan_drag_last.take().is_some() {
+                                    if let Some(w) = self.window.as_ref() {
+                                        w.set_cursor(CursorIcon::Default);
+                                    }
+                                }
+                                let is_tap = drag_start.is_none_or(|(sx, sy)| {
+                                    (self.cursor_pos.0 - sx).hypot(self.cursor_pos.1 - sy) < 6.0
+                                });
+                                if is_tap && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip {
+                                    let canvas_w = win_w.saturating_sub(sidebar_w).max(1);
+                                    let rel_x = (self.cursor_pos.0 - sidebar_w as f64)
+                                        / (canvas_w as f64);
+                                    let delta = if rel_x < 0.50 {
+                                        if self.comic_prefs.rtl_manga { 1 } else { -1 }
+                                    } else if self.comic_prefs.rtl_manga {
+                                        -1
+                                    } else {
+                                        1
+                                    };
+                                    self.comic_step_page(delta);
+                                } else {
+                                    self.request_redraw();
+                                }
+                            }
+                        }
+                    } else if button == MouseButton::Right
+                        && state == ElementState::Pressed
+                        && self.comic_prefs.layout_mode != ComicLayoutMode::VerticalStrip
+                    {
+                        self.comic_step_page(-1);
+                    }
                     return;
                 }
 

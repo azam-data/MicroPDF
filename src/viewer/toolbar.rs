@@ -186,6 +186,14 @@ pub enum ToolbarAction {
     MdZoomIn,
     MdReload,
     MdExportPrint,
+    ComicToggleRtl,
+    ComicCycleLayout,
+    ComicToggleCoverFirst,
+    ComicCycleFit,
+    ComicZoomOut,
+    ComicZoomReset,
+    ComicZoomIn,
+    ComicReload,
     UiScaleDown,
     UiScaleReset,
     UiScaleUp,
@@ -195,9 +203,9 @@ pub enum ToolbarAction {
 impl ToolbarAction {
     pub fn tooltip(self) -> &'static str {
         match self {
-            Self::ToggleSidebar => "Bookmarks Sidebar (B)",
+            Self::ToggleSidebar => "Bookmarks / Pages Sidebar (B)",
             Self::ToggleGrid => "Thumbnail Grid (Tab)",
-            Self::Open => "Open Documents (PDF / MD / LaTeX / EPUB) (O)",
+            Self::Open => "Open Documents (PDF / MD / LaTeX / EPUB / DOCX / CBZ) (O)",
             Self::Save => "Save (S / Ctrl+S)",
             Self::SaveAs => "Save As... (Ctrl+Shift+S)",
             Self::Print => "Print Preview / Export (Ctrl+P)",
@@ -226,6 +234,14 @@ impl ToolbarAction {
             Self::MdZoomIn => "Zoom In (+)",
             Self::MdReload => "Reload File from Disk",
             Self::MdExportPrint => "Export to PDF / Word / EPUB or Print (Ctrl+P)",
+            Self::ComicToggleRtl => "Toggle Reading Direction: LTR / RTL Manga (R)",
+            Self::ComicCycleLayout => "Cycle Comic Layout: Single / 2-Page Spread / Vertical Strip (D)",
+            Self::ComicToggleCoverFirst => "Keep First Page (Cover) Solo in 2-Page Spread",
+            Self::ComicCycleFit => "Cycle Image Fit: Fit Page / Fit Width / Fit Height (F)",
+            Self::ComicZoomOut => "Zoom Out (-)",
+            Self::ComicZoomReset => "Reset Zoom to 100% (0)",
+            Self::ComicZoomIn => "Zoom In (+)",
+            Self::ComicReload => "Reload Comic Archive from Disk",
             Self::UiScaleDown => "Shrink Interface Scale (-10%)",
             Self::UiScaleReset => "Reset Interface Scale to 100%",
             Self::UiScaleUp => "Enlarge Interface Scale (+10%)",
@@ -404,16 +420,18 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         let distinct_epub = self.is_distinct_epub_mode();
+        let distinct_comic = self.is_distinct_comic_mode();
+        let is_comic = self.is_comic_tab();
         let distinct_reflowable = self.ui_skin == super::theme::UiSkin::Distinct && self.is_markdown_tab();
 
         // Group 1: Panels & File actions (Sidebar, Grid, Open, Save, SaveAs, Print)
         let mut g1 = 0usize;
-        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) || distinct_epub {
+        if self.toolbar_config.is_enabled(ToolbarItem::Sidebar) || distinct_epub || distinct_comic {
             if try_push(mk_ic(ToolbarAction::ToggleSidebar, UiIcon::Sidebar, self.show_bookmarks, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Grid) && !distinct_reflowable {
+        if self.toolbar_config.is_enabled(ToolbarItem::Grid) && !distinct_reflowable && !is_comic {
             if try_push(mk_ic(ToolbarAction::ToggleGrid, UiIcon::Grid, self.view_mode == ViewMode::ThumbnailGrid, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
@@ -423,41 +441,44 @@ impl<'a> PdfViewerApp<'a> {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Save) && !distinct_epub {
+        if self.toolbar_config.is_enabled(ToolbarItem::Save) && !distinct_epub && !is_comic {
             if try_push(mk_ic(ToolbarAction::Save, UiIcon::Save, self.has_unsaved_edits, self.has_unsaved_edits), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::SaveAs) && !self.is_markdown_tab() {
+        if self.toolbar_config.is_enabled(ToolbarItem::SaveAs) && !self.is_markdown_tab() && !is_comic {
             if try_push(mk_ic(ToolbarAction::SaveAs, UiIcon::SaveAs, false, false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
-        if self.toolbar_config.is_enabled(ToolbarItem::Print) && !self.is_markdown_tab() {
+        if self.toolbar_config.is_enabled(ToolbarItem::Print) && !self.is_markdown_tab() && !is_comic {
             if try_push(mk_ic(ToolbarAction::Print, UiIcon::Print, self.print_preview.is_some(), false), &mut cur_x, &mut widgets) {
                 g1 += 1;
             }
         }
 
+        let mk_pill = |action: ToolbarAction, label: String, w: u32, active: bool, accent_dot: bool| ToolbarWidgetRect {
+            x: 0,
+            y: btn_y,
+            w,
+            h: btn_h,
+            action,
+            icon: None,
+            label: Some(label),
+            swatch_rgb: None,
+            active,
+            accent_dot,
+        };
+
         if self.is_markdown_tab() {
-            // Contextual Document Section — active and visible ONLY for Markdown (.md), LaTeX (.tex), and EPUB (.epub)
+            // Contextual Document Section — active and visible ONLY for Markdown (.md), LaTeX (.tex), EPUB (.epub), and Word (.docx)
             let is_epub = Self::is_epub_path(&self.file_path);
-            let mk_pill = |action: ToolbarAction, label: String, w: u32, active: bool, accent_dot: bool| ToolbarWidgetRect {
-                x: 0,
-                y: btn_y,
-                w,
-                h: btn_h,
-                action,
-                icon: None,
-                label: Some(label),
-                swatch_rgb: None,
-                active,
-                accent_dot,
-            };
+            let is_word = Self::is_word_path(&self.file_path);
+            let is_readonly_reflow = is_epub || is_word;
 
             push_sep(&mut cur_x, &mut seps, g1);
             let mut g_md = 0usize;
-            if !is_epub {
+            if !is_readonly_reflow {
                 let modes = [
                     (ToolbarAction::MdModePreview, "Preview", (52.0 * s).round() as u32, self.md_editor_mode == super::text_editor::MdEditorMode::Preview),
                     (ToolbarAction::MdModeSplit, "Split", (38.0 * s).round() as u32, self.md_editor_mode == super::text_editor::MdEditorMode::Split),
@@ -487,7 +508,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
                 push_sep(&mut cur_x, &mut seps, g_zoom);
 
-                if !is_epub && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
+                if !is_readonly_reflow && (self.has_unsaved_edits || self.md_editor_mode != super::text_editor::MdEditorMode::Preview) {
                     try_push(
                         mk_pill(ToolbarAction::MdSave, "Save".to_string(), (44.0 * s).round() as u32, self.has_unsaved_edits, self.has_unsaved_edits),
                         &mut cur_x,
@@ -513,6 +534,44 @@ impl<'a> PdfViewerApp<'a> {
                     &mut widgets,
                 );
             }
+        } else if is_comic {
+            // Contextual Comic (.cbz) Section — RTL Manga, Layout, Cover 1st, Fit, Zoom, Reload
+            push_sep(&mut cur_x, &mut seps, g1);
+            let rtl_lbl = if self.comic_prefs.rtl_manga { "RTL" } else { "LTR" }.to_string();
+            let layout_lbl = self.comic_prefs.layout_mode.short_label().to_string();
+            let fit_lbl = self.comic_prefs.fit_mode.label().to_string();
+            let mut g_comic = 0usize;
+            for (act, lbl, pw, active) in [
+                (ToolbarAction::ComicToggleRtl, rtl_lbl, (38.0 * s).round() as u32, self.comic_prefs.rtl_manga),
+                (ToolbarAction::ComicCycleLayout, layout_lbl, (56.0 * s).round() as u32, self.comic_prefs.layout_mode != ComicLayoutMode::SinglePage),
+                (ToolbarAction::ComicToggleCoverFirst, "Cover 1st".to_string(), (66.0 * s).round() as u32, self.comic_prefs.cover_first),
+                (ToolbarAction::ComicCycleFit, fit_lbl, (62.0 * s).round() as u32, false),
+            ] {
+                if try_push(mk_pill(act, lbl, pw, active, false), &mut cur_x, &mut widgets) {
+                    g_comic += 1;
+                }
+            }
+            push_sep(&mut cur_x, &mut seps, g_comic);
+
+            let z_pct = format!("{}%", (self.zoom_level * 100.0).round() as i32);
+            let zbtn_w = (22.0 * s).round() as u32;
+            let zlbl_w = (44.0 * s).round() as u32;
+            let mut g_zoom = 0usize;
+            for (act, lbl, pw) in [
+                (ToolbarAction::ComicZoomOut, "-".to_string(), zbtn_w),
+                (ToolbarAction::ComicZoomReset, z_pct, zlbl_w),
+                (ToolbarAction::ComicZoomIn, "+".to_string(), zbtn_w),
+            ] {
+                if try_push(mk_pill(act, lbl, pw, false, false), &mut cur_x, &mut widgets) {
+                    g_zoom += 1;
+                }
+            }
+            push_sep(&mut cur_x, &mut seps, g_zoom);
+            try_push(
+                mk_pill(ToolbarAction::ComicReload, "Reload".to_string(), (50.0 * s).round() as u32, false, false),
+                &mut cur_x,
+                &mut widgets,
+            );
         } else {
             // Group 2: Select + Full Annotations Suite + Color Swatch (PDF tabs only)
             let mut g2 = 0usize;
@@ -589,13 +648,16 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn toolbar_action_enabled(&self, action: ToolbarAction) -> bool {
         let is_md_doc = self.is_markdown_tab();
+        let is_comic = self.is_comic_tab();
         let is_epub = is_md_doc && Self::is_epub_path(&self.file_path);
-        let is_md_tex = is_md_doc && !is_epub;
-        let is_pdf = self.doc.is_some() && !is_md_doc;
-        let has_any = is_pdf || is_md_doc;
+        let is_word = is_md_doc && Self::is_word_path(&self.file_path);
+        let is_md_tex = is_md_doc && !is_epub && !is_word;
+        let is_pdf = self.doc.is_some() && !is_md_doc && !is_comic;
+        let has_any = is_pdf || is_md_doc || is_comic;
         match action {
             ToolbarAction::Open => true,
-            ToolbarAction::ToggleSidebar | ToolbarAction::FindText => has_any,
+            ToolbarAction::ToggleSidebar => has_any,
+            ToolbarAction::FindText => is_pdf || is_md_doc,
             ToolbarAction::ToggleGrid => is_pdf,
             ToolbarAction::Save => is_pdf || is_md_tex,
             ToolbarAction::SaveAs
@@ -618,12 +680,20 @@ impl<'a> PdfViewerApp<'a> {
             ToolbarAction::MdModePreview
             | ToolbarAction::MdModeSplit
             | ToolbarAction::MdModeEdit
-            | ToolbarAction::MdSave
-            | ToolbarAction::MdReload => is_md_tex,
+            | ToolbarAction::MdSave => is_md_tex,
+            ToolbarAction::MdReload => is_md_tex || is_word,
             ToolbarAction::MdZoomOut
             | ToolbarAction::MdZoomReset
             | ToolbarAction::MdZoomIn
             | ToolbarAction::MdExportPrint => is_md_doc,
+            ToolbarAction::ComicToggleRtl
+            | ToolbarAction::ComicCycleLayout
+            | ToolbarAction::ComicToggleCoverFirst
+            | ToolbarAction::ComicCycleFit
+            | ToolbarAction::ComicZoomOut
+            | ToolbarAction::ComicZoomReset
+            | ToolbarAction::ComicZoomIn
+            | ToolbarAction::ComicReload => is_comic,
             ToolbarAction::UiScaleDown
             | ToolbarAction::UiScaleReset
             | ToolbarAction::UiScaleUp
@@ -925,14 +995,14 @@ impl<'a> PdfViewerApp<'a> {
                 self.md_layout = None;
             }
             ToolbarAction::MdModeSplit => {
-                if !Self::is_epub_path(&self.file_path) {
+                if !Self::is_epub_path(&self.file_path) && !Self::is_word_path(&self.file_path) {
                     self.md_editor_mode = super::text_editor::MdEditorMode::Split;
                     self.ensure_md_editor_initialized();
                     self.md_layout = None;
                 }
             }
             ToolbarAction::MdModeEdit => {
-                if !Self::is_epub_path(&self.file_path) {
+                if !Self::is_epub_path(&self.file_path) && !Self::is_word_path(&self.file_path) {
                     self.md_editor_mode = super::text_editor::MdEditorMode::Edit;
                     self.ensure_md_editor_initialized();
                 }
@@ -959,6 +1029,59 @@ impl<'a> PdfViewerApp<'a> {
             }
             ToolbarAction::MdExportPrint => {
                 self.open_markdown_export_modal();
+                return;
+            }
+            ToolbarAction::ComicToggleRtl => {
+                self.comic_prefs.rtl_manga = !self.comic_prefs.rtl_manga;
+                self.save_session_to_ini();
+                self.status_notice = Some(if self.comic_prefs.rtl_manga {
+                    "Comic Reading Direction: Right-to-Left (Manga)".to_string()
+                } else {
+                    "Comic Reading Direction: Left-to-Right".to_string()
+                });
+            }
+            ToolbarAction::ComicCycleLayout => {
+                self.comic_prefs.layout_mode = self.comic_prefs.layout_mode.next();
+                self.scroll_y = 0.0;
+                self.pan_x = 0.0;
+                self.save_session_to_ini();
+                self.status_notice = Some(format!("Comic Layout: {}", self.comic_prefs.layout_mode.label()));
+            }
+            ToolbarAction::ComicToggleCoverFirst => {
+                self.comic_prefs.cover_first = !self.comic_prefs.cover_first;
+                self.save_session_to_ini();
+                self.status_notice = Some(if self.comic_prefs.cover_first {
+                    "Cover-First Pairing ON (Page 1 solo)".to_string()
+                } else {
+                    "Cover-First Pairing OFF".to_string()
+                });
+            }
+            ToolbarAction::ComicCycleFit => {
+                self.comic_prefs.fit_mode = self.comic_prefs.fit_mode.next();
+                self.zoom_level = 1.0;
+                self.scroll_y = 0.0;
+                self.pan_x = 0.0;
+                self.save_session_to_ini();
+                self.status_notice = Some(format!("Comic Fit: {}", self.comic_prefs.fit_mode.label()));
+            }
+            ToolbarAction::ComicZoomOut => {
+                self.zoom_level = (self.zoom_level * 0.85).clamp(0.25, 6.0);
+                let pct = (self.zoom_level * 100.0).round() as u32;
+                self.status_notice = Some(format!("Comic Zoom: {pct}%"));
+            }
+            ToolbarAction::ComicZoomReset => {
+                self.zoom_level = 1.0;
+                self.scroll_y = 0.0;
+                self.pan_x = 0.0;
+                self.status_notice = Some("Comic Zoom reset to 100%".to_string());
+            }
+            ToolbarAction::ComicZoomIn => {
+                self.zoom_level = (self.zoom_level * 1.18).clamp(0.25, 6.0);
+                let pct = (self.zoom_level * 100.0).round() as u32;
+                self.status_notice = Some(format!("Comic Zoom: {pct}%"));
+            }
+            ToolbarAction::ComicReload => {
+                self.reload_active_comic();
                 return;
             }
             ToolbarAction::UiScaleDown => {

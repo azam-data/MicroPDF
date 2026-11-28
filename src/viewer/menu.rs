@@ -67,7 +67,9 @@ impl<'a> PdfViewerApp<'a> {
             let is_open = self.open_menu == Some(cat);
             let is_hover = self.hovered_widget == Some(UiHit::MenuHeader(cat));
             let cat_enabled = match cat {
-                MenuCategory::Page | MenuCategory::Tools => self.doc.is_some() && !self.is_markdown_tab(),
+                MenuCategory::Page | MenuCategory::Tools => {
+                    self.doc.is_some() && !self.is_markdown_tab() && !self.is_comic_tab()
+                }
                 _ => true,
             };
             if is_open {
@@ -107,10 +109,12 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn menu_item_enabled(&self, cat: MenuCategory, idx: usize) -> bool {
         let is_md_doc = self.is_markdown_tab();
+        let is_comic = self.is_comic_tab();
         let is_epub = is_md_doc && Self::is_epub_path(&self.file_path);
-        let is_md_tex = is_md_doc && !is_epub;
-        let is_pdf = self.doc.is_some() && !is_md_doc;
-        let has_any = is_pdf || is_md_doc;
+        let is_word = is_md_doc && Self::is_word_path(&self.file_path);
+        let is_md_tex = is_md_doc && !is_epub && !is_word;
+        let is_pdf = self.doc.is_some() && !is_md_doc && !is_comic;
+        let has_any = is_pdf || is_md_doc || is_comic;
 
         match cat {
             MenuCategory::File => match idx {
@@ -121,19 +125,22 @@ impl<'a> PdfViewerApp<'a> {
                 _ => !self.recent_files.is_empty(),
             },
             MenuCategory::View => match idx {
-                0 | 4 | 5 | 7 | 8 | 10..=12 | 14 => has_any,
-                1 | 2 | 3 | 6 | 9 | 13 => is_pdf,
+                0 | 4 | 5 | 10..=12 | 14 => has_any,
+                1 | 3 => is_pdf || is_comic,
+                7 | 8 => is_pdf || is_md_doc,
+                2 | 6 | 9 | 13 => is_pdf,
+                17 => !is_comic,
                 _ => true,
             },
             MenuCategory::Edit => match idx {
                 0 | 1 => is_pdf || (is_md_tex && self.md_editor.is_some()),
-                2 => is_pdf || is_md_tex || (is_epub && self.epub_selection_drag.is_some()),
-                3 => has_any,
+                2 => is_pdf || is_md_tex || ((is_epub || is_word) && self.epub_selection_drag.is_some()),
+                3 => is_pdf || is_md_doc,
                 _ => is_pdf,
             },
             MenuCategory::Page | MenuCategory::Tools => is_pdf,
             MenuCategory::Export => match idx {
-                5 => is_pdf || is_md_tex,
+                5 => is_pdf || is_md_tex || is_word,
                 _ => is_pdf,
             },
             MenuCategory::Favorites => match idx {
@@ -148,7 +155,10 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn menu_items_for_category(&self, cat: MenuCategory) -> Vec<String> {
         let mut list: Vec<String> = cat.items().iter().map(|s| (*s).to_string()).collect();
         if cat == MenuCategory::File {
-            if self.is_markdown_tab() && !Self::is_epub_path(&self.file_path) {
+            if self.is_markdown_tab()
+                && !Self::is_epub_path(&self.file_path)
+                && !Self::is_word_path(&self.file_path)
+            {
                 if let Some(slot) = list.get_mut(5) {
                     *slot = "Save Document  S".to_string();
                 }
@@ -195,12 +205,42 @@ impl<'a> PdfViewerApp<'a> {
         }
         match (cat, idx) {
             (MenuCategory::File, 11) => self.encrypt_config,
-            (MenuCategory::View, 0) => self.effective_layout_mode() == ViewMode::FitPage && self.view_mode.is_page_view(),
-            (MenuCategory::View, 1) => self.effective_layout_mode() == ViewMode::FitWidth && self.view_mode.is_page_view(),
+            (MenuCategory::View, 0) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.fit_mode == ComicFitMode::FitPage
+                } else {
+                    self.effective_layout_mode() == ViewMode::FitPage && self.view_mode.is_page_view()
+                }
+            }
+            (MenuCategory::View, 1) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.fit_mode == ComicFitMode::FitWidth
+                } else {
+                    self.effective_layout_mode() == ViewMode::FitWidth && self.view_mode.is_page_view()
+                }
+            }
             (MenuCategory::View, 2) => self.effective_layout_mode() == ViewMode::FitTextWidth && self.view_mode.is_page_view(),
-            (MenuCategory::View, 3) => self.effective_layout_mode() == ViewMode::TwoPageSpread && self.view_mode.is_page_view(),
-            (MenuCategory::View, 4) => self.effective_scroll_mode() == ScrollMode::SinglePage,
-            (MenuCategory::View, 5) => self.effective_scroll_mode() == ScrollMode::ContinuousVertical,
+            (MenuCategory::View, 3) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode == ComicLayoutMode::TwoPageSpread
+                } else {
+                    self.effective_layout_mode() == ViewMode::TwoPageSpread && self.view_mode.is_page_view()
+                }
+            }
+            (MenuCategory::View, 4) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode == ComicLayoutMode::SinglePage
+                } else {
+                    self.effective_scroll_mode() == ScrollMode::SinglePage
+                }
+            }
+            (MenuCategory::View, 5) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode == ComicLayoutMode::VerticalStrip
+                } else {
+                    self.effective_scroll_mode() == ScrollMode::ContinuousVertical
+                }
+            }
             (MenuCategory::View, 6) => self.effective_scroll_mode() == ScrollMode::ContinuousHorizontal,
             (MenuCategory::View, 7) => self.effective_scroll_mode() == ScrollMode::MagazineBook,
             (MenuCategory::View, 9) => self.view_mode == ViewMode::TextView,
@@ -539,7 +579,7 @@ impl<'a> PdfViewerApp<'a> {
                         .and_then(|s| s.to_str())
                         .unwrap_or("document.pdf")
                         .to_string();
-                    let res = if self.doc.is_none() && !self.is_markdown_tab() {
+                    let res = if !self.has_any_document() {
                         self.load_document(rpath)
                     } else {
                         self.open_document_in_new_tab(rpath)
@@ -551,15 +591,67 @@ impl<'a> PdfViewerApp<'a> {
             }
 
             // View menu
-            (MenuCategory::View, 0) => self.set_view_mode(ViewMode::FitPage),
-            (MenuCategory::View, 1) => self.set_view_mode(ViewMode::FitWidth),
+            (MenuCategory::View, 0) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.fit_mode = ComicFitMode::FitPage;
+                    self.zoom_level = 1.0;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.save_session_to_ini();
+                    self.status_notice = Some("Comic Fit: Fit Page".to_string());
+                } else {
+                    self.set_view_mode(ViewMode::FitPage);
+                }
+            }
+            (MenuCategory::View, 1) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.fit_mode = ComicFitMode::FitWidth;
+                    self.zoom_level = 1.0;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.save_session_to_ini();
+                    self.status_notice = Some("Comic Fit: Fit Width".to_string());
+                } else {
+                    self.set_view_mode(ViewMode::FitWidth);
+                }
+            }
             (MenuCategory::View, 2) => self.set_view_mode(ViewMode::FitTextWidth),
-            (MenuCategory::View, 3) => self.set_view_mode(ViewMode::TwoPageSpread),
+            (MenuCategory::View, 3) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode = ComicLayoutMode::TwoPageSpread;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.save_session_to_ini();
+                    self.status_notice = Some("Comic Layout: 2-Page Spread".to_string());
+                } else {
+                    self.set_view_mode(ViewMode::TwoPageSpread);
+                }
+            }
             (MenuCategory::View, 4) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode = ComicLayoutMode::SinglePage;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.save_session_to_ini();
+                    self.status_notice = Some("Comic Layout: Single Page".to_string());
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                }
                 self.set_scroll_mode(ScrollMode::SinglePage);
                 return;
             }
             (MenuCategory::View, 5) => {
+                if self.is_comic_tab() {
+                    self.comic_prefs.layout_mode = ComicLayoutMode::VerticalStrip;
+                    self.scroll_y = 0.0;
+                    self.pan_x = 0.0;
+                    self.save_session_to_ini();
+                    self.status_notice = Some("Comic Layout: Vertical Strip".to_string());
+                    self.update_title_bar();
+                    self.request_redraw();
+                    return;
+                }
                 self.set_scroll_mode(ScrollMode::ContinuousVertical);
                 return;
             }
@@ -852,7 +944,7 @@ impl<'a> PdfViewerApp<'a> {
                 } else if self.doc.is_some() {
                     self.pending_dialog = Some(PendingDialog::ExportEpub);
                 } else {
-                    self.status_notice = Some("Open a PDF, Markdown, or LaTeX file first to export as EPUB".to_string());
+                    self.status_notice = Some("Open a PDF, Markdown, LaTeX, or Word file first to export as EPUB".to_string());
                 }
             }
 
@@ -869,7 +961,7 @@ impl<'a> PdfViewerApp<'a> {
                 let fav_idx = idx - MenuCategory::Favorites.items().len();
                 let docs = self.favorites.all_docs();
                 if let Some((fname, path)) = docs.get(fav_idx).cloned() {
-                    let res = if self.doc.is_none() && !self.is_markdown_tab() {
+                    let res = if !self.has_any_document() {
                         self.load_document(path)
                     } else {
                         self.open_document_in_new_tab(path)

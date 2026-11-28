@@ -41,12 +41,14 @@ impl<'a> PdfViewerApp<'a> {
             slot.markdown_doc = self.markdown_doc.take();
             slot.md_source = self.md_source.take();
             slot.md_editor_mode = self.md_editor_mode;
+            slot.comic_doc = self.comic_doc.take();
             self.md_editor = None;
             self.epub_cover_thumb = None;
             self.epub_word_rects.clear();
             self.epub_word_rects.shrink_to_fit();
             self.epub_selection_drag = None;
             self.epub_selection_pill_rect = None;
+            self.comic_scrubber_drag = false;
         }
         if !self.file_path.as_os_str().is_empty() {
             let path = self.file_path.clone();
@@ -131,6 +133,9 @@ impl<'a> PdfViewerApp<'a> {
             self.markdown_doc = slot.markdown_doc.take();
             self.md_source = slot.md_source.take();
             self.md_editor_mode = slot.md_editor_mode;
+            self.comic_doc = slot.comic_doc.take();
+            self.comic_scrubber_drag = false;
+            self.comic_sidebar_scroll = 0;
             self.md_editor = None;
             self.md_doc_gen = self.md_doc_gen.wrapping_add(1);
             self.md_layout = None;
@@ -215,6 +220,14 @@ impl<'a> PdfViewerApp<'a> {
         super::theme::DocKind::from_path(path) == super::theme::DocKind::Epub
     }
 
+    pub(super) fn is_word_path(path: &std::path::Path) -> bool {
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Word
+    }
+
+    pub(super) fn is_comic_path(path: &std::path::Path) -> bool {
+        super::theme::DocKind::from_path(path) == super::theme::DocKind::Comic
+    }
+
     pub(super) fn is_doc_reader_path(path: &std::path::Path) -> bool {
         super::theme::DocKind::from_path(path).is_reflowable()
     }
@@ -266,7 +279,11 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn save_active_markdown(&mut self) {
-        if !self.is_markdown_tab() || self.file_path.as_os_str().is_empty() || Self::is_epub_path(&self.file_path) {
+        if !self.is_markdown_tab()
+            || self.file_path.as_os_str().is_empty()
+            || Self::is_epub_path(&self.file_path)
+            || Self::is_word_path(&self.file_path)
+        {
             return;
         }
         let text = if let Some(ref ed) = self.md_editor {
@@ -310,6 +327,7 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("Document");
         let is_epub = Self::is_epub_path(&self.file_path);
+        let is_word = Self::is_word_path(&self.file_path);
         let is_tex = Self::is_latex_path(&self.file_path);
 
         let (raw_opt, parsed) = if is_epub {
@@ -317,6 +335,18 @@ impl<'a> PdfViewerApp<'a> {
                 return false;
             };
             match crate::epub::parse_epub_bytes(&bytes, fallback) {
+                Ok(doc) => (None, doc),
+                Err(e) => {
+                    self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                    self.request_redraw();
+                    return false;
+                }
+            }
+        } else if is_word {
+            let Ok(bytes) = std::fs::read(&self.file_path) else {
+                return false;
+            };
+            match crate::docx_reader::parse_docx_bytes(&bytes, fallback) {
                 Ok(doc) => (None, doc),
                 Err(e) => {
                     self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
@@ -363,6 +393,8 @@ impl<'a> PdfViewerApp<'a> {
         }
         self.status_notice = Some(if is_epub {
             "Reloaded EPUB document".to_string()
+        } else if is_word {
+            "Reloaded Word document".to_string()
         } else if is_tex {
             "Reloaded LaTeX document".to_string()
         } else {
@@ -379,11 +411,16 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("Document");
         let is_epub = Self::is_epub_path(&path);
+        let is_word = Self::is_word_path(&path);
         let is_tex = Self::is_latex_path(&path);
 
         let (raw_opt, parsed) = if is_epub {
             let bytes = std::fs::read(&path)?;
             let doc = crate::epub::parse_epub_bytes(&bytes, fallback)?;
+            (None, doc)
+        } else if is_word {
+            let bytes = std::fs::read(&path)?;
+            let doc = crate::docx_reader::parse_docx_bytes(&bytes, fallback)?;
             (None, doc)
         } else {
             let raw = std::fs::read_to_string(&path)?;
@@ -412,6 +449,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.clear();
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
+        self.comic_doc = None;
 
         let restored = self.lookup_last_position(&path);
         let restored_zoom = restored.map(|(_, z)| z.clamp(0.6, 3.0)).unwrap_or(1.0);
@@ -456,7 +494,7 @@ impl<'a> PdfViewerApp<'a> {
         self.bookmarks = loaded_bookmarks.clone();
         self.selected_bookmark = if self.bookmarks.is_empty() { None } else { Some(0) };
         self.bookmark_scroll_y = 0;
-        let initial_mode = if self.ui_skin == UiSkin::Distinct && !is_epub {
+        let initial_mode = if self.ui_skin == UiSkin::Distinct && !is_epub && !is_word {
             super::text_editor::MdEditorMode::Split
         } else {
             super::text_editor::MdEditorMode::Preview
@@ -501,6 +539,7 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: initial_mode,
+            comic_doc: None,
         };
         if new_tab || self.tabs.is_empty() {
             self.tabs.push(slot);
@@ -515,6 +554,173 @@ impl<'a> PdfViewerApp<'a> {
         Ok(())
     }
 
+    pub(super) fn reload_active_comic(&mut self) -> bool {
+        if !self.is_comic_tab() || self.file_path.as_os_str().is_empty() {
+            return false;
+        }
+        let fallback = self
+            .file_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Comic");
+        let archive = match crate::comic::ComicArchive::open(&self.file_path) {
+            Ok(a) => a,
+            Err(e) => {
+                self.status_notice = Some(format!("Cannot reload '{fallback}': {e}"));
+                self.request_redraw();
+                return false;
+            }
+        };
+        let count = archive.page_count();
+        self.invalidate_page_caches();
+        self.comic_doc = Some(archive);
+        if count > 0 {
+            let max_idx = count.min(u16::MAX as usize).saturating_sub(1) as u16;
+            self.current_page_index = self.current_page_index.min(max_idx);
+        } else {
+            self.current_page_index = 0;
+        }
+        let mtime = Self::read_file_mtime(&self.file_path);
+        self.last_file_mtime = mtime;
+        if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab].last_file_mtime = mtime;
+            self.tabs[self.active_tab].current_page_index = self.current_page_index;
+        }
+        self.status_notice = Some("Reloaded Comic archive".to_string());
+        self.update_title_bar();
+        self.request_redraw();
+        true
+    }
+
+    fn load_comic_document(&mut self, path: PathBuf, new_tab: bool) -> Result<()> {
+        let archive = crate::comic::ComicArchive::open(&path)?;
+        let page_count = archive.page_count();
+        let file_mtime = Self::read_file_mtime(&path);
+
+        if new_tab && !self.tabs.is_empty() {
+            self.sync_active_tab_to_slot();
+        }
+        self.invalidate_page_caches();
+        self.thumbnail_cache.clear();
+        self.thumbnail_cache.shrink_to_fit();
+        self.doc = None;
+        self.markdown_doc = None;
+        self.md_source = None;
+        self.md_editor = None;
+        self.md_layout = None;
+        self.md_active_hits.clear();
+
+        let restored = self.lookup_last_position(&path);
+        let (restored_page, restored_zoom) = restored
+            .map(|(p, z)| {
+                let max_p = page_count.min(u16::MAX as usize).saturating_sub(1) as u16;
+                (
+                    if page_count > 0 { p.min(max_p) } else { 0 },
+                    z.clamp(MIN_ZOOM_LEVEL, MAX_ZOOM_LEVEL),
+                )
+            })
+            .unwrap_or((0, 1.0));
+
+        // Respect ComicInfo.xml Manga RTL flag automatically when opening a file fresh
+        if restored.is_none() {
+            if let Some(ref info) = archive.info {
+                if info.manga_rtl {
+                    self.comic_prefs.rtl_manga = true;
+                }
+            }
+        }
+
+        self.file_path = path.clone();
+        self.current_page_index = restored_page;
+        self.view_mode = ViewMode::FitPage;
+        self.last_page_view_mode = ViewMode::FitPage;
+        self.zoom_level = restored_zoom;
+        self.pan_x = 0.0;
+        self.scroll_y = 0.0;
+        self.scroll_x = 0.0;
+        self.nav_back_stack.clear();
+        self.nav_forward_stack.clear();
+        self.hovered_link = None;
+        self.hovered_form_field = None;
+        self.last_measurement = None;
+        self.compare_mode = None;
+        self.deskew_bar = None;
+        self.roman_end = 0;
+        self.skip_pages = 0;
+        self.bw_pages.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_generation = 0;
+        self.saved_undo_generation = 0;
+        self.redacted = false;
+        self.has_unsaved_edits = false;
+        self.last_file_mtime = file_mtime;
+        self.flatten_confirm_at = None;
+        self.input_mode = InputMode::Normal;
+        self.drag_start = None;
+        self.grid_drag_page = None;
+        self.selected_thumbs.clear();
+        self.last_thumb_anchor = None;
+        self.grid_scroll_y = 0.0;
+        self.search_query.clear();
+        self.search_matches.clear();
+        self.current_search_match = 0;
+        self.incremental_search = None;
+        self.bookmarks.clear();
+        self.selected_bookmark = None;
+        self.bookmark_scroll_y = 0;
+        self.comic_scrubber_drag = false;
+        self.comic_sidebar_scroll = 0;
+        self.comic_doc = Some(archive);
+
+        self.record_recent_file(&path);
+
+        let slot = DocumentTab {
+            doc: None,
+            file_path: path,
+            current_page_index: restored_page,
+            view_mode: ViewMode::FitPage,
+            last_page_view_mode: ViewMode::FitPage,
+            scroll_mode: self.scroll_mode,
+            zoom_level: restored_zoom,
+            pan_x: 0.0,
+            scroll_y: 0.0,
+            scroll_x: 0.0,
+            nav_back_stack: VecDeque::new(),
+            nav_forward_stack: Vec::new(),
+            roman_end: 0,
+            skip_pages: 0,
+            bookmarks: Vec::new(),
+            selected_bookmark: None,
+            bookmark_scroll_y: 0,
+            grid_scroll_y: 0.0,
+            bw_pages: HashSet::new(),
+            undo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            redo_stack: VecDeque::with_capacity(MAX_UNDO_STATES),
+            undo_generation: 0,
+            saved_undo_generation: 0,
+            redacted: false,
+            has_unsaved_edits: false,
+            last_file_mtime: file_mtime,
+            markdown_doc: None,
+            md_source: None,
+            md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
+        };
+        if new_tab || self.tabs.is_empty() {
+            self.tabs.push(slot);
+            self.active_tab = self.tabs.len() - 1;
+        } else if self.active_tab < self.tabs.len() {
+            self.tabs[self.active_tab] = slot;
+        }
+
+        self.sync_epub_tab_resources();
+        self.ensure_active_tab_scrolled_into_view();
+        self.update_title_bar();
+        self.request_redraw();
+        Ok(())
+    }
+
     /// Loads `path` into the current tab using an optional `password` (never stored after loading).
     pub(super) fn load_document_with_password(
         &mut self,
@@ -523,6 +729,9 @@ impl<'a> PdfViewerApp<'a> {
     ) -> Result<()> {
         if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, false);
+        }
+        if Self::is_comic_path(&path) {
+            return self.load_comic_document(path, false);
         }
         let loaded = self.engine.load_pdf_with_password(&path, password)?;
         let (skip_pages, roman_end) = PdfEngine::read_page_labels_skip_and_roman_from_doc(&loaded);
@@ -535,6 +744,7 @@ impl<'a> PdfViewerApp<'a> {
         self.thumbnail_cache.shrink_to_fit();
         self.doc = None;
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
 
@@ -626,6 +836,7 @@ impl<'a> PdfViewerApp<'a> {
                 markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
             });
             self.active_tab = 0;
             self.tab_scroll_offset = 0;
@@ -698,6 +909,9 @@ impl<'a> PdfViewerApp<'a> {
         if Self::is_doc_reader_path(&path) {
             return self.load_markdown_document(path, true);
         }
+        if Self::is_comic_path(&path) {
+            return self.load_comic_document(path, true);
+        }
         if self.tabs.is_empty() {
             return self.load_document_with_password(path, password);
         }
@@ -761,11 +975,13 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
         self.file_path = path;
@@ -853,11 +1069,13 @@ impl<'a> PdfViewerApp<'a> {
             markdown_doc: None,
             md_source: None,
             md_editor_mode: super::text_editor::MdEditorMode::Preview,
+            comic_doc: None,
         });
 
         self.active_tab = new_idx;
         self.doc = Some(loaded);
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_layout = None;
         self.md_active_hits.clear();
         self.file_path = virtual_path;
@@ -1003,10 +1221,12 @@ impl<'a> PdfViewerApp<'a> {
         self.active_note_popover = None;
         self.dragging_annotation = None;
         self.markdown_doc = None;
+        self.comic_doc = None;
         self.md_source = None;
         self.md_editor = None;
         self.md_layout = None;
         self.md_active_hits.clear();
+        self.invalidate_page_caches();
         self.sync_epub_tab_resources();
         self.status_notice = Some(notice);
         self.update_title_bar();
@@ -1056,11 +1276,20 @@ impl<'a> PdfViewerApp<'a> {
             self.close_editor_popout(false);
         }
 
-        let next_active = if close_idx < self.active_tab {
+        let mut next_active = if close_idx < self.active_tab {
             self.active_tab - 1
         } else {
             self.active_tab.min(self.tabs.len() - 1)
         };
+        if let Some(kind) = self.tab_format_filter {
+            if self.tab_doc_kind(next_active) != kind {
+                if let Some(sib) = (0..self.tabs.len()).find(|&i| self.tab_doc_kind(i) == kind) {
+                    next_active = sib;
+                } else {
+                    self.tab_format_filter = None;
+                }
+            }
+        }
         self.load_slot_into_active(next_active);
         self.ensure_active_tab_scrolled_into_view();
         self.status_notice = Some(format!("Closed tab '{closed_name}'"));
@@ -1115,7 +1344,7 @@ impl<'a> PdfViewerApp<'a> {
 
     /// Closes all open tabs and returns cleanly to the Welcome Screen.
     pub(super) fn close_all_tabs(&mut self) {
-        if self.tabs.is_empty() && self.doc.is_none() {
+        if self.tabs.is_empty() && !self.has_any_document() {
             self.tab_context_menu = None;
             self.show_tab_list_popover = false;
             return;
@@ -1135,7 +1364,12 @@ impl<'a> PdfViewerApp<'a> {
         scale_factor: f64,
     ) -> (bool, usize, usize, u32, i32, i32, i32, i32, i32, u32, u32) {
         let s = scale_factor as f32;
-        let num_tabs = self.tabs.len().max(1);
+        let vis_count_total = if self.tabs.is_empty() {
+            0
+        } else {
+            self.visible_tab_indices().len()
+        };
+        let num_tabs = vis_count_total.max(1);
         let pad_l = (8.0 * s).round() as i32;
         let pad_r = (8.0 * s).round() as i32;
         let tab_gap = (3.0 * s).round() as i32;
@@ -1159,7 +1393,7 @@ impl<'a> PdfViewerApp<'a> {
             .max(min_tab_w);
 
         let needed_at_min = (num_tabs as u32) * min_tab_w + (num_tabs.saturating_sub(1) as u32) * (tab_gap as u32);
-        let overflowing = self.tabs.len() > 1 && needed_at_min > base_avail;
+        let overflowing = vis_count_total > 1 && needed_at_min > base_avail;
 
         let (strip_x, strip_avail, left_arr_x, right_arr_x) = if overflowing {
             let sx = pad_l + arr_w as i32 + 3;
@@ -1215,6 +1449,14 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     pub(super) fn ensure_active_tab_scrolled_into_view(&mut self) {
+        if let Some(kind) = self.tab_format_filter {
+            if !self.tabs.is_empty()
+                && self.active_tab < self.tabs.len()
+                && self.tab_doc_kind(self.active_tab) != kind
+            {
+                self.tab_format_filter = None;
+            }
+        }
         let (buf_w, sf) = if let Some(w) = self.window.as_ref() {
             (w.inner_size().width.max(320), self.effective_scale_factor(w.scale_factor()))
         } else {
@@ -1225,11 +1467,13 @@ impl<'a> PdfViewerApp<'a> {
             self.tab_scroll_offset = 0;
             return;
         }
+        let vis_tabs = self.visible_tab_indices();
+        let active_vis = vis_tabs.iter().position(|&i| i == self.active_tab).unwrap_or(0);
         let vis_count = vis_end.saturating_sub(vis_start).max(1);
-        if self.active_tab < self.tab_scroll_offset {
-            self.tab_scroll_offset = self.active_tab;
-        } else if self.active_tab >= self.tab_scroll_offset + vis_count {
-            self.tab_scroll_offset = self.active_tab + 1 - vis_count;
+        if active_vis < self.tab_scroll_offset {
+            self.tab_scroll_offset = active_vis;
+        } else if active_vis >= self.tab_scroll_offset + vis_count {
+            self.tab_scroll_offset = active_vis + 1 - vis_count;
         }
     }
 
@@ -1245,7 +1489,8 @@ impl<'a> PdfViewerApp<'a> {
             return;
         }
         let vis_count = vis_end.saturating_sub(vis_start).max(1);
-        let max_off = self.tabs.len().saturating_sub(vis_count);
+        let total_vis = self.visible_tab_indices().len();
+        let max_off = total_vis.saturating_sub(vis_count);
         let next = (self.tab_scroll_offset as isize + delta).clamp(0, max_off as isize) as usize;
         if next != self.tab_scroll_offset {
             self.tab_scroll_offset = next;
@@ -1308,10 +1553,11 @@ impl<'a> PdfViewerApp<'a> {
         let arr_w = (22.0 * s).round() as u32;
         let arr_ic = (11.0 * s).round() as u32;
 
+        let vis_tabs = self.visible_tab_indices();
         // Scroll arrows `<` and `>` only when tabs overflow the window width
         if overflowing {
             let can_left = vis_start > 0;
-            let can_right = vis_end < self.tabs.len();
+            let can_right = vis_end < vis_tabs.len();
             let l_hov = can_left && self.hovered_widget == Some(UiHit::TabScrollLeft);
             if l_hov {
                 super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, left_arr_x, btn_y, arr_w, btn_h, (4.0 * s).max(3.0), theme.hover_bg);
@@ -1338,7 +1584,8 @@ impl<'a> PdfViewerApp<'a> {
         }
 
         let mut cur_x = strip_x;
-        for idx in vis_start..vis_end {
+        for vis_pos in vis_start..vis_end {
+            let idx = if vis_tabs.is_empty() { 0 } else { vis_tabs[vis_pos] };
             let is_active = idx == self.active_tab;
             let is_tab_hov = matches!(
                 self.hovered_widget,
@@ -1577,10 +1824,12 @@ impl<'a> PdfViewerApp<'a> {
             return Some(TabBarHit::NewTab);
         }
 
+        let vis_tabs = self.visible_tab_indices();
         let tab_gap = (3.0 * s).round() as i32;
         let close_sz = (16.0 * s).round() as i32;
         let mut cur_x = strip_x;
-        for idx in vis_start..vis_end {
+        for vis_pos in vis_start..vis_end {
+            let idx = if vis_tabs.is_empty() { 0 } else { vis_tabs[vis_pos] };
             if ix >= cur_x && ix < cur_x + tab_w as i32 {
                 let close_x = cur_x + tab_w as i32 - close_sz - (6.0 * s).round() as i32;
                 let star_x = close_x - close_sz - (2.0 * s).round() as i32;
@@ -1938,5 +2187,235 @@ impl<'a> PdfViewerApp<'a> {
                 let _ = self.request_close_action(super::doc_props_modal::PendingCloseAction::CloseAllTabs);
             }
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Leftmost Format Drawer Rail (`All` + open format drawers)
+    // -------------------------------------------------------------------------
+
+    fn format_drawer_item_rect(
+        rail_w: u32,
+        top_bars_h: u32,
+        content_bot: u32,
+        slot: usize,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return None;
+        }
+        let s = sf as f32;
+        let btn_sz = (28.0 * s)
+            .round()
+            .min((rail_w.saturating_sub(6)) as f32)
+            .max(18.0) as u32;
+        let bx = ((rail_w.saturating_sub(btn_sz)) / 2) as i32;
+        let pad_top = (8.0 * s).round() as i32;
+        let gap = (6.0 * s).round() as i32;
+        let by = top_bars_h as i32 + pad_top + (slot as i32) * (btn_sz as i32 + gap);
+        if by + (btn_sz as i32) > content_bot as i32 {
+            return None;
+        }
+        Some((bx, by, btn_sz, btn_sz))
+    }
+
+    pub(super) fn format_drawer_rect_for(
+        &self,
+        target: Option<DocKind>,
+        buf_h: u32,
+        top_bars_h: u32,
+        status_bar_h: u32,
+        sf: f64,
+    ) -> Option<(i32, i32, u32, u32)> {
+        let rail_w = self.format_rail_width_px(sf);
+        let content_bot = buf_h.saturating_sub(status_bar_h);
+        let items = self.format_rail_items();
+        let slot = items.iter().position(|&(k, _)| k == target)?;
+        Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+    }
+
+    pub(super) fn format_drawer_tooltip(&self, filter: Option<DocKind>) -> String {
+        let items = self.format_rail_items();
+        let count = items
+            .iter()
+            .find(|&&(k, _)| k == filter)
+            .map(|&(_, c)| c)
+            .unwrap_or(0);
+        match filter {
+            None => format!("All Open Files ({count})"),
+            Some(DocKind::Pdf) => format!("PDF Documents ({count})"),
+            Some(DocKind::Word) => format!("Word Documents (.docx) ({count})"),
+            Some(DocKind::Comic) => format!("Comic Archives (.cbz) ({count})"),
+            Some(DocKind::Epub) => format!("EPUB Books ({count})"),
+            Some(DocKind::Markdown) => format!("Markdown Notes ({count})"),
+            Some(DocKind::LaTeX) => format!("LaTeX Documents ({count})"),
+        }
+    }
+
+    pub(super) fn draw_format_drawer_rail(
+        &self,
+        buffer: &mut [u32],
+        buf_w: u32,
+        buf_h: u32,
+        top_bars_h: u32,
+        content_bot: u32,
+        sf: f64,
+    ) {
+        let rail_w = self.format_rail_width_px(sf);
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return;
+        }
+        let theme = self.ui_theme();
+        let s = sf as f32;
+        let top_y = top_bars_h as i32;
+        let rail_h = content_bot.saturating_sub(top_bars_h);
+
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            0,
+            top_y,
+            rail_w.saturating_sub(1),
+            rail_h,
+            theme.sidebar_header_bg,
+        );
+        fill_rect_clipped(
+            buffer,
+            buf_w,
+            buf_h,
+            rail_w.saturating_sub(1) as i32,
+            top_y,
+            1,
+            rail_h,
+            theme.divider,
+        );
+
+        let items = self.format_rail_items();
+        let is_dark = self.ui_theme_mode == super::theme::UiThemeMode::Dark;
+        let rad = (6.0 * s).clamp(4.0, 9.0);
+        let ic_sz = (17.0 * s).round().clamp(12.0, 26.0) as u32;
+
+        for (slot, &(opt_kind, _count)) in items.iter().enumerate() {
+            let Some((bx, by, bw, bh)) =
+                Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+            else {
+                break;
+            };
+            let is_active = self.tab_format_filter == opt_kind;
+            let is_hov = self.hovered_widget == Some(UiHit::FormatDrawer(opt_kind));
+            let bg = if is_active {
+                theme.accent_soft_bg
+            } else if is_hov {
+                theme.hover_bg
+            } else {
+                theme.surface_elevated
+            };
+            let border = if is_active {
+                theme.accent
+            } else {
+                theme.border_subtle
+            };
+            super::ui_draw::fill_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, bg);
+            super::ui_draw::stroke_rounded_rect(buffer, buf_w, buf_h, bx, by, bw, bh, rad, border);
+
+            if is_active {
+                let bar_w = (3.0 * s).round().max(2.0) as u32;
+                let bar_pad = (5.0 * s).round() as i32;
+                super::ui_draw::fill_rounded_rect(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    1,
+                    by + bar_pad,
+                    bar_w,
+                    bh.saturating_sub((bar_pad * 2) as u32).max(6),
+                    1.5,
+                    theme.accent,
+                );
+            }
+
+            let ix = bx + ((bw.saturating_sub(ic_sz)) / 2) as i32;
+            let iy = by + ((bh.saturating_sub(ic_sz)) / 2) as i32;
+            match opt_kind {
+                None => {
+                    let gap_px = (2.0 * s).round().max(1.0) as i32;
+                    let cell = ((ic_sz as i32 - gap_px) / 2).max(4) as u32;
+                    let cr = (1.5 * s).max(1.0);
+                    let col = if is_active {
+                        theme.accent
+                    } else if is_hov {
+                        theme.text_primary
+                    } else {
+                        theme.text_secondary
+                    };
+                    for gx in 0..2 {
+                        for gy in 0..2 {
+                            super::ui_draw::fill_rounded_rect(
+                                buffer,
+                                buf_w,
+                                buf_h,
+                                ix + gx * (cell as i32 + gap_px),
+                                iy + gy * (cell as i32 + gap_px),
+                                cell,
+                                cell,
+                                cr,
+                                col,
+                            );
+                        }
+                    }
+                }
+                Some(kind) => {
+                    super::ui_draw::draw_doc_type_icon(
+                        buffer, buf_w, buf_h, kind, ix, iy, ic_sz, is_dark,
+                    );
+                }
+            }
+        }
+    }
+
+    pub(super) fn hit_test_format_drawer_rail(
+        &self,
+        mx: f64,
+        my: f64,
+        content_bot: u32,
+        top_bars_h: u32,
+        sf: f64,
+    ) -> Option<Option<DocKind>> {
+        let rail_w = self.format_rail_width_px(sf);
+        if rail_w == 0 || content_bot <= top_bars_h {
+            return None;
+        }
+        let ix = mx.round() as i32;
+        let iy = my.round() as i32;
+        if ix < 0 || ix >= rail_w as i32 || iy < top_bars_h as i32 || iy >= content_bot as i32 {
+            return None;
+        }
+        let items = self.format_rail_items();
+        for (slot, &(opt_kind, _)) in items.iter().enumerate() {
+            if let Some((bx, by, bw, bh)) =
+                Self::format_drawer_item_rect(rail_w, top_bars_h, content_bot, slot, sf)
+            {
+                if ix >= bx && ix < bx + bw as i32 && iy >= by && iy < by + bh as i32 {
+                    return Some(opt_kind);
+                }
+            }
+        }
+        None
+    }
+
+    pub(super) fn set_tab_format_filter(&mut self, filter: Option<DocKind>) {
+        self.tab_format_filter = filter;
+        self.tab_scroll_offset = 0;
+        if let Some(kind) = filter {
+            if self.active_tab >= self.tabs.len() || self.tab_doc_kind(self.active_tab) != kind {
+                if let Some(first_match) = (0..self.tabs.len()).find(|&i| self.tab_doc_kind(i) == kind) {
+                    self.switch_to_tab(first_match);
+                } else {
+                    self.tab_format_filter = None;
+                }
+            }
+        }
+        self.ensure_active_tab_scrolled_into_view();
+        self.request_redraw();
     }
 }

@@ -156,6 +156,8 @@ impl<'a> PdfViewerApp<'a> {
             } else {
                 format!("{phys}/{total}")
             }
+        } else if self.is_comic_tab() {
+            self.comic_page_badge_text()
         } else {
             "— / —".to_string()
         };
@@ -203,7 +205,9 @@ impl<'a> PdfViewerApp<'a> {
         let distinct_studio = self.ui_skin == super::theme::UiSkin::Distinct
             && matches!(
                 self.active_doc_kind(),
-                super::theme::DocKind::Markdown | super::theme::DocKind::LaTeX
+                super::theme::DocKind::Markdown
+                    | super::theme::DocKind::LaTeX
+                    | super::theme::DocKind::Word
             );
 
         // Group 0: Bookmarks/Outline Sidebar & Thumbnail Grid (left of Page Selector)
@@ -508,7 +512,7 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(ref job) = self.print_job {
                 let (done, total) = job.job.progress();
                 (format!("Printing {done}/{total} (Esc cancels)"), theme.accent_soft_fg, true)
-            } else if self.doc.is_none() && !self.is_markdown_tab() {
+            } else if !self.has_any_document() {
                 ("Drop a document or press O".to_string(), theme.text_secondary, false)
             } else {
                 let mut fname = self.filename_display();
@@ -620,7 +624,7 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             BottomBarAction::PageJump => {
-                if self.doc.is_some() {
+                if self.doc.is_some() || self.is_comic_tab() {
                     self.input_mode = InputMode::JumpToPage { input: String::new() };
                 }
             }

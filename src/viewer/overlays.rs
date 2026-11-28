@@ -44,7 +44,7 @@ impl BoxHit {
 }
 
 impl<'a> PdfViewerApp<'a> {
-    /// Computes Welcome card geometry and clickable regions when `self.doc.is_none()`.
+    /// Computes Welcome card geometry and clickable regions when `!self.has_any_document()`.
     fn layout_welcome(&self, buf_w: u32, buf_h: u32, top_bars_h: u32, status_bar_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
         let has_restore = matches!(self.input_mode, InputMode::RestoreSessionPrompt { .. });
@@ -228,7 +228,7 @@ impl<'a> PdfViewerApp<'a> {
         status_bar_h: u32,
         sf: f64,
     ) -> Option<OverlayHit> {
-        if self.doc.is_some() {
+        if self.has_any_document() {
             return None;
         }
         let (_, hits) = self.layout_welcome(buf_w, buf_h, top_bars_h, status_bar_h, sf);
@@ -279,7 +279,7 @@ impl<'a> PdfViewerApp<'a> {
         let s = sf as f32;
         match &self.input_mode {
             InputMode::Normal => {}
-            InputMode::RestoreSessionPrompt { .. } if self.doc.is_none() => {
+            InputMode::RestoreSessionPrompt { .. } if !self.has_any_document() => {
                 // Rendered inline inside the Welcome card
             }
             InputMode::SearchText { query_input } => {
@@ -730,7 +730,7 @@ impl<'a> PdfViewerApp<'a> {
         let iy = my.round() as i32;
         match &self.input_mode {
             InputMode::Normal => None,
-            InputMode::RestoreSessionPrompt { .. } if self.doc.is_none() => None,
+            InputMode::RestoreSessionPrompt { .. } if !self.has_any_document() => None,
             InputMode::SearchText { .. } => {
                 let ((px, py, pw, ph), hits) = self.layout_floating_search(buf_w, top_bars_h, sf);
                 if ix < px || ix >= px + pw as i32 || iy < py || iy >= py + ph as i32 {
@@ -762,7 +762,7 @@ impl<'a> PdfViewerApp<'a> {
         blend_rect_rgba(buffer, buf_w, buf_h, 0, 0, buf_w, buf_h, theme.modal_scrim);
 
         let cw = ((760.0 * s).round() as u32).min(buf_w.saturating_sub(28));
-        let ch = ((480.0 * s).round() as u32).min(buf_h.saturating_sub(28));
+        let ch = ((515.0 * s).round() as u32).min(buf_h.saturating_sub(28));
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = (buf_h.saturating_sub(ch) / 2) as i32;
         let rad = (10.0 * s).clamp(6.0, 16.0);
@@ -785,34 +785,36 @@ impl<'a> PdfViewerApp<'a> {
         let left_items: &[(&str, &str)] = &[
             ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Flow (Vert/Book/Mag 3D Curl)"),
             ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
-            ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
+            ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% Word/EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
-            ("B / A / L", "Sidebar (Book Drawer/Outline/Bookmarks) / Add / Import"),
-            ("G", "Smart Jump to Page (5, iii, or #5)"),
+            ("B / A / L", "Sidebar (Thumbnails/Word Nav/Outline/Marks) / Add / Import"),
+            ("G", "Smart Jump to Page (5, iii, or #5; Works in Comic too)"),
             ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V / Aa", "Eye-Care Modes (V); Aa: 4-Side Margins, Spacing & Fonts"),
-            ("Ctrl+F", "Persistent Find Bar (Enter=Next, Focus=100%/Blur=50%, ×=Close)"),
+            ("V / Aa", "Eye-Care Modes (V); Aa: Word/EPUB Margins, Spacing & Fonts"),
+            ("Ctrl+F", "Persistent Find Bar across PDF/Word/EPUB/MD/LaTeX"),
+            ("R / D / F / W", "Comic (.cbz): RTL Manga (R), 2-Pg (D), Fit Page/Width (F/W)"),
         ];
         let right_items: &[(&str, &str)] = &[
-            ("O / S / W", "Open Documents / Save / Watermark Dialog"),
+            ("O / S / W", "Open PDF/DOCX/CBZ/EPUB/MD/TEX / Save / Watermark"),
             ("Ctrl+D / ★", "Favorites Menu & Tab ★ Star / Close Tab (Ctrl+W)"),
-            ("Ctrl+P", "Print Preview (or Export .md/.tex/.epub to PDF/Word)"),
+            ("Ctrl+P", "Print Preview (or Export Word/EPUB/MD/LaTeX to PDF)"),
             ("Ctrl+Z / Y", "Undo (Ctrl+Z) / Redo (Ctrl+Y or Ctrl+Shift+Z)"),
             ("Ctrl+B/I/D", "Editor: Bold / Italic / Dup (Shift+D) / Comment (/)"),
             ("Pop Out ↗", "Detach .md/.tex Editor Window (Dock Back restores Split)"),
             ("Drag / 2×Div", "EPUB Highlight/Note pill; Drag Split Divider (2×=50/50)"),
+            ("Scrub / Click", "Comic (.cbz): Drag Scrubber, Wheel, or Click Left/Right Half"),
             ("Shift+M / X", "Combine PDFs / Split & Extract Pages"),
             ("N / H / P / Z", "Page Numbers / Header & Footer / Stamps / Optimize"),
-            ("I / R / D / K", "Insert Blank / Rotate 90° / Delete / Page B&W"),
-            ("Help Menu", "User Guide, UI Skin (Classic/Distinct), Compare & Ruler"),
+            ("I / R / D / K", "PDF: Insert Blank / Rotate 90° / Delete / Page B&W"),
+            ("Help Menu", "11-Ch User Guide, UI Skin (Classic/Distinct), Compare & Ruler"),
         ];
 
         let col_w = (cw.saturating_sub((pad * 3) as u32)) / 2;
         let row_h = (35.0 * s).round() as i32;
         let start_y = cy + (54.0 * s).round() as i32;
-        let key_w = (92.0 * s).round().min((col_w as f32 * 0.34).round()) as u32;
+        let key_w = (96.0 * s).round().min((col_w as f32 * 0.34).round()) as u32;
         let key_h = (22.0 * s).round() as u32;
 
         for (col_idx, list) in [left_items, right_items].iter().enumerate() {
@@ -863,7 +865,7 @@ impl<'a> PdfViewerApp<'a> {
         };
 
         center_text(buffer, cy + (70.0 * s).round() as i32, "MicroPDF", title_sz, theme.text_primary, true);
-        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.7.0 — Portable PDF, Markdown, LaTeX & EPUB Suite", body_sz, theme.text_secondary, false);
+        center_text(buffer, cy + (93.0 * s).round() as i32, "Version 1.7.0 — Portable PDF, Word, Comic, EPUB, MD & LaTeX", body_sz, theme.text_secondary, false);
         let ram = get_current_rss_mb().unwrap_or(0.0);
         center_text(buffer, cy + (116.0 * s).round() as i32, &format!("CPU-Rendered (Zero GPU) · Current RAM: {ram:.1} MB"), sub_sz, theme.text_muted, false);
         center_text(buffer, cy + (136.0 * s).round() as i32, "Powered by PDFium (Apache-2.0), winit, softbuffer, lopdf & ab_glyph", sub_sz, theme.text_muted, false);

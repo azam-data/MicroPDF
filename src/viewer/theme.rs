@@ -279,6 +279,118 @@ impl UiThemeMode {
                 active_row_bg: 0x00452E10,
                 ..base
             },
+            // Distinct Word (.docx): Executive Document Reader (crisp paper-sheet chrome + Azure Blue)
+            (UiThemeMode::Light, DocKind::Word) => UiTheme {
+                canvas_bg: 0x00EDF1F5,
+                page_border: 0x00C6D0DC,
+                topbar_bg: 0x00F6F9FC,
+                topbar_border: 0x00D8E2EC,
+                tabbar_bg: 0x00EAEFF5,
+                tab_active_bg: 0x00FFFFFF,
+                tab_active_border: 0x000369A1,
+                tab_hover_bg: 0x00DFE7F0,
+                sidebar_bg: 0x00F4F7FA,
+                sidebar_header_bg: 0x00EAF0F6,
+                statusbar_bg: 0x00F6F9FC,
+                surface_bg: 0x00FFFFFF,
+                surface_elevated: 0x00FFFFFF,
+                input_bg: 0x00FFFFFF,
+                input_border: 0x00C5D1DE,
+                input_focus_border: 0x000369A1,
+                divider: 0x00D6E0EA,
+                border_subtle: 0x00E4EBF2,
+                accent: 0x000369A1,
+                accent_hover: 0x00075985,
+                accent_soft_bg: 0x00E0F2FE,
+                accent_soft_fg: 0x000C4A6E,
+                hover_bg: 0x00E5EEF6,
+                active_row_bg: 0x00E0F2FE,
+                ..base
+            },
+            (UiThemeMode::Dark, DocKind::Word) => UiTheme {
+                canvas_bg: 0x00121720,
+                page_border: 0x00273344,
+                topbar_bg: 0x00181F2B,
+                topbar_border: 0x00273344,
+                tabbar_bg: 0x00131922,
+                tab_active_bg: 0x001F2937,
+                tab_active_border: 0x0038BDF8,
+                tab_hover_bg: 0x001C2432,
+                sidebar_bg: 0x00161C26,
+                sidebar_header_bg: 0x001C2432,
+                statusbar_bg: 0x00181F2B,
+                surface_bg: 0x001C2432,
+                surface_elevated: 0x00242E3F,
+                input_bg: 0x0010151D,
+                input_border: 0x00314054,
+                input_focus_border: 0x0038BDF8,
+                divider: 0x00273344,
+                border_subtle: 0x00202938,
+                text_on_accent: 0x00082F49,
+                accent: 0x0038BDF8,
+                accent_hover: 0x007DD3FC,
+                accent_soft_bg: 0x0013364D,
+                accent_soft_fg: 0x00BAE6FD,
+                hover_bg: 0x00222C3C,
+                active_row_bg: 0x0013364D,
+                ..base
+            },
+            // Distinct Comic (.cbz): Gallery / Graphic Novel Studio (neutral theater + Vivid Rose)
+            (UiThemeMode::Light, DocKind::Comic) => UiTheme {
+                canvas_bg: 0x00E6E5EA,
+                page_border: 0x00C8C7CE,
+                topbar_bg: 0x00F6F5F8,
+                topbar_border: 0x00DCDBE2,
+                tabbar_bg: 0x00ECEBEF,
+                tab_active_bg: 0x00FFFFFF,
+                tab_active_border: 0x00E11D48,
+                tab_hover_bg: 0x00E2E1E7,
+                sidebar_bg: 0x00F2F1F5,
+                sidebar_header_bg: 0x00E8E7EC,
+                statusbar_bg: 0x00F6F5F8,
+                surface_bg: 0x00FFFFFF,
+                surface_elevated: 0x00FFFFFF,
+                input_bg: 0x00FFFFFF,
+                input_border: 0x00CFCED6,
+                input_focus_border: 0x00E11D48,
+                divider: 0x00D8D7DF,
+                border_subtle: 0x00E5E4EB,
+                accent: 0x00E11D48,
+                accent_hover: 0x00BE123C,
+                accent_soft_bg: 0x00FFE4E6,
+                accent_soft_fg: 0x009F1239,
+                hover_bg: 0x00EAE8EE,
+                active_row_bg: 0x00FFE4E6,
+                ..base
+            },
+            (UiThemeMode::Dark, DocKind::Comic) => UiTheme {
+                canvas_bg: 0x00101015,
+                page_border: 0x002B2A34,
+                topbar_bg: 0x0018181F,
+                topbar_border: 0x002B2A34,
+                tabbar_bg: 0x00131319,
+                tab_active_bg: 0x0022212B,
+                tab_active_border: 0x00FB7185,
+                tab_hover_bg: 0x001D1C24,
+                sidebar_bg: 0x0015151B,
+                sidebar_header_bg: 0x001D1C24,
+                statusbar_bg: 0x0018181F,
+                surface_bg: 0x001D1C24,
+                surface_elevated: 0x00262530,
+                input_bg: 0x00101015,
+                input_border: 0x00383645,
+                input_focus_border: 0x00FB7185,
+                divider: 0x002B2A34,
+                border_subtle: 0x0022212A,
+                text_on_accent: 0x00270A12,
+                accent: 0x00FB7185,
+                accent_hover: 0x00FDA4AF,
+                accent_soft_bg: 0x004A1725,
+                accent_soft_fg: 0x00FECDD3,
+                hover_bg: 0x0025242F,
+                active_row_bg: 0x004A1725,
+                ..base
+            },
         }
     }
 }
@@ -287,8 +399,8 @@ impl UiThemeMode {
 /// `Distinct` enables the Phase 1–4 editorial/magazine UI skin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum UiSkin {
-    #[default]
     Classic,
+    #[default]
     Distinct,
 }
 
@@ -315,10 +427,10 @@ impl UiSkin {
     }
 
     pub fn from_ini_str(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("distinct") {
-            UiSkin::Distinct
-        } else {
+        if s.trim().eq_ignore_ascii_case("classic") {
             UiSkin::Classic
+        } else {
+            UiSkin::Distinct
         }
     }
 }
@@ -330,6 +442,8 @@ pub enum DocKind {
     Markdown,
     LaTeX,
     Epub,
+    Word,
+    Comic,
 }
 
 impl DocKind {
@@ -343,13 +457,17 @@ impl DocKind {
             DocKind::LaTeX
         } else if ext.eq_ignore_ascii_case("epub") {
             DocKind::Epub
+        } else if ext.eq_ignore_ascii_case("docx") {
+            DocKind::Word
+        } else if ext.eq_ignore_ascii_case("cbz") {
+            DocKind::Comic
         } else {
             DocKind::Pdf
         }
     }
 
     pub fn is_reflowable(self) -> bool {
-        matches!(self, DocKind::Markdown | DocKind::LaTeX | DocKind::Epub)
+        matches!(self, DocKind::Markdown | DocKind::LaTeX | DocKind::Epub | DocKind::Word)
     }
 
     #[allow(dead_code)]
@@ -359,6 +477,8 @@ impl DocKind {
             DocKind::Markdown => "Markdown",
             DocKind::LaTeX => "LaTeX",
             DocKind::Epub => "EPUB",
+            DocKind::Word => "Word",
+            DocKind::Comic => "Comic",
         }
     }
 }

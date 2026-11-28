@@ -1,7 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app_icon;
+mod comic;
 mod config_crypto;
+mod docx_reader;
 mod engine;
 mod epub;
 mod epub_export;

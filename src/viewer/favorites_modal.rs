@@ -110,10 +110,12 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn add_favorite_file_dialog(&mut self) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
-                "Supported Documents (PDF, Markdown, LaTeX, EPUB)",
-                &["pdf", "md", "markdown", "tex", "epub"],
+                "Supported Documents (PDF, Markdown, LaTeX, EPUB, Word, Comic)",
+                &["pdf", "md", "markdown", "tex", "epub", "docx", "cbz"],
             )
             .add_filter("PDF Document", &["pdf"])
+            .add_filter("Word Document", &["docx"])
+            .add_filter("Comic Book Archive", &["cbz"])
             .add_filter("EPUB E-Book", &["epub"])
             .add_filter("Markdown Document", &["md", "markdown"])
             .add_filter("LaTeX Document", &["tex"])
@@ -150,7 +152,7 @@ impl<'a> PdfViewerApp<'a> {
             .and_then(|s| s.to_str())
             .unwrap_or("document")
             .to_string();
-        let res = if self.doc.is_none() && !self.is_markdown_tab() {
+        let res = if !self.has_any_document() {
             self.load_document(path)
         } else {
             self.open_document_in_new_tab(path)

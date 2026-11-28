@@ -179,6 +179,8 @@ impl<'a> PdfViewerApp<'a> {
     ) {
         if self.is_distinct_epub_mode() {
             self.draw_distinct_epub_bottom_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
+        } else if self.is_distinct_comic_mode() {
+            self.draw_distinct_comic_bottom_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
         } else {
             self.draw_bottom_view_bar(buffer, buf_w, buf_h, status_bar_h, scale_factor);
         }

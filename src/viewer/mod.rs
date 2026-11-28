@@ -2,6 +2,7 @@ mod book_ui;
 mod bookmarks;
 mod bottom_bar;
 mod combine_modal;
+mod comic_view;
 mod compare_mode;
 mod deskew;
 mod doc_props_modal;
@@ -2570,7 +2571,7 @@ mod tests {
         use std::path::Path;
 
         // UiSkin defaults, toggle, labels, and INI round-trip
-        assert_eq!(UiSkin::default(), UiSkin::Classic);
+        assert_eq!(UiSkin::default(), UiSkin::Distinct);
         assert_eq!(UiSkin::Classic.label(), "Classic");
         assert_eq!(UiSkin::Distinct.label(), "Distinct");
         assert_eq!(UiSkin::Classic.toggle(), UiSkin::Distinct);
@@ -2578,18 +2579,19 @@ mod tests {
         assert_eq!(UiSkin::from_ini_str("distinct"), UiSkin::Distinct);
         assert_eq!(UiSkin::from_ini_str("DISTINCT"), UiSkin::Distinct);
         assert_eq!(UiSkin::from_ini_str("classic"), UiSkin::Classic);
-        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("CLASSIC"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Distinct);
 
         let legacy_ini = "ui_theme=dark\nactive_tab=0\n";
         let parsed_legacy = PdfViewerApp::parse_session_ini(legacy_ini);
-        assert_eq!(parsed_legacy.ui_skin, UiSkin::Classic);
+        assert_eq!(parsed_legacy.ui_skin, UiSkin::Distinct);
 
         let mut cfg = SessionConfig::default();
-        cfg.ui_skin = UiSkin::Distinct;
+        cfg.ui_skin = UiSkin::Classic;
         let ini = PdfViewerApp::serialize_session_ini(&cfg);
-        assert!(ini.contains("ui_skin=distinct"));
+        assert!(ini.contains("ui_skin=classic"));
         let roundtripped = PdfViewerApp::parse_session_ini(&ini);
-        assert_eq!(roundtripped.ui_skin, UiSkin::Distinct);
+        assert_eq!(roundtripped.ui_skin, UiSkin::Classic);
 
         // DocKind detection
         assert_eq!(DocKind::from_path(Path::new("report.pdf")), DocKind::Pdf);
@@ -2599,10 +2601,16 @@ mod tests {
         assert_eq!(DocKind::from_path(Path::new("README.MARKDOWN")), DocKind::Markdown);
         assert_eq!(DocKind::from_path(Path::new("paper.tex")), DocKind::LaTeX);
         assert_eq!(DocKind::from_path(Path::new("novel.EPUB")), DocKind::Epub);
+        assert_eq!(DocKind::from_path(Path::new("memo.docx")), DocKind::Word);
+        assert_eq!(DocKind::from_path(Path::new("REPORT.DOCX")), DocKind::Word);
+        assert_eq!(DocKind::from_path(Path::new("issue01.cbz")), DocKind::Comic);
+        assert_eq!(DocKind::from_path(Path::new("MANGA.CBZ")), DocKind::Comic);
         assert!(!DocKind::Pdf.is_reflowable());
         assert!(DocKind::Markdown.is_reflowable());
         assert!(DocKind::LaTeX.is_reflowable());
         assert!(DocKind::Epub.is_reflowable());
+        assert!(DocKind::Word.is_reflowable());
+        assert!(!DocKind::Comic.is_reflowable());
 
         // Help menu contains UI Skin entry without breaking existing items
         let help_items = MenuCategory::Help.items();
@@ -2652,25 +2660,27 @@ mod tests {
             "Expected negative kerning on BookSerif 'To': kerned={to_kerned}, sum={to_sum}"
         );
 
-        // Render BookSerif (regular/bold/italic), CodeMono, and all 4 DocKind icons
-        let mut buf = vec![0x00FF_FFFFu32; 360 * 180];
-        draw_text_styled_clipped(&mut buf, 360, 180, 12, 10, 348, "AV Book Serif", serif_reg, 0x000F_172A);
-        draw_text_styled_clipped(&mut buf, 360, 180, 12, 42, 348, "Bold Serif", serif_bold, 0x000F_172A);
-        draw_text_styled_clipped(&mut buf, 360, 180, 12, 74, 348, "Italic Serif", serif_ital, 0x000F_172A);
-        draw_text_styled_clipped(&mut buf, 360, 180, 12, 108, 348, "fn main() {}", mono, 0x001E_293B);
+        // Render BookSerif (regular/bold/italic), CodeMono, and all 6 DocKind icons
+        let mut buf = vec![0x00FF_FFFFu32; 420 * 180];
+        draw_text_styled_clipped(&mut buf, 420, 180, 12, 10, 408, "AV Book Serif", serif_reg, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 420, 180, 12, 42, 408, "Bold Serif", serif_bold, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 420, 180, 12, 74, 408, "Italic Serif", serif_ital, 0x000F_172A);
+        draw_text_styled_clipped(&mut buf, 420, 180, 12, 108, 408, "fn main() {}", mono, 0x001E_293B);
 
         for (i, (kind, icon)) in [
             (DocKind::Pdf, UiIcon::DocPdf),
             (DocKind::Epub, UiIcon::DocEpub),
             (DocKind::Markdown, UiIcon::DocMarkdown),
             (DocKind::LaTeX, UiIcon::DocLatex),
+            (DocKind::Word, UiIcon::DocWord),
+            (DocKind::Comic, UiIcon::DocComic),
         ]
         .into_iter()
         .enumerate()
         {
-            draw_doc_type_icon(&mut buf, 360, 180, kind, 12 + (i as i32) * 24, 140, 16, false);
-            draw_doc_type_icon(&mut buf, 360, 180, kind, 120 + (i as i32) * 24, 140, 16, true);
-            draw_icon(&mut buf, 360, 180, icon, 228 + (i as i32) * 24, 140, 16, 0x001E_293B);
+            draw_doc_type_icon(&mut buf, 420, 180, kind, 12 + (i as i32) * 20, 140, 16, false);
+            draw_doc_type_icon(&mut buf, 420, 180, kind, 144 + (i as i32) * 20, 140, 16, true);
+            draw_icon(&mut buf, 420, 180, icon, 276 + (i as i32) * 20, 140, 16, 0x001E_293B);
         }
         assert!(buf.iter().any(|&p| p != 0x00FF_FFFF), "expected pixels to be drawn");
 
@@ -3100,9 +3110,9 @@ mod tests {
     fn test_tier3_user_guide_chapters_and_export() {
         use super::user_guide::{format_full_user_guide_txt, GuideBlock, USER_GUIDE_CHAPTERS};
 
-        assert_eq!(USER_GUIDE_CHAPTERS.len(), 10, "User Guide must have 10 chapters");
+        assert_eq!(USER_GUIDE_CHAPTERS.len(), 11, "User Guide must have 11 chapters");
         for (idx, ch) in USER_GUIDE_CHAPTERS.iter().enumerate() {
-            assert_eq!(ch.number as usize, idx + 1, "Chapter numbering must be sequential 1..=10");
+            assert_eq!(ch.number as usize, idx + 1, "Chapter numbering must be sequential 1..=11");
             assert!(!ch.short_title.trim().is_empty());
             assert!(!ch.title.trim().is_empty());
             assert!(!ch.summary.trim().is_empty());
@@ -3125,6 +3135,7 @@ mod tests {
         assert!(txt.contains("MicroPDF v1.4 — Step-by-Step User Guide"));
         assert!(txt.contains("CHAPTER 1:"));
         assert!(txt.contains("CHAPTER 10:"));
+        assert!(txt.contains("CHAPTER 11:"));
         assert!(txt.contains("Step 1:"));
         assert!(txt.contains("[TIP]"));
         assert!(txt.contains("Create PDF from Images"));
@@ -3133,6 +3144,9 @@ mod tests {
         assert!(txt.contains("Strip Personal Metadata & XMP"));
         assert!(txt.contains("Deskew Page(s)"));
         assert!(txt.contains("Auto (Hybrid)"));
+        assert!(txt.contains(".docx"));
+        assert!(txt.contains(".cbz"));
+        assert!(txt.contains("Manga"));
     }
 
     #[test]
@@ -3944,6 +3958,265 @@ By probing image headers during layout and decoding visible figures into a bound
         let full_loc = app.epub_loc_and_time_label(1, 5);
         assert!(full_loc.contains("Loc. 1 of 5 ·"), "Expected combined Loc + time-left, got {full_loc}");
         assert!(app.epub_loc_for_block(0) >= 1);
+    }
+
+    #[test]
+    fn test_milestone8_6_format_palettes_docx_cbz_and_cache_discipline() {
+        use crate::comic::ComicArchive;
+        use crate::docx_reader::parse_docx_bytes;
+        use crate::markdown::parse_markdown;
+        use crate::markdown_docx::export_markdown_to_docx;
+        use crate::zip_mini::ZipWriter;
+        use std::collections::HashSet;
+        use super::theme::{DocKind, UiSkin, UiThemeMode};
+
+        // 1. All 6 DocKinds must map from extensions and expose 6 distinct accents in Light & Dark
+        let all_kinds = [
+            DocKind::Pdf,
+            DocKind::Markdown,
+            DocKind::LaTeX,
+            DocKind::Epub,
+            DocKind::Word,
+            DocKind::Comic,
+        ];
+        assert_eq!(DocKind::from_path(Path::new("doc.pdf")), DocKind::Pdf);
+        assert_eq!(DocKind::from_path(Path::new("notes.md")), DocKind::Markdown);
+        assert_eq!(DocKind::from_path(Path::new("paper.tex")), DocKind::LaTeX);
+        assert_eq!(DocKind::from_path(Path::new("book.epub")), DocKind::Epub);
+        assert_eq!(DocKind::from_path(Path::new("spec.docx")), DocKind::Word);
+        assert_eq!(DocKind::from_path(Path::new("manga.cbz")), DocKind::Comic);
+
+        for mode in [UiThemeMode::Light, UiThemeMode::Dark] {
+            let mut accents = HashSet::new();
+            for kind in all_kinds {
+                let theme = mode.theme_for(UiSkin::Distinct, kind);
+                assert!(
+                    accents.insert(theme.accent),
+                    "Duplicate Distinct accent color {:#08X} for {kind:?} in {mode:?}",
+                    theme.accent
+                );
+            }
+            assert_eq!(accents.len(), 6);
+        }
+
+        let tmp = std::env::temp_dir().join(format!(
+            "micropdf_m8_6fmt_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // 2. Real Word (.docx) roundtrip -> headings TOC & blocks
+        let docx_src_md = parse_markdown(
+            "# Executive Summary\n\nIntro **bold** and *italic*.\n\n## Findings\n\n| Metric | Value |\n| --- | --- |\n| Speed | Fast |\n\n- Item A\n- Item B\n",
+            "Executive Spec",
+        );
+        let docx_path = tmp.join("spec.docx");
+        export_markdown_to_docx(&docx_src_md, &docx_path).expect("export synthetic docx");
+        let docx_raw = std::fs::read(&docx_path).expect("read synthetic docx");
+        let parsed_docx = parse_docx_bytes(&docx_raw, "Executive Spec").expect("parse synthetic docx");
+        assert!(parsed_docx.headings.len() >= 2, "Expected Word Navigation Pane headings");
+        assert!(!parsed_docx.blocks.is_empty(), "Expected Word parsed blocks");
+
+        // 3. Real Comic (.cbz) with PNG + JPEG + WebP + ComicInfo.xml -> decode & RTL/Spread checks
+        let encode_img = |r: u8, g: u8, b: u8, fmt: image::ImageFormat| -> Vec<u8> {
+            let mut img = image::RgbaImage::new(16, 24);
+            for p in img.pixels_mut() {
+                *p = image::Rgba([r, g, b, 255]);
+            }
+            let mut out = Vec::new();
+            image::DynamicImage::ImageRgba8(img)
+                .write_to(&mut std::io::Cursor::new(&mut out), fmt)
+                .expect("encode comic frame");
+            out
+        };
+        let png_b = encode_img(220, 40, 60, image::ImageFormat::Png);
+        let jpg_b = encode_img(40, 120, 220, image::ImageFormat::Jpeg);
+        let webp_b = encode_img(30, 180, 90, image::ImageFormat::WebP);
+        let mut zw = ZipWriter::new();
+        zw.add_deflated(
+            "ComicInfo.xml",
+            br#"<?xml version="1.0" encoding="utf-8"?>
+<ComicInfo>
+  <Series>Neon Horizon</Series>
+  <Title>Chapter 1</Title>
+  <Writer>A. Mori</Writer>
+  <Manga>YesAndRightToLeft</Manga>
+</ComicInfo>"#,
+        );
+        zw.add_stored("p10.webp", &webp_b);
+        zw.add_stored("p2.jpg", &jpg_b);
+        zw.add_stored("p1.png", &png_b);
+        let cbz_path = tmp.join("neon.cbz");
+        std::fs::write(&cbz_path, zw.finish()).unwrap();
+
+        let archive = ComicArchive::open(&cbz_path).expect("open synthetic cbz");
+        assert_eq!(archive.pages, vec!["p1.png", "p2.jpg", "p10.webp"]);
+        assert!(archive.info.as_ref().is_some_and(|i| i.manga_rtl));
+        for idx in 0..3 {
+            let bmp = archive.decode_page(idx).expect("decode comic page");
+            assert_eq!((bmp.width, bmp.height), (16, 24));
+        }
+        assert_eq!(
+            PdfViewerApp::comic_spread_visual_pages_for(3, 1, true, true),
+            (Some(2), Some(1))
+        );
+
+        // 4. Full 6-tab PdfViewerApp integration (runs when PDFium shared library is available)
+        if let Ok(engine) = crate::engine::PdfEngine::new() {
+            let md_path = tmp.join("notes.md");
+            let tex_path = tmp.join("paper.tex");
+            let epub_path = tmp.join("book.epub");
+            let pdf_path = tmp.join("report.pdf");
+            let docx_export_pdf = tmp.join("spec_exported.pdf");
+            std::fs::write(&md_path, "# Notes\n\nMarkdown body.\n").unwrap();
+            std::fs::write(&tex_path, "\\documentclass{article}\n\\begin{document}\n\\section{Intro}\nHello \\LaTeX.\n\\end{document}\n").unwrap();
+
+            let mut ezw = ZipWriter::new();
+            ezw.add_stored("mimetype", b"application/epub+zip");
+            ezw.add_deflated(
+                "META-INF/container.xml",
+                br#"<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#,
+            );
+            ezw.add_deflated(
+                "OEBPS/content.opf",
+                br#"<package xmlns="http://www.idpf.org/opf" version="3.0"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Book</dc:title></metadata><manifest><item id="c1" href="c1.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="c1"/></spine></package>"#,
+            );
+            ezw.add_deflated("OEBPS/c1.xhtml", b"<html><body><h1>Ch 1</h1><p>EPUB body.</p></body></html>");
+            std::fs::write(&epub_path, ezw.finish()).unwrap();
+
+            crate::markdown_pdf::export_markdown_to_pdf(
+                &engine.pdfium,
+                &docx_src_md,
+                &pdf_path,
+                crate::markdown_pdf::MdPdfPageSize::A4,
+            )
+            .expect("create sample pdf");
+            crate::markdown_pdf::export_markdown_to_pdf(
+                &engine.pdfium,
+                &parsed_docx,
+                &docx_export_pdf,
+                crate::markdown_pdf::MdPdfPageSize::A4,
+            )
+            .expect("export docx to pdf");
+            assert!(std::fs::metadata(&docx_export_pdf).unwrap().len() > 200);
+
+            let mut app = PdfViewerApp::new(&engine, Some(pdf_path)).expect("open pdf tab");
+            app.ui_skin = UiSkin::Distinct;
+            app.open_document_in_new_tab(md_path).expect("open md tab");
+            app.open_document_in_new_tab(tex_path).expect("open tex tab");
+            app.open_document_in_new_tab(epub_path).expect("open epub tab");
+            app.open_document_in_new_tab(docx_path.clone()).expect("open docx tab");
+            app.open_document_in_new_tab(cbz_path.clone()).expect("open cbz tab");
+
+            assert_eq!(app.tabs.len(), 6, "All 6 formats should be open in tabs");
+            assert_eq!(app.active_doc_kind(), DocKind::Comic);
+            assert!(app.comic_prefs.rtl_manga, "ComicInfo.xml must enable RTL Manga on open");
+            assert!(app.ensure_comic_page_cached(0).is_some());
+            assert!(app.ensure_comic_thumb_cached(0, 120, 160).is_some());
+            assert!(!app.comic_page_cache.is_empty());
+            assert!(!app.comic_thumb_cache.is_empty());
+
+            // Switching away from .cbz must flush all decoded comic pixel buffers immediately
+            app.switch_to_tab(4);
+            assert_eq!(app.active_doc_kind(), DocKind::Word);
+            assert!(app.comic_page_cache.is_empty(), "Inactive CBZ tab must drop comic_page_cache");
+            assert!(app.comic_thumb_cache.is_empty(), "Inactive CBZ tab must drop comic_thumb_cache");
+        }
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_format_drawers_and_cbz_curl_polish() {
+        use super::state::PdfViewerApp;
+        use super::theme::{DocKind, UiSkin};
+        use crate::comic::ComicArchive;
+
+        // 1. Comic RTL & LTR spread pairing
+        assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, false), (Some(1), Some(2)));
+        assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, true), (Some(2), Some(1)));
+
+        // 2. Full PdfViewerApp integration (when libpdfium is available)
+        let Ok(engine) = crate::engine::PdfEngine::new() else {
+            return;
+        };
+        let tmp = std::env::temp_dir().join(format!("micropdf_polish_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&tmp);
+        let pdf_path = tmp.join("a.pdf");
+        let md_path = tmp.join("b.md");
+        let docx_path = tmp.join("c.docx");
+        let cbz_path = tmp.join("d.cbz");
+        engine.create_sample_pdf(&pdf_path, 3).expect("create sample pdf");
+        std::fs::write(&md_path, "# Title\n\nBody.\n").unwrap();
+
+        let md_for_docx = crate::markdown::parse_markdown("# Report\n\nWord body.\n", "Report");
+        crate::markdown_docx::export_markdown_to_docx(&md_for_docx, &docx_path).expect("export docx");
+
+        // Build valid 2-page CBZ
+        let mut img_a = image::RgbaImage::new(24, 32);
+        for p in img_a.pixels_mut() {
+            *p = image::Rgba([220, 40, 40, 255]);
+        }
+        let mut png_a = Vec::new();
+        image::DynamicImage::ImageRgba8(img_a)
+            .write_to(&mut std::io::Cursor::new(&mut png_a), image::ImageFormat::Png)
+            .unwrap();
+        let mut zw = crate::zip_mini::ZipWriter::new();
+        zw.add_deflated(
+            "ComicInfo.xml",
+            b"<ComicInfo><Series>CurlTest</Series><Manga>YesAndRightToLeft</Manga></ComicInfo>",
+        );
+        zw.add_stored("01.png", &png_a);
+        zw.add_stored("02.png", &png_a);
+        std::fs::write(&cbz_path, zw.finish()).unwrap();
+        let _ = ComicArchive::open(&cbz_path).expect("valid cbz");
+
+        let mut app = PdfViewerApp::new(&engine, None).expect("init empty app");
+        assert_eq!(app.ui_skin, UiSkin::Distinct, "Distinct skin must be the app default");
+        assert_eq!(app.format_rail_width_px(1.0), 0, "Rail hidden when no tabs are open");
+
+        app.open_document_in_new_tab(pdf_path).expect("open pdf");
+        app.open_document_in_new_tab(md_path).expect("open md");
+        app.open_document_in_new_tab(docx_path).expect("open docx");
+        app.open_document_in_new_tab(cbz_path).expect("open cbz");
+
+        let rail = app.format_rail_items();
+        assert_eq!(rail[0], (None, 4));
+        assert!(rail.contains(&(Some(DocKind::Pdf), 1)));
+        assert!(rail.contains(&(Some(DocKind::Word), 1)));
+        assert!(rail.contains(&(Some(DocKind::Comic), 1)));
+        assert!(rail.contains(&(Some(DocKind::Markdown), 1)));
+        assert_eq!(app.format_rail_width_px(1.0), 38);
+
+        // Filter to Word drawer -> only tab 2 shown
+        app.set_tab_format_filter(Some(DocKind::Word));
+        assert_eq!(app.visible_tab_indices(), vec![2]);
+        assert_eq!(app.active_tab, 2);
+
+        // Switch back to All drawer -> all 4 tabs shown
+        app.set_tab_format_filter(None);
+        assert_eq!(app.visible_tab_indices(), vec![0, 1, 2, 3]);
+
+        // Filter to Comic and verify RTL step triggers spread curl snapshot when cached
+        app.ui_skin = UiSkin::Distinct;
+        app.set_tab_format_filter(Some(DocKind::Comic));
+        assert_eq!(app.active_tab, 3);
+        app.comic_prefs.layout_mode = super::state::ComicLayoutMode::SinglePage;
+        app.page_turn_anim_ms = 220;
+        let _ = app.ensure_comic_page_cached(0);
+        app.page_draw_rect = (100, 80, 240, 320);
+        app.second_page_draw_rect = None;
+        app.comic_step_page(1);
+        assert_eq!(app.current_page_index, 1);
+        let anim = app.page_turn_anim.as_ref().expect("CBZ single-page step must trigger spread curl");
+        assert!(anim.prev_spread.is_some());
+        assert_eq!(anim.direction, -1, "RTL Manga next-page visual curl sweeps left-to-right (-1)");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
 
