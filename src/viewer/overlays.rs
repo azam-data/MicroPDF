@@ -13,8 +13,6 @@ pub(super) enum OverlayHit {
     WelcomeRecent(usize),
     WelcomeRestoreSession,
     WelcomeDismissSession,
-    WelcomeScratchpad,
-    WelcomeScratchpadClear,
     SearchPrev,
     SearchNext,
     SearchCaseToggle,
@@ -46,50 +44,13 @@ impl BoxHit {
 }
 
 impl<'a> PdfViewerApp<'a> {
-    pub(super) fn wrap_scratchpad_lines(text: &str, max_w: f32, font_sz: f32) -> Vec<String> {
-        let mut lines = Vec::new();
-        for raw_para in text.split('\n') {
-            if raw_para.is_empty() {
-                lines.push(String::new());
-                continue;
-            }
-            let mut cur = String::new();
-            for ch in raw_para.chars() {
-                let mut cand = cur.clone();
-                cand.push(ch);
-                if !cur.is_empty() && measure_text(&cand, font_sz, false) > max_w {
-                    if let Some(sp_byte) = cur.rfind(' ') {
-                        let head = cur[..sp_byte].to_string();
-                        let tail = cur[sp_byte + 1..].to_string();
-                        if !head.is_empty() {
-                            lines.push(head);
-                            cur = tail;
-                            cur.push(ch);
-                            continue;
-                        }
-                    }
-                    lines.push(cur);
-                    cur = ch.to_string();
-                } else {
-                    cur = cand;
-                }
-            }
-            lines.push(cur);
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines
-    }
-
     /// Computes Welcome card geometry and clickable regions when `!self.has_any_document()`.
     fn layout_welcome(&self, buf_w: u32, buf_h: u32, top_bars_h: u32, status_bar_h: u32, sf: f64) -> ((i32, i32, u32, u32), Vec<BoxHit>) {
         let s = sf as f32;
         let has_restore = matches!(self.input_mode, InputMode::RestoreSessionPrompt { .. });
         let recent_count = self.recent_files.len().min(5);
-        let cw = ((500.0 * s).round() as u32).min(buf_w.saturating_sub(32));
-        let scratch_section_h = (138.0 * s).round() as u32;
-        let mut ch = (210.0 * s).round() as u32 + scratch_section_h;
+        let cw = ((460.0 * s).round() as u32).min(buf_w.saturating_sub(32));
+        let mut ch = (210.0 * s).round() as u32;
         if has_restore {
             ch += (54.0 * s).round() as u32;
         }
@@ -97,7 +58,7 @@ impl<'a> PdfViewerApp<'a> {
             ch += (34.0 * s).round() as u32 + (recent_count as u32) * ((28.0 * s).round() as u32);
         }
         let avail_h = buf_h.saturating_sub(top_bars_h + status_bar_h);
-        ch = ch.min(avail_h.saturating_sub(24).max(160));
+        ch = ch.min(avail_h.saturating_sub(24).max(120));
         let cx = (buf_w.saturating_sub(cw) / 2) as i32;
         let cy = top_bars_h as i32 + ((avail_h.saturating_sub(ch)) / 2) as i32;
 
@@ -133,10 +94,9 @@ impl<'a> PdfViewerApp<'a> {
         if recent_count > 0 {
             cur_y += (24.0 * s).round() as i32;
             let row_h = (28.0 * s).round() as u32;
-            let reserve_for_scratch = (116.0 * s).round() as i32;
             for i in 0..recent_count {
                 let ry = cur_y + (i as i32) * (row_h as i32);
-                if ry + row_h as i32 <= cy + ch as i32 - reserve_for_scratch {
+                if ry + row_h as i32 <= cy + ch as i32 - (8.0 * s).round() as i32 {
                     hits.push(BoxHit {
                         x: cx + pad,
                         y: ry,
@@ -144,35 +104,9 @@ impl<'a> PdfViewerApp<'a> {
                         h: row_h,
                         hit: OverlayHit::WelcomeRecent(i),
                     });
-                    cur_y = ry + row_h as i32;
                 }
             }
-            cur_y += (14.0 * s).round() as i32;
-        } else {
-            cur_y += (8.0 * s).round() as i32;
         }
-
-        // Persistent Scratchpad box at the bottom of the Welcome Card
-        let clear_w = (46.0 * s).round() as u32;
-        let clear_h = (18.0 * s).round() as u32;
-        let hdr_y = cur_y;
-        let box_y = hdr_y + (22.0 * s).round() as i32;
-        let bottom_pad = (16.0 * s).round() as i32;
-        let box_h = ((cy + ch as i32 - bottom_pad) - box_y).max((48.0 * s).round() as i32) as u32;
-        hits.push(BoxHit {
-            x: cx + cw as i32 - pad - clear_w as i32,
-            y: hdr_y - (1.0 * s).round() as i32,
-            w: clear_w,
-            h: clear_h,
-            hit: OverlayHit::WelcomeScratchpadClear,
-        });
-        hits.push(BoxHit {
-            x: cx + pad,
-            y: box_y,
-            w: cw.saturating_sub((pad * 2) as u32),
-            h: box_h,
-            hit: OverlayHit::WelcomeScratchpad,
-        });
 
         ((cx, cy, cw, ch), hits)
     }
@@ -280,116 +214,6 @@ impl<'a> PdfViewerApp<'a> {
                 let max_w = (rh.x + rh.w as i32 - text_x - 8).max(20) as f32;
                 let short = truncate_ellipsis(fname, max_w, sub_sz, false);
                 draw_text_vcenter(buffer, buf_w, buf_h, text_x, rh.y, rh.h, rh.x + rh.w as i32 - 6, &short, sub_sz, theme.text_primary, false);
-            }
-        }
-
-        // Persistent Scratchpad section
-        if let Some(pad_box) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeScratchpad) {
-            let lbl_sz = (11.0 * s).clamp(9.0, 20.0);
-            let hdr_y = pad_box.y - (20.0 * s).round() as i32;
-            let hdr_lbl = if self.scratchpad_focused {
-                "Scratchpad  •  Typing (Esc to finish)"
-            } else {
-                "Scratchpad  (saved locally)"
-            };
-            let hdr_col = if self.scratchpad_focused {
-                theme.accent_soft_fg
-            } else {
-                theme.text_muted
-            };
-            draw_text(buffer, buf_w, buf_h, pad_box.x, hdr_y, hdr_lbl, lbl_sz, hdr_col, true);
-
-            if let Some(clr) = hits.iter().find(|h| h.hit == OverlayHit::WelcomeScratchpadClear) {
-                let can_clear = !self.scratchpad_text.is_empty();
-                let clr_hov = can_clear
-                    && self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeScratchpadClear));
-                let clr_bg = if clr_hov {
-                    theme.danger_soft_bg
-                } else {
-                    theme.surface_elevated
-                };
-                let clr_fg = if !can_clear {
-                    theme.text_muted
-                } else if clr_hov {
-                    theme.danger
-                } else {
-                    theme.text_secondary
-                };
-                fill_rounded_rect(buffer, buf_w, buf_h, clr.x, clr.y, clr.w, clr.h, (4.0 * s).max(3.0), clr_bg);
-                stroke_rounded_rect(buffer, buf_w, buf_h, clr.x, clr.y, clr.w, clr.h, (4.0 * s).max(3.0), theme.border_subtle);
-                let cs_sz = (10.0 * s).clamp(8.5, 16.0);
-                let cw_txt = measure_text("Clear", cs_sz, false);
-                draw_text_vcenter(
-                    buffer,
-                    buf_w,
-                    buf_h,
-                    clr.x + ((clr.w as f32 - cw_txt) * 0.5).round() as i32,
-                    clr.y,
-                    clr.h,
-                    clr.x + clr.w as i32,
-                    "Clear",
-                    cs_sz,
-                    clr_fg,
-                    false,
-                );
-            }
-
-            let pad_hov = self.hovered_widget == Some(UiHit::Overlay(OverlayHit::WelcomeScratchpad));
-            let box_rad = (7.0 * s).max(4.0);
-            let border = if self.scratchpad_focused {
-                theme.input_focus_border
-            } else if pad_hov {
-                theme.accent
-            } else {
-                theme.input_border
-            };
-            fill_rounded_rect(buffer, buf_w, buf_h, pad_box.x, pad_box.y, pad_box.w, pad_box.h, box_rad, theme.input_bg);
-            stroke_rounded_rect(buffer, buf_w, buf_h, pad_box.x, pad_box.y, pad_box.w, pad_box.h, box_rad, border);
-
-            let in_pad = (10.0 * s).round() as i32;
-            let top_pad = (8.0 * s).round() as i32;
-            let text_sz = (11.5 * s).clamp(9.5, 22.0);
-            let line_h = (16.5 * s).round().max(13.0) as i32;
-            let max_text_w = (pad_box.w as i32 - in_pad * 2).max(24) as f32;
-            let max_x = pad_box.x + pad_box.w as i32 - in_pad;
-            let max_lines = (((pad_box.h as i32 - top_pad * 2).max(line_h)) / line_h).max(1) as usize;
-
-            if self.scratchpad_text.is_empty() && !self.scratchpad_focused {
-                draw_text_clipped(
-                    buffer,
-                    buf_w,
-                    buf_h,
-                    pad_box.x + in_pad,
-                    pad_box.y + top_pad,
-                    max_x,
-                    "Click here to jot quick notes, reading lists, or reminders...",
-                    text_sz,
-                    theme.text_muted,
-                    false,
-                );
-            } else {
-                let mut wrapped = Self::wrap_scratchpad_lines(&self.scratchpad_text, max_text_w, text_sz);
-                if self.scratchpad_focused {
-                    if let Some(last) = wrapped.last_mut() {
-                        last.push('|');
-                    }
-                }
-                let start = wrapped.len().saturating_sub(max_lines);
-                for (row, line) in wrapped.iter().skip(start).enumerate() {
-                    let ly = pad_box.y + top_pad + (row as i32) * line_h;
-                    draw_text_clipped(
-                        buffer,
-                        buf_w,
-                        buf_h,
-                        pad_box.x + in_pad,
-                        ly,
-                        max_x,
-                        line,
-                        text_sz,
-                        theme.text_primary,
-                        false,
-                    );
-                }
             }
         }
     }
@@ -1079,16 +903,6 @@ impl<'a> PdfViewerApp<'a> {
             OverlayHit::WelcomeDismissSession => {
                 self.input_mode = InputMode::Normal;
                 self.pending_restore_tabs.clear();
-            }
-            OverlayHit::WelcomeScratchpad => {
-                self.scratchpad_focused = true;
-            }
-            OverlayHit::WelcomeScratchpadClear => {
-                if !self.scratchpad_text.is_empty() {
-                    self.scratchpad_text.clear();
-                    self.save_scratchpad();
-                    self.status_notice = Some("Cleared scratchpad notes".to_string());
-                }
             }
             OverlayHit::SearchPrev => {
                 if let InputMode::SearchText { ref query_input } = self.input_mode {

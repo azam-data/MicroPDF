@@ -1126,7 +1126,11 @@ impl<'a> PdfViewerApp<'a> {
                 return true;
             }
             let bmp_h = self.second_page_draw_rect.map_or(self.page_draw_rect.3, |r| self.page_draw_rect.3.max(r.3));
-            let pad = (24.0 * sf as f32).round();
+            let pad = if self.is_presentation || self.is_fullscreen {
+                0.0
+            } else {
+                (18.0 * sf as f32).round()
+            };
             let max_s = ((bmp_h as f32 + pad * 2.0) - ch as f32).max(0.0);
             if max_s > 4.0 {
                 let next_y = (self.scroll_y + scroll_delta_px).clamp(0.0, max_s);
@@ -5109,108 +5113,6 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
-        // 2c. Welcome Screen persistent scratchpad keyboard capture when focused
-        if !self.has_any_document()
-            && self.scratchpad_focused
-            && self.open_menu.is_none()
-            && !self.show_help_overlay
-            && !self.has_blocking_modal()
-            && !self.has_open_popover()
-        {
-            if self.cmd_or_ctrl_pressed {
-                if let Key::Character(ch) = &logical_key {
-                    let s = ch.as_str();
-                    if s.eq_ignore_ascii_case("c") {
-                        let _ = Self::copy_text_to_os_clipboard(&self.scratchpad_text);
-                        self.status_notice = Some("Copied scratchpad notes to clipboard".to_string());
-                        self.request_redraw();
-                        return;
-                    } else if s.eq_ignore_ascii_case("v") {
-                        if let Ok(clip) = Self::read_text_from_os_clipboard() {
-                            let normalized = clip.replace("\r\n", "\n").replace('\r', "\n");
-                            let clean: String = normalized
-                                .chars()
-                                .filter(|&c| c == '\n' || c == '\t' || !c.is_control())
-                                .take(8192)
-                                .collect();
-                            if !clean.is_empty() {
-                                let room = 16384usize.saturating_sub(self.scratchpad_text.len());
-                                for ch in clean.chars() {
-                                    if self.scratchpad_text.len() + ch.len_utf8() <= 16384 && room > 0 {
-                                        self.scratchpad_text.push(ch);
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                self.save_scratchpad();
-                                self.request_redraw();
-                            }
-                        }
-                        return;
-                    } else if s.eq_ignore_ascii_case("backspace") {
-                        self.scratchpad_text.clear();
-                        self.save_scratchpad();
-                        self.request_redraw();
-                        return;
-                    }
-                }
-            } else if !self.alt_pressed {
-                match &logical_key {
-                    Key::Named(NamedKey::Escape) => {
-                        self.scratchpad_focused = false;
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Named(NamedKey::Backspace) => {
-                        self.scratchpad_text.pop();
-                        self.save_scratchpad();
-                        self.request_redraw();
-                        return;
-                    }
-                    Key::Named(NamedKey::Enter) => {
-                        if self.scratchpad_text.len() < 16384 {
-                            self.scratchpad_text.push('\n');
-                            self.save_scratchpad();
-                            self.request_redraw();
-                        }
-                        return;
-                    }
-                    Key::Named(NamedKey::Tab) => {
-                        if self.scratchpad_text.len() + 2 <= 16384 {
-                            self.scratchpad_text.push_str("  ");
-                            self.save_scratchpad();
-                            self.request_redraw();
-                        }
-                        return;
-                    }
-                    Key::Named(NamedKey::Space) => {
-                        if self.scratchpad_text.len() < 16384 {
-                            self.scratchpad_text.push(' ');
-                            self.save_scratchpad();
-                            self.request_redraw();
-                        }
-                        return;
-                    }
-                    Key::Named(NamedKey::F1 | NamedKey::F5 | NamedKey::F11) => {}
-                    _ => {
-                        if let Some(t) = text {
-                            let clean: String = t.chars().filter(|c| !c.is_control()).collect();
-                            if !clean.is_empty() {
-                                for ch in clean.chars() {
-                                    if self.scratchpad_text.len() + ch.len_utf8() <= 16384 {
-                                        self.scratchpad_text.push(ch);
-                                    }
-                                }
-                                self.save_scratchpad();
-                                self.request_redraw();
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         // 3. OS-native modifier shortcuts: Cmd/Ctrl + Z/C/F/G/P/S/W/0/+/-/Tab/1..9.
         // Any unrecognized Ctrl/Cmd or Alt+Character combo returns early so e.g. Ctrl+D NEVER triggers bare 'D' (Delete Page)!
         if self.cmd_or_ctrl_pressed {
@@ -8172,24 +8074,6 @@ impl<'a> ApplicationHandler for PdfViewerApp<'a> {
                             self.request_redraw();
                         }
                     }
-                }
-
-                if self.scratchpad_focused
-                    && state == ElementState::Pressed
-                    && button == MouseButton::Left
-                    && !self.has_any_document()
-                    && self.hit_test_welcome(
-                        self.cursor_pos.0,
-                        self.cursor_pos.1,
-                        win_w,
-                        win_h,
-                        top_bars_h,
-                        status_bar_h,
-                        scale_factor,
-                    ) != Some(super::overlays::OverlayHit::WelcomeScratchpad)
-                {
-                    self.scratchpad_focused = false;
-                    self.request_redraw();
                 }
 
                 // 0b. Unified Top Bar clicks (Menus on left + Inline Customizable Toolbar beside Help)

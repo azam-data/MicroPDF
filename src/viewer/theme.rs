@@ -399,8 +399,8 @@ impl UiThemeMode {
 /// `Distinct` enables the Phase 1–4 editorial/magazine UI skin.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum UiSkin {
-    #[default]
     Classic,
+    #[default]
     Distinct,
 }
 
@@ -427,10 +427,10 @@ impl UiSkin {
     }
 
     pub fn from_ini_str(s: &str) -> Self {
-        if s.trim().eq_ignore_ascii_case("distinct") {
-            UiSkin::Distinct
-        } else {
+        if s.trim().eq_ignore_ascii_case("classic") {
             UiSkin::Classic
+        } else {
+            UiSkin::Distinct
         }
     }
 }

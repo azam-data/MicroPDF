@@ -762,7 +762,7 @@ impl Default for SessionConfig {
             recent_files: Vec::new(),
             last_positions: Vec::new(),
             ui_theme: UiThemeMode::Light,
-            ui_skin: UiSkin::Classic,
+            ui_skin: UiSkin::Distinct,
             ui_scale: 1.0,
             scroll_mode: ScrollMode::SinglePage,
             page_turn_anim_ms: 450,
@@ -1384,9 +1384,6 @@ pub struct PdfViewerApp<'a> {
     pub(super) tab_format_filter: Option<super::theme::DocKind>,
     /// First visible tab index when tabs overflow the horizontal tab strip.
     pub(super) tab_scroll_offset: usize,
-    /// Persistent landing-page scratchpad text + focus state (`micropdf_scratchpad.txt`).
-    pub(super) scratchpad_text: String,
-    pub(super) scratchpad_focused: bool,
     /// True when the `▾` All-Tabs overflow dropdown is open.
     pub(super) show_tab_list_popover: bool,
     /// Scroll offset (first visible row) inside the `▾` All-Tabs dropdown.
@@ -1612,7 +1609,7 @@ pub struct PdfViewerApp<'a> {
     pub(super) show_customize_toolbar: bool,
     /// Bright Light default UI theme with Dark Mode toggle.
     pub(super) ui_theme_mode: UiThemeMode,
-    /// Visual skin mode (`Classic` default vs `Distinct`).
+    /// Visual skin mode (`Distinct` default vs `Classic`).
     pub(super) ui_skin: UiSkin,
     /// User-adjustable UI interface scale multiplier (`0.80..=1.60`, persisted in `micropdf.ini`).
     pub(super) ui_scale: f32,
@@ -1918,8 +1915,6 @@ impl<'a> PdfViewerApp<'a> {
             active_tab: 0,
             tab_format_filter: None,
             tab_scroll_offset: 0,
-            scratchpad_text: String::new(),
-            scratchpad_focused: false,
             show_tab_list_popover: false,
             tab_list_scroll: 0,
             tab_context_menu: None,
@@ -2069,7 +2064,7 @@ impl<'a> PdfViewerApp<'a> {
             show_about_overlay: false,
             show_customize_toolbar: false,
             ui_theme_mode: UiThemeMode::Light,
-            ui_skin: UiSkin::Classic,
+            ui_skin: UiSkin::Distinct,
             ui_scale: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
@@ -2122,7 +2117,6 @@ impl<'a> PdfViewerApp<'a> {
         };
         app.record_status_notice_if_new();
         app.load_session_from_ini(initial_path.is_none());
-        app.load_scratchpad();
         if let Some(path) = initial_path {
             app.load_document(path)?;
         }
@@ -2285,49 +2279,6 @@ impl<'a> PdfViewerApp<'a> {
             .ok()
             .and_then(|p| p.parent().map(|d| d.join("micropdf.ini")))
             .unwrap_or_else(|| PathBuf::from("micropdf.ini"))
-    }
-
-    pub(super) fn portable_scratchpad_path(&self) -> PathBuf {
-        self.portable_session_ini_path()
-            .with_file_name("micropdf_scratchpad.txt")
-    }
-
-    pub(super) fn fallback_os_scratchpad_path() -> PathBuf {
-        Self::fallback_os_config_ini_path().with_file_name("micropdf_scratchpad.txt")
-    }
-
-    pub(super) fn load_scratchpad(&mut self) {
-        let primary = self.portable_scratchpad_path();
-        let fallback = Self::fallback_os_scratchpad_path();
-        let raw = std::fs::read_to_string(&primary)
-            .or_else(|_| std::fs::read_to_string(&fallback));
-        let Ok(raw_text) = raw else {
-            return;
-        };
-        if crate::config_crypto::is_encrypted_config(&raw_text) {
-            if let Ok(plain) = crate::config_crypto::decrypt_config(&raw_text) {
-                self.scratchpad_text = plain;
-            }
-        } else {
-            self.scratchpad_text = raw_text;
-        }
-    }
-
-    pub(super) fn save_scratchpad(&self) {
-        let payload = if self.encrypt_config {
-            crate::config_crypto::encrypt_config(&self.scratchpad_text)
-        } else {
-            self.scratchpad_text.clone()
-        };
-        let primary = self.portable_scratchpad_path();
-        if std::fs::write(&primary, &payload).is_ok() {
-            return;
-        }
-        let fallback = Self::fallback_os_scratchpad_path();
-        if let Some(dir) = fallback.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        let _ = std::fs::write(fallback, payload);
     }
 
     /// Returns the fallback OS config folder `micropdf.ini` path when the executable folder is not writable.

@@ -2571,7 +2571,7 @@ mod tests {
         use std::path::Path;
 
         // UiSkin defaults, toggle, labels, and INI round-trip
-        assert_eq!(UiSkin::default(), UiSkin::Classic);
+        assert_eq!(UiSkin::default(), UiSkin::Distinct);
         assert_eq!(UiSkin::Classic.label(), "Classic");
         assert_eq!(UiSkin::Distinct.label(), "Distinct");
         assert_eq!(UiSkin::Classic.toggle(), UiSkin::Distinct);
@@ -2579,18 +2579,19 @@ mod tests {
         assert_eq!(UiSkin::from_ini_str("distinct"), UiSkin::Distinct);
         assert_eq!(UiSkin::from_ini_str("DISTINCT"), UiSkin::Distinct);
         assert_eq!(UiSkin::from_ini_str("classic"), UiSkin::Classic);
-        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("CLASSIC"), UiSkin::Classic);
+        assert_eq!(UiSkin::from_ini_str("unknown"), UiSkin::Distinct);
 
         let legacy_ini = "ui_theme=dark\nactive_tab=0\n";
         let parsed_legacy = PdfViewerApp::parse_session_ini(legacy_ini);
-        assert_eq!(parsed_legacy.ui_skin, UiSkin::Classic);
+        assert_eq!(parsed_legacy.ui_skin, UiSkin::Distinct);
 
         let mut cfg = SessionConfig::default();
-        cfg.ui_skin = UiSkin::Distinct;
+        cfg.ui_skin = UiSkin::Classic;
         let ini = PdfViewerApp::serialize_session_ini(&cfg);
-        assert!(ini.contains("ui_skin=distinct"));
+        assert!(ini.contains("ui_skin=classic"));
         let roundtripped = PdfViewerApp::parse_session_ini(&ini);
-        assert_eq!(roundtripped.ui_skin, UiSkin::Distinct);
+        assert_eq!(roundtripped.ui_skin, UiSkin::Classic);
 
         // DocKind detection
         assert_eq!(DocKind::from_path(Path::new("report.pdf")), DocKind::Pdf);
@@ -4130,31 +4131,16 @@ By probing image headers during layout and decoding visible figures into a bound
     }
 
     #[test]
-    fn test_format_drawers_scratchpad_and_cbz_curl_polish() {
+    fn test_format_drawers_and_cbz_curl_polish() {
         use super::state::PdfViewerApp;
         use super::theme::{DocKind, UiSkin};
         use crate::comic::ComicArchive;
 
-        // 1. Multiline scratchpad word-wrapping & authenticated encryption roundtrip
-        let wrapped = PdfViewerApp::wrap_scratchpad_lines(
-            "Line one has several words that wrap cleanly\nSecond paragraph",
-            120.0,
-            12.0,
-        );
-        assert!(wrapped.len() >= 3, "Long line + explicit newline should wrap cleanly");
-        assert_eq!(wrapped.last().map(String::as_str), Some("Second paragraph"));
-
-        let sample_notes = "To read:\n- Chapter 4\n- Review annotations";
-        let enc = crate::config_crypto::encrypt_config(sample_notes);
-        assert!(crate::config_crypto::is_encrypted_config(&enc));
-        let dec = crate::config_crypto::decrypt_config(&enc).expect("decrypt scratchpad");
-        assert_eq!(dec, sample_notes);
-
-        // 2. Comic RTL & LTR spread pairing
+        // 1. Comic RTL & LTR spread pairing
         assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, false), (Some(1), Some(2)));
         assert_eq!(PdfViewerApp::comic_spread_visual_pages_for(5, 1, true, true), (Some(2), Some(1)));
 
-        // 3. Full PdfViewerApp integration (when libpdfium is available)
+        // 2. Full PdfViewerApp integration (when libpdfium is available)
         let Ok(engine) = crate::engine::PdfEngine::new() else {
             return;
         };
@@ -4190,7 +4176,7 @@ By probing image headers during layout and decoding visible figures into a bound
         let _ = ComicArchive::open(&cbz_path).expect("valid cbz");
 
         let mut app = PdfViewerApp::new(&engine, None).expect("init empty app");
-        app.scratchpad_text = sample_notes.to_string();
+        assert_eq!(app.ui_skin, UiSkin::Distinct, "Distinct skin must be the app default");
         assert_eq!(app.format_rail_width_px(1.0), 0, "Rail hidden when no tabs are open");
 
         app.open_document_in_new_tab(pdf_path).expect("open pdf");
