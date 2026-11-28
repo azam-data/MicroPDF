@@ -69,10 +69,13 @@ impl<'a> PdfViewerApp<'a> {
         self.epub_selection_pill_rect = None;
         self.book_info_popover = false;
         self.show_aa_popover = false;
+        self.aa_margins_submenu = false;
         self.book_toc_collapsed.clear();
         self.book_toc_search = None;
         self.md_split_drag = false;
-        self.epub_margin_slider_drag = false;
+        self.epub_margin_slider_drag = None;
+        self.epub_scrubber_drag = false;
+        self.epub_sidebar_scrollbar_drag = false;
         self.md_image_cache.clear();
         self.md_search_matches.clear();
         self.page_turn_anim = None;

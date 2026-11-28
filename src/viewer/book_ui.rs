@@ -179,8 +179,15 @@ pub(super) struct EpubReaderPrefs {
     pub(super) font_choice: EpubFontChoice,
     pub(super) font_size_px: f32,
     pub(super) line_spacing: LineSpacingPreset,
+    pub(super) line_spacing_mult: f32,
+    pub(super) word_spacing_px: f32,
+    pub(super) paragraph_spacing_mult: f32,
     pub(super) margins: MarginPreset,
     pub(super) margin_ratio: f32,
+    pub(super) margin_top: f32,
+    pub(super) margin_bottom: f32,
+    pub(super) margin_outer: f32,
+    pub(super) margin_inner: f32,
     pub(super) justify: bool,
     pub(super) hyphenate: bool,
     pub(super) two_page_spread: bool,
@@ -193,8 +200,15 @@ impl Default for EpubReaderPrefs {
             font_choice: EpubFontChoice::BookSerif,
             font_size_px: 16.5,
             line_spacing: LineSpacingPreset::Normal,
+            line_spacing_mult: LineSpacingPreset::Normal.multiplier(),
+            word_spacing_px: 0.0,
+            paragraph_spacing_mult: 1.0,
             margins: MarginPreset::Normal,
             margin_ratio: MarginPreset::Normal.pad_ratio(),
+            margin_top: 0.075,
+            margin_bottom: 0.060,
+            margin_outer: 0.130,
+            margin_inner: 0.080,
             justify: true,
             hyphenate: true,
             two_page_spread: true,
@@ -207,19 +221,71 @@ impl EpubReaderPrefs {
     pub(super) const MARGIN_MIN: f32 = 0.06;
     pub(super) const MARGIN_MAX: f32 = 0.24;
 
-    pub(super) fn effective_margin_ratio(&self) -> f32 {
-        self.margin_ratio.clamp(Self::MARGIN_MIN, Self::MARGIN_MAX)
+    pub(super) fn margin_part_bounds(part: u8) -> (f32, f32) {
+        match part {
+            0 => (0.04, 0.20), // Top
+            1 => (0.04, 0.20), // Bottom
+            2 => (0.04, 0.24), // Outer
+            _ => (0.03, 0.20), // Inner / Spine
+        }
     }
 
-    pub(super) fn margin_slider_norm(&self) -> f32 {
-        ((self.effective_margin_ratio() - Self::MARGIN_MIN)
-            / (Self::MARGIN_MAX - Self::MARGIN_MIN))
-            .clamp(0.0, 1.0)
+    pub(super) fn margin_part(&self, part: u8) -> f32 {
+        let (lo, hi) = Self::margin_part_bounds(part);
+        match part {
+            0 => self.margin_top.clamp(lo, hi),
+            1 => self.margin_bottom.clamp(lo, hi),
+            2 => self.margin_outer.clamp(lo, hi),
+            _ => self.margin_inner.clamp(lo, hi),
+        }
+    }
+
+    pub(super) fn margin_part_norm(&self, part: u8) -> f32 {
+        let (lo, hi) = Self::margin_part_bounds(part);
+        ((self.margin_part(part) - lo) / (hi - lo)).clamp(0.0, 1.0)
+    }
+
+    pub(super) fn set_margin_part(&mut self, part: u8, val: f32) {
+        let (lo, hi) = Self::margin_part_bounds(part);
+        let c = val.clamp(lo, hi);
+        match part {
+            0 => self.margin_top = c,
+            1 => self.margin_bottom = c,
+            2 => {
+                self.margin_outer = c;
+                self.margin_ratio = c.clamp(Self::MARGIN_MIN, Self::MARGIN_MAX);
+                self.margins = if c < 0.105 {
+                    MarginPreset::Narrow
+                } else if c <= 0.16 {
+                    MarginPreset::Normal
+                } else {
+                    MarginPreset::Wide
+                };
+            }
+            _ => self.margin_inner = c,
+        }
+    }
+
+    pub(super) fn set_margin_part_norm(&mut self, part: u8, norm: f32) {
+        let (lo, hi) = Self::margin_part_bounds(part);
+        self.set_margin_part(part, lo + norm.clamp(0.0, 1.0) * (hi - lo));
+    }
+
+    pub(super) fn effective_margin_ratio(&self) -> f32 {
+        self.margin_outer.clamp(0.04, 0.24)
+    }
+
+    pub(super) fn effective_inner_margin_ratio(&self) -> f32 {
+        self.margin_inner.clamp(0.03, 0.20)
     }
 
     pub(super) fn set_margin_ratio(&mut self, ratio: f32) {
         let clamped = ratio.clamp(Self::MARGIN_MIN, Self::MARGIN_MAX);
         self.margin_ratio = clamped;
+        self.margin_outer = clamped;
+        self.margin_inner = (clamped * 0.62).clamp(0.03, 0.14);
+        self.margin_top = (0.045 + ((clamped - Self::MARGIN_MIN) / (Self::MARGIN_MAX - Self::MARGIN_MIN)) * 0.085).clamp(0.04, 0.20);
+        self.margin_bottom = (self.margin_top * 0.80).clamp(0.04, 0.20);
         self.margins = if clamped < 0.105 {
             MarginPreset::Narrow
         } else if clamped <= 0.16 {
@@ -229,6 +295,7 @@ impl EpubReaderPrefs {
         };
     }
 
+    #[cfg(test)]
     pub(super) fn set_margin_slider_norm(&mut self, norm: f32) {
         let r = Self::MARGIN_MIN + norm.clamp(0.0, 1.0) * (Self::MARGIN_MAX - Self::MARGIN_MIN);
         self.set_margin_ratio(r);
@@ -237,16 +304,45 @@ impl EpubReaderPrefs {
     pub(super) fn set_margin_preset(&mut self, preset: MarginPreset) {
         self.margins = preset;
         self.margin_ratio = preset.pad_ratio();
+        match preset {
+            MarginPreset::Narrow => {
+                self.margin_top = 0.050;
+                self.margin_bottom = 0.045;
+                self.margin_outer = 0.080;
+                self.margin_inner = 0.055;
+            }
+            MarginPreset::Normal => {
+                self.margin_top = 0.075;
+                self.margin_bottom = 0.060;
+                self.margin_outer = 0.130;
+                self.margin_inner = 0.080;
+            }
+            MarginPreset::Wide => {
+                self.margin_top = 0.115;
+                self.margin_bottom = 0.095;
+                self.margin_outer = 0.190;
+                self.margin_inner = 0.110;
+            }
+        }
     }
 
-    /// Computes generous book `(top_pad_px, bottom_pad_px)` scaled smoothly with the active
-    /// margin setting so Narrow / Normal / Wide and the Margins slider adjust both top and side margins.
+    /// Computes independent `(top_pad_px, bottom_pad_px)` from `margin_top` and `margin_bottom`.
+    /// Adjusting top margin NEVER widens the inner spine gap or bottom margin.
     pub(super) fn vertical_pad_px(&self, spread_h: f32, s: f32) -> (f32, f32) {
-        let norm = self.margin_slider_norm();
-        let top_pad = (spread_h * (0.045 + norm * 0.085))
-            .clamp(28.0 * s, (spread_h * 0.20).max(28.0 * s));
-        let bottom_pad = (top_pad * 0.72).max(24.0 * s);
+        let top_pad = (spread_h * self.margin_part(0))
+            .clamp(22.0 * s, (spread_h * 0.24).max(22.0 * s));
+        let bottom_pad = (spread_h * self.margin_part(1))
+            .clamp(20.0 * s, (spread_h * 0.22).max(20.0 * s));
         (top_pad, bottom_pad)
+    }
+
+    pub(super) fn effective_line_mult(&self) -> f32 {
+        self.line_spacing_mult.clamp(1.20, 2.20)
+    }
+
+    pub(super) fn set_line_spacing_preset(&mut self, preset: LineSpacingPreset) {
+        self.line_spacing = preset;
+        self.line_spacing_mult = preset.multiplier();
     }
 }
 
@@ -283,7 +379,7 @@ pub(super) enum BookSidebarTab {
     Bookmarks,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) enum BookSidebarHit {
     ToggleSearch,
     ToggleExpandAll,
@@ -295,8 +391,11 @@ pub(super) enum BookSidebarHit {
     AnnotDelete(usize),
     BookmarkRow(usize),
     BookmarkDelete(usize),
+    ScrollbarTrack(f32),
     Tab(BookSidebarTab),
 }
+
+impl Eq for BookSidebarHit {}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub(super) enum AaPopoverHit {
@@ -306,9 +405,20 @@ pub(super) enum AaPopoverHit {
     FontOsNext,
     SizeMinus,
     SizePlus,
+    CodeSizeMinus,
+    CodeSizePlus,
     Spacing(LineSpacingPreset),
+    LineSpacingMinus,
+    LineSpacingPlus,
+    WordSpacingMinus,
+    WordSpacingPlus,
+    ParaSpacingMinus,
+    ParaSpacingPlus,
+    OpenMarginsSubmenu,
+    CloseMarginsSubmenu,
+    ResetMargins,
     Margin(MarginPreset),
-    MarginSlider(f32),
+    MarginPartSlider(u8, f32),
     ToggleJustify,
     ToggleHyphenate,
     SpreadTwoPage,
@@ -801,9 +911,52 @@ impl<'a> PdfViewerApp<'a> {
 
     fn book_sidebar_layout(s: f32) -> (u32, u32, u32) {
         let util_h = (34.0 * s).round() as u32;
-        let card_h = (82.0 * s).round() as u32;
-        let seg_h = (38.0 * s).round() as u32;
+        let card_h = (92.0 * s).round() as u32;
+        let seg_h = (40.0 * s).round() as u32;
         (util_h, card_h, seg_h)
+    }
+
+    pub(super) fn epub_sidebar_list_metrics(
+        &self,
+        buf_h: u32,
+        top_bars_h: u32,
+        sf: f64,
+    ) -> (i32, i32, u32, usize, usize) {
+        let s = sf as f32;
+        let top_y = top_bars_h as i32;
+        let total_h = buf_h.saturating_sub(top_bars_h) as i32;
+        let (util_h, card_h, seg_h) = Self::book_sidebar_layout(s);
+        let search_bar_h = if self.book_toc_search.is_some() && self.book_sidebar_tab == BookSidebarTab::Contents {
+            (32.0 * s).round() as i32
+        } else {
+            0
+        };
+        let list_top_y = top_y + util_h as i32 + card_h as i32 + search_bar_h;
+        let seg_y = top_y + total_h - seg_h as i32;
+        let list_bot_y = (seg_y - 2).max(list_top_y + 1);
+        let item_h = match self.book_sidebar_tab {
+            BookSidebarTab::Annotations => (60.0 * s).round().max(36.0) as u32,
+            BookSidebarTab::Contents | BookSidebarTab::Bookmarks => (38.0 * s).round().max(26.0) as u32,
+        };
+        let total_items = match self.book_sidebar_tab {
+            BookSidebarTab::Contents => {
+                let toc: &[TocEntry] = self
+                    .markdown_doc
+                    .as_ref()
+                    .and_then(|d| d.book_meta.as_ref())
+                    .map(|m| m.toc.as_slice())
+                    .unwrap_or(&[]);
+                let mut rows = Vec::new();
+                let mut nid = 0usize;
+                flatten_toc(toc, &self.book_toc_collapsed, self.book_toc_search.as_deref(), &mut nid, &mut rows);
+                rows.len()
+            }
+            BookSidebarTab::Annotations => self.epub_book_data.highlights.len(),
+            BookSidebarTab::Bookmarks => self.epub_book_data.bookmarks.len(),
+        };
+        let avail_h = (list_bot_y - list_top_y).max(0) as u32;
+        let visible_items = ((avail_h / item_h.max(1)) as usize).max(1);
+        (list_top_y, list_bot_y, item_h, total_items, visible_items)
     }
 
     pub(super) fn draw_distinct_epub_sidebar(
@@ -822,11 +975,12 @@ impl<'a> PdfViewerApp<'a> {
         let total_h = buf_h.saturating_sub(top_bars_h);
         let (util_h, card_h, seg_h) = Self::book_sidebar_layout(s);
         let search_bar_h = if self.book_toc_search.is_some() && self.book_sidebar_tab == BookSidebarTab::Contents {
-            (30.0 * s).round() as u32
+            (32.0 * s).round() as u32
         } else {
             0
         };
-        let pad = (10.0 * s).round() as i32;
+        let pad = (14.0 * s).round() as i32;
+        let left_margin = (18.0 * s).round() as i32;
         let rad = (6.0 * s).max(4.0);
 
         // Background + right subtle border
@@ -865,13 +1019,13 @@ impl<'a> PdfViewerApp<'a> {
             );
         }
 
-        // 2. Book Header Card (Cover thumbnail + Title + Author + (i) info button)
+        // 2. Book Header Card (Cover thumbnail + Title + Author + Chapter X of Y + (i) info button)
         let card_y = top_y + util_h as i32;
         fill_rect_clipped(buffer, buf_w, buf_h, 0, card_y, sidebar_w.saturating_sub(1), card_h, theme.sidebar_header_bg);
         fill_rect_clipped(buffer, buf_w, buf_h, 0, card_y + card_h as i32 - 1, sidebar_w.saturating_sub(1), 1, theme.divider);
 
-        let thumb_w = (44.0 * s).round() as u32;
-        let thumb_h = (62.0 * s).round() as u32;
+        let thumb_w = (46.0 * s).round() as u32;
+        let thumb_h = (66.0 * s).round() as u32;
         let thumb_x = pad;
         let thumb_y = card_y + ((card_h.saturating_sub(thumb_h)) / 2) as i32;
 
@@ -911,13 +1065,33 @@ impl<'a> PdfViewerApp<'a> {
             (self.filename_display(), None)
         };
 
+        let cur_block = self.current_visible_epub_block_idx();
+        let (chap_cur, chap_total) = if let Some(toc) = self.markdown_doc.as_ref().and_then(|d| d.book_meta.as_ref()).map(|m| m.toc.as_slice()) {
+            let mut flattened = Vec::new();
+            let mut nid = 0usize;
+            let empty = std::collections::HashSet::new();
+            flatten_toc(toc, &empty, None, &mut nid, &mut flattened);
+            let top_chapters: Vec<usize> = flattened.iter().filter(|r| r.entry.level == 0).map(|r| r.entry.block_idx).collect();
+            let pool: Vec<usize> = if !top_chapters.is_empty() {
+                top_chapters
+            } else {
+                flattened.iter().map(|r| r.entry.block_idx).collect()
+            };
+            let tot = pool.len();
+            let idx = pool.iter().enumerate().filter(|&(_, &b)| b <= cur_block).map(|(i, _)| i + 1).last().unwrap_or(1).min(tot.max(1));
+            (idx, tot)
+        } else {
+            (0, 0)
+        };
+
         let info_sz = (18.0 * s).round() as u32;
         let info_x = sidebar_w as i32 - pad - info_sz as i32;
         let info_y = card_y + card_h as i32 - info_sz as i32 - (10.0 * s).round() as i32;
         let text_x = thumb_x + thumb_w as i32 + (10.0 * s).round() as i32;
         let text_max_x = sidebar_w as i32 - pad - 4;
-        let title_sz = (12.0 * s).clamp(10.5, 22.0);
-        let auth_sz = (10.5 * s).clamp(9.0, 18.0);
+        let title_sz = (13.5 * s).clamp(11.0, 22.0);
+        let auth_sz = (11.5 * s).clamp(9.5, 19.0);
+        let chap_sub_sz = (11.0 * s).clamp(9.0, 18.0);
         let title_budget = (text_max_x - text_x).max(20) as f32;
         let title_clipped = truncate_ellipsis_styled(
             &book_title,
@@ -925,14 +1099,22 @@ impl<'a> PdfViewerApp<'a> {
             TextStyle::book(title_sz, true, false),
         );
         draw_text_styled_clipped(
-            buffer, buf_w, buf_h, text_x, thumb_y + (4.0 * s).round() as i32, text_max_x,
+            buffer, buf_w, buf_h, text_x, thumb_y + (2.0 * s).round() as i32, text_max_x,
             &title_clipped, TextStyle::book(title_sz, true, false), theme.text_primary,
         );
         if let Some(ref auth) = book_author {
             let auth_clipped = truncate_ellipsis(auth, (info_x - text_x - 6).max(20) as f32, auth_sz, false);
             draw_text_clipped(
-                buffer, buf_w, buf_h, text_x, thumb_y + (26.0 * s).round() as i32, info_x - 4,
+                buffer, buf_w, buf_h, text_x, thumb_y + (24.0 * s).round() as i32, info_x - 4,
                 &auth_clipped, auth_sz, theme.text_muted, false,
+            );
+        }
+        if chap_total > 0 {
+            let chap_lbl = format!("• Chapter {chap_cur} of {chap_total}");
+            let chap_clipped = truncate_ellipsis(&chap_lbl, (info_x - text_x - 6).max(20) as f32, chap_sub_sz, false);
+            draw_text_clipped(
+                buffer, buf_w, buf_h, text_x, thumb_y + (43.0 * s).round() as i32, info_x - 4,
+                &chap_clipped, chap_sub_sz, theme.text_secondary, false,
             );
         }
         let info_hov = self.hovered_widget == Some(UiHit::BookSidebar(BookSidebarHit::BookInfo)) || self.book_info_popover;
@@ -951,7 +1133,7 @@ impl<'a> PdfViewerApp<'a> {
             1.1,
             if info_hov { theme.accent } else { theme.border_subtle },
         );
-        let i_sz = (10.0 * s).clamp(8.5, 16.0);
+        let i_sz = (10.5 * s).clamp(8.5, 16.0);
         let iw = measure_text("i", i_sz, true);
         draw_text_vcenter(
             buffer, buf_w, buf_h,
@@ -975,12 +1157,12 @@ impl<'a> PdfViewerApp<'a> {
             }
         }
 
-        // Bottom 3-tab segmented switcher: Contents | Annotations | Bookmarks
+        // Bottom 3-tab segmented switcher: Contents | Notes | Marks
         let seg_y = top_y + total_h as i32 - seg_h as i32;
         fill_rect_clipped(buffer, buf_w, buf_h, 0, seg_y, sidebar_w.saturating_sub(1), seg_h, theme.sidebar_header_bg);
         fill_rect_clipped(buffer, buf_w, buf_h, 0, seg_y, sidebar_w.saturating_sub(1), 1, theme.divider);
 
-        let pill_pad = (6.0 * s).round() as i32;
+        let pill_pad = (8.0 * s).round() as i32;
         let track_x = pill_pad;
         let track_y = seg_y + (5.0 * s).round() as i32;
         let track_w = sidebar_w.saturating_sub((pill_pad * 2 + 1) as u32);
@@ -994,7 +1176,7 @@ impl<'a> PdfViewerApp<'a> {
             (BookSidebarTab::Bookmarks, "Marks"),
         ];
         let seg_w = track_w / 3;
-        let seg_sz = (10.0 * s).clamp(8.5, 18.0);
+        let seg_sz = (12.0 * s).clamp(9.5, 19.0);
         for (i, (tab, lbl)) in tabs.iter().enumerate() {
             let bx = track_x + (i as i32) * (seg_w as i32);
             let bw = if i == 2 { (track_x + track_w as i32 - bx).max(16) as u32 } else { seg_w };
@@ -1010,12 +1192,21 @@ impl<'a> PdfViewerApp<'a> {
             draw_text_vcenter(buffer, buf_w, buf_h, bx + ((bw as f32 - tw) * 0.5).round() as i32, track_y, track_h, bx + bw as i32 - 2, lbl, seg_sz, fg, is_active);
         }
 
-        // Scrollable middle list area
+        // Scrollable middle list area (Tweak 1 & Tweak 9)
         let list_bot_y = seg_y - 2;
-        let row_h = (28.0 * s).round() as u32;
-        let body_sz = (11.5 * s).clamp(9.5, 22.0);
-        let small_sz = (10.0 * s).clamp(8.5, 18.0);
-        let cur_block = self.current_visible_epub_block_idx();
+        let row_h = (38.0 * s).round().max(26.0) as u32;
+        let main_sz = (16.5 * s).clamp(13.0, 26.0);
+        let sub_sz = (14.5 * s).clamp(11.5, 23.0);
+        let loc_sz = (13.0 * s).clamp(10.5, 20.0);
+
+        let list_total: usize;
+        let mut list_item_h = row_h;
+
+        let (_, _, _, metric_tot, metric_vis) = self.epub_sidebar_list_metrics(buf_h, top_bars_h, scale_factor);
+        let has_scrollbar = metric_tot > metric_vis;
+        let sb_w = (7.0 * s).round().max(5.0) as u32;
+        let sb_reserve = if has_scrollbar { (14.0 * s).round() as i32 } else { (6.0 * s).round() as i32 };
+        let content_right = sidebar_w as i32 - sb_reserve;
 
         match self.book_sidebar_tab {
             BookSidebarTab::Contents => {
@@ -1028,123 +1219,164 @@ impl<'a> PdfViewerApp<'a> {
                 let mut rows = Vec::new();
                 let mut nid = 0usize;
                 flatten_toc(toc, &self.book_toc_collapsed, self.book_toc_search.as_deref(), &mut nid, &mut rows);
+                list_total = rows.len();
 
                 if rows.is_empty() {
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 14, "No chapters found.", body_sz, theme.text_muted, false);
-                    return;
-                }
-
-                // Active chapter = last row with block_idx <= cur_block
-                let mut active_row_idx: Option<usize> = None;
-                for (ri, r) in rows.iter().enumerate() {
-                    if r.entry.block_idx <= cur_block {
-                        active_row_idx = Some(ri);
-                    }
-                }
-
-                let start = self.bookmark_scroll_y.min(rows.len().saturating_sub(1));
-                for (vis_i, row) in rows.iter().enumerate().skip(start) {
-                    let ry = list_top_y + (vis_i - start) as i32 * row_h as i32;
-                    if ry + row_h as i32 > list_bot_y {
-                        break;
-                    }
-                    let is_cur = active_row_idx == Some(vis_i);
-                    let is_hov = matches!(
-                        self.hovered_widget,
-                        Some(UiHit::BookSidebar(BookSidebarHit::TocRow(i)))
-                            | Some(UiHit::BookSidebar(BookSidebarHit::TocToggle(i))) if i == vis_i
-                    );
-                    if is_cur {
-                        fill_rounded_rect(buffer, buf_w, buf_h, (6.0 * s).round() as i32, ry + 2, sidebar_w.saturating_sub((13.0 * s).round() as u32), row_h.saturating_sub(4), 6.0 * s, theme.accent_soft_bg);
-                    } else if is_hov {
-                        fill_rounded_rect(buffer, buf_w, buf_h, (6.0 * s).round() as i32, ry + 2, sidebar_w.saturating_sub((13.0 * s).round() as u32), row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 16, "No chapters found.", main_sz, theme.text_muted, false);
+                } else {
+                    let mut active_row_idx: Option<usize> = None;
+                    for (ri, r) in rows.iter().enumerate() {
+                        if r.entry.block_idx <= cur_block {
+                            active_row_idx = Some(ri);
+                        }
                     }
 
-                    let indent = (row.entry.level.min(3) as i32) * (12.0 * s).round() as i32;
-                    let base_x = (12.0 * s).round() as i32 + indent;
-                    if row.has_children {
-                        let chev_sz = (10.0 * s).round() as u32;
-                        let ic = if row.is_collapsed { UiIcon::ChevronRight } else { UiIcon::ChevronDown };
-                        draw_icon(buffer, buf_w, buf_h, ic, base_x, ry + ((row_h.saturating_sub(chev_sz)) / 2) as i32, chev_sz, theme.text_muted);
+                    let start = self.bookmark_scroll_y.min(rows.len().saturating_sub(1));
+                    for (vis_i, row) in rows.iter().enumerate().skip(start) {
+                        let ry = list_top_y + (vis_i - start) as i32 * row_h as i32;
+                        if ry + row_h as i32 > list_bot_y {
+                            break;
+                        }
+                        let is_cur = active_row_idx == Some(vis_i);
+                        let is_hov = matches!(
+                            self.hovered_widget,
+                            Some(UiHit::BookSidebar(BookSidebarHit::TocRow(i)))
+                                | Some(UiHit::BookSidebar(BookSidebarHit::TocToggle(i))) if i == vis_i
+                        );
+                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
+                        if is_cur {
+                            fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.accent_soft_bg);
+                            fill_circle_aa(buffer, buf_w, buf_h, 15.0 * s, ry as f32 + row_h as f32 * 0.5, 3.0 * s, theme.accent);
+                        } else if is_hov {
+                            fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
+                        }
+
+                        let loc_num = self.epub_loc_for_block(row.entry.block_idx);
+                        let loc_txt = format!("Loc {loc_num}");
+                        let loc_w = measure_text(&loc_txt, loc_sz, false).ceil() as i32;
+                        let loc_x = content_right - (8.0 * s).round() as i32 - loc_w;
+
+                        let indent = (row.entry.level.min(3) as i32) * (14.0 * s).round() as i32;
+                        let base_x = left_margin + (4.0 * s).round() as i32 + indent;
+                        if row.has_children {
+                            let chev_sz = (11.0 * s).round() as u32;
+                            let ic = if row.is_collapsed { UiIcon::ChevronRight } else { UiIcon::ChevronDown };
+                            draw_icon(buffer, buf_w, buf_h, ic, base_x, ry + ((row_h.saturating_sub(chev_sz)) / 2) as i32, chev_sz, theme.text_muted);
+                        }
+                        let tx = base_x + if row.has_children { (16.0 * s).round() as i32 } else { 2 };
+                        let title_max_x = (loc_x - (8.0 * s).round() as i32).max(tx + 24);
+                        let row_sz = if row.entry.level == 0 { main_sz } else { sub_sz };
+                        let clipped = truncate_ellipsis(&row.entry.title, (title_max_x - tx).max(20) as f32, row_sz, is_cur);
+                        let fg = if is_cur { theme.accent_soft_fg } else if row.entry.level == 0 { theme.text_primary } else { theme.text_secondary };
+                        draw_text_vcenter(buffer, buf_w, buf_h, tx, ry, row_h, title_max_x, &clipped, row_sz, fg, is_cur);
+                        draw_text_vcenter(buffer, buf_w, buf_h, loc_x, ry, row_h, content_right - 4, &loc_txt, loc_sz, if is_cur { theme.accent_soft_fg } else { theme.text_muted }, false);
                     }
-                    let tx = base_x + if row.has_children { (14.0 * s).round() as i32 } else { 2 };
-                    let max_x = sidebar_w as i32 - (12.0 * s).round() as i32;
-                    let clipped = truncate_ellipsis(&row.entry.title, (max_x - tx).max(20) as f32, body_sz, is_cur);
-                    let fg = if is_cur { theme.accent_soft_fg } else if row.entry.level == 0 { theme.text_primary } else { theme.text_secondary };
-                    draw_text_vcenter(buffer, buf_w, buf_h, tx, ry, row_h, max_x, &clipped, body_sz, fg, is_cur);
                 }
             }
             BookSidebarTab::Annotations => {
+                list_item_h = (60.0 * s).round().max(36.0) as u32;
+                list_total = self.epub_book_data.highlights.len();
                 if self.epub_book_data.highlights.is_empty() {
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 14, "No highlights or notes yet.", body_sz, theme.text_muted, false);
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 34, "Drag across words on the page", small_sz, theme.text_muted, false);
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 50, "to Highlight or Add Note.", small_sz, theme.text_muted, false);
-                    return;
-                }
-                let card_row_h = (46.0 * s).round() as u32;
-                let del_sz = (18.0 * s).round() as u32;
-                let del_ic = (10.0 * s).round() as u32;
-                for (i, hl) in self.epub_book_data.highlights.iter().enumerate() {
-                    let ry = list_top_y + (i as i32) * (card_row_h as i32);
-                    if ry + card_row_h as i32 > list_bot_y {
-                        break;
-                    }
-                    let hov = matches!(
-                        self.hovered_widget,
-                        Some(UiHit::BookSidebar(BookSidebarHit::AnnotRow(idx)))
-                            | Some(UiHit::BookSidebar(BookSidebarHit::AnnotDelete(idx))) if idx == i
-                    );
-                    if hov {
-                        fill_rounded_rect(buffer, buf_w, buf_h, (6.0 * s).round() as i32, ry + 2, sidebar_w.saturating_sub((13.0 * s).round() as u32), card_row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
-                    }
-                    let swatch_col = EPUB_HIGHLIGHT_COLORS.get(hl.color_idx as usize).map(|c| c.0).unwrap_or(EPUB_HIGHLIGHT_COLORS[0].0);
-                    fill_circle_aa(buffer, buf_w, buf_h, 16.0 * s, ry as f32 + 14.0 * s, 4.0 * s, swatch_col);
-                    let dx = sidebar_w as i32 - del_sz as i32 - (10.0 * s).round() as i32;
-                    let q_clip = truncate_ellipsis(&hl.quote, (dx - (26.0 * s).round() as i32).max(24) as f32, body_sz, false);
-                    draw_text_clipped(buffer, buf_w, buf_h, (25.0 * s).round() as i32, ry + (6.0 * s).round() as i32, dx - 2, &q_clip, body_sz, theme.text_primary, false);
-                    if let Some(ref note) = hl.note {
-                        let n_clip = truncate_ellipsis(note, (dx - (26.0 * s).round() as i32).max(24) as f32, small_sz, false);
-                        draw_text_clipped(buffer, buf_w, buf_h, (25.0 * s).round() as i32, ry + (24.0 * s).round() as i32, dx - 2, &n_clip, small_sz, theme.accent_soft_fg, false);
-                    }
-                    if hov {
-                        draw_icon(buffer, buf_w, buf_h, UiIcon::Close, dx + ((del_sz - del_ic) / 2) as i32, ry + ((card_row_h - del_ic) / 2) as i32, del_ic, theme.danger);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 16, "No highlights or notes yet.", main_sz, theme.text_muted, false);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 42, "Drag across words on the page", loc_sz, theme.text_muted, false);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 62, "to Highlight or Add Note.", loc_sz, theme.text_muted, false);
+                } else {
+                    let del_sz = (18.0 * s).round() as u32;
+                    let del_ic = (10.0 * s).round() as u32;
+                    let start = self.bookmark_scroll_y.min(self.epub_book_data.highlights.len().saturating_sub(1));
+                    for (vis_i, hl) in self.epub_book_data.highlights.iter().enumerate().skip(start) {
+                        let ry = list_top_y + (vis_i - start) as i32 * list_item_h as i32;
+                        if ry + list_item_h as i32 > list_bot_y {
+                            break;
+                        }
+                        let hov = matches!(
+                            self.hovered_widget,
+                            Some(UiHit::BookSidebar(BookSidebarHit::AnnotRow(idx)))
+                                | Some(UiHit::BookSidebar(BookSidebarHit::AnnotDelete(idx))) if idx == vis_i
+                        );
+                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
+                        if hov {
+                            fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, list_item_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
+                        }
+                        let swatch_col = EPUB_HIGHLIGHT_COLORS.get(hl.color_idx as usize).map(|c| c.0).unwrap_or(EPUB_HIGHLIGHT_COLORS[0].0);
+                        fill_circle_aa(buffer, buf_w, buf_h, left_margin as f32 + 4.0 * s, ry as f32 + 18.0 * s, 4.5 * s, swatch_col);
+                        let dx = content_right - del_sz as i32 - (6.0 * s).round() as i32;
+                        let q_x = left_margin + (14.0 * s).round() as i32;
+                        let q_clip = truncate_ellipsis(&hl.quote, (dx - q_x - 6).max(24) as f32, sub_sz, false);
+                        draw_text_clipped(buffer, buf_w, buf_h, q_x, ry + (8.0 * s).round() as i32, dx - 2, &q_clip, sub_sz, theme.text_primary, false);
+                        if let Some(ref note) = hl.note {
+                            let n_clip = truncate_ellipsis(note, (dx - q_x - 6).max(24) as f32, loc_sz, false);
+                            draw_text_clipped(buffer, buf_w, buf_h, q_x, ry + (31.0 * s).round() as i32, dx - 2, &n_clip, loc_sz, theme.accent_soft_fg, false);
+                        }
+                        if hov {
+                            draw_icon(buffer, buf_w, buf_h, UiIcon::Close, dx + ((del_sz - del_ic) / 2) as i32, ry + ((list_item_h - del_ic) / 2) as i32, del_ic, theme.danger);
+                        }
                     }
                 }
             }
             BookSidebarTab::Bookmarks => {
+                list_total = self.epub_book_data.bookmarks.len();
                 if self.epub_book_data.bookmarks.is_empty() {
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 14, "No page bookmarks yet.", body_sz, theme.text_muted, false);
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 34, "Click the Bookmark icon on the", small_sz, theme.text_muted, false);
-                    draw_text(buffer, buf_w, buf_h, pad, list_top_y + 50, "bottom bar to save a page.", small_sz, theme.text_muted, false);
-                    return;
-                }
-                let del_sz = (18.0 * s).round() as u32;
-                let del_ic = (10.0 * s).round() as u32;
-                for (i, bm) in self.epub_book_data.bookmarks.iter().enumerate() {
-                    let ry = list_top_y + (i as i32) * (row_h as i32);
-                    if ry + row_h as i32 > list_bot_y {
-                        break;
-                    }
-                    let hov = matches!(
-                        self.hovered_widget,
-                        Some(UiHit::BookSidebar(BookSidebarHit::BookmarkRow(idx)))
-                            | Some(UiHit::BookSidebar(BookSidebarHit::BookmarkDelete(idx))) if idx == i
-                    );
-                    if hov {
-                        fill_rounded_rect(buffer, buf_w, buf_h, (6.0 * s).round() as i32, ry + 2, sidebar_w.saturating_sub((13.0 * s).round() as u32), row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
-                    }
-                    let loc_txt = format!("Loc. {}", bm.page_num);
-                    let lw = measure_text(&loc_txt, small_sz, true).ceil() as i32;
-                    let dx = sidebar_w as i32 - del_sz as i32 - (10.0 * s).round() as i32;
-                    let max_lbl_x = if hov { dx - lw - 8 } else { sidebar_w as i32 - lw - 14 };
-                    let lbl = truncate_ellipsis(&bm.label, (max_lbl_x - pad).max(20) as f32, body_sz, false);
-                    draw_text_vcenter(buffer, buf_w, buf_h, pad, ry, row_h, max_lbl_x, &lbl, body_sz, theme.text_primary, false);
-                    draw_text_vcenter(buffer, buf_w, buf_h, max_lbl_x + 4, ry, row_h, if hov { dx - 2 } else { sidebar_w as i32 - 8 }, &loc_txt, small_sz, theme.accent_soft_fg, true);
-                    if hov {
-                        draw_icon(buffer, buf_w, buf_h, UiIcon::Close, dx + ((del_sz - del_ic) / 2) as i32, ry + ((row_h - del_ic) / 2) as i32, del_ic, theme.danger);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 16, "No page bookmarks yet.", main_sz, theme.text_muted, false);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 42, "Click the Bookmark icon on the", loc_sz, theme.text_muted, false);
+                    draw_text(buffer, buf_w, buf_h, left_margin, list_top_y + 62, "bottom bar to save a page.", loc_sz, theme.text_muted, false);
+                } else {
+                    let del_sz = (18.0 * s).round() as u32;
+                    let del_ic = (10.0 * s).round() as u32;
+                    let start = self.bookmark_scroll_y.min(self.epub_book_data.bookmarks.len().saturating_sub(1));
+                    for (vis_i, bm) in self.epub_book_data.bookmarks.iter().enumerate().skip(start) {
+                        let ry = list_top_y + (vis_i - start) as i32 * row_h as i32;
+                        if ry + row_h as i32 > list_bot_y {
+                            break;
+                        }
+                        let hov = matches!(
+                            self.hovered_widget,
+                            Some(UiHit::BookSidebar(BookSidebarHit::BookmarkRow(idx)))
+                                | Some(UiHit::BookSidebar(BookSidebarHit::BookmarkDelete(idx))) if idx == vis_i
+                        );
+                        let pill_x = (10.0 * s).round() as i32;
+                        let pill_w = (content_right - pill_x - (4.0 * s).round() as i32).max(20) as u32;
+                        if hov {
+                            fill_rounded_rect(buffer, buf_w, buf_h, pill_x, ry + 2, pill_w, row_h.saturating_sub(4), 6.0 * s, theme.hover_bg);
+                        }
+                        let loc_txt = format!("Loc {}", bm.page_num);
+                        let lw = measure_text(&loc_txt, loc_sz, true).ceil() as i32;
+                        let dx = content_right - del_sz as i32 - (6.0 * s).round() as i32;
+                        let max_lbl_x = if hov { dx - lw - 10 } else { content_right - lw - 10 };
+                        let lbl = truncate_ellipsis(&bm.label, (max_lbl_x - left_margin).max(20) as f32, main_sz, false);
+                        draw_text_vcenter(buffer, buf_w, buf_h, left_margin, ry, row_h, max_lbl_x, &lbl, main_sz, theme.text_primary, false);
+                        draw_text_vcenter(buffer, buf_w, buf_h, max_lbl_x + 4, ry, row_h, if hov { dx - 2 } else { content_right - 4 }, &loc_txt, loc_sz, theme.accent_soft_fg, true);
+                        if hov {
+                            draw_icon(buffer, buf_w, buf_h, UiIcon::Close, dx + ((del_sz - del_ic) / 2) as i32, ry + ((row_h - del_ic) / 2) as i32, del_ic, theme.danger);
+                        }
                     }
                 }
             }
+        }
+
+        // Draw vertical scrollbar whenever items overflow (Tweak 1)
+        let avail_h = (list_bot_y - list_top_y).max(0) as u32;
+        let visible_rows = ((avail_h / list_item_h.max(1)) as usize).max(1);
+        if list_total > visible_rows && avail_h > 20 {
+            let track_x = sidebar_w as i32 - sb_w as i32 - (4.0 * s).round() as i32;
+            let track_y = list_top_y + (4.0 * s).round() as i32;
+            let track_h = avail_h.saturating_sub((8.0 * s).round() as u32).max(16);
+            fill_rounded_rect(buffer, buf_w, buf_h, track_x, track_y, sb_w, track_h, sb_w as f32 * 0.5, theme.surface_elevated);
+            let max_scroll = list_total.saturating_sub(visible_rows).max(1);
+            let start = self.bookmark_scroll_y.min(max_scroll);
+            let thumb_h = ((track_h as f32 * visible_rows as f32 / list_total as f32).round() as u32).clamp((22.0 * s).round() as u32, track_h);
+            let travel = track_h.saturating_sub(thumb_h) as f32;
+            let thumb_y = track_y + ((start as f32 / max_scroll as f32) * travel).round() as i32;
+            let sb_active = self.epub_sidebar_scrollbar_drag
+                || matches!(self.hovered_widget, Some(UiHit::BookSidebar(BookSidebarHit::ScrollbarTrack(_))));
+            fill_rounded_rect(
+                buffer, buf_w, buf_h,
+                track_x, thumb_y, sb_w, thumb_h,
+                sb_w as f32 * 0.5,
+                if sb_active { theme.accent } else { theme.text_muted },
+            );
         }
     }
 
@@ -1166,12 +1398,7 @@ impl<'a> PdfViewerApp<'a> {
         let top_y = top_bars_h as i32;
         let total_h = buf_h.saturating_sub(top_bars_h) as i32;
         let (util_h, card_h, seg_h) = Self::book_sidebar_layout(s);
-        let search_bar_h = if self.book_toc_search.is_some() && self.book_sidebar_tab == BookSidebarTab::Contents {
-            (30.0 * s).round() as i32
-        } else {
-            0
-        };
-        let pad = (10.0 * s).round() as i32;
+        let pad = (14.0 * s).round() as i32;
 
         // Top utility row
         if iy < top_y + util_h as i32 {
@@ -1191,7 +1418,7 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
 
-        // Book header card -> (i) info button or card info
+        // Book header card -> (i) info button
         let card_y = top_y + util_h as i32;
         if iy < card_y + card_h as i32 {
             let info_sz = (18.0 * s).round() as i32;
@@ -1206,7 +1433,7 @@ impl<'a> PdfViewerApp<'a> {
         // Bottom 3-tab segmented switcher
         let seg_y = top_y + total_h - seg_h as i32;
         if iy >= seg_y {
-            let pill_pad = (6.0 * s).round() as i32;
+            let pill_pad = (8.0 * s).round() as i32;
             let track_w = (sidebar_w as i32 - pill_pad * 2 - 1).max(30);
             let rel_x = (ix - pill_pad).clamp(0, track_w - 1);
             let seg = ((rel_x * 3) / track_w).clamp(0, 2);
@@ -1217,12 +1444,25 @@ impl<'a> PdfViewerApp<'a> {
             });
         }
 
-        let list_top_y = card_y + card_h as i32 + search_bar_h;
-        if iy < list_top_y {
+        let (list_top_y, list_bot_y, item_h_u, total_items, visible_items) =
+            self.epub_sidebar_list_metrics(buf_h, top_bars_h, scale_factor);
+        if iy < list_top_y || iy >= list_bot_y {
             return None;
         }
+        let has_scrollbar = total_items > visible_items;
+        let sb_hit_x = sidebar_w as i32 - (16.0 * s).round().max(12.0) as i32;
+        if has_scrollbar && ix >= sb_hit_x {
+            let ratio = ((iy - list_top_y) as f32 / (list_bot_y - list_top_y).max(1) as f32).clamp(0.0, 1.0);
+            return Some(BookSidebarHit::ScrollbarTrack(ratio));
+        }
 
-        let row_h = (28.0 * s).round() as i32;
+        let content_right = sidebar_w as i32 - if has_scrollbar { (14.0 * s).round() as i32 } else { (6.0 * s).round() as i32 };
+        let item_h = item_h_u as i32;
+        let start = self.bookmark_scroll_y.min(total_items.saturating_sub(1));
+        let vis_idx = ((iy - list_top_y) / item_h.max(1)) as usize;
+        let row_idx = start + vis_idx;
+        let left_margin = (18.0 * s).round() as i32;
+
         match self.book_sidebar_tab {
             BookSidebarTab::Contents => {
                 let toc: &[TocEntry] = self
@@ -1234,44 +1474,44 @@ impl<'a> PdfViewerApp<'a> {
                 let mut rows = Vec::new();
                 let mut nid = 0usize;
                 flatten_toc(toc, &self.book_toc_collapsed, self.book_toc_search.as_deref(), &mut nid, &mut rows);
-                let start = self.bookmark_scroll_y.min(rows.len().saturating_sub(1));
-                let vis_idx = ((iy - list_top_y) / row_h.max(1)) as usize;
-                let row_idx = start + vis_idx;
                 if let Some(row) = rows.get(row_idx) {
-                    let indent = (row.entry.level.min(3) as i32) * (12.0 * s).round() as i32;
-                    let base_x = (12.0 * s).round() as i32 + indent;
-                    if row.has_children && ix >= base_x - 4 && ix < base_x + (14.0 * s).round() as i32 {
+                    let indent = (row.entry.level.min(3) as i32) * (14.0 * s).round() as i32;
+                    let base_x = left_margin + (4.0 * s).round() as i32 + indent;
+                    if row.has_children && ix >= base_x - 4 && ix < base_x + (16.0 * s).round() as i32 {
                         return Some(BookSidebarHit::TocToggle(row_idx));
                     }
                     return Some(BookSidebarHit::TocRow(row_idx));
                 }
             }
             BookSidebarTab::Annotations => {
-                let card_row_h = (46.0 * s).round() as i32;
-                let idx = ((iy - list_top_y) / card_row_h.max(1)) as usize;
-                if idx < self.epub_book_data.highlights.len() {
-                    let del_x = sidebar_w as i32 - (28.0 * s).round() as i32;
+                if row_idx < self.epub_book_data.highlights.len() {
+                    let del_x = content_right - (24.0 * s).round() as i32;
                     if ix >= del_x {
-                        return Some(BookSidebarHit::AnnotDelete(idx));
+                        return Some(BookSidebarHit::AnnotDelete(row_idx));
                     }
-                    return Some(BookSidebarHit::AnnotRow(idx));
+                    return Some(BookSidebarHit::AnnotRow(row_idx));
                 }
             }
             BookSidebarTab::Bookmarks => {
-                let idx = ((iy - list_top_y) / row_h.max(1)) as usize;
-                if idx < self.epub_book_data.bookmarks.len() {
-                    let del_x = sidebar_w as i32 - (28.0 * s).round() as i32;
+                if row_idx < self.epub_book_data.bookmarks.len() {
+                    let del_x = content_right - (24.0 * s).round() as i32;
                     if ix >= del_x {
-                        return Some(BookSidebarHit::BookmarkDelete(idx));
+                        return Some(BookSidebarHit::BookmarkDelete(row_idx));
                     }
-                    return Some(BookSidebarHit::BookmarkRow(idx));
+                    return Some(BookSidebarHit::BookmarkRow(row_idx));
                 }
             }
         }
         None
     }
 
-    pub(super) fn handle_distinct_epub_sidebar_click(&mut self, hit: BookSidebarHit) {
+    pub(super) fn handle_distinct_epub_sidebar_click(
+        &mut self,
+        hit: BookSidebarHit,
+        buf_h: u32,
+        top_bars_h: u32,
+        scale_factor: f64,
+    ) {
         match hit {
             BookSidebarHit::ToggleSearch => {
                 self.book_toc_search = if self.book_toc_search.is_some() {
@@ -1312,6 +1552,12 @@ impl<'a> PdfViewerApp<'a> {
             BookSidebarHit::Tab(tab) => {
                 self.book_sidebar_tab = tab;
                 self.bookmark_scroll_y = 0;
+            }
+            BookSidebarHit::ScrollbarTrack(ratio) => {
+                let (_, _, _, total_items, visible_items) =
+                    self.epub_sidebar_list_metrics(buf_h, top_bars_h, scale_factor);
+                let max_scroll = total_items.saturating_sub(visible_items);
+                self.bookmark_scroll_y = ((max_scroll as f32) * ratio).round() as usize;
             }
             BookSidebarHit::TocToggle(row_idx) => {
                 let toc: &[TocEntry] = self
@@ -1478,43 +1724,60 @@ impl<'a> PdfViewerApp<'a> {
     // `Aa` Typography Popover
     // -----------------------------------------------------------------------
 
-    fn aa_popover_rect(buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) -> (i32, i32, u32, u32) {
+    fn aa_popover_rect(&self, buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) -> (i32, i32, u32, u32) {
         let s = sf as f32;
-        let pw = (340.0 * s).round().min(buf_w.saturating_sub(24) as f32) as u32;
-        let ph = (392.0 * s).round().min(buf_h.saturating_sub(status_bar_h + 24) as f32).max(220.0) as u32;
+        let is_epub = Self::is_epub_path(&self.file_path);
+        let base_h = if !is_epub {
+            264.0
+        } else if self.aa_margins_submenu {
+            320.0
+        } else {
+            428.0
+        };
+        let pw = (352.0 * s).round().min(buf_w.saturating_sub(24) as f32) as u32;
+        let ph = (base_h * s).round().min(buf_h.saturating_sub(status_bar_h + 24) as f32).max(200.0) as u32;
         let px = (buf_w as i32 - pw as i32 - (14.0 * s).round() as i32).max(8);
         let py = (buf_h.saturating_sub(status_bar_h) as i32 - ph as i32 - (8.0 * s).round() as i32).max(8);
         (px, py, pw, ph)
     }
 
-    fn aa_popover_row_metrics(ph: u32, s: f32) -> (u32, i32, i32) {
+    fn aa_popover_row_metrics(ph: u32, row_count: i32, s: f32) -> (u32, i32, i32) {
+        let count = row_count.max(1);
         let gap = (6.0 * s).round().max(3.0) as i32;
-        let hdr_offset = (36.0 * s).round() as i32;
-        let avail = (ph as i32 - hdr_offset - (14.0 * s).round() as i32 - gap * 8 - (4.0 * s).round() as i32).max(140);
-        let row_h = ((avail / 9) as u32).clamp(18, (29.0 * s).round().max(18.0) as u32);
+        let hdr_offset = (38.0 * s).round() as i32;
+        let avail = (ph as i32 - hdr_offset - (14.0 * s).round() as i32 - gap * (count - 1) - (4.0 * s).round() as i32).max(100);
+        let row_h = ((avail / count) as u32).clamp(18, (30.0 * s).round().max(18.0) as u32);
         (row_h, gap, hdr_offset)
     }
 
-    pub(super) fn aa_margin_slider_track_x(buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) -> (i32, i32) {
+    pub(super) fn aa_4side_slider_track_x(&self, buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) -> (i32, i32) {
         let s = sf as f32;
-        let (px, _, pw, _) = Self::aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
+        let (px, _, pw, _) = self.aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
         let pad = (14.0 * s).round() as i32;
         let inner_w = pw as i32 - pad * 2;
-        let lbl_w = (58.0 * s).round() as i32;
-        let val_w = (62.0 * s).round() as i32;
+        let lbl_w = (76.0 * s).round() as i32;
+        let val_w = (50.0 * s).round() as i32;
         let track_x0 = px + pad + lbl_w;
         let track_x1 = (px + pad + inner_w - val_w).max(track_x0 + 40);
         (track_x0, track_x1)
     }
 
     pub(super) fn draw_aa_popover(&self, buffer: &mut [u32], buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) {
-        if !self.show_aa_popover || !self.is_distinct_epub_mode() {
+        if !self.show_aa_popover || !self.is_markdown_tab() {
             return;
         }
+        let is_epub = Self::is_epub_path(&self.file_path);
         let theme = self.ui_theme();
         let s = sf as f32;
-        let (px, py, pw, ph) = Self::aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
-        let (row_h, gap, hdr_offset) = Self::aa_popover_row_metrics(ph, s);
+        let (px, py, pw, ph) = self.aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
+        let row_count = if !is_epub {
+            6
+        } else if self.aa_margins_submenu {
+            6
+        } else {
+            10
+        };
+        let (row_h, gap, hdr_offset) = Self::aa_popover_row_metrics(ph, row_count, s);
         let rad = (10.0 * s).clamp(6.0, 14.0);
         let pad = (14.0 * s).round() as i32;
         let lbl_sz = (11.0 * s).clamp(9.0, 20.0);
@@ -1527,11 +1790,6 @@ impl<'a> PdfViewerApp<'a> {
         fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
         stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.border_subtle);
 
-        let mut cy = py + (12.0 * s).round() as i32;
-        draw_text(buffer, buf_w, buf_h, px + pad, cy, "Typography & Reading", hdr_sz, theme.text_primary, true);
-        cy = py + hdr_offset;
-        fill_rect_clipped(buffer, buf_w, buf_h, px + pad, cy - 4, inner_w, 1, theme.divider);
-
         let draw_chip = |buf: &mut [u32], x: i32, y: i32, w: u32, h: u32, txt: &str, active: bool, hit: AaPopoverHit| {
             let hov = self.hovered_widget == Some(UiHit::AaPopover(hit));
             let bg = if active { theme.accent_soft_bg } else if hov { theme.hover_bg } else { theme.surface_elevated };
@@ -1542,6 +1800,20 @@ impl<'a> PdfViewerApp<'a> {
             let clipped = truncate_ellipsis(txt, (w as f32 - 8.0).max(16.0), lbl_sz, active);
             let tw = measure_text(&clipped, lbl_sz, active);
             draw_text_vcenter(buf, buf_w, buf_h, x + ((w as f32 - tw) * 0.5).round().max(3.0) as i32, y, h, x + w as i32 - 2, &clipped, lbl_sz, fg, active);
+        };
+
+        let draw_stepper_row = |buf: &mut [u32], y: i32, label: &str, val_txt: &str, minus_lbl: &str, plus_lbl: &str, hit_minus: AaPopoverHit, hit_plus: AaPopoverHit| {
+            let lbl_w = (128.0 * s).round() as u32;
+            let btn_w = (36.0 * s).round() as u32;
+            let val_w = inner_w.saturating_sub(lbl_w + btn_w * 2 + gap as u32 * 2);
+            draw_text_vcenter(buf, buf_w, buf_h, px + pad + 2, y, row_h, px + pad + lbl_w as i32 - 4, label, lbl_sz, theme.text_secondary, false);
+            let bx0 = px + pad + lbl_w as i32;
+            draw_chip(buf, bx0, y, btn_w, row_h, minus_lbl, false, hit_minus);
+            let vx = bx0 + btn_w as i32 + gap;
+            let vw = measure_text(val_txt, lbl_sz, true);
+            draw_text_vcenter(buf, buf_w, buf_h, vx + ((val_w as f32 - vw) * 0.5).round() as i32, y, row_h, vx + val_w as i32, val_txt, lbl_sz, theme.text_primary, true);
+            let bx1 = vx + val_w as i32 + gap;
+            draw_chip(buf, bx1, y, btn_w, row_h, plus_lbl, false, hit_plus);
         };
 
         let draw_toggle_row = |buf: &mut [u32], y: i32, label: &str, is_on: bool, hit: AaPopoverHit| {
@@ -1574,6 +1846,123 @@ impl<'a> PdfViewerApp<'a> {
             let knob_cy = sw_y as f32 + sw_h as f32 * 0.5;
             fill_circle_aa(buf, buf_w, buf_h, knob_cx, knob_cy, knob_r, 0x00FF_FFFF);
         };
+
+        let draw_swatches_row = |buf: &mut [u32], y: i32| {
+            let sw_count = ReadingFilter::ALL.len() as u32;
+            let sw_w = (inner_w.saturating_sub(gap as u32 * (sw_count - 1))) / sw_count;
+            let sw_h = row_h;
+            for (i, filter) in ReadingFilter::ALL.into_iter().enumerate() {
+                let sx = px + pad + (i as i32) * (sw_w as i32 + gap);
+                let is_cur = self.reading_filter == filter;
+                let fill_col = match filter {
+                    ReadingFilter::Normal => 0x00FF_FFFF,
+                    ReadingFilter::PaperEInk => 0x00F2_F1EC,
+                    ReadingFilter::WarmSepia => 0x00F6_ECD8,
+                    ReadingFilter::SageEyeCare => 0x00E7_F0E7,
+                    ReadingFilter::DarkInvert => 0x001B_1E24,
+                    ReadingFilter::NightAmber => 0x0017_120E,
+                };
+                fill_rounded_rect(buf, buf_w, buf_h, sx, y, sw_w, sw_h, btn_rad, fill_col);
+                stroke_rounded_rect(buf, buf_w, buf_h, sx, y, sw_w, sw_h, btn_rad, if is_cur { theme.accent } else { theme.border_subtle });
+                if is_cur {
+                    let ic_col = match filter {
+                        ReadingFilter::DarkInvert | ReadingFilter::NightAmber => 0x00F8_FAFC,
+                        _ => theme.accent,
+                    };
+                    let ic = (12.0 * s).round() as u32;
+                    draw_icon(buf, buf_w, buf_h, UiIcon::Check, sx + ((sw_w - ic) / 2) as i32, y + ((sw_h - ic) / 2) as i32, ic, ic_col);
+                }
+            }
+        };
+
+        // Branch 1: Markdown / LaTeX Typography & Spacing Popover (Tweaks 7 & 8)
+        if !is_epub {
+            let hdr = if self.active_doc_kind() == DocKind::LaTeX {
+                "LaTeX Typography & Spacing"
+            } else {
+                "Markdown Typography & Spacing"
+            };
+            draw_text(buffer, buf_w, buf_h, px + pad, py + (12.0 * s).round() as i32, hdr, hdr_sz, theme.text_primary, true);
+            let mut cy = py + hdr_offset;
+            fill_rect_clipped(buffer, buf_w, buf_h, px + pad, cy - 4, inner_w, 1, theme.divider);
+
+            draw_stepper_row(buffer, cy, "Preview Font", &format!("{:.0} px", self.md_preview_font_px), "A-", "A+", AaPopoverHit::SizeMinus, AaPopoverHit::SizePlus);
+            cy += row_h as i32 + gap;
+            draw_stepper_row(buffer, cy, "Code Font", &format!("{:.0} px", self.md_code_font_px), "A-", "A+", AaPopoverHit::CodeSizeMinus, AaPopoverHit::CodeSizePlus);
+            cy += row_h as i32 + gap;
+            draw_stepper_row(buffer, cy, "Line Spacing", &format!("{:.2}×", self.md_line_spacing), "-", "+", AaPopoverHit::LineSpacingMinus, AaPopoverHit::LineSpacingPlus);
+            cy += row_h as i32 + gap;
+            draw_stepper_row(buffer, cy, "Word Spacing", &format!("{:.1} px", self.md_word_spacing_px), "-", "+", AaPopoverHit::WordSpacingMinus, AaPopoverHit::WordSpacingPlus);
+            cy += row_h as i32 + gap;
+            draw_stepper_row(buffer, cy, "Para Spacing", &format!("{:.2}×", self.md_para_spacing_mult), "-", "+", AaPopoverHit::ParaSpacingMinus, AaPopoverHit::ParaSpacingPlus);
+            cy += row_h as i32 + gap;
+            draw_swatches_row(buffer, cy);
+            return;
+        }
+
+        // Branch 2: EPUB 4-Side Margins Sub-Menu (Tweak 2)
+        if self.aa_margins_submenu {
+            let back_w = (58.0 * s).round() as u32;
+            let rst_w = (54.0 * s).round() as u32;
+            let hdr_y = py + (7.0 * s).round() as i32;
+            let hdr_btn_h = (24.0 * s).round() as u32;
+            draw_chip(buffer, px + pad, hdr_y, back_w, hdr_btn_h, "‹ Back", false, AaPopoverHit::CloseMarginsSubmenu);
+            let title = "Margins (4 Sides)";
+            let tw = measure_text(title, hdr_sz, true);
+            draw_text_vcenter(buffer, buf_w, buf_h, px + ((pw as f32 - tw) * 0.5).round() as i32, hdr_y, hdr_btn_h, px + pw as i32 - pad - rst_w as i32, title, hdr_sz, theme.text_primary, true);
+            draw_chip(buffer, px + pad + inner_w as i32 - rst_w as i32, hdr_y, rst_w, hdr_btn_h, "Reset", false, AaPopoverHit::ResetMargins);
+
+            let mut cy = py + hdr_offset;
+            fill_rect_clipped(buffer, buf_w, buf_h, px + pad, cy - 4, inner_w, 1, theme.divider);
+
+            // Row 1: Quick Presets (Narrow | Normal | Wide)
+            let tri_w = (inner_w.saturating_sub(gap as u32 * 2)) / 3;
+            for (i, mp) in [MarginPreset::Narrow, MarginPreset::Normal, MarginPreset::Wide].into_iter().enumerate() {
+                let bx = px + pad + (i as i32) * (tri_w as i32 + gap);
+                let bw = if i == 2 { inner_w - (tri_w + gap as u32) * 2 } else { tri_w };
+                draw_chip(buffer, bx, cy, bw, row_h, mp.label(), self.epub_prefs.margins == mp, AaPopoverHit::Margin(mp));
+            }
+            cy += row_h as i32 + gap;
+
+            // Rows 2..5: Top / Bottom / Outer / Inner sliders
+            let (track_x0, track_x1) = self.aa_4side_slider_track_x(buf_w, buf_h, status_bar_h, sf);
+            let track_w = (track_x1 - track_x0).max(20) as u32;
+            let track_h = (4.0 * s).round().max(3.0) as u32;
+            let knob_r = (6.0 * s).clamp(5.0, 9.0);
+            let side_names = [(0u8, "Top Margin"), (1u8, "Bottom"), (2u8, "Outer Side"), (3u8, "Inner Spine")];
+            for (part, label) in side_names {
+                fill_rounded_rect(buffer, buf_w, buf_h, px + pad, cy, inner_w, row_h, btn_rad, theme.surface_elevated);
+                stroke_rounded_rect(buffer, buf_w, buf_h, px + pad, cy, inner_w, row_h, btn_rad, theme.border_subtle);
+                let norm = self.epub_prefs.margin_part_norm(part);
+                let track_y = cy + ((row_h.saturating_sub(track_h)) / 2) as i32;
+                draw_text_vcenter(buffer, buf_w, buf_h, px + pad + (8.0 * s).round() as i32, cy, row_h, track_x0 - 4, label, small_sz, theme.text_primary, false);
+                fill_rounded_rect(buffer, buf_w, buf_h, track_x0, track_y, track_w, track_h, track_h as f32 * 0.5, theme.border_subtle);
+                let fill_w = (track_w as f32 * norm).round() as u32;
+                if fill_w > 0 {
+                    fill_rounded_rect(buffer, buf_w, buf_h, track_x0, track_y, fill_w, track_h, track_h as f32 * 0.5, theme.accent);
+                }
+                let knob_x = track_x0 as f32 + track_w as f32 * norm;
+                let knob_y = cy as f32 + row_h as f32 * 0.5;
+                fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, knob_r + 1.0, theme.surface_bg);
+                fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, knob_r, theme.accent);
+                let pct_txt = format!("{:.0}%", self.epub_prefs.margin_part(part) * 100.0);
+                let pw_t = measure_text(&pct_txt, small_sz, true);
+                draw_text_vcenter(buffer, buf_w, buf_h, px + pad + inner_w as i32 - pw_t.ceil() as i32 - (8.0 * s).round() as i32, cy, row_h, px + pad + inner_w as i32 - 4, &pct_txt, small_sz, theme.text_secondary, true);
+                cy += row_h as i32 + gap;
+            }
+            draw_text_vcenter(
+                buffer, buf_w, buf_h, px + pad + 2, cy, row_h, px + pad + inner_w as i32,
+                "Top/Bottom changes leave Spine untouched.",
+                small_sz, theme.text_muted, false,
+            );
+            return;
+        }
+
+        // Branch 3: Main EPUB Aa Typography Popover
+        let mut cy = py + (12.0 * s).round() as i32;
+        draw_text(buffer, buf_w, buf_h, px + pad, cy, "Typography & Reading", hdr_sz, theme.text_primary, true);
+        cy = py + hdr_offset;
+        fill_rect_clipped(buffer, buf_w, buf_h, px + pad, cy - 4, inner_w, 1, theme.divider);
 
         // Row 1: Font Family (Book Serif | UI Sans)
         let half_w = (inner_w.saturating_sub(gap as u32)) / 2;
@@ -1615,91 +2004,169 @@ impl<'a> PdfViewerApp<'a> {
         }
         cy += row_h as i32 + gap;
 
-        // Row 5: Margins Slider (adjusts both horizontal & top/bottom page margins)
-        fill_rounded_rect(buffer, buf_w, buf_h, px + pad, cy, inner_w, row_h, btn_rad, theme.surface_elevated);
-        stroke_rounded_rect(buffer, buf_w, buf_h, px + pad, cy, inner_w, row_h, btn_rad, theme.border_subtle);
-        let (track_x0, track_x1) = Self::aa_margin_slider_track_x(buf_w, buf_h, status_bar_h, sf);
-        let track_w = (track_x1 - track_x0).max(20) as u32;
-        let track_h = (4.0 * s).round().max(3.0) as u32;
-        let track_y = cy + ((row_h.saturating_sub(track_h)) / 2) as i32;
-        let norm = self.epub_prefs.margin_slider_norm();
-        draw_text_vcenter(buffer, buf_w, buf_h, px + pad + (8.0 * s).round() as i32, cy, row_h, track_x0 - 4, "Margins", lbl_sz, theme.text_primary, false);
-        fill_rounded_rect(buffer, buf_w, buf_h, track_x0, track_y, track_w, track_h, track_h as f32 * 0.5, theme.border_subtle);
-        let fill_w = (track_w as f32 * norm).round() as u32;
-        if fill_w > 0 {
-            fill_rounded_rect(buffer, buf_w, buf_h, track_x0, track_y, fill_w, track_h, track_h as f32 * 0.5, theme.accent);
-        }
-        let knob_x = track_x0 as f32 + track_w as f32 * norm;
-        let knob_y = cy as f32 + row_h as f32 * 0.5;
-        let knob_r = (6.0 * s).clamp(5.0, 9.0);
-        fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, knob_r + 1.0, theme.surface_bg);
-        fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, knob_r, theme.accent);
-        let m_lbl = format!("{} {}%", self.epub_prefs.margins.label().chars().next().unwrap_or('N'), (self.epub_prefs.effective_margin_ratio() * 100.0).round() as i32);
-        let mlw = measure_text(&m_lbl, small_sz, true);
-        draw_text_vcenter(buffer, buf_w, buf_h, px + pad + inner_w as i32 - mlw.ceil() as i32 - (8.0 * s).round() as i32, cy, row_h, px + pad + inner_w as i32 - 4, &m_lbl, small_sz, theme.text_secondary, true);
+        // Row 5: Word Spacing & Paragraph Spacing compact steppers (Tweak 8)
+        let left_half_w = half_w;
+        let right_half_x = px + pad + left_half_w as i32 + gap;
+        let right_half_w = inner_w - left_half_w - gap as u32;
+        let mini_btn_w = (24.0 * s).round().max(18.0) as u32;
+        let sub_gap = (4.0 * s).round() as i32;
+        // Left half: Word spacing
+        draw_chip(buffer, px + pad, cy, mini_btn_w, row_h, "-", false, AaPopoverHit::WordSpacingMinus);
+        let w_lbl = format!("Word {:+.1}", self.epub_prefs.word_spacing_px);
+        let wl_w = measure_text(&w_lbl, small_sz, false);
+        let wl_x0 = px + pad + mini_btn_w as i32 + sub_gap;
+        let wl_x1 = px + pad + left_half_w as i32 - mini_btn_w as i32 - sub_gap;
+        draw_text_vcenter(buffer, buf_w, buf_h, wl_x0 + (((wl_x1 - wl_x0) as f32 - wl_w) * 0.5).round().max(0.0) as i32, cy, row_h, wl_x1, &w_lbl, small_sz, theme.text_secondary, false);
+        draw_chip(buffer, px + pad + left_half_w as i32 - mini_btn_w as i32, cy, mini_btn_w, row_h, "+", false, AaPopoverHit::WordSpacingPlus);
+        // Right half: Paragraph spacing
+        draw_chip(buffer, right_half_x, cy, mini_btn_w, row_h, "-", false, AaPopoverHit::ParaSpacingMinus);
+        let p_lbl = format!("Para {:.2}×", self.epub_prefs.paragraph_spacing_mult);
+        let pl_w = measure_text(&p_lbl, small_sz, false);
+        let pl_x0 = right_half_x + mini_btn_w as i32 + sub_gap;
+        let pl_x1 = right_half_x + right_half_w as i32 - mini_btn_w as i32 - sub_gap;
+        draw_text_vcenter(buffer, buf_w, buf_h, pl_x0 + (((pl_x1 - pl_x0) as f32 - pl_w) * 0.5).round().max(0.0) as i32, cy, row_h, pl_x1, &p_lbl, small_sz, theme.text_secondary, false);
+        draw_chip(buffer, right_half_x + right_half_w as i32 - mini_btn_w as i32, cy, mini_btn_w, row_h, "+", false, AaPopoverHit::ParaSpacingPlus);
         cy += row_h as i32 + gap;
 
-        // Row 6: Justify Text toggle
+        // Row 6: Margins Quick Presets + 4-Side Sub-Menu button (Tweak 2)
+        let quad_w = (inner_w.saturating_sub(gap as u32 * 3)) / 4;
+        for (i, mp) in [MarginPreset::Narrow, MarginPreset::Normal, MarginPreset::Wide].into_iter().enumerate() {
+            let bx = px + pad + (i as i32) * (quad_w as i32 + gap);
+            draw_chip(buffer, bx, cy, quad_w, row_h, mp.label(), self.epub_prefs.margins == mp, AaPopoverHit::Margin(mp));
+        }
+        let custom_x = px + pad + (quad_w as i32 + gap) * 3;
+        let custom_w = inner_w - (quad_w + gap as u32) * 3;
+        draw_chip(buffer, custom_x, cy, custom_w, row_h, "4-Side ›", false, AaPopoverHit::OpenMarginsSubmenu);
+        cy += row_h as i32 + gap;
+
+        // Row 7: Justify Text toggle
         draw_toggle_row(buffer, cy, "Justify Text", self.epub_prefs.justify, AaPopoverHit::ToggleJustify);
         cy += row_h as i32 + gap;
 
-        // Row 7: Avoid Breaking Words with Hyphens toggle (ON = hyphenate is OFF)
+        // Row 8: Avoid Breaking Words (-) toggle
         draw_toggle_row(buffer, cy, "Avoid Breaking Words (-)", !self.epub_prefs.hyphenate, AaPopoverHit::ToggleHyphenate);
         cy += row_h as i32 + gap;
 
-        // Row 8: Spread Mode + Page Curl Animation (2-Page | 1-Page | Curl: On/Off)
+        // Row 9: Spread Mode + Page Curl Animation
         draw_chip(buffer, px + pad, cy, tri_w, row_h, "2-Page Book", self.epub_prefs.two_page_spread, AaPopoverHit::SpreadTwoPage);
         draw_chip(buffer, px + pad + tri_w as i32 + gap, cy, tri_w, row_h, "1-Page Flow", !self.epub_prefs.two_page_spread, AaPopoverHit::SpreadOnePage);
         draw_chip(buffer, px + pad + (tri_w as i32 + gap) * 2, cy, inner_w - (tri_w + gap as u32) * 2, row_h, if self.epub_prefs.page_curl_anim { "Curl: On" } else { "Curl: Off" }, self.epub_prefs.page_curl_anim, AaPopoverHit::TogglePageCurl);
-        cy += row_h as i32 + (8.0 * s).round() as i32;
+        cy += row_h as i32 + gap;
 
-        // Row 9: 6 Paper Theme Swatches
-        let sw_count = ReadingFilter::ALL.len() as u32;
-        let sw_w = (inner_w.saturating_sub(gap as u32 * (sw_count - 1))) / sw_count;
-        let sw_h = row_h;
-        for (i, filter) in ReadingFilter::ALL.into_iter().enumerate() {
-            let sx = px + pad + (i as i32) * (sw_w as i32 + gap);
-            let is_cur = self.reading_filter == filter;
-            let fill_col = match filter {
-                ReadingFilter::Normal => 0x00FF_FFFF,
-                ReadingFilter::PaperEInk => 0x00F2_F1EC,
-                ReadingFilter::WarmSepia => 0x00F6_ECD8,
-                ReadingFilter::SageEyeCare => 0x00E7_F0E7,
-                ReadingFilter::DarkInvert => 0x001B_1E24,
-                ReadingFilter::NightAmber => 0x0017_120E,
-            };
-            fill_rounded_rect(buffer, buf_w, buf_h, sx, cy, sw_w, sw_h, btn_rad, fill_col);
-            stroke_rounded_rect(buffer, buf_w, buf_h, sx, cy, sw_w, sw_h, btn_rad, if is_cur { theme.accent } else { theme.border_subtle });
-            if is_cur {
-                let ic_col = match filter {
-                    ReadingFilter::DarkInvert | ReadingFilter::NightAmber => 0x00F8_FAFC,
-                    _ => theme.accent,
-                };
-                let ic = (12.0 * s).round() as u32;
-                draw_icon(buffer, buf_w, buf_h, UiIcon::Check, sx + ((sw_w - ic) / 2) as i32, cy + ((sw_h - ic) / 2) as i32, ic, ic_col);
-            }
-        }
+        // Row 10: 6 Paper Theme Swatches
+        draw_swatches_row(buffer, cy);
     }
 
     pub(super) fn hit_test_aa_popover(&self, mx: f64, my: f64, buf_w: u32, buf_h: u32, status_bar_h: u32, sf: f64) -> Option<AaPopoverHit> {
-        if !self.show_aa_popover || !self.is_distinct_epub_mode() {
+        if !self.show_aa_popover || !self.is_markdown_tab() {
             return None;
         }
+        let is_epub = Self::is_epub_path(&self.file_path);
         let s = sf as f32;
-        let (px, py, pw, ph) = Self::aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
+        let (px, py, pw, ph) = self.aa_popover_rect(buf_w, buf_h, status_bar_h, sf);
         let ix = mx.round() as i32;
         let iy = my.round() as i32;
         if ix < px || ix >= px + pw as i32 || iy < py || iy >= py + ph as i32 {
             return None;
         }
+        let row_count = if !is_epub {
+            6
+        } else if self.aa_margins_submenu {
+            6
+        } else {
+            10
+        };
         let pad = (14.0 * s).round() as i32;
-        let (row_h_u, gap, hdr_offset) = Self::aa_popover_row_metrics(ph, s);
+        let (row_h_u, gap, hdr_offset) = Self::aa_popover_row_metrics(ph, row_count, s);
         let row_h = row_h_u as i32;
         let inner_w = pw as i32 - pad * 2;
         let mut cy = py + hdr_offset;
 
         let half_w = (inner_w - gap) / 2;
         let tri_w = (inner_w - gap * 2) / 3;
+
+        let hit_swatches = |y: i32| -> Option<AaPopoverHit> {
+            let sw_count = ReadingFilter::ALL.len() as i32;
+            let sw_w = (inner_w - gap * (sw_count - 1)) / sw_count;
+            if iy >= y && iy < y + row_h {
+                for (i, filter) in ReadingFilter::ALL.into_iter().enumerate() {
+                    let sx = px + pad + (i as i32) * (sw_w + gap);
+                    if ix >= sx && ix < sx + sw_w {
+                        return Some(AaPopoverHit::ThemeFilter(filter));
+                    }
+                }
+            }
+            None
+        };
+
+        if !is_epub {
+            let lbl_w = (128.0 * s).round() as i32;
+            let btn_w = (36.0 * s).round() as i32;
+            let val_w = inner_w - lbl_w - btn_w * 2 - gap * 2;
+            let bx0 = px + pad + lbl_w;
+            let bx1 = bx0 + btn_w + gap + val_w + gap;
+            let step_rows = [
+                (AaPopoverHit::SizeMinus, AaPopoverHit::SizePlus),
+                (AaPopoverHit::CodeSizeMinus, AaPopoverHit::CodeSizePlus),
+                (AaPopoverHit::LineSpacingMinus, AaPopoverHit::LineSpacingPlus),
+                (AaPopoverHit::WordSpacingMinus, AaPopoverHit::WordSpacingPlus),
+                (AaPopoverHit::ParaSpacingMinus, AaPopoverHit::ParaSpacingPlus),
+            ];
+            for (h_minus, h_plus) in step_rows {
+                if iy >= cy && iy < cy + row_h {
+                    if ix >= bx0 && ix < bx0 + btn_w {
+                        return Some(h_minus);
+                    }
+                    if ix >= bx1 && ix < bx1 + btn_w {
+                        return Some(h_plus);
+                    }
+                    return Some(AaPopoverHit::InsidePopover);
+                }
+                cy += row_h + gap;
+            }
+            if let Some(h) = hit_swatches(cy) {
+                return Some(h);
+            }
+            return Some(AaPopoverHit::InsidePopover);
+        }
+
+        if self.aa_margins_submenu {
+            let back_w = (58.0 * s).round() as i32;
+            let rst_w = (54.0 * s).round() as i32;
+            let hdr_y = py + (7.0 * s).round() as i32;
+            let hdr_btn_h = (24.0 * s).round() as i32;
+            if iy >= hdr_y && iy < hdr_y + hdr_btn_h {
+                if ix >= px + pad && ix < px + pad + back_w {
+                    return Some(AaPopoverHit::CloseMarginsSubmenu);
+                }
+                if ix >= px + pad + inner_w - rst_w && ix < px + pad + inner_w {
+                    return Some(AaPopoverHit::ResetMargins);
+                }
+            }
+            if iy >= cy && iy < cy + row_h {
+                if ix >= px + pad && ix < px + pad + tri_w {
+                    return Some(AaPopoverHit::Margin(MarginPreset::Narrow));
+                } else if ix >= px + pad + tri_w + gap && ix < px + pad + tri_w * 2 + gap {
+                    return Some(AaPopoverHit::Margin(MarginPreset::Normal));
+                } else if ix >= px + pad + (tri_w + gap) * 2 && ix < px + pad + inner_w {
+                    return Some(AaPopoverHit::Margin(MarginPreset::Wide));
+                }
+            }
+            cy += row_h + gap;
+            let (tx0, tx1) = self.aa_4side_slider_track_x(buf_w, buf_h, status_bar_h, sf);
+            for part in 0u8..4 {
+                if iy >= cy && iy < cy + row_h {
+                    if ix >= tx0 - 8 && ix <= tx1 + 8 {
+                        let norm = ((ix - tx0) as f32 / (tx1 - tx0).max(1) as f32).clamp(0.0, 1.0);
+                        return Some(AaPopoverHit::MarginPartSlider(part, norm));
+                    }
+                    return Some(AaPopoverHit::InsidePopover);
+                }
+                cy += row_h + gap;
+            }
+            return Some(AaPopoverHit::InsidePopover);
+        }
+
         let step_w = (32.0 * s).round() as i32;
         let os_lbl_w = inner_w - step_w * 2 - gap * 2;
 
@@ -1735,7 +2202,7 @@ impl<'a> PdfViewerApp<'a> {
         }
         cy += row_h + gap;
 
-        // Row 4: Spacing
+        // Row 4: Line Spacing
         if iy >= cy && iy < cy + row_h {
             if ix >= px + pad && ix < px + pad + tri_w {
                 return Some(AaPopoverHit::Spacing(LineSpacingPreset::Compact));
@@ -1747,38 +2214,52 @@ impl<'a> PdfViewerApp<'a> {
         }
         cy += row_h + gap;
 
-        // Row 5: Margins Slider (clicking right readout cycles Narrow / Normal / Wide)
+        // Row 5: Word Spacing & Paragraph Spacing
         if iy >= cy && iy < cy + row_h {
-            let (tx0, tx1) = Self::aa_margin_slider_track_x(buf_w, buf_h, status_bar_h, sf);
-            if ix > tx1 + 8 && ix < px + pad + inner_w {
-                let next_preset = match self.epub_prefs.margins {
-                    MarginPreset::Narrow => MarginPreset::Normal,
-                    MarginPreset::Normal => MarginPreset::Wide,
-                    MarginPreset::Wide => MarginPreset::Narrow,
-                };
-                return Some(AaPopoverHit::Margin(next_preset));
-            }
-            if ix >= tx0 - 8 && ix <= tx1 + 8 {
-                let norm = ((ix - tx0) as f32 / (tx1 - tx0).max(1) as f32).clamp(0.0, 1.0);
-                return Some(AaPopoverHit::MarginSlider(norm));
+            let right_half_x = px + pad + half_w + gap;
+            let right_half_w = inner_w - half_w - gap;
+            let mini_btn_w = (24.0 * s).round().max(18.0) as i32;
+            if ix >= px + pad && ix < px + pad + mini_btn_w {
+                return Some(AaPopoverHit::WordSpacingMinus);
+            } else if ix >= px + pad + half_w - mini_btn_w && ix < px + pad + half_w {
+                return Some(AaPopoverHit::WordSpacingPlus);
+            } else if ix >= right_half_x && ix < right_half_x + mini_btn_w {
+                return Some(AaPopoverHit::ParaSpacingMinus);
+            } else if ix >= right_half_x + right_half_w - mini_btn_w && ix < right_half_x + right_half_w {
+                return Some(AaPopoverHit::ParaSpacingPlus);
             }
             return Some(AaPopoverHit::InsidePopover);
         }
         cy += row_h + gap;
 
-        // Row 6: Justify Text toggle
+        // Row 6: Margins presets + 4-Side Submenu
+        if iy >= cy && iy < cy + row_h {
+            let quad_w = (inner_w - gap * 3) / 4;
+            if ix >= px + pad && ix < px + pad + quad_w {
+                return Some(AaPopoverHit::Margin(MarginPreset::Narrow));
+            } else if ix >= px + pad + quad_w + gap && ix < px + pad + quad_w * 2 + gap {
+                return Some(AaPopoverHit::Margin(MarginPreset::Normal));
+            } else if ix >= px + pad + (quad_w + gap) * 2 && ix < px + pad + quad_w * 3 + gap * 2 {
+                return Some(AaPopoverHit::Margin(MarginPreset::Wide));
+            } else if ix >= px + pad + (quad_w + gap) * 3 && ix < px + pad + inner_w {
+                return Some(AaPopoverHit::OpenMarginsSubmenu);
+            }
+        }
+        cy += row_h + gap;
+
+        // Row 7: Justify Text toggle
         if iy >= cy && iy < cy + row_h && ix >= px + pad && ix < px + pad + inner_w {
             return Some(AaPopoverHit::ToggleJustify);
         }
         cy += row_h + gap;
 
-        // Row 7: Avoid Breaking Words (-) toggle
+        // Row 8: Avoid Breaking Words (-) toggle
         if iy >= cy && iy < cy + row_h && ix >= px + pad && ix < px + pad + inner_w {
             return Some(AaPopoverHit::ToggleHyphenate);
         }
         cy += row_h + gap;
 
-        // Row 8: Spread Mode + Page Curl
+        // Row 9: Spread Mode + Page Curl
         if iy >= cy && iy < cy + row_h {
             if ix >= px + pad && ix < px + pad + tri_w {
                 return Some(AaPopoverHit::SpreadTwoPage);
@@ -1788,25 +2269,18 @@ impl<'a> PdfViewerApp<'a> {
                 return Some(AaPopoverHit::TogglePageCurl);
             }
         }
-        cy += row_h + (8.0 * s).round() as i32;
+        cy += row_h + gap;
 
-        // Row 9: 6 Paper Theme Swatches
-        let sw_count = ReadingFilter::ALL.len() as i32;
-        let sw_w = (inner_w - gap * (sw_count - 1)) / sw_count;
-        let sw_h = row_h;
-        if iy >= cy && iy < cy + sw_h {
-            for (i, filter) in ReadingFilter::ALL.into_iter().enumerate() {
-                let sx = px + pad + (i as i32) * (sw_w + gap);
-                if ix >= sx && ix < sx + sw_w {
-                    return Some(AaPopoverHit::ThemeFilter(filter));
-                }
-            }
+        // Row 10: 6 Paper Theme Swatches
+        if let Some(h) = hit_swatches(cy) {
+            return Some(h);
         }
 
         Some(AaPopoverHit::InsidePopover)
     }
 
     pub(super) fn handle_aa_popover_click(&mut self, hit: AaPopoverHit) {
+        let is_epub = Self::is_epub_path(&self.file_path);
         let mut prefs_changed = false;
         match hit {
             AaPopoverHit::FontBookSerif => {
@@ -1839,23 +2313,107 @@ impl<'a> PdfViewerApp<'a> {
                 }
             }
             AaPopoverHit::SizeMinus => {
-                self.epub_prefs.font_size_px = (self.epub_prefs.font_size_px - 1.0).clamp(11.0, 30.0);
+                if is_epub {
+                    self.epub_prefs.font_size_px = (self.epub_prefs.font_size_px - 1.0).clamp(11.0, 30.0);
+                } else {
+                    self.md_preview_font_px = (self.md_preview_font_px - 1.0).clamp(11.0, 28.0);
+                }
                 prefs_changed = true;
             }
             AaPopoverHit::SizePlus => {
-                self.epub_prefs.font_size_px = (self.epub_prefs.font_size_px + 1.0).clamp(11.0, 30.0);
+                if is_epub {
+                    self.epub_prefs.font_size_px = (self.epub_prefs.font_size_px + 1.0).clamp(11.0, 30.0);
+                } else {
+                    self.md_preview_font_px = (self.md_preview_font_px + 1.0).clamp(11.0, 28.0);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::CodeSizeMinus => {
+                self.md_code_font_px = (self.md_code_font_px - 1.0).clamp(10.0, 24.0);
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.font_size_px = self.md_code_font_px;
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::CodeSizePlus => {
+                self.md_code_font_px = (self.md_code_font_px + 1.0).clamp(10.0, 24.0);
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.font_size_px = self.md_code_font_px;
+                }
                 prefs_changed = true;
             }
             AaPopoverHit::Spacing(sp) => {
-                self.epub_prefs.line_spacing = sp;
+                self.epub_prefs.set_line_spacing_preset(sp);
+                prefs_changed = true;
+            }
+            AaPopoverHit::LineSpacingMinus => {
+                if is_epub {
+                    self.epub_prefs.line_spacing_mult = (self.epub_prefs.line_spacing_mult - 0.1).clamp(1.10, 2.20);
+                } else {
+                    self.md_line_spacing = (self.md_line_spacing - 0.1).clamp(1.10, 2.20);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::LineSpacingPlus => {
+                if is_epub {
+                    self.epub_prefs.line_spacing_mult = (self.epub_prefs.line_spacing_mult + 0.1).clamp(1.10, 2.20);
+                } else {
+                    self.md_line_spacing = (self.md_line_spacing + 0.1).clamp(1.10, 2.20);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::WordSpacingMinus => {
+                if is_epub {
+                    self.epub_prefs.word_spacing_px = (self.epub_prefs.word_spacing_px - 0.5).clamp(-1.0, 6.0);
+                } else {
+                    self.md_word_spacing_px = (self.md_word_spacing_px - 0.5).clamp(-1.0, 6.0);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::WordSpacingPlus => {
+                if is_epub {
+                    self.epub_prefs.word_spacing_px = (self.epub_prefs.word_spacing_px + 0.5).clamp(-1.0, 6.0);
+                } else {
+                    self.md_word_spacing_px = (self.md_word_spacing_px + 0.5).clamp(-1.0, 6.0);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::ParaSpacingMinus => {
+                if is_epub {
+                    self.epub_prefs.paragraph_spacing_mult = (self.epub_prefs.paragraph_spacing_mult - 0.15).clamp(0.50, 2.50);
+                } else {
+                    self.md_para_spacing_mult = (self.md_para_spacing_mult - 0.15).clamp(0.50, 2.50);
+                }
+                prefs_changed = true;
+            }
+            AaPopoverHit::ParaSpacingPlus => {
+                if is_epub {
+                    self.epub_prefs.paragraph_spacing_mult = (self.epub_prefs.paragraph_spacing_mult + 0.15).clamp(0.50, 2.50);
+                } else {
+                    self.md_para_spacing_mult = (self.md_para_spacing_mult + 0.15).clamp(0.50, 2.50);
+                }
                 prefs_changed = true;
             }
             AaPopoverHit::Margin(mp) => {
                 self.epub_prefs.set_margin_preset(mp);
                 prefs_changed = true;
             }
-            AaPopoverHit::MarginSlider(norm) => {
-                self.epub_prefs.set_margin_slider_norm(norm);
+            AaPopoverHit::OpenMarginsSubmenu => {
+                self.aa_margins_submenu = true;
+                self.request_redraw();
+                return;
+            }
+            AaPopoverHit::CloseMarginsSubmenu => {
+                self.aa_margins_submenu = false;
+                self.request_redraw();
+                return;
+            }
+            AaPopoverHit::ResetMargins => {
+                self.epub_prefs.set_margin_preset(MarginPreset::Normal);
+                prefs_changed = true;
+            }
+            AaPopoverHit::MarginPartSlider(part, norm) => {
+                self.epub_prefs.set_margin_part_norm(part, norm);
                 prefs_changed = true;
             }
             AaPopoverHit::ToggleJustify => {
@@ -2230,19 +2788,16 @@ impl<'a> PdfViewerApp<'a> {
             if self.is_fullscreen { theme.accent } else { theme.text_secondary },
         );
 
-        // Loc. X of Y label immediately left of Find button
+        // Loc. X of Y · Z min left label immediately left of Find button (Tweak 10)
         let (cur_loc, total_loc) = self.current_epub_loc_pair();
-        let loc_txt = format!("Loc. {cur_loc} of {total_loc}");
+        let loc_txt = self.epub_loc_and_time_label(cur_loc, total_loc);
         let loc_w = measure_text(&loc_txt, small_sz, false).ceil() as i32;
         let loc_x = (find_x - (12.0 * s).round() as i32 - loc_w).max(left_text_x);
         draw_text_vcenter(buffer, buf_w, buf_h, loc_x, top_y, bar_h, find_x - 4, &loc_txt, small_sz, theme.text_muted, false);
 
         // Center Reading Progress Scrubber
-        let scrub_w = ((buf_w as f32 * 0.26).clamp(80.0 * s, 300.0 * s)).round() as i32;
-        let scrub_right = loc_x - (12.0 * s).round() as i32;
-        let scrub_x = ((buf_w as i32 - scrub_w) / 2).min(scrub_right - scrub_w).max(left_text_x + 60);
-        if scrub_right - scrub_x >= (64.0 * s).round() as i32 {
-            let actual_w = (scrub_right - scrub_x).min(scrub_w) as u32;
+        if let Some((scrub_x, scrub_end)) = self.epub_scrubber_track_x(buf_w, sf) {
+            let actual_w = (scrub_end - scrub_x).max(1) as u32;
             let track_h = (4.0 * s).round().max(3.0) as u32;
             let track_y = top_y + ((bar_h.saturating_sub(track_h)) / 2) as i32;
             let ratio = if total_loc > 1 {
@@ -2257,7 +2812,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             let knob_x = scrub_x as f32 + (actual_w as f32) * ratio;
             let knob_y = top_y as f32 + bar_h as f32 * 0.5;
-            fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, (5.0 * s).clamp(4.0, 8.0), theme.accent);
+            fill_circle_aa(buffer, buf_w, buf_h, knob_x, knob_y, (5.5 * s).clamp(4.5, 8.5), theme.accent);
 
             // Left: Chapter title (or active status notice if recent)
             let (chap_title, _) = self.active_epub_chapter_title_and_block();
@@ -2269,6 +2824,47 @@ impl<'a> PdfViewerApp<'a> {
             let (chap_title, _) = self.active_epub_chapter_title_and_block();
             let clipped = truncate_ellipsis(&chap_title, (loc_x - left_text_x - 8).max(20) as f32, small_sz, false);
             draw_text_vcenter(buffer, buf_w, buf_h, left_text_x, top_y, bar_h, loc_x - 4, &clipped, small_sz, theme.text_secondary, false);
+        }
+    }
+
+    pub(super) fn epub_loc_and_time_label(&self, cur_loc: usize, total_loc: usize) -> String {
+        if let Some(t_left) = self.epub_chapter_time_left_label() {
+            format!("Loc. {cur_loc} of {total_loc} · {t_left}")
+        } else {
+            format!("Loc. {cur_loc} of {total_loc}")
+        }
+    }
+
+    pub(super) fn epub_scrubber_track_x(&self, buf_w: u32, sf: f64) -> Option<(i32, i32)> {
+        let s = sf as f32;
+        let pad = (12.0 * s).round() as i32;
+        let sb_w = (26.0 * s).round() as i32;
+        let left_text_x = pad + sb_w + (8.0 * s).round() as i32;
+
+        let fs_w = (26.0 * s).round() as i32;
+        let bm_w = (26.0 * s).round() as i32;
+        let aa_w = (34.0 * s).round() as i32;
+        let find_w = (26.0 * s).round() as i32;
+        let gap = (6.0 * s).round() as i32;
+        let fs_x = buf_w as i32 - pad - fs_w;
+        let bm_x = fs_x - gap - bm_w;
+        let aa_x = bm_x - gap - aa_w;
+        let find_x = aa_x - gap - find_w;
+
+        let small_sz = (10.5 * s).clamp(8.5, 18.0);
+        let (cur_loc, total_loc) = self.current_epub_loc_pair();
+        let loc_txt = self.epub_loc_and_time_label(cur_loc, total_loc);
+        let loc_w = measure_text(&loc_txt, small_sz, false).ceil() as i32;
+        let loc_x = (find_x - (12.0 * s).round() as i32 - loc_w).max(left_text_x);
+
+        let scrub_w = ((buf_w as f32 * 0.24).clamp(80.0 * s, 280.0 * s)).round() as i32;
+        let scrub_right = loc_x - (12.0 * s).round() as i32;
+        let scrub_x = ((buf_w as i32 - scrub_w) / 2).min(scrub_right - scrub_w).max(left_text_x + 60);
+        if scrub_right - scrub_x >= (64.0 * s).round() as i32 {
+            let actual_w = (scrub_right - scrub_x).min(scrub_w);
+            Some((scrub_x, scrub_x + actual_w))
+        } else {
+            None
         }
     }
 
@@ -2293,7 +2889,6 @@ impl<'a> PdfViewerApp<'a> {
         if ix >= pad && ix < pad + sb_w {
             return Some(EpubBottomHit::ToggleSidebar);
         }
-        let left_text_x = pad + sb_w + (8.0 * s).round() as i32;
 
         let fs_w = (26.0 * s).round() as i32;
         let bm_w = (26.0 * s).round() as i32;
@@ -2319,19 +2914,9 @@ impl<'a> PdfViewerApp<'a> {
             return Some(EpubBottomHit::FindInDoc);
         }
 
-        let small_sz = (10.5 * s).clamp(8.5, 18.0);
-        let (cur_loc, total_loc) = self.current_epub_loc_pair();
-        let loc_txt = format!("Loc. {cur_loc} of {total_loc}");
-        let loc_w = measure_text(&loc_txt, small_sz, false).ceil() as i32;
-        let loc_x = find_x - (12.0 * s).round() as i32 - loc_w;
-
-        let scrub_w = ((buf_w as f32 * 0.26).clamp(80.0 * s, 300.0 * s)).round() as i32;
-        let scrub_right = loc_x - (12.0 * s).round() as i32;
-        let scrub_x = ((buf_w as i32 - scrub_w) / 2).min(scrub_right - scrub_w).max(left_text_x + 60);
-        if scrub_right - scrub_x >= (64.0 * s).round() as i32 {
-            let actual_w = (scrub_right - scrub_x).min(scrub_w);
-            if ix >= scrub_x - 6 && ix <= scrub_x + actual_w + 6 {
-                let ratio = ((ix - scrub_x) as f32 / actual_w.max(1) as f32).clamp(0.0, 1.0);
+        if let Some((scrub_x, scrub_end)) = self.epub_scrubber_track_x(buf_w, sf) {
+            if ix >= scrub_x - 6 && ix <= scrub_end + 6 {
+                let ratio = ((ix - scrub_x) as f32 / (scrub_end - scrub_x).max(1) as f32).clamp(0.0, 1.0);
                 return Some(EpubBottomHit::Scrubber(ratio));
             }
         }
@@ -2349,6 +2934,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.input_mode = InputMode::SearchText {
                     query_input: self.search_query.clone(),
                 };
+                self.search_bar_focused = true;
                 self.status_notice = None;
             }
             EpubBottomHit::ToggleAa => {

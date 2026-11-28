@@ -49,6 +49,7 @@ pub(super) struct TextEditorState {
     pub(super) scroll_y: f32,
     pub(super) dragging: bool,
     pub(super) scrollbar_drag: bool,
+    pub(super) font_size_px: f32,
     content_gen: u64,
     wrap_key: (u32, u32, u64),
     visual_rows: Vec<VisualRow>,
@@ -67,10 +68,10 @@ struct EditorMetrics {
     sb_reserve: u32,
 }
 
-fn compute_metrics(sf: f64, zoom: f32) -> EditorMetrics {
+fn compute_metrics(sf: f64, zoom: f32, base_font_px: f32) -> EditorMetrics {
     let s = sf as f32;
     let z = zoom.clamp(0.5, 3.0);
-    let font_sz = (13.5 * s * z).clamp(9.0, 34.0);
+    let font_sz = (base_font_px.clamp(10.0, 28.0) * s * z).clamp(9.0, 44.0);
     let line_h = (font_sz * 1.48).max(13.0);
     let gutter_w = ((32.0 * s + font_sz * 1.4).round() as u32).max(36);
     let pad_y = 12.0 * s;
@@ -719,6 +720,8 @@ pub(super) enum EditorBarAction {
     LatexFrac,
     LatexSum,
     LatexList,
+    CodeFontDown,
+    CodeFontUp,
     ModeSplit,
     ModeEdit,
     ModePreview,
@@ -758,7 +761,7 @@ pub(super) fn layout_editor_header(
     let pad_x = (8.0 * s).round() as i32;
     let gap = (4.0 * s).round().max(2.0) as i32;
 
-    // Right-aligned controls first (Pop Out ↗ / Dock Back, plus Split/Edit/Preview in main window)
+    // Right-aligned controls first (Pop Out ↗ / Dock Back, Split/Edit/Preview, Code font A-/A+)
     let mut right_specs: Vec<(EditorBarAction, &'static str, bool, bool)> = Vec::new();
     right_specs.push((
         EditorBarAction::PopOutOrDock,
@@ -771,6 +774,8 @@ pub(super) fn layout_editor_header(
         right_specs.push((EditorBarAction::ModeEdit, "Edit", mode == MdEditorMode::Edit, false));
         right_specs.push((EditorBarAction::ModeSplit, "Split", mode == MdEditorMode::Split, false));
     }
+    right_specs.push((EditorBarAction::CodeFontUp, "A+", false, false));
+    right_specs.push((EditorBarAction::CodeFontDown, "A-", false, false));
 
     let mut right_edge = ex + ew as i32 - pad_x;
     let mut right_btns = Vec::new();
@@ -937,6 +942,7 @@ impl TextEditorState {
             scroll_y: 0.0,
             dragging: false,
             scrollbar_drag: false,
+            font_size_px: 13.5,
             content_gen: 1,
             wrap_key: (0, 0, 0),
             visual_rows: Vec::new(),
@@ -1349,7 +1355,7 @@ impl TextEditorState {
     }
 
     fn ensure_wrapped(&mut self, ew: u32, sf: f64, zoom: f32) -> EditorMetrics {
-        let m = compute_metrics(sf, zoom);
+        let m = compute_metrics(sf, zoom, self.font_size_px);
         let key = (ew, m.font_sz.to_bits(), self.content_gen);
         if self.wrap_key == key && !self.visual_rows.is_empty() {
             return m;
@@ -1725,7 +1731,9 @@ impl TextEditorState {
                 self.insert_str("\\begin{itemize}\n  \\item \n\\end{itemize}\n");
                 true
             }
-            EditorBarAction::ModeSplit
+            EditorBarAction::CodeFontDown
+            | EditorBarAction::CodeFontUp
+            | EditorBarAction::ModeSplit
             | EditorBarAction::ModeEdit
             | EditorBarAction::ModePreview
             | EditorBarAction::PopOutOrDock => false,

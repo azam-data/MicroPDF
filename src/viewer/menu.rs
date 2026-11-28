@@ -66,6 +66,10 @@ impl<'a> PdfViewerApp<'a> {
             let w = (x1 - x0).max(0) as u32;
             let is_open = self.open_menu == Some(cat);
             let is_hover = self.hovered_widget == Some(UiHit::MenuHeader(cat));
+            let cat_enabled = match cat {
+                MenuCategory::Page | MenuCategory::Tools => self.doc.is_some() && !self.is_markdown_tab(),
+                _ => true,
+            };
             if is_open {
                 fill_rounded_rect(buffer, buf_w, buf_h, x0, pill_y, w, pill_h, rad, theme.accent_soft_bg);
             } else if is_hover {
@@ -73,6 +77,8 @@ impl<'a> PdfViewerApp<'a> {
             }
             let fg = if is_open {
                 theme.accent_soft_fg
+            } else if !cat_enabled {
+                theme.text_muted
             } else if is_hover {
                 theme.text_primary
             } else {
@@ -99,9 +105,54 @@ impl<'a> PdfViewerApp<'a> {
         self.draw_inline_toolbar(buffer, buf_w, buf_h, tb_x, menu_bar_h, scale_factor);
     }
 
+    pub(super) fn menu_item_enabled(&self, cat: MenuCategory, idx: usize) -> bool {
+        let is_md_doc = self.is_markdown_tab();
+        let is_epub = is_md_doc && Self::is_epub_path(&self.file_path);
+        let is_md_tex = is_md_doc && !is_epub;
+        let is_pdf = self.doc.is_some() && !is_md_doc;
+        let has_any = is_pdf || is_md_doc;
+
+        match cat {
+            MenuCategory::File => match idx {
+                0 | 1 | 2 | 11 => true,
+                3 | 4 | 6 | 7 => is_pdf,
+                5 => is_pdf || is_md_tex,
+                8 | 9 | 10 => !self.tabs.is_empty(),
+                _ => !self.recent_files.is_empty(),
+            },
+            MenuCategory::View => match idx {
+                0 | 4 | 5 | 7 | 8 | 10..=12 | 14 => has_any,
+                1 | 2 | 3 | 6 | 9 | 13 => is_pdf,
+                _ => true,
+            },
+            MenuCategory::Edit => match idx {
+                0 | 1 => is_pdf || (is_md_tex && self.md_editor.is_some()),
+                2 => is_pdf || is_md_tex || (is_epub && self.epub_selection_drag.is_some()),
+                3 => has_any,
+                _ => is_pdf,
+            },
+            MenuCategory::Page | MenuCategory::Tools => is_pdf,
+            MenuCategory::Export => match idx {
+                5 => is_pdf || is_md_tex,
+                _ => is_pdf,
+            },
+            MenuCategory::Favorites => match idx {
+                0 => true,
+                1 => has_any,
+                _ => !self.favorites.all_docs().is_empty(),
+            },
+            MenuCategory::Help => true,
+        }
+    }
+
     pub(super) fn menu_items_for_category(&self, cat: MenuCategory) -> Vec<String> {
         let mut list: Vec<String> = cat.items().iter().map(|s| (*s).to_string()).collect();
         if cat == MenuCategory::File {
+            if self.is_markdown_tab() && !Self::is_epub_path(&self.file_path) {
+                if let Some(slot) = list.get_mut(5) {
+                    *slot = "Save Document  S".to_string();
+                }
+            }
             if self.recent_files.is_empty() {
                 list.push("Recent: (none)".to_string());
             } else {
@@ -139,6 +190,9 @@ impl<'a> PdfViewerApp<'a> {
     }
 
     fn menu_item_checked(&self, cat: MenuCategory, idx: usize) -> bool {
+        if !self.menu_item_enabled(cat, idx) {
+            return false;
+        }
         match (cat, idx) {
             (MenuCategory::File, 11) => self.encrypt_config,
             (MenuCategory::View, 0) => self.effective_layout_mode() == ViewMode::FitPage && self.view_mode.is_page_view(),
@@ -286,7 +340,9 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
 
-            let is_disabled = item_str == "Recent: (none)";
+            let is_disabled = item_str == "Recent: (none)"
+                || item_str == "Saved Favorites: (none yet)"
+                || !self.menu_item_enabled(cat, idx);
             let hovered = !is_disabled && self.hovered_widget == Some(UiHit::MenuItem(idx));
             if hovered {
                 fill_rounded_rect(
@@ -302,14 +358,21 @@ impl<'a> PdfViewerApp<'a> {
                 );
             }
 
+            let disabled_fg = ((theme.text_muted >> 1) & 0x007F_7F7F) + ((theme.surface_bg >> 1) & 0x007F_7F7F);
             let fg = if is_disabled {
-                theme.text_muted
+                disabled_fg
             } else if hovered {
                 theme.text_on_accent
             } else {
                 theme.text_primary
             };
-            let sc_fg = if hovered { theme.text_on_accent } else { theme.text_muted };
+            let sc_fg = if is_disabled {
+                disabled_fg
+            } else if hovered {
+                theme.text_on_accent
+            } else {
+                theme.text_muted
+            };
 
             if self.menu_item_checked(cat, idx) {
                 draw_icon(
@@ -389,7 +452,7 @@ impl<'a> PdfViewerApp<'a> {
             return None;
         }
         let idx = ((iy - (drop_y + pad_v)) / row_h as i32) as usize;
-        if idx < items.len() {
+        if idx < items.len() && self.menu_item_enabled(cat, idx) {
             Some((cat, idx))
         } else {
             None
@@ -398,6 +461,10 @@ impl<'a> PdfViewerApp<'a> {
 
     pub(super) fn execute_menu_item(&mut self, cat: MenuCategory, item_idx: usize) {
         self.open_menu = None;
+        if !self.menu_item_enabled(cat, item_idx) {
+            self.request_redraw();
+            return;
+        }
         match (cat, item_idx) {
             // File menu
             (MenuCategory::File, 0) => {
@@ -419,6 +486,10 @@ impl<'a> PdfViewerApp<'a> {
                 return;
             }
             (MenuCategory::File, 5) => {
+                if self.is_markdown_tab() {
+                    self.save_active_markdown();
+                    return;
+                }
                 self.pending_dialog = Some(PendingDialog::Save);
             }
             (MenuCategory::File, 6) => {
@@ -575,6 +646,7 @@ impl<'a> PdfViewerApp<'a> {
                 self.input_mode = InputMode::SearchText {
                     query_input: self.search_query.clone(),
                 };
+                self.search_bar_focused = true;
             }
             (MenuCategory::Edit, 4) => {
                 self.mouse_mode = MouseMode::Select;

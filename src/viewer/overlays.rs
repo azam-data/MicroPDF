@@ -284,13 +284,32 @@ impl<'a> PdfViewerApp<'a> {
             }
             InputMode::SearchText { query_input } => {
                 let ((px, py, pw, ph), hits) = self.layout_floating_search(buf_w, top_bars_h, sf);
+                let focused = self.search_bar_focused;
+                let margin = (12.0 * s).ceil() as i32;
+                let bx0 = (px - margin).max(0);
+                let by0 = (py - margin).max(0);
+                let bx1 = (px + pw as i32 + margin).min(buf_w as i32);
+                let by1 = (py + ph as i32 + margin).min(buf_h as i32);
+                let bw = (bx1 - bx0).max(0) as usize;
+                let bh = (by1 - by0).max(0) as usize;
+                let saved_bg = if !focused && bw > 0 && bh > 0 {
+                    let mut bg = Vec::with_capacity(bw * bh);
+                    for y in by0..by1 {
+                        let row = y as usize * buf_w as usize;
+                        bg.extend_from_slice(&buffer[row + bx0 as usize..row + bx1 as usize]);
+                    }
+                    Some(bg)
+                } else {
+                    None
+                };
+
                 let rad = (8.0 * s).clamp(5.0, 14.0);
                 draw_soft_shadow(buffer, buf_w, buf_h, px, py, pw, ph, rad, (8.0 * s).round() as i32, (3.0 * s).round() as i32, theme.shadow_rgb, theme.shadow_max_alpha);
                 fill_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.surface_bg);
-                stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, theme.accent);
+                stroke_rounded_rect(buffer, buf_w, buf_h, px, py, pw, ph, rad, if focused { theme.accent } else { theme.border_subtle });
 
                 let ic = (14.0 * s).round() as u32;
-                draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, theme.accent);
+                draw_icon(buffer, buf_w, buf_h, UiIcon::Search, px + (10.0 * s).round() as i32, py + ((ph - ic) / 2) as i32, ic, if focused { theme.accent } else { theme.text_secondary });
 
                 let body_sz = (12.0 * s).clamp(10.0, 26.0);
                 let small_sz = (10.5 * s).clamp(9.0, 22.0);
@@ -309,9 +328,11 @@ impl<'a> PdfViewerApp<'a> {
                 let input_x = px + (30.0 * s).round() as i32;
                 let input_max_x = (first_btn_x - count_w - 6).max(input_x + 20);
                 let display = if query_input.is_empty() {
-                    "Find in the document... |".to_string()
-                } else {
+                    if focused { "Find in the document... |" } else { "Find in the document..." }.to_string()
+                } else if focused {
                     format!("{query_input}|")
+                } else {
+                    query_input.clone()
                 };
                 let fg = if query_input.is_empty() { theme.text_muted } else { theme.text_primary };
                 draw_text_vcenter(buffer, buf_w, buf_h, input_x, py, ph, input_max_x, &display, body_sz, fg, false);
@@ -370,6 +391,19 @@ impl<'a> PdfViewerApp<'a> {
                             draw_icon(buffer, buf_w, buf_h, icon, h.x + ((h.w - b_ic) / 2) as i32, h.y + ((h.h - b_ic) / 2) as i32, b_ic, theme.text_secondary);
                         }
                         _ => {}
+                    }
+                }
+
+                if let Some(bg) = saved_bg {
+                    for row_i in 0..bh {
+                        let y = by0 + row_i as i32;
+                        let dst_off = y as usize * buf_w as usize + bx0 as usize;
+                        let bg_off = row_i * bw;
+                        for col_i in 0..bw {
+                            let fg_px = buffer[dst_off + col_i];
+                            let bg_px = bg[bg_off + col_i];
+                            buffer[dst_off + col_i] = ((fg_px >> 1) & 0x007F_7F7F) + ((bg_px >> 1) & 0x007F_7F7F);
+                        }
                     }
                 }
             }
@@ -749,17 +783,17 @@ impl<'a> PdfViewerApp<'a> {
         fill_rect_clipped(buffer, buf_w, buf_h, cx + 1, cy + (42.0 * s).round() as i32, cw.saturating_sub(2), 1, theme.divider);
 
         let left_items: &[(&str, &str)] = &[
-            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Scroll (Vert/Book/Mag)"),
+            ("1 - 4 / 5", "Fit Page/Width/Text/2-Pg & Flow (Vert/Book/Mag 3D Curl)"),
             ("T", "Reflowable Text View (Tables + Export .md/.tex)"),
             ("Ctrl+Wheel", "Zoom 25%–800% (60%–300% EPUB/MD/LaTeX; 0 resets)"),
             ("Tab", "Thumbnail Grid (Ctrl/Shift+Click multi-select)"),
             ("Ctrl+1..9", "Jump to Tab 1–9 (Ctrl+Tab / Ctrl+Shift+Tab)"),
-            ("B / A / L", "Sidebar (Book/Outline/Bookmarks) / Add / Import .txt"),
+            ("B / A / L", "Sidebar (Book Drawer/Outline/Bookmarks) / Add / Import"),
             ("G", "Smart Jump to Page (5, iii, or #5)"),
             ("Alt+Arrows", "History Back/Fwd (or Move Line in .md/.tex Editor)"),
             ("F11 / F5", "Fullscreen / Presentation Mode"),
-            ("V / Aa", "Reading Modes (V) / EPUB Aa Fonts, Margins, Justify & Curl"),
-            ("Ctrl+F", "Find in the document (PDF/EPUB/MD/LaTeX; F3 / Shift+F3)"),
+            ("V / Aa", "Eye-Care Modes (V); Aa: 4-Side Margins, Spacing & Fonts"),
+            ("Ctrl+F", "Persistent Find Bar (Enter=Next, Focus=100%/Blur=50%, ×=Close)"),
         ];
         let right_items: &[(&str, &str)] = &[
             ("O / S / W", "Open Documents / Save / Watermark Dialog"),
@@ -926,6 +960,7 @@ impl<'a> PdfViewerApp<'a> {
             }
             OverlayHit::SearchClose => {
                 self.input_mode = InputMode::Normal;
+                self.search_bar_focused = false;
                 self.cancel_incremental_search();
                 self.search_matches.clear();
                 self.md_search_matches.clear();

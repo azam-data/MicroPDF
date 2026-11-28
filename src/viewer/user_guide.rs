@@ -116,7 +116,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and customizable page-turn animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
+                text: "Magazine / Book Mode works for PDF, EPUB, Markdown, and LaTeX — showing Page 1 alone as a front cover, followed by two-page spreads (2–3, 4–5, ...) with a spine crease and smooth 3D hand Page Curl animation (adjust speed anytime via View -> Magazine Page-Turn Speed...).",
             },
             GuideBlock::Heading("Zooming In & Out"),
             GuideBlock::Step {
@@ -150,15 +150,15 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             GuideBlock::Heading("Reading EPUB E-Books in Distinct UI Skin"),
             GuideBlock::Step {
                 number: 1,
-                text: "With Help -> UI Skin: Classic / Distinct turned on, open any .epub file to read in a calm two-page open book spread with serif fonts, chapter-per-page breaks, optional 3D hand Page Curl turns, soft page shadows, and 'Loc. X of Y' footers (flip pages with Arrow keys, mouse wheel, or the bottom scrubber bar).",
+                text: "With Help -> UI Skin: Classic / Distinct turned on, open any .epub file to read in a calm two-page open book spread with serif fonts, chapter-per-page breaks, optional 3D hand Page Curl turns, soft page shadows, and 'Loc. X of Y · Z min left' footers (flip pages with Arrow keys, mouse wheel, or glide smoothly along the bottom scrubber slider).",
             },
             GuideBlock::Step {
                 number: 2,
-                text: "Click Aa on the bottom bar to customize typography: choose Book Serif, UI Sans, or cycle installed system serif fonts (< / >); tap A- / A+; set spacing (Compact / Normal / Relaxed); adjust both top and side page margins with Narrow / Normal / Wide presets or the continuous Margins slider; toggle Justify Text and Avoid Breaking Words (-); pick 2-Page Book or 1-Page Flow; toggle Curl: On / Off; or tap any of the 6 paper color swatches.",
+                text: "Click Aa on the bottom bar to customize typography: choose Book Serif, UI Sans, or cycle installed system serif fonts (< / >); tap A- / A+; pick Compact / Normal / Relaxed line spacing; fine-tune Word spacing and Para spacing (- / +); pick Narrow / Normal / Wide margins or click 4-Side > for independent Top Margin, Bottom, Outer Side, and Inner Spine sliders; toggle Justify Text and Avoid Breaking Words (-); pick 2-Page Book or 1-Page Flow; toggle Curl: On / Off; or tap any paper swatch.",
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Click the Sidebar button on the far-left of the bottom bar (or top toolbar, or press B) to open the Book Drawer showing the cover thumbnail, an (i) book details popup, and three tabs: Contents (searchable collapsible Table of Contents, automatically kept out of the book body), Annotations, and Bookmarks. Click the magnifying-glass Find button (or press Ctrl+F) to search the entire book, or click the star icon beside Aa to bookmark the current page.",
+                text: "Click the Sidebar button on the far-left of the bottom bar (or top toolbar, or press B) to open the wide Book Drawer showing cover art, '• Chapter X of Y', an (i) book details popup, a vertical scrollbar across all three tabs — Contents (with 'Loc X' labels), Notes, and Marks — plus a magnifying-glass Find button (Ctrl+F) and star Bookmark toggle on the bottom bar.",
             },
             GuideBlock::Step {
                 number: 4,
@@ -487,7 +487,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 4,
-                text: "Click buttons on the editor's single-row formatting bar to insert markup without memorizing codes — B, I, Code, H1, H2, H3, List, Link, Table (Markdown) or \\section, \\textbf, \\emph, $math$, Equation, \\frac, \\sum, List (LaTeX) — or switch modes using Split, Edit, and Preview.",
+                text: "Click buttons on the editor's single-row formatting bar to insert markup without memorizing codes — B, I, Code, H1, H2, H3, List, Link, Table (Markdown) or \\section, \\textbf, \\emph, $math$, Equation, \\frac, \\sum, List (LaTeX), plus A- / A+ to resize the code font directly — or click Aa on the bottom bar for separate Preview Font, Code Font, Line Spacing, Word Spacing, and Para Spacing steppers.",
             },
             GuideBlock::Step {
                 number: 5,
@@ -571,7 +571,7 @@ pub(super) const USER_GUIDE_CHAPTERS: &[GuideChapter] = &[
             },
             GuideBlock::Step {
                 number: 3,
-                text: "Click the ▲ / ▼ arrows (or press F3 for next match and Shift+F3 for previous match) to jump cleanly through every occurrence.",
+                text: "Press Enter repeatedly (or click the ▲ / ▼ arrows / press F3) to jump cleanly through every match — the Find bar stays open until you click × (and fades smoothly to half transparency when you click the document, remaining ready for one-click controls).",
             },
             GuideBlock::Heading("Comparing Two PDF Versions Side-by-Side"),
             GuideBlock::Step {

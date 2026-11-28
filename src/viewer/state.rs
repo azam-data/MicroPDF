@@ -609,6 +609,11 @@ pub(super) struct SessionConfig {
     pub(super) page_turn_anim_ms: u64,
     pub(super) reading_filter: ReadingFilter,
     pub(super) epub_prefs: EpubReaderPrefs,
+    pub(super) md_code_font_px: f32,
+    pub(super) md_preview_font_px: f32,
+    pub(super) md_line_spacing: f32,
+    pub(super) md_word_spacing_px: f32,
+    pub(super) md_para_spacing_mult: f32,
     pub(super) show_toolbar: bool,
     pub(super) toolbar_config: ToolbarConfig,
     pub(super) hf_profiles: Vec<HeaderFooterProfile>,
@@ -630,6 +635,11 @@ impl Default for SessionConfig {
             page_turn_anim_ms: 450,
             reading_filter: ReadingFilter::Normal,
             epub_prefs: EpubReaderPrefs::default(),
+            md_code_font_px: 13.5,
+            md_preview_font_px: 14.5,
+            md_line_spacing: 1.56,
+            md_word_spacing_px: 0.0,
+            md_para_spacing_mult: 1.0,
             show_toolbar: true,
             toolbar_config: ToolbarConfig::default(),
             hf_profiles: Vec::new(),
@@ -1221,6 +1231,14 @@ pub struct PdfViewerApp<'a> {
     pub(super) md_image_cache: MdDecodedImageCache,
     pub(super) md_search_matches: Vec<MdSearchMatch>,
     pub(super) md_active_hits: Vec<super::markdown_view::MdHitRect>,
+    /// True while floating Find bar has active keyboard focus; false renders at 50% opacity while keeping controls clickable.
+    pub(super) search_bar_focused: bool,
+    /// Separate Code & Preview font sizes + Line / Word / Paragraph spacing for Markdown & LaTeX.
+    pub(super) md_code_font_px: f32,
+    pub(super) md_preview_font_px: f32,
+    pub(super) md_line_spacing: f32,
+    pub(super) md_word_spacing_px: f32,
+    pub(super) md_para_spacing_mult: f32,
     /// Phase 2 Distinct EPUB reader preferences & per-book annotations/bookmarks/UI state.
     pub(super) epub_prefs: EpubReaderPrefs,
     pub(super) epub_book_data: EpubBookData,
@@ -1229,7 +1247,10 @@ pub struct PdfViewerApp<'a> {
     pub(super) book_toc_search: Option<String>,
     pub(super) book_info_popover: bool,
     pub(super) show_aa_popover: bool,
-    pub(super) epub_margin_slider_drag: bool,
+    pub(super) aa_margins_submenu: bool,
+    pub(super) epub_margin_slider_drag: Option<u8>,
+    pub(super) epub_scrubber_drag: bool,
+    pub(super) epub_sidebar_scrollbar_drag: bool,
     pub(super) epub_cover_thumb: Option<(String, u32, u32, Vec<u32>)>,
     pub(super) epub_word_rects: Vec<EpubWordHit>,
     pub(super) epub_selection_drag: Option<((usize, usize), (usize, usize))>,
@@ -1698,6 +1719,12 @@ impl<'a> PdfViewerApp<'a> {
             md_image_cache: MdDecodedImageCache::default(),
             md_search_matches: Vec::new(),
             md_active_hits: Vec::new(),
+            search_bar_focused: false,
+            md_code_font_px: 13.5,
+            md_preview_font_px: 14.5,
+            md_line_spacing: 1.56,
+            md_word_spacing_px: 0.0,
+            md_para_spacing_mult: 1.0,
             epub_prefs: EpubReaderPrefs::default(),
             epub_book_data: EpubBookData::default(),
             book_sidebar_tab: BookSidebarTab::Contents,
@@ -1705,7 +1732,10 @@ impl<'a> PdfViewerApp<'a> {
             book_toc_search: None,
             book_info_popover: false,
             show_aa_popover: false,
-            epub_margin_slider_drag: false,
+            aa_margins_submenu: false,
+            epub_margin_slider_drag: None,
+            epub_scrubber_drag: false,
+            epub_sidebar_scrollbar_drag: false,
             epub_cover_thumb: None,
             epub_word_rects: Vec::new(),
             epub_selection_drag: None,
@@ -1920,6 +1950,7 @@ impl<'a> PdfViewerApp<'a> {
         self.show_scroll_mode_popover = false;
         self.show_notifications = false;
         self.show_aa_popover = false;
+        self.aa_margins_submenu = false;
         self.book_info_popover = false;
         self.active_note_popover = None;
     }
@@ -2069,12 +2100,24 @@ impl<'a> PdfViewerApp<'a> {
         out.push_str(&format!("epub_font={}\n", cfg.epub_prefs.font_choice.to_ini_str()));
         out.push_str(&format!("epub_font_size={:.1}\n", cfg.epub_prefs.font_size_px.clamp(11.0, 32.0)));
         out.push_str(&format!("epub_line_spacing={}\n", cfg.epub_prefs.line_spacing.to_ini_str()));
+        out.push_str(&format!("epub_line_mult={:.2}\n", cfg.epub_prefs.effective_line_mult()));
+        out.push_str(&format!("epub_word_spacing={:.1}\n", cfg.epub_prefs.word_spacing_px.clamp(0.0, 8.0)));
+        out.push_str(&format!("epub_para_spacing={:.2}\n", cfg.epub_prefs.paragraph_spacing_mult.clamp(0.5, 2.5)));
         out.push_str(&format!("epub_margins={}\n", cfg.epub_prefs.margins.to_ini_str()));
         out.push_str(&format!("epub_margin_ratio={:.3}\n", cfg.epub_prefs.effective_margin_ratio()));
+        out.push_str(&format!("epub_margin_top={:.3}\n", cfg.epub_prefs.margin_part(0)));
+        out.push_str(&format!("epub_margin_bottom={:.3}\n", cfg.epub_prefs.margin_part(1)));
+        out.push_str(&format!("epub_margin_outer={:.3}\n", cfg.epub_prefs.margin_part(2)));
+        out.push_str(&format!("epub_margin_inner={:.3}\n", cfg.epub_prefs.margin_part(3)));
         out.push_str(&format!("epub_justify={}\n", if cfg.epub_prefs.justify { 1 } else { 0 }));
         out.push_str(&format!("epub_hyphenate={}\n", if cfg.epub_prefs.hyphenate { 1 } else { 0 }));
         out.push_str(&format!("epub_spread={}\n", if cfg.epub_prefs.two_page_spread { 1 } else { 0 }));
         out.push_str(&format!("epub_page_curl={}\n", if cfg.epub_prefs.page_curl_anim { 1 } else { 0 }));
+        out.push_str(&format!("md_code_font_size={:.1}\n", cfg.md_code_font_px.clamp(10.0, 28.0)));
+        out.push_str(&format!("md_preview_font_size={:.1}\n", cfg.md_preview_font_px.clamp(10.0, 30.0)));
+        out.push_str(&format!("md_line_spacing={:.2}\n", cfg.md_line_spacing.clamp(1.20, 2.20)));
+        out.push_str(&format!("md_word_spacing={:.1}\n", cfg.md_word_spacing_px.clamp(0.0, 8.0)));
+        out.push_str(&format!("md_para_spacing={:.2}\n", cfg.md_para_spacing_mult.clamp(0.5, 2.5)));
         out.push_str(&format!("toolbar_items={}\n", cfg.toolbar_config.to_ini_str()));
         for prof in &cfg.hf_profiles {
             out.push_str(&format!("hf_profile={}\n", prof.to_ini_str()));
@@ -2160,13 +2203,55 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 }
             } else if let Some(val) = line.strip_prefix("epub_line_spacing=") {
-                cfg.epub_prefs.line_spacing = LineSpacingPreset::from_ini_str(val);
+                cfg.epub_prefs.set_line_spacing_preset(LineSpacingPreset::from_ini_str(val));
+            } else if let Some(val) = line.strip_prefix("epub_line_mult=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.epub_prefs.line_spacing_mult = v.clamp(1.20, 2.20);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_word_spacing=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.epub_prefs.word_spacing_px = v.clamp(0.0, 8.0);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_para_spacing=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.epub_prefs.paragraph_spacing_mult = v.clamp(0.5, 2.5);
+                    }
+                }
             } else if let Some(val) = line.strip_prefix("epub_margins=") {
                 cfg.epub_prefs.set_margin_preset(MarginPreset::from_ini_str(val));
             } else if let Some(val) = line.strip_prefix("epub_margin_ratio=") {
                 if let Ok(r) = val.trim().parse::<f32>() {
                     if r.is_finite() {
                         cfg.epub_prefs.set_margin_ratio(r);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_margin_top=") {
+                if let Ok(r) = val.trim().parse::<f32>() {
+                    if r.is_finite() {
+                        cfg.epub_prefs.set_margin_part(0, r);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_margin_bottom=") {
+                if let Ok(r) = val.trim().parse::<f32>() {
+                    if r.is_finite() {
+                        cfg.epub_prefs.set_margin_part(1, r);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_margin_outer=") {
+                if let Ok(r) = val.trim().parse::<f32>() {
+                    if r.is_finite() {
+                        cfg.epub_prefs.set_margin_part(2, r);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("epub_margin_inner=") {
+                if let Ok(r) = val.trim().parse::<f32>() {
+                    if r.is_finite() {
+                        cfg.epub_prefs.set_margin_part(3, r);
                     }
                 }
             } else if let Some(val) = line.strip_prefix("epub_justify=") {
@@ -2181,6 +2266,36 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(val) = line.strip_prefix("epub_page_curl=") {
                 let v = val.trim();
                 cfg.epub_prefs.page_curl_anim = !(v == "0" || v.eq_ignore_ascii_case("false"));
+            } else if let Some(val) = line.strip_prefix("md_code_font_size=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.md_code_font_px = v.clamp(10.0, 28.0);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("md_preview_font_size=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.md_preview_font_px = v.clamp(10.0, 30.0);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("md_line_spacing=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.md_line_spacing = v.clamp(1.20, 2.20);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("md_word_spacing=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.md_word_spacing_px = v.clamp(0.0, 8.0);
+                    }
+                }
+            } else if let Some(val) = line.strip_prefix("md_para_spacing=") {
+                if let Ok(v) = val.trim().parse::<f32>() {
+                    if v.is_finite() {
+                        cfg.md_para_spacing_mult = v.clamp(0.5, 2.5);
+                    }
+                }
             } else if let Some(val) = line.strip_prefix("toolbar_items=") {
                 cfg.toolbar_config = ToolbarConfig::from_ini_str(val);
             } else if let Some(val) = line.strip_prefix("hf_profile=") {
@@ -2399,6 +2514,11 @@ impl<'a> PdfViewerApp<'a> {
             encrypt_config: self.encrypt_config,
             favorites: self.favorites.clone(),
             epub_prefs: self.epub_prefs.clone(),
+            md_code_font_px: self.md_code_font_px,
+            md_preview_font_px: self.md_preview_font_px,
+            md_line_spacing: self.md_line_spacing,
+            md_word_spacing_px: self.md_word_spacing_px,
+            md_para_spacing_mult: self.md_para_spacing_mult,
         };
         let ini_text = Self::serialize_session_ini(&cfg);
         let payload = if self.encrypt_config {
@@ -2463,6 +2583,11 @@ impl<'a> PdfViewerApp<'a> {
         self.encrypt_config = was_encrypted || cfg.encrypt_config;
         self.favorites = cfg.favorites;
         self.epub_prefs = cfg.epub_prefs;
+        self.md_code_font_px = cfg.md_code_font_px;
+        self.md_preview_font_px = cfg.md_preview_font_px;
+        self.md_line_spacing = cfg.md_line_spacing;
+        self.md_word_spacing_px = cfg.md_word_spacing_px;
+        self.md_para_spacing_mult = cfg.md_para_spacing_mult;
         self.toolbar_config = cfg.toolbar_config;
         self.hf_profiles = cfg.hf_profiles;
         self.last_positions = cfg.last_positions;
@@ -3042,7 +3167,12 @@ impl<'a> PdfViewerApp<'a> {
             return 0;
         }
         if self.show_bookmarks {
-            ((SIDEBAR_WIDTH_LOGICAL as f64) * scale_factor).round() as u32
+            let base_w = if self.is_distinct_epub_mode() {
+                320.0
+            } else {
+                SIDEBAR_WIDTH_LOGICAL as f64
+            };
+            (base_w * scale_factor).round() as u32
         } else {
             0
         }

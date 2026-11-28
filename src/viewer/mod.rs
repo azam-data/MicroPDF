@@ -3220,6 +3220,8 @@ mod tests {
             book_mode: true,
             font_family: FontFamily::BookSerif,
             line_mult: 1.56,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
             justify: true,
             hyphenate: true,
             hypher_lang: hypher::Lang::English,
@@ -3286,8 +3288,15 @@ mod tests {
             font_choice: EpubFontChoice::OsSerif("Georgia".to_string()),
             font_size_px: 19.5,
             line_spacing: LineSpacingPreset::Relaxed,
+            line_spacing_mult: 1.75,
+            word_spacing_px: 1.5,
+            paragraph_spacing_mult: 1.30,
             margins: MarginPreset::Wide,
-            margin_ratio: 0.215,
+            margin_ratio: 0.22,
+            margin_top: 0.14,
+            margin_bottom: 0.12,
+            margin_outer: 0.22,
+            margin_inner: 0.15,
             justify: false,
             hyphenate: false,
             two_page_spread: false,
@@ -3334,7 +3343,7 @@ mod tests {
         use crate::markdown::{InlineSpan, MarkdownDoc, MdBlock};
         use std::collections::HashMap;
 
-        // 1. Top/vertical padding scales cleanly with Narrow / Normal / Wide and Margins slider
+        // 1. Top/vertical padding scales cleanly with Narrow / Normal / Wide and 4-side margin controls
         let mut prefs = EpubReaderPrefs::default();
         prefs.set_margin_preset(MarginPreset::Narrow);
         let (top_narrow, bot_narrow) = prefs.vertical_pad_px(800.0, 1.0);
@@ -3365,6 +3374,8 @@ mod tests {
             book_mode: true,
             font_family: FontFamily::BookSerif,
             line_mult: 1.5,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
             justify: true,
             hyphenate: false,
             hypher_lang: hypher::Lang::English,
@@ -3749,6 +3760,190 @@ By probing image headers during layout and decoding visible figures into a bound
 
         let _ = std::fs::remove_dir_all(&tmp);
         println!("Generated 6 screenshots in {}", out_dir.display());
+    }
+
+    #[test]
+    fn test_ten_ux_tweaks_regressions() {
+        use super::book_ui::{
+            AaPopoverHit, BookSidebarHit, BookSidebarTab, EpubBookmark, EpubHighlight,
+            EpubReaderPrefs,
+        };
+        use super::markdown_view::{layout_blocks, BookLayoutOpts, LaidOutBlock};
+        use super::state::{InputMode, MenuCategory, PdfViewerApp, SessionConfig};
+        use super::theme::UiSkin;
+        use super::toolbar::ToolbarAction;
+        use super::ui_draw::FontFamily;
+        use crate::markdown::{BookMetadata, InlineSpan, MarkdownDoc, MdBlock, TocEntry};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        // 1. Independent 4-side EPUB margins: changing Top must NOT alter Inner/Spine, Bottom, or Outer
+        let mut prefs = EpubReaderPrefs::default();
+        let orig_inner = prefs.effective_inner_margin_ratio();
+        let orig_outer = prefs.effective_margin_ratio();
+        let orig_bottom = prefs.margin_bottom;
+        prefs.set_margin_part_norm(0, 1.0); // Max Top margin
+        assert!(prefs.margin_top > orig_bottom);
+        assert!((prefs.effective_inner_margin_ratio() - orig_inner).abs() < 1e-5, "Top margin must not widen spine gap");
+        assert!((prefs.effective_margin_ratio() - orig_outer).abs() < 1e-5, "Top margin must not alter outer side");
+        assert!((prefs.margin_bottom - orig_bottom).abs() < 1e-5, "Top margin must not alter bottom");
+
+        // 2. Line, word & paragraph spacing + separate Code & Preview font INI roundtrip
+        let mut cfg = SessionConfig::default();
+        cfg.md_code_font_px = 16.5;
+        cfg.md_preview_font_px = 18.0;
+        cfg.md_line_spacing = 1.75;
+        cfg.md_word_spacing_px = 2.0;
+        cfg.md_para_spacing_mult = 1.60;
+        let ini = PdfViewerApp::serialize_session_ini(&cfg);
+        let parsed = PdfViewerApp::parse_session_ini(&ini);
+        assert!((parsed.md_code_font_px - 16.5).abs() < 0.01);
+        assert!((parsed.md_preview_font_px - 18.0).abs() < 0.01);
+        assert!((parsed.md_line_spacing - 1.75).abs() < 0.01);
+        assert!((parsed.md_word_spacing_px - 2.0).abs() < 0.01);
+        assert!((parsed.md_para_spacing_mult - 1.60).abs() < 0.01);
+
+        // Verify paragraph spacing multiplier & word spacing increase layout height cleanly
+        let ast = vec![
+            MdBlock::Paragraph(vec![InlineSpan::Text("Alpha beta gamma delta.".into())]),
+            MdBlock::Paragraph(vec![InlineSpan::Text("Second paragraph after gap.".into())]),
+        ];
+        let base_opts = BookLayoutOpts {
+            book_mode: false,
+            font_family: FontFamily::BookSerif,
+            line_mult: 1.45,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
+            justify: false,
+            hyphenate: false,
+            hypher_lang: hypher::Lang::English,
+        };
+        let wide_opts = BookLayoutOpts {
+            line_mult: 1.85,
+            word_spacing_px: 3.0,
+            para_mult: 2.0,
+            ..base_opts
+        };
+        let mut l1 = Vec::new();
+        let mut cb1 = Vec::new();
+        let mut d1 = HashMap::new();
+        let emb = HashMap::new();
+        let (b_base, h_base) = layout_blocks(&ast, 300.0, 15.0, 1.0, 0.0, &mut l1, &mut cb1, &mut d1, &emb, false, None, base_opts, None);
+        let (_, h_wide) = layout_blocks(&ast, 300.0, 15.0, 1.0, 0.0, &mut l1, &mut cb1, &mut d1, &emb, false, None, wide_opts, None);
+        assert!(matches!(b_base[0], LaidOutBlock::Paragraph { .. }));
+        assert!(h_wide > h_base + 10.0, "Larger line/para spacing must increase total height");
+
+        // 3. PdfViewerApp-backed checks (runs whenever PDFium shared library is available)
+        let Ok(engine) = crate::engine::PdfEngine::new() else {
+            return;
+        };
+        let app_empty = PdfViewerApp::new(&engine, None).expect("init empty app");
+        assert!(!app_empty.menu_item_enabled(MenuCategory::Page, 0));
+        assert!(!app_empty.menu_item_enabled(MenuCategory::Tools, 0));
+        assert!(app_empty.toolbar_action_enabled(ToolbarAction::Open));
+        assert!(!app_empty.toolbar_action_enabled(ToolbarAction::Save));
+        assert!(!app_empty.toolbar_action_enabled(ToolbarAction::Print));
+
+        // Separate Code vs Preview font sizes on Markdown tab via Aa handler + persistent Find bar
+        let mut app = PdfViewerApp::new(&engine, None).expect("init app");
+        app.ui_skin = UiSkin::Distinct;
+        app.file_path = PathBuf::from("notes.md");
+        app.markdown_doc = Some(MarkdownDoc {
+            title: "Notes".into(),
+            blocks: ast,
+            headings: Vec::new(),
+            embedded_images: HashMap::new(),
+            book_meta: None,
+        });
+        assert!(app.menu_item_enabled(MenuCategory::File, 5)); // Save Document enabled for MD
+        assert!(!app.menu_item_enabled(MenuCategory::Page, 0)); // PDF Page menu disabled
+        assert!(app.toolbar_action_enabled(ToolbarAction::MdSave));
+
+        let orig_code = app.md_code_font_px;
+        let orig_prev = app.md_preview_font_px;
+        app.handle_aa_popover_click(AaPopoverHit::CodeSizePlus);
+        assert!(app.md_code_font_px > orig_code);
+        assert!((app.md_preview_font_px - orig_prev).abs() < 0.01);
+        app.handle_aa_popover_click(AaPopoverHit::SizePlus);
+        assert!(app.md_preview_font_px > orig_prev);
+
+        // Persistent Find bar stays open after handle_prompt_submission
+        app.input_mode = InputMode::SearchText {
+            query_input: "Alpha".to_string(),
+        };
+        app.handle_prompt_submission();
+        assert!(matches!(app.input_mode, InputMode::SearchText { ref query_input } if query_input == "Alpha"));
+        assert!(app.search_bar_focused);
+
+        // 4. EPUB sidebar width, scrollbar across tabs, chapter Loc labels & chapter time remaining
+        app.file_path = PathBuf::from("novel.epub");
+        let many_toc: Vec<TocEntry> = (0..40)
+            .map(|i| TocEntry {
+                title: format!("Chapter {}", i + 1),
+                level: 0,
+                block_idx: i % 2,
+                children: Vec::new(),
+            })
+            .collect();
+        let mut long_ast = Vec::new();
+        for i in 0..4 {
+            long_ast.push(MdBlock::Heading {
+                level: 1,
+                spans: vec![InlineSpan::Text(format!("Chapter {}", i + 1))],
+            });
+            long_ast.push(MdBlock::Paragraph(vec![InlineSpan::Text("word ".repeat(260))]));
+        }
+        app.markdown_doc = Some(MarkdownDoc {
+            title: "Novel".into(),
+            blocks: long_ast,
+            headings: Vec::new(),
+            embedded_images: HashMap::new(),
+            book_meta: Some(BookMetadata {
+                title: "Novel".into(),
+                author: Some("Author".into()),
+                publisher: None,
+                language: None,
+                description: None,
+                cover_image_key: None,
+                toc: many_toc,
+            }),
+        });
+        app.show_bookmarks = true;
+        assert!(app.sidebar_width_px(1.0) >= 315);
+        assert!(!app.menu_item_enabled(MenuCategory::File, 5)); // Save disabled for read-only EPUB
+
+        // Ensure scrollbar metrics overflow & click scrolls on Contents, Annotations & Bookmarks tabs
+        for i in 0..25u64 {
+            app.epub_book_data.highlights.push(EpubHighlight {
+                id: i + 1,
+                block_idx: 0,
+                start_word: 0,
+                end_word: 2,
+                quote: format!("Quote {i}"),
+                color_idx: 0,
+                note: Some("Note".into()),
+            });
+            app.epub_book_data.bookmarks.push(EpubBookmark {
+                block_idx: 0,
+                page_num: (i + 1) as usize,
+                label: format!("Bookmark {i}"),
+            });
+        }
+        for tab in [BookSidebarTab::Contents, BookSidebarTab::Annotations, BookSidebarTab::Bookmarks] {
+            app.book_sidebar_tab = tab;
+            app.bookmark_scroll_y = 0;
+            let (_, _, _, tot, vis) = app.epub_sidebar_list_metrics(420, 64, 1.0);
+            assert!(tot > vis, "Expected overflow for scrollbar on {tab:?}");
+            app.handle_distinct_epub_sidebar_click(BookSidebarHit::ScrollbarTrack(1.0), 420, 64, 1.0);
+            assert!(app.bookmark_scroll_y > 0, "Scrollbar click must scroll {tab:?}");
+        }
+
+        app.ensure_md_layout(1280, 1.0);
+        let time_lbl = app.epub_chapter_time_left_label().expect("Expected chapter time remaining");
+        assert!(time_lbl.contains("left"), "Unexpected time-left label: {time_lbl}");
+        let full_loc = app.epub_loc_and_time_label(1, 5);
+        assert!(full_loc.contains("Loc. 1 of 5 ·"), "Expected combined Loc + time-left, got {full_loc}");
+        assert!(app.epub_loc_for_block(0) >= 1);
     }
 }
 

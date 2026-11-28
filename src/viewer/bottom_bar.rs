@@ -25,6 +25,7 @@ pub(super) enum BottomBarAction {
     Continuous,
     TextView,
     ReadingFilter,
+    AaTypography,
     Fullscreen,
     Presentation,
     NotificationBoard,
@@ -48,6 +49,7 @@ impl BottomBarAction {
             Self::Continuous => "Scroll Flow: Single / Continuous Vertical / Book Horizontal (5)",
             Self::TextView => "Reflowable Text View (T)",
             Self::ReadingFilter => "Reading Mode Picker — E-Ink (Day) / Sepia / Sage / Dark / Night Amber (V)",
+            Self::AaTypography => "Typography, Font Sizes & Spacing (Aa)",
             Self::Fullscreen => "Fullscreen Mode (F11)",
             Self::Presentation => "Presentation Mode (F5)",
             Self::NotificationBoard => "Click to view Session Notification History",
@@ -229,11 +231,26 @@ impl<'a> PdfViewerApp<'a> {
             mk_lbl(zoom_pill_w, BottomBarAction::ZoomReset, zoom_txt, None, false),
             mk_icon(sq_w, BottomBarAction::ZoomIn, UiIcon::ZoomIn, false),
         ];
-        // Group 3: Layout/Fit Modes + Independent Scroll Flow + Text View (PDF only in Distinct mode)
+        // Group 3: Layout/Fit Modes + Independent Scroll Flow + Text View (or Flow + Aa for Markdown/LaTeX)
         let g_views = if distinct_studio {
-            Vec::new()
-        } else {
             vec![
+                mk_lbl(
+                    scroll_pill_w,
+                    BottomBarAction::Continuous,
+                    scroll_txt,
+                    Some(UiIcon::Continuous),
+                    scroll_mode != ScrollMode::SinglePage || self.show_scroll_mode_popover,
+                ),
+                mk_lbl(
+                    (measure_text("Aa", font_sz, true).ceil() as u32 + (16.0 * s).round() as u32).max((34.0 * s).round() as u32),
+                    BottomBarAction::AaTypography,
+                    "Aa".to_string(),
+                    None,
+                    self.show_aa_popover,
+                ),
+            ]
+        } else {
+            let mut v = vec![
                 mk_icon(sq_w, BottomBarAction::FitPage, UiIcon::FitPage, on_page_view && layout_mode == ViewMode::FitPage),
                 mk_icon(sq_w, BottomBarAction::FitWidth, UiIcon::FitWidth, on_page_view && layout_mode == ViewMode::FitWidth),
                 mk_icon(sq_w, BottomBarAction::FitTextWidth, UiIcon::FitText, on_page_view && layout_mode == ViewMode::FitTextWidth),
@@ -246,7 +263,17 @@ impl<'a> PdfViewerApp<'a> {
                     scroll_mode != ScrollMode::SinglePage || self.show_scroll_mode_popover,
                 ),
                 mk_icon(sq_w, BottomBarAction::TextView, UiIcon::TextView, self.view_mode == ViewMode::TextView),
-            ]
+            ];
+            if self.is_markdown_tab() && !Self::is_epub_path(&self.file_path) {
+                v.push(mk_lbl(
+                    (measure_text("Aa", font_sz, true).ceil() as u32 + (16.0 * s).round() as u32).max((34.0 * s).round() as u32),
+                    BottomBarAction::AaTypography,
+                    "Aa".to_string(),
+                    None,
+                    self.show_aa_popover,
+                ));
+            }
+            v
         };
         // Group 4: Reading Filter picker pill
         let g_filter = vec![mk_lbl(
@@ -481,7 +508,7 @@ impl<'a> PdfViewerApp<'a> {
             } else if let Some(ref job) = self.print_job {
                 let (done, total) = job.job.progress();
                 (format!("Printing {done}/{total} (Esc cancels)"), theme.accent_soft_fg, true)
-            } else if self.doc.is_none() {
+            } else if self.doc.is_none() && !self.is_markdown_tab() {
                 ("Drop a document or press O".to_string(), theme.text_secondary, false)
             } else {
                 let mut fname = self.filename_display();
@@ -632,6 +659,13 @@ impl<'a> PdfViewerApp<'a> {
             }
             BottomBarAction::ReadingFilter => {
                 self.show_reading_mode_popover = !self.show_reading_mode_popover;
+                self.show_scroll_mode_popover = false;
+                self.show_aa_popover = false;
+                self.show_notifications = false;
+            }
+            BottomBarAction::AaTypography => {
+                self.show_aa_popover = !self.show_aa_popover;
+                self.show_reading_mode_popover = false;
                 self.show_scroll_mode_popover = false;
                 self.show_notifications = false;
             }

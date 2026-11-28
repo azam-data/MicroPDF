@@ -1992,18 +1992,46 @@ impl<'a> PdfViewerApp<'a> {
                         (r1.0, top_y, r1.2, (bot_y - top_y).max(0) as u32)
                     };
                     if let Some((eased, dir)) = self.page_turn_anim_progress() {
-                        super::ui_draw::draw_magazine_page_turn_overlay(
-                            buffer,
-                            width,
-                            bottom_limit,
-                            spread_x,
-                            spread_y,
-                            spread_w,
-                            spread_h,
-                            eased,
-                            dir,
-                            s,
-                        );
+                        let canvas_x = sidebar_w as i32;
+                        let canvas_y = top_bars_h as i32;
+                        let canvas_w = width.saturating_sub(sidebar_w);
+                        let canvas_h = bottom_limit.saturating_sub(top_bars_h);
+                        let prev_canvas = self.page_turn_anim.as_ref().and_then(|a| a.prev_spread.as_ref());
+                        if let Some((sw, sh, prev_px)) = prev_canvas {
+                            if *sw == canvas_w && *sh == canvas_h && !prev_px.is_empty() {
+                                super::ui_draw::draw_apple_books_page_curl(
+                                    buffer,
+                                    width,
+                                    bottom_limit,
+                                    prev_px,
+                                    canvas_x,
+                                    canvas_y,
+                                    canvas_w,
+                                    canvas_h,
+                                    eased,
+                                    dir,
+                                    theme.canvas_bg,
+                                    s,
+                                );
+                            } else {
+                                super::ui_draw::draw_magazine_page_turn_overlay(
+                                    buffer, width, bottom_limit, spread_x, spread_y, spread_w, spread_h, eased, dir, s,
+                                );
+                            }
+                        } else {
+                            super::ui_draw::draw_magazine_page_turn_overlay(
+                                buffer,
+                                width,
+                                bottom_limit,
+                                spread_x,
+                                spread_y,
+                                spread_w,
+                                spread_h,
+                                eased,
+                                dir,
+                                s,
+                            );
+                        }
                     }
                 }
             }
@@ -2252,9 +2280,9 @@ impl<'a> PdfViewerApp<'a> {
             self.draw_scroll_mode_popover(buffer, width, height, status_bar_h, scale_factor);
         }
 
-        // Distinct EPUB Book Metadata Info Popover & Aa Typography Popover
-        if chrome_visible && self.is_distinct_epub_mode() {
-            if self.book_info_popover && self.show_bookmarks && sidebar_w > 0 {
+        // Distinct EPUB Book Metadata Info Popover & Aa Typography Popover (EPUB / MD / LaTeX)
+        if chrome_visible && self.is_markdown_tab() {
+            if self.is_distinct_epub_mode() && self.book_info_popover && self.show_bookmarks && sidebar_w > 0 {
                 self.draw_book_info_popover(buffer, width, height, sidebar_w, top_bars_h, scale_factor);
             }
             if self.show_aa_popover {
@@ -2396,6 +2424,64 @@ impl<'a> PdfViewerApp<'a> {
         if self.unsaved_changes_modal.is_some() {
             self.draw_unsaved_changes_modal(buffer, width, height, scale_factor);
         }
+    }
+
+    pub(super) fn capture_pdf_magazine_canvas_snapshot(&self) -> Option<(u32, u32, Vec<u32>)> {
+        let win = self.window.as_ref()?;
+        let sz = win.inner_size();
+        let width = sz.width;
+        let height = sz.height;
+        if width < 80 || height < 80 {
+            return None;
+        }
+        let scale_factor = self.effective_scale_factor(win.scale_factor());
+        let sidebar_w = self.sidebar_width_px(scale_factor).min(width.saturating_sub(64));
+        let top_bars_h = self.top_bars_height_px(scale_factor).min(height.saturating_sub(48));
+        let status_bar_h = self.status_bar_height_px(scale_factor).min(height.saturating_sub(top_bars_h + 16));
+        let bottom_limit = height.saturating_sub(status_bar_h);
+        let canvas_w = width.saturating_sub(sidebar_w);
+        let canvas_h = bottom_limit.saturating_sub(top_bars_h);
+        if canvas_w == 0 || canvas_h == 0 {
+            return None;
+        }
+        let theme = self.ui_theme();
+        let canvas_bg = match self.reading_filter {
+            ReadingFilter::DarkInvert => 0x0014_161A,
+            ReadingFilter::NightAmber => 0x0014_0F0B,
+            _ => theme.canvas_bg,
+        };
+        let mut snap = vec![canvas_bg; (canvas_w as usize).saturating_mul(canvas_h as usize)];
+        let dx = -(sidebar_w as i32);
+        let dy = -(top_bars_h as i32);
+        if let Some(ref cache) = self.cached_page {
+            let r1 = self.page_draw_rect;
+            if r1.2 > 0 && r1.3 > 0 {
+                let local_r1 = (r1.0 + dx, r1.1 + dy, r1.2, r1.3);
+                self.draw_page_frame_chrome(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r1, scale_factor);
+                self.blit_page_or_tiles(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r1, cache);
+            }
+        }
+        if let (Some(second_cache), Some(r2)) = (&self.cached_second_page, self.second_page_draw_rect) {
+            if r2.2 > 0 && r2.3 > 0 {
+                let local_r2 = (r2.0 + dx, r2.1 + dy, r2.2, r2.3);
+                self.draw_page_frame_chrome(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r2, scale_factor);
+                self.blit_page_or_tiles(&mut snap, canvas_w, canvas_h, 0, 0, 0, local_r2, second_cache);
+                let s = scale_factor as f32;
+                let r1 = self.page_draw_rect;
+                let top_y = (r1.1 + dy).min(local_r2.1).max(0);
+                let bot_y = (r1.1 + dy + r1.3 as i32).max(local_r2.1 + local_r2.3 as i32).min(canvas_h as i32);
+                super::ui_draw::draw_book_spine_crease(
+                    &mut snap,
+                    canvas_w,
+                    canvas_h,
+                    local_r2.0,
+                    top_y,
+                    (bot_y - top_y).max(0) as u32,
+                    (14.0 * s).round().max(6.0) as i32,
+                );
+            }
+        }
+        Some((canvas_w, canvas_h, snap))
     }
 
     /// Converts a PDF-coordinate rectangle on `page_idx` into `(screen_x, screen_y, width, height)`

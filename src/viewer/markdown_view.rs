@@ -176,6 +176,8 @@ pub(super) struct BookLayoutOpts {
     pub(super) book_mode: bool,
     pub(super) font_family: FontFamily,
     pub(super) line_mult: f32,
+    pub(super) word_spacing_px: f32,
+    pub(super) para_mult: f32,
     pub(super) justify: bool,
     pub(super) hyphenate: bool,
     pub(super) hypher_lang: hypher::Lang,
@@ -187,6 +189,8 @@ impl Default for BookLayoutOpts {
             book_mode: false,
             font_family: FontFamily::UiSans,
             line_mult: 1.56,
+            word_spacing_px: 0.0,
+            para_mult: 1.0,
             justify: false,
             hyphenate: false,
             hypher_lang: hypher::Lang::English,
@@ -199,11 +203,12 @@ pub(super) struct MdLayoutCache {
     pub(super) zoom_bits: u32,
     pub(super) sf_bits: u64,
     pub(super) doc_gen: u64,
-    pub(super) epub_sig: (bool, super::book_ui::EpubReaderPrefs),
+    pub(super) epub_sig: (bool, super::book_ui::EpubReaderPrefs, u32, u32, u32, u32),
     pub(super) book_mode: bool,
     pub(super) book_font_family: FontFamily,
     pub(super) total_h: f32,
     pub(super) word_count: usize,
+    pub(super) cum_words_by_block: Vec<usize>,
     blocks: Vec<LaidOutBlock>,
     pub(super) block_y_by_ast_idx: HashMap<usize, f32>,
     pub(super) book_pages: Vec<BookPage>,
@@ -305,7 +310,7 @@ pub(super) fn tokenize_spans(
             continue;
         }
         // Compute space width once per span instead of re-measuring on every whitespace token
-        let space_w = measure_word_for_opts(" ", font_sz, bold, italic, false, opts);
+        let space_w = (measure_word_for_opts(" ", font_sz, bold, italic, false, opts) + opts.word_spacing_px).max(1.0);
         let mut cur_start = 0usize;
         let bytes = txt.as_bytes();
         let mut i = 0usize;
@@ -658,7 +663,7 @@ pub(super) fn layout_blocks(
             }
             MdBlock::Paragraph(spans) => {
                 let font_sz = base_fs;
-                let line_h = font_sz * if opts.book_mode { opts.line_mult } else { 1.56 };
+                let line_h = font_sz * opts.line_mult.clamp(1.15, 2.50);
                 let first_indent = if opts.book_mode && prev_was_body_para {
                     font_sz * 1.5
                 } else {
@@ -676,7 +681,8 @@ pub(super) fn layout_blocks(
                     font_sz,
                     justify: opts.book_mode && opts.justify,
                 });
-                y += h + if opts.book_mode { 4.5 * s } else { 11.0 * s };
+                let base_para_gap = if opts.book_mode { 5.0 * s } else { 11.0 * s };
+                y += h + base_para_gap * opts.para_mult.clamp(0.4, 3.0);
                 prev_was_body_para = true;
             }
             MdBlock::CodeBlock { lang, code } => {
@@ -1270,7 +1276,14 @@ impl<'a> PdfViewerApp<'a> {
         } else {
             self.effective_scroll_mode() == super::state::ScrollMode::MagazineBook
         };
-        let epub_sig = (book_mode, self.epub_prefs.clone());
+        let epub_sig = (
+            book_mode,
+            self.epub_prefs.clone(),
+            self.md_preview_font_px.to_bits(),
+            self.md_line_spacing.to_bits(),
+            self.md_word_spacing_px.to_bits(),
+            self.md_para_spacing_mult.to_bits(),
+        );
         let font_family = if book_mode {
             self.epub_prefs.font_choice.resolve_font_family()
         } else {
@@ -1283,26 +1296,28 @@ impl<'a> PdfViewerApp<'a> {
         let s = sf as f32;
         let is_magazine = spread_mode && self.md_editor_mode == MdEditorMode::Preview;
         let col_w = if book_mode {
-            let margin_ratio = self.epub_prefs.effective_margin_ratio();
+            let outer_ratio = self.epub_prefs.effective_margin_ratio();
+            let inner_ratio = self.epub_prefs.effective_inner_margin_ratio();
             if is_magazine {
                 let spread_w = canvas_w
-                    .saturating_sub((28.0 * s).round() as u32)
-                    .min((1260.0 * s).round() as u32)
+                    .saturating_sub((14.0 * s).round() as u32)
+                    .min((1280.0 * s).round() as u32)
                     .max(320);
                 let half_w = (spread_w / 2) as f32;
-                let pad = (half_w * margin_ratio).max(20.0 * s);
-                (half_w - pad * 2.0).round().max(150.0) as u32
+                let outer_pad = (half_w * outer_ratio).max(16.0 * s);
+                let inner_pad = (half_w * inner_ratio).max(14.0 * s);
+                (half_w - outer_pad - inner_pad).round().max(150.0) as u32
             } else {
                 let page_w = canvas_w
-                    .saturating_sub((36.0 * s).round() as u32)
-                    .min((840.0 * s).round() as u32)
+                    .saturating_sub((24.0 * s).round() as u32)
+                    .min((860.0 * s).round() as u32)
                     .max(220);
-                let pad = (page_w as f32 * margin_ratio).max(20.0 * s);
-                (page_w as f32 - pad * 2.0).round().max(180.0) as u32
+                let outer_pad = (page_w as f32 * outer_ratio).max(18.0 * s);
+                (page_w as f32 - outer_pad * 2.0).round().max(180.0) as u32
             }
         } else if is_magazine {
             let spread_w = canvas_w
-                .saturating_sub((36.0 * s).round() as u32)
+                .saturating_sub((24.0 * s).round() as u32)
                 .min((1240.0 * s).round() as u32)
                 .max(300);
             ((spread_w.saturating_sub((64.0 * s).round() as u32)) / 2).max(160)
@@ -1319,11 +1334,11 @@ impl<'a> PdfViewerApp<'a> {
         let sf_bits = sf.to_bits();
         let doc_gen = self.md_doc_gen;
 
-        let cached_word_count = self
+        let cached_words = self
             .md_layout
             .as_ref()
             .filter(|c| c.doc_gen == doc_gen)
-            .map(|c| c.word_count);
+            .map(|c| (c.word_count, c.cum_words_by_block.clone()));
 
         if let Some(ref cache) = self.md_layout {
             if cache.col_w == col_w
@@ -1339,13 +1354,15 @@ impl<'a> PdfViewerApp<'a> {
         let base_fs = if book_mode {
             (self.epub_prefs.font_size_px * s * self.zoom_level).clamp(10.0 * s, 64.0 * s)
         } else {
-            (14.5 * s * self.zoom_level).clamp(9.0 * s, 64.0 * s)
+            (self.md_preview_font_px.clamp(10.0, 30.0) * s * self.zoom_level).clamp(9.0 * s, 64.0 * s)
         };
         let opts = if book_mode {
             BookLayoutOpts {
                 book_mode: true,
                 font_family,
-                line_mult: self.epub_prefs.line_spacing.multiplier(),
+                line_mult: self.epub_prefs.effective_line_mult(),
+                word_spacing_px: self.epub_prefs.word_spacing_px * s * self.zoom_level,
+                para_mult: self.epub_prefs.paragraph_spacing_mult,
                 justify: self.epub_prefs.justify,
                 hyphenate: self.epub_prefs.hyphenate,
                 hypher_lang: hypher_lang_from_meta(
@@ -1353,7 +1370,16 @@ impl<'a> PdfViewerApp<'a> {
                 ),
             }
         } else {
-            BookLayoutOpts::default()
+            BookLayoutOpts {
+                book_mode: false,
+                font_family: FontFamily::UiSans,
+                line_mult: self.md_line_spacing.clamp(1.20, 2.20),
+                word_spacing_px: self.md_word_spacing_px.clamp(0.0, 8.0) * s * self.zoom_level,
+                para_mult: self.md_para_spacing_mult.clamp(0.5, 2.5),
+                justify: false,
+                hyphenate: false,
+                hypher_lang: hypher::Lang::English,
+            }
         };
         let mut links = Vec::new();
         let mut code_blocks = Vec::new();
@@ -1384,7 +1410,8 @@ impl<'a> PdfViewerApp<'a> {
             Some(&mut block_y_by_ast_idx),
         );
         let code_h_scroll = vec![0.0f32; code_blocks.len()];
-        let word_count = cached_word_count.unwrap_or_else(|| count_doc_words(&doc.blocks));
+        let (word_count, cum_words_by_block) =
+            cached_words.unwrap_or_else(|| build_cum_words_by_block(&doc.blocks));
         self.md_layout = Some(MdLayoutCache {
             col_w,
             zoom_bits,
@@ -1403,6 +1430,7 @@ impl<'a> PdfViewerApp<'a> {
             code_blocks,
             code_h_scroll,
             word_count,
+            cum_words_by_block,
         });
     }
 
@@ -1549,6 +1577,74 @@ impl<'a> PdfViewerApp<'a> {
         Some((left_idx + 1, right_idx_opt.map(|r| r + 1), total))
     }
 
+    /// Maps an AST block index to a 1-based book Location number (`Loc X`).
+    pub(super) fn epub_loc_for_block(&self, ast_block_idx: usize) -> usize {
+        if let Some(ref cache) = self.md_layout {
+            if !cache.book_pages.is_empty() {
+                if let Some((pi, _)) = cache.book_pages.iter().enumerate().find(|(_, pg)| {
+                    pg.slices.iter().any(|sl| sl.ast_block_idx >= ast_block_idx)
+                }) {
+                    return pi.max(1);
+                }
+                for (pi, pg) in cache.book_pages.iter().enumerate() {
+                    if pg.first_ast_block >= ast_block_idx {
+                        return pi.max(1);
+                    }
+                }
+                return cache.book_pages.len().saturating_sub(1).max(1);
+            }
+            if let Some(&by) = cache.block_y_by_ast_idx.get(&ast_block_idx) {
+                let frac = (by / cache.total_h.max(1.0)).clamp(0.0, 1.0);
+                return ((frac * (cache.word_count.max(1) as f32 / 220.0).max(1.0)).round() as usize).max(1);
+            }
+        }
+        let total_blocks = self.markdown_doc.as_ref().map(|d| d.blocks.len()).unwrap_or(1).max(1);
+        ((ast_block_idx * 100) / total_blocks).max(1)
+    }
+
+    /// Estimates remaining reading time in the current chapter (`"~6 min left"` or `"< 1 min left"`).
+    pub(super) fn epub_chapter_time_left_label(&self) -> Option<String> {
+        let doc = self.markdown_doc.as_ref()?;
+        let cache = self.md_layout.as_ref()?;
+        if doc.blocks.is_empty() || cache.cum_words_by_block.len() != doc.blocks.len() + 1 {
+            return None;
+        }
+        let cur_blk = self.current_visible_epub_block_idx().min(doc.blocks.len().saturating_sub(1));
+        // End of current chapter = next PageBreak or next level-1 TocEntry after cur_blk
+        let mut chap_end = doc.blocks.len();
+        for bi in (cur_blk + 1)..doc.blocks.len() {
+            if matches!(doc.blocks[bi], MdBlock::PageBreak) {
+                chap_end = bi;
+                break;
+            }
+        }
+        if let Some(ref meta) = doc.book_meta {
+            fn find_next_top_toc(entries: &[crate::markdown::TocEntry], after: usize, best: &mut usize) {
+                for e in entries {
+                    if e.block_idx > after + 1 && e.block_idx < *best {
+                        *best = e.block_idx;
+                    }
+                    if e.level == 0 {
+                        find_next_top_toc(&e.children, after, best);
+                    }
+                }
+            }
+            find_next_top_toc(&meta.toc, cur_blk, &mut chap_end);
+        }
+        let w_now = cache.cum_words_by_block[cur_blk];
+        let w_end = cache.cum_words_by_block[chap_end.min(doc.blocks.len())];
+        let rem_words = w_end.saturating_sub(w_now);
+        if rem_words == 0 {
+            return Some("< 1 min left".to_string());
+        }
+        let mins = ((rem_words as f32) / 220.0).ceil() as usize;
+        if mins <= 1 && rem_words < 180 {
+            Some("< 1 min left".to_string())
+        } else {
+            Some(format!("{} min left", mins.max(1)))
+        }
+    }
+
     pub(super) fn step_md_magazine_spread(&mut self, dir: i8, buf_w: u32, canvas_h: u32, sf: f64) {
         let sidebar_w = self.sidebar_width_px(sf).min(buf_w.saturating_sub(64));
         let canvas_w = buf_w.saturating_sub(sidebar_w).max(200);
@@ -1608,9 +1704,18 @@ impl<'a> PdfViewerApp<'a> {
             cur_spread.saturating_sub(1)
         };
         if next_spread != cur_spread {
+            let old_scroll_y = self.scroll_y;
             let (target_left_idx, _) = md_magazine_pages_for_spread(next_spread, total);
             self.scroll_y = pages[target_left_idx.min(pages.len().saturating_sub(1))];
-            self.trigger_page_turn_anim(dir);
+            if self.page_turn_anim_ms > 0 {
+                self.page_turn_anim = Some(PageTurnAnim {
+                    started_at: std::time::Instant::now(),
+                    duration_ms: self.page_turn_anim_ms.clamp(220, 1400),
+                    direction: dir,
+                    from_scroll_y: Some(old_scroll_y),
+                    prev_spread: None,
+                });
+            }
             self.request_redraw();
         }
     }
@@ -1779,7 +1884,11 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn ensure_md_editor_initialized(&mut self) {
         if self.md_editor.is_none() {
             let src = self.md_source.as_deref().unwrap_or("");
-            self.md_editor = Some(TextEditorState::from_text(src));
+            let mut ed = TextEditorState::from_text(src);
+            ed.font_size_px = self.md_code_font_px.clamp(10.0, 28.0);
+            self.md_editor = Some(ed);
+        } else if let Some(ref mut ed) = self.md_editor {
+            ed.font_size_px = self.md_code_font_px.clamp(10.0, 28.0);
         }
     }
 
@@ -1863,12 +1972,15 @@ impl<'a> PdfViewerApp<'a> {
 
                 if self.epub_prefs.two_page_spread {
                     let avail_h = (content_bottom - content_top).max(160) as u32;
-                    let spread_h = avail_h.saturating_sub((24.0 * s).round() as u32).max(140);
+                    let spread_h = avail_h.saturating_sub((16.0 * s).round() as u32).max(140);
                     let spread_y = content_top + ((avail_h - spread_h) / 2) as i32;
                     let spread_w = preview_w
-                        .saturating_sub((28.0 * s).round() as u32)
-                        .min((1260.0 * s).round() as u32)
+                        .saturating_sub((14.0 * s).round() as u32)
+                        .min((1280.0 * s).round() as u32)
                         .max(320);
+                    let half_w = (spread_w / 2) as f32;
+                    let outer_pad = (half_w * self.epub_prefs.effective_margin_ratio()).max(16.0 * s).round() as i32;
+                    let inner_pad = (half_w * self.epub_prefs.effective_inner_margin_ratio()).max(14.0 * s).round() as i32;
                     let (top_pad_f, bot_pad_f) = self.epub_prefs.vertical_pad_px(spread_h as f32, s);
                     let top_pad = top_pad_f.round() as i32;
                     let bot_pad = bot_pad_f.round() as i32;
@@ -1916,6 +2028,8 @@ impl<'a> PdfViewerApp<'a> {
                             spread_h,
                             top_pad,
                             bot_pad,
+                            outer_pad,
+                            inner_pad,
                             scroll_y,
                             cache,
                             embedded_imgs,
@@ -1969,6 +2083,8 @@ impl<'a> PdfViewerApp<'a> {
                                         spread_h,
                                         top_pad,
                                         bot_pad,
+                                        outer_pad,
+                                        inner_pad,
                                         old_y,
                                         cache,
                                         embedded_imgs,
@@ -2028,7 +2144,7 @@ impl<'a> PdfViewerApp<'a> {
                     }
                 } else if let Some(ref cache) = self.md_layout {
                     // 1-Page centered Distinct Book Flow
-                    let pad = ((preview_w.min((840.0 * s).round() as u32) as f32) * self.epub_prefs.effective_margin_ratio()).max(20.0 * s);
+                    let pad = ((preview_w.min((860.0 * s).round() as u32) as f32) * self.epub_prefs.effective_margin_ratio()).max(18.0 * s);
                     let sheet_w = (cache.col_w as f32 + pad * 2.0).round() as u32;
                     let sheet_x = preview_x0 + ((preview_w.saturating_sub(sheet_w)) / 2) as i32;
                     let sheet_y = content_top + (8.0 * s).round() as i32;
@@ -2108,142 +2224,106 @@ impl<'a> PdfViewerApp<'a> {
                 };
 
                 if is_magazine {
-                    // Warm matte desk around the open book (Classic MagazineBook mode)
+                    // Warm matte desk around the open book (Markdown / LaTeX MagazineBook mode with 3D Curl!)
                     fill_rect_clipped(buffer, buf_w, buf_h, x0, content_top, preview_w, (content_bottom - content_top).max(0) as u32, theme.canvas_bg);
                     let avail_h = (content_bottom - content_top).max(160) as u32;
                     let spread_h = avail_h.saturating_sub((24.0 * s).round() as u32).max(140);
                     let spread_y = content_top + ((avail_h - spread_h) / 2) as i32;
-                    let spread_w = preview_w.saturating_sub((36.0 * s).round() as u32).min((1240.0 * s).round() as u32).max(300);
+                    let spread_w = preview_w.saturating_sub((24.0 * s).round() as u32).min((1240.0 * s).round() as u32).max(300);
                     let page_pad_y = (22.0 * s).round() as i32;
                     let page_top = spread_y + page_pad_y;
                     let page_bot = (spread_y + spread_h as i32 - page_pad_y - (18.0 * s).round() as i32).max(page_top + 40);
                     let page_inner_h = (page_bot - page_top) as f32;
 
-                    let mut anim_rect = (preview_x0, spread_y, spread_w, spread_h);
-
                     if let Some(ref cache) = self.md_layout {
                         let pages = md_paginate_blocks(&cache.blocks, page_inner_h);
-                        let total_pages = pages.len().max(1);
-                        let num_spreads = md_magazine_total_spreads(total_pages);
-                        let mut page_idx = 0usize;
-                        for (i, &sy) in pages.iter().enumerate() {
-                            if sy <= scroll_y + 2.0 {
-                                page_idx = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        let spread_idx = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
-                        let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total_pages);
-                        let num_sz = (10.5 * s).clamp(9.0, 18.0);
-                        let num_y = spread_y + spread_h as i32 - (20.0 * s).round() as i32;
-
-                        if spread_idx == 0 {
-                            let cover_w = (spread_w / 2).max(cache.col_w + (32.0 * s).round() as u32).min(preview_w.saturating_sub(24));
-                            let cover_x = preview_x0 + ((preview_w.saturating_sub(cover_w)) / 2) as i32;
-                            anim_rect = (cover_x, spread_y, cover_w, spread_h);
-
-                            draw_soft_shadow(
-                                buffer, buf_w, buf_h,
-                                cover_x, spread_y, cover_w, spread_h,
-                                3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
-                                (0, 0, 0), 72,
-                            );
-                            fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, page_bg);
-                            fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, 1, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y + spread_h as i32 - 1, cover_w, 1, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, 1, spread_h, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, cover_x + cover_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
-
-                            let col_x = cover_x + ((cover_w as i32 - cache.col_w as i32) / 2).max(12);
-                            let start_y = pages[0];
-                            let end_y = pages.get(1).copied().unwrap_or(f32::MAX);
-                            for blk in &cache.blocks {
-                                let (by, _) = md_block_y_h(blk);
-                                if by >= start_y - 0.5 && by < end_y - 0.5 {
-                                    draw_laid_out_block(
-                                        buffer, buf_w, buf_h, blk, col_x, cache.col_w as f32,
-                                        page_top, page_bot, start_y, start_y, end_y,
-                                        &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
-                                        &self.hovered_widget, s, &mut self.md_active_hits,
-                                        None, search_ctx,
-                                    );
-                                }
-                            }
-                            let lbl = "1";
-                            let lw = measure_text(lbl, num_sz, false);
-                            draw_text(buffer, buf_w, buf_h, cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32, num_y, lbl, num_sz, content_theme.text_muted, false);
-                        } else {
-                            let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
-                            let spine_x = spread_x + (spread_w / 2) as i32;
-                            anim_rect = (spread_x, spread_y, spread_w, spread_h);
-
-                            draw_soft_shadow(
-                                buffer, buf_w, buf_h,
-                                spread_x, spread_y, spread_w, spread_h,
-                                3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
-                                (0, 0, 0), 68,
-                            );
-                            fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, page_bg);
-                            fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, 1, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y + spread_h as i32 - 1, spread_w, 1, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, 1, spread_h, content_theme.border_subtle);
-                            fill_rect_clipped(buffer, buf_w, buf_h, spread_x + spread_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
-
-                            let half_w = (spread_w / 2) as i32;
-                            let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(12);
-                            let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(12);
-
-                            let left_start = pages[left_idx];
-                            let left_end = pages.get(left_idx + 1).copied().unwrap_or(f32::MAX);
-                            for blk in &cache.blocks {
-                                let (by, _) = md_block_y_h(blk);
-                                if by >= left_start - 0.5 && by < left_end - 0.5 {
-                                    draw_laid_out_block(
-                                        buffer, buf_w, buf_h, blk, left_col_x, cache.col_w as f32,
-                                        page_top, page_bot, left_start, left_start, left_end,
-                                        &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
-                                        &self.hovered_widget, s, &mut self.md_active_hits,
-                                        None, search_ctx,
-                                    );
-                                }
-                            }
-                            let l_lbl = format!("{}", left_idx + 1);
-                            draw_text(buffer, buf_w, buf_h, spread_x + (18.0 * s).round() as i32, num_y, &l_lbl, num_sz, content_theme.text_muted, false);
-
-                            if let Some(right_idx) = right_idx_opt {
-                                let right_start = pages[right_idx];
-                                let right_end = pages.get(right_idx + 1).copied().unwrap_or(f32::MAX);
-                                for blk in &cache.blocks {
-                                    let (by, _) = md_block_y_h(blk);
-                                    if by >= right_start - 0.5 && by < right_end - 0.5 {
-                                        draw_laid_out_block(
-                                            buffer, buf_w, buf_h, blk, right_col_x, cache.col_w as f32,
-                                            page_top, page_bot, right_start, right_start, right_end,
-                                            &cache.code_h_scroll, embedded_imgs, &mut self.md_image_cache, &content_theme,
-                                            &self.hovered_widget, s, &mut self.md_active_hits,
-                                            None, search_ctx,
-                                        );
-                                    }
-                                }
-                                let r_lbl = format!("{}", right_idx + 1);
-                                let rw = measure_text(&r_lbl, num_sz, false);
-                                draw_text(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (18.0 * s).round() as i32 - rw.round() as i32, num_y, &r_lbl, num_sz, content_theme.text_muted, false);
-                            }
-
-                            draw_book_spine_crease(
-                                buffer, buf_w, buf_h, spine_x, spread_y, spread_h,
-                                (16.0 * s).round().max(6.0) as i32,
-                            );
-                        }
-                    }
-
-                    if let Some((eased, dir)) = self.page_turn_anim_progress() {
-                        draw_magazine_page_turn_overlay(
-                            buffer, buf_w, buf_h,
-                            anim_rect.0, anim_rect.1, anim_rect.2, anim_rect.3,
-                            eased, dir, s,
+                        let spread_x = preview_x0 + ((preview_w.saturating_sub(spread_w)) / 2) as i32;
+                        let anim_rect = render_classic_md_magazine_spread_surface(
+                            buffer,
+                            buf_w,
+                            buf_h,
+                            preview_x0,
+                            preview_w,
+                            spread_x,
+                            spread_y,
+                            spread_w,
+                            spread_h,
+                            page_top,
+                            page_bot,
+                            scroll_y,
+                            cache,
+                            &pages,
+                            embedded_imgs,
+                            &mut self.md_image_cache,
+                            theme.canvas_bg,
+                            page_bg,
+                            &content_theme,
+                            &self.hovered_widget,
+                            s,
+                            Some(&mut self.md_active_hits),
+                            search_ctx,
+                            true,
                         );
+
+                        let mut anim_done = false;
+                        if let Some(ref mut anim) = self.page_turn_anim {
+                            let elapsed_ms = anim.started_at.elapsed().as_secs_f32() * 1000.0;
+                            let linear_t = (elapsed_ms / anim.duration_ms.max(1) as f32).clamp(0.0, 1.0);
+                            if linear_t >= 1.0 {
+                                anim_done = true;
+                            } else if let Some(old_y) = anim.from_scroll_y {
+                                let (ax, ay, aw, ah) = anim_rect;
+                                let need_snap = anim
+                                    .prev_spread
+                                    .as_ref()
+                                    .is_none_or(|(pw, ph, _)| *pw != aw || *ph != ah);
+                                if need_snap && aw > 0 && ah > 0 {
+                                    let mut snap = vec![theme.canvas_bg; (aw as usize) * (ah as usize)];
+                                    render_classic_md_magazine_spread_surface(
+                                        &mut snap,
+                                        aw,
+                                        ah,
+                                        0,
+                                        aw,
+                                        0,
+                                        0,
+                                        aw,
+                                        ah,
+                                        page_pad_y,
+                                        (ah as i32 - page_pad_y - (18.0 * s).round() as i32).max(page_pad_y + 40),
+                                        old_y,
+                                        cache,
+                                        &pages,
+                                        embedded_imgs,
+                                        &mut self.md_image_cache,
+                                        theme.canvas_bg,
+                                        page_bg,
+                                        &content_theme,
+                                        &None,
+                                        s,
+                                        None,
+                                        search_ctx,
+                                        false,
+                                    );
+                                    anim.prev_spread = Some((aw, ah, snap));
+                                }
+                                if let Some((_, _, ref prev_px)) = anim.prev_spread {
+                                    draw_apple_books_page_curl(
+                                        buffer, buf_w, buf_h, prev_px, ax, ay, aw, ah, linear_t, anim.direction, page_bg, s,
+                                    );
+                                }
+                            } else {
+                                let eased = 1.0 - (1.0 - linear_t).powi(3);
+                                draw_magazine_page_turn_overlay(
+                                    buffer, buf_w, buf_h,
+                                    anim_rect.0, anim_rect.1, anim_rect.2, anim_rect.3,
+                                    eased, anim.direction, s,
+                                );
+                            }
+                        }
+                        if anim_done {
+                            self.page_turn_anim = None;
+                        }
                     }
                 } else if let Some(ref cache) = self.md_layout {
                     let col_x = preview_x0 + ((preview_w.saturating_sub(cache.col_w)) / 2) as i32;
@@ -2338,6 +2418,22 @@ impl<'a> PdfViewerApp<'a> {
     pub(super) fn handle_editor_bar_action(&mut self, action: super::text_editor::EditorBarAction, editor_w: u32, editor_h: f32, sf: f64) {
         use super::text_editor::EditorBarAction;
         match action {
+            EditorBarAction::CodeFontDown => {
+                self.md_code_font_px = (self.md_code_font_px - 1.0).clamp(10.0, 28.0);
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.font_size_px = self.md_code_font_px;
+                }
+                self.status_notice = Some(format!("Code Font: {:.0} px", self.md_code_font_px));
+                self.save_session_to_ini();
+            }
+            EditorBarAction::CodeFontUp => {
+                self.md_code_font_px = (self.md_code_font_px + 1.0).clamp(10.0, 28.0);
+                if let Some(ref mut ed) = self.md_editor {
+                    ed.font_size_px = self.md_code_font_px;
+                }
+                self.status_notice = Some(format!("Code Font: {:.0} px", self.md_code_font_px));
+                self.save_session_to_ini();
+            }
             EditorBarAction::ModeSplit => {
                 if !Self::is_epub_path(&self.file_path) {
                     self.md_editor_mode = MdEditorMode::Split;
@@ -2481,6 +2577,8 @@ fn render_distinct_epub_spread_surface(
     spread_h: u32,
     top_pad: i32,
     bot_pad: i32,
+    outer_pad: i32,
+    inner_pad: i32,
     scroll_y: f32,
     cache: &MdLayoutCache,
     embedded_images: &HashMap<String, Vec<u8>>,
@@ -2602,9 +2700,10 @@ fn render_distinct_epub_spread_surface(
         fill_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, page_bg);
         stroke_rounded_rect(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, 4.0 * s, content_theme.border_subtle);
 
-        let half_w = (spread_w / 2) as i32;
-        let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(16);
-        let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(16);
+        // Asymmetric symmetric-book margins: Left page respects `outer_pad` on left and `inner_pad` on spine;
+        // Right page respects `inner_pad` on spine and `outer_pad` on right!
+        let left_col_x = spread_x + outer_pad.max(12);
+        let right_col_x = spine_x + inner_pad.max(10);
 
         let mut scratch_hits = Vec::new();
         let mut scratch_words = Vec::new();
@@ -2710,6 +2809,163 @@ fn render_distinct_epub_spread_surface(
             spread_h,
             (18.0 * s).round().max(6.0) as i32,
         );
+    }
+}
+
+/// Renders a Classic / Studio MagazineBook spread for Markdown & LaTeX into `buffer`
+/// and returns `(anim_x, anim_y, anim_w, anim_h)` so the Apple Books 3D curl animation works seamlessly.
+#[allow(clippy::too_many_arguments)]
+fn render_classic_md_magazine_spread_surface(
+    buffer: &mut [u32],
+    buf_w: u32,
+    buf_h: u32,
+    preview_x0: i32,
+    preview_w: u32,
+    spread_x: i32,
+    spread_y: i32,
+    spread_w: u32,
+    spread_h: u32,
+    page_top: i32,
+    page_bot: i32,
+    scroll_y: f32,
+    cache: &MdLayoutCache,
+    pages: &[f32],
+    embedded_images: &HashMap<String, Vec<u8>>,
+    image_cache: &mut MdDecodedImageCache,
+    desk_bg: u32,
+    page_bg: u32,
+    content_theme: &UiTheme,
+    hovered_widget: &Option<UiHit>,
+    s: f32,
+    mut hits: Option<&mut Vec<MdHitRect>>,
+    search_ctx: BookDrawCtx<'_>,
+    draw_outer_shadow: bool,
+) -> (i32, i32, u32, u32) {
+    let total_pages = pages.len().max(1);
+    let num_spreads = md_magazine_total_spreads(total_pages);
+    let mut page_idx = 0usize;
+    for (i, &sy) in pages.iter().enumerate() {
+        if sy <= scroll_y + 2.0 {
+            page_idx = i;
+        } else {
+            break;
+        }
+    }
+    let spread_idx = md_magazine_spread_for_page(page_idx).min(num_spreads.saturating_sub(1));
+    let (left_idx, right_idx_opt) = md_magazine_pages_for_spread(spread_idx, total_pages);
+    let num_sz = (10.5 * s).clamp(9.0, 18.0);
+    let num_y = spread_y + spread_h as i32 - (20.0 * s).round() as i32;
+    let mut scratch_hits = Vec::new();
+
+    if spread_idx == 0 {
+        let cover_w = if !draw_outer_shadow {
+            spread_w
+        } else {
+            (spread_w / 2).max(cache.col_w + (32.0 * s).round() as u32).min(preview_w.saturating_sub(16))
+        };
+        let cover_x = if !draw_outer_shadow {
+            spread_x
+        } else {
+            preview_x0 + ((preview_w.saturating_sub(cover_w)) / 2) as i32
+        };
+
+        if !draw_outer_shadow {
+            fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, desk_bg);
+        } else {
+            draw_soft_shadow(
+                buffer, buf_w, buf_h,
+                cover_x, spread_y, cover_w, spread_h,
+                3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
+                (0, 0, 0), 72,
+            );
+        }
+        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, page_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, 1, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y + spread_h as i32 - 1, cover_w, 1, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, cover_x, spread_y, 1, spread_h, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, cover_x + cover_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
+
+        let col_x = cover_x + ((cover_w as i32 - cache.col_w as i32) / 2).max(12);
+        let start_y = pages[0];
+        let end_y = pages.get(1).copied().unwrap_or(f32::MAX);
+        for blk in &cache.blocks {
+            let (by, _) = md_block_y_h(blk);
+            if by >= start_y - 0.5 && by < end_y - 0.5 {
+                draw_laid_out_block(
+                    buffer, buf_w, buf_h, blk, col_x, cache.col_w as f32,
+                    page_top, page_bot, start_y, start_y, end_y,
+                    &cache.code_h_scroll, embedded_images, image_cache, content_theme,
+                    hovered_widget, s, hits.as_deref_mut().unwrap_or(&mut scratch_hits),
+                    None, search_ctx,
+                );
+            }
+        }
+        let lbl = "1";
+        let lw = measure_text(lbl, num_sz, false);
+        draw_text(buffer, buf_w, buf_h, cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32, num_y, lbl, num_sz, content_theme.text_muted, false);
+        (cover_x, spread_y, cover_w, spread_h)
+    } else {
+        let spine_x = spread_x + (spread_w / 2) as i32;
+        if draw_outer_shadow {
+            draw_soft_shadow(
+                buffer, buf_w, buf_h,
+                spread_x, spread_y, spread_w, spread_h,
+                3.0 * s, (12.0 * s).round().max(4.0) as i32, (5.0 * s).round().max(2.0) as i32,
+                (0, 0, 0), 68,
+            );
+        }
+        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, page_bg);
+        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, 1, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y + spread_h as i32 - 1, spread_w, 1, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, 1, spread_h, content_theme.border_subtle);
+        fill_rect_clipped(buffer, buf_w, buf_h, spread_x + spread_w as i32 - 1, spread_y, 1, spread_h, content_theme.border_subtle);
+
+        let half_w = (spread_w / 2) as i32;
+        let left_col_x = spread_x + ((half_w - cache.col_w as i32) / 2).max(12);
+        let right_col_x = spine_x + ((half_w - cache.col_w as i32) / 2).max(12);
+
+        let left_start = pages[left_idx];
+        let left_end = pages.get(left_idx + 1).copied().unwrap_or(f32::MAX);
+        for blk in &cache.blocks {
+            let (by, _) = md_block_y_h(blk);
+            if by >= left_start - 0.5 && by < left_end - 0.5 {
+                draw_laid_out_block(
+                    buffer, buf_w, buf_h, blk, left_col_x, cache.col_w as f32,
+                    page_top, page_bot, left_start, left_start, left_end,
+                    &cache.code_h_scroll, embedded_images, image_cache, content_theme,
+                    hovered_widget, s, hits.as_deref_mut().unwrap_or(&mut scratch_hits),
+                    None, search_ctx,
+                );
+            }
+        }
+        let l_lbl = format!("{}", left_idx + 1);
+        draw_text(buffer, buf_w, buf_h, spread_x + (18.0 * s).round() as i32, num_y, &l_lbl, num_sz, content_theme.text_muted, false);
+
+        if let Some(right_idx) = right_idx_opt {
+            let right_start = pages[right_idx];
+            let right_end = pages.get(right_idx + 1).copied().unwrap_or(f32::MAX);
+            for blk in &cache.blocks {
+                let (by, _) = md_block_y_h(blk);
+                if by >= right_start - 0.5 && by < right_end - 0.5 {
+                    draw_laid_out_block(
+                        buffer, buf_w, buf_h, blk, right_col_x, cache.col_w as f32,
+                        page_top, page_bot, right_start, right_start, right_end,
+                        &cache.code_h_scroll, embedded_images, image_cache, content_theme,
+                        hovered_widget, s, hits.as_deref_mut().unwrap_or(&mut scratch_hits),
+                        None, search_ctx,
+                    );
+                }
+            }
+            let r_lbl = format!("{}", right_idx + 1);
+            let rw = measure_text(&r_lbl, num_sz, false);
+            draw_text(buffer, buf_w, buf_h, spread_x + spread_w as i32 - (18.0 * s).round() as i32 - rw.round() as i32, num_y, &r_lbl, num_sz, content_theme.text_muted, false);
+        }
+
+        draw_book_spine_crease(
+            buffer, buf_w, buf_h, spine_x, spread_y, spread_h,
+            (16.0 * s).round().max(6.0) as i32,
+        );
+        (spread_x, spread_y, spread_w, spread_h)
     }
 }
 
@@ -3805,6 +4061,17 @@ fn count_doc_words(blocks: &[crate::markdown::MdBlock]) -> usize {
         }
     }
     total
+}
+
+fn build_cum_words_by_block(blocks: &[crate::markdown::MdBlock]) -> (usize, Vec<usize>) {
+    let mut cum = Vec::with_capacity(blocks.len() + 1);
+    let mut running = 0usize;
+    cum.push(0);
+    for b in blocks {
+        running += count_doc_words(std::slice::from_ref(b));
+        cum.push(running);
+    }
+    (running, cum)
 }
 
 fn md_block_y_h(blk: &LaidOutBlock) -> (f32, f32) {
