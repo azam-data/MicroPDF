@@ -278,6 +278,18 @@ pub fn parse_epub_bytes(data: &[u8], fallback_title: &str) -> Result<MarkdownDoc
             continue;
         }
 
+        // Skip redundant standalone cover-wrapper spine item when the exact same cover image
+        // is already displayed on the full-page Cover (prevents duplicate cover on Page 1).
+        if blocks.is_empty() && spine_hrefs.len() > 1 {
+            if let Some(ref ck) = cover_image_key {
+                let is_only_cover_img = chap_blocks.len() == 1
+                    && matches!(&chap_blocks[0], MdBlock::Image { path, .. } if path == ck);
+                if is_only_cover_img {
+                    continue;
+                }
+            }
+        }
+
         // Start every EPUB chapter on a clean new page (regardless of font or size)
         if !blocks.is_empty() {
             blocks.push(MdBlock::PageBreak);

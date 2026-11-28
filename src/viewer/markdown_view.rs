@@ -2620,65 +2620,149 @@ fn render_distinct_epub_spread_surface(
         if !draw_outer_shadow {
             fill_rect_clipped(buffer, buf_w, buf_h, spread_x, spread_y, spread_w, spread_h, desk_bg);
         }
-        let cover_w = (spread_w / 2)
-            .max(cache.col_w + (40.0 * s).round() as u32)
-            .min(spread_w);
-        let cover_x = spread_x + ((spread_w.saturating_sub(cover_w)) / 2) as i32;
+        let full_cover_key = cover_thumb
+            .map(|(k, _, _, _)| k.as_str())
+            .filter(|k| embedded_images.contains_key(*k));
 
-        if draw_outer_shadow {
-            draw_soft_shadow(
+        let mut drew_full_cover = false;
+        if let Some(ckey) = full_cover_key {
+            let nat_dims = embedded_images.get(ckey).and_then(|bytes| {
+                image::ImageReader::new(std::io::Cursor::new(bytes))
+                    .with_guessed_format()
+                    .ok()
+                    .and_then(|r| r.into_dimensions().ok())
+            });
+            let (nw, nh) = nat_dims.filter(|&(w, h)| w > 0 && h > 0).unwrap_or((600, 900));
+            let aspect = (nw as f32 / nh as f32).clamp(0.42, 1.55);
+            let max_h = spread_h.max(64);
+            let max_w = spread_w.max(64);
+            let mut dh = max_h as f32;
+            let mut dw = dh * aspect;
+            if dw > max_w as f32 {
+                dw = max_w as f32;
+                dh = (dw / aspect).min(max_h as f32);
+            }
+            let cover_w = dw.round().max(1.0) as u32;
+            let cover_h = dh.round().max(1.0) as u32;
+            let cover_x = spread_x + ((spread_w.saturating_sub(cover_w)) / 2) as i32;
+            let cover_y = spread_y + ((spread_h.saturating_sub(cover_h)) / 2) as i32;
+
+            if let Some((sw, sh, src_px)) =
+                ensure_md_image_decoded(ckey, cover_w, cover_h, embedded_images, image_cache)
+            {
+                if draw_outer_shadow {
+                    draw_soft_shadow(
+                        buffer,
+                        buf_w,
+                        buf_h,
+                        cover_x,
+                        cover_y,
+                        cover_w,
+                        cover_h,
+                        4.0 * s,
+                        (16.0 * s).round().max(4.0) as i32,
+                        (6.0 * s).round().max(2.0) as i32,
+                        (0, 0, 0),
+                        82,
+                    );
+                }
+                for dy in 0..cover_h {
+                    let py = cover_y + dy as i32;
+                    if py < 0 || py >= buf_h as i32 {
+                        continue;
+                    }
+                    let sy = if *sh == cover_h {
+                        dy as usize
+                    } else {
+                        ((dy as u64 * *sh as u64) / cover_h as u64).min(*sh as u64 - 1) as usize
+                    };
+                    let dst_row = py as usize * buf_w as usize;
+                    let src_row = sy * (*sw as usize);
+                    for dx in 0..cover_w {
+                        let px_x = cover_x + dx as i32;
+                        if px_x < 0 || px_x >= buf_w as i32 {
+                            continue;
+                        }
+                        let sx = if *sw == cover_w {
+                            dx as usize
+                        } else {
+                            ((dx as u64 * *sw as u64) / cover_w as u64).min(*sw as u64 - 1) as usize
+                        };
+                        buffer[dst_row + px_x as usize] = src_px[src_row + sx];
+                    }
+                }
+                // Subtle bookbinding groove near the left edge + crisp border
+                let groove_w = (2.0 * s).round().max(1.0) as u32;
+                let groove_x = (cover_x + (10.0 * s).round().max(4.0) as i32).max(0) as u32;
+                let groove_y = cover_y.max(0) as u32;
+                super::render::blend_rect_rgba(buffer, buf_w, buf_h, groove_x, groove_y, groove_w, cover_h, (0, 0, 0, 34));
+                super::render::blend_rect_rgba(buffer, buf_w, buf_h, groove_x + groove_w, groove_y, 1, cover_h, (255, 255, 255, 28));
+                stroke_rounded_rect(buffer, buf_w, buf_h, cover_x, cover_y, cover_w, cover_h, 2.0 * s, content_theme.border_subtle);
+                drew_full_cover = true;
+            }
+        }
+
+        if !drew_full_cover {
+            let cover_w = (spread_w / 2)
+                .max(cache.col_w + (40.0 * s).round() as u32)
+                .min(spread_w);
+            let cover_x = spread_x + ((spread_w.saturating_sub(cover_w)) / 2) as i32;
+
+            if draw_outer_shadow {
+                draw_soft_shadow(
+                    buffer,
+                    buf_w,
+                    buf_h,
+                    cover_x,
+                    spread_y,
+                    cover_w,
+                    spread_h,
+                    4.0 * s,
+                    (14.0 * s).round().max(4.0) as i32,
+                    (5.0 * s).round().max(2.0) as i32,
+                    (0, 0, 0),
+                    72,
+                );
+            }
+            fill_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, page_bg);
+            stroke_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, content_theme.border_subtle);
+
+            draw_distinct_epub_cover_card(
                 buffer,
                 buf_w,
                 buf_h,
                 cover_x,
-                spread_y,
+                page_top,
                 cover_w,
-                spread_h,
-                4.0 * s,
-                (14.0 * s).round().max(4.0) as i32,
-                (5.0 * s).round().max(2.0) as i32,
-                (0, 0, 0),
-                72,
+                (page_bot - page_top).max(60) as u32,
+                None,
+                book_meta_title,
+                book_meta_author,
+                book_meta_pub,
+                cache.book_font_family,
+                content_theme,
+                s,
+            );
+            let lbl = "Cover";
+            let f_style = TextStyle {
+                family: cache.book_font_family,
+                size_px: num_sz,
+                bold: false,
+                italic: true,
+            };
+            let lw = measure_text_styled(lbl, f_style);
+            draw_text_styled_clipped(
+                buffer,
+                buf_w,
+                buf_h,
+                cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32,
+                num_y,
+                cover_x + cover_w as i32 - 8,
+                lbl,
+                f_style,
+                content_theme.text_muted,
             );
         }
-        fill_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, page_bg);
-        stroke_rounded_rect(buffer, buf_w, buf_h, cover_x, spread_y, cover_w, spread_h, 4.0 * s, content_theme.border_subtle);
-
-        draw_distinct_epub_cover_card(
-            buffer,
-            buf_w,
-            buf_h,
-            cover_x,
-            page_top,
-            cover_w,
-            (page_bot - page_top).max(60) as u32,
-            cover_thumb,
-            book_meta_title,
-            book_meta_author,
-            book_meta_pub,
-            cache.book_font_family,
-            content_theme,
-            s,
-        );
-        let lbl = "Cover";
-        let f_style = TextStyle {
-            family: cache.book_font_family,
-            size_px: num_sz,
-            bold: false,
-            italic: true,
-        };
-        let lw = measure_text_styled(lbl, f_style);
-        draw_text_styled_clipped(
-            buffer,
-            buf_w,
-            buf_h,
-            cover_x + ((cover_w as f32 - lw) * 0.5).round() as i32,
-            num_y,
-            cover_x + cover_w as i32 - 8,
-            lbl,
-            f_style,
-            content_theme.text_muted,
-        );
     } else {
         let spine_x = spread_x + (spread_w / 2) as i32;
         if draw_outer_shadow {

@@ -799,7 +799,7 @@ impl<'a> PdfViewerApp<'a> {
             return;
         };
         let rgb = im.to_rgb8();
-        let (tw, th) = (44u32, 62u32);
+        let (tw, th) = (92u32, 132u32);
         let resized = image::imageops::resize(&rgb, tw, th, image::imageops::FilterType::Triangle);
         let mut px = Vec::with_capacity((tw * th) as usize);
         for p in resized.pixels() {
